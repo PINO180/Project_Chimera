@@ -1,0 +1,38 @@
+name: ss-class-env
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  # -------------------------------------------------------------------
+  # ベースイメージに既に含まれているものは全て削除します。
+  # python, rapids, cudf, cuml, cupy, numba, jupyterlab, pandas, numpy,
+  # scikit-learn, matplotlib, seaborn などは記載不要です。
+  # -------------------------------------------------------------------
+
+  # --- Conda パッケージ (ベースイメージにないものだけ) ---
+  # 高度計量経済モデル
+  - pmdarima
+  - arch-py
+  - hmmlearn
+
+  # 高性能機械学習 (py-lightgbm-gpuはconda-forgeにあります)
+  - py-lightgbm-gpu
+
+  # --- Pip パッケージ ---
+  - pip
+  - pip:
+    # 時間幾何学・カオス理論
+    - fathon==0.5
+    - MFDFA==0.4.3
+    - nolds==0.5.2
+
+    # 信号分解・解析
+    - EMD-signal==1.5.0
+    - emd==0.8.1
+
+    # 情報流・因果性
+    - PyCausality==0.1.3
+
+    # PyTorch (CUDA 12.2の環境でも、cu124のPyTorchはドライバが対応していれば動作します)
+    - torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+    - torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
