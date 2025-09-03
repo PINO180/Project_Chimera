@@ -1,0 +1,28 @@
+# requirements.txt
+
+# 高度計量経済モデル
+pmdarima
+arch
+hmmlearn
+
+# 高性能機械学習
+lightgbm
+
+# 時間幾何学・カオス理論
+fathom
+MFDFA
+nolds
+
+# 信号分解・解析
+EMD-signal
+emd
+
+# 情報流・因果性
+PyCausality
+
+# PyTorch
+torch
+torchvision
+
+# 開発用（バージョン制約で依存関係解決を支援）
+jupyterlab>=4.0,<5.0

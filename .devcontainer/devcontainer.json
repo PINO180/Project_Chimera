@@ -40,7 +40,7 @@
     },
     // コンテナ初回起動時のみ実行されるコマンド
     // 例: pipで追加パッケージをインストールする
-    "postCreateCommand": "pip install --user jupyterlab && echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc",
+    "postCreateCommand": "pip install --user -r requirements.txt && echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc",
     // GitHub CLIの追加
     "features": {
         "ghcr.io/devcontainers/features/github-cli:1": {}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SS級GPU加速MFDFA環境統合検証プロトコル
+SS級GPU加速環境統合検証プロトコル
 文書仕様: 2.3章「コアスタック検証プロトコル」+ 4.4章「統合ビルド後検証プロトコル」
 """
 
@@ -8,7 +8,7 @@ import sys
 import traceback
 
 def main():
-    print("SS級GPU-MFDFA統合検証プロトコル開始")
+    print("SS級GPU統合検証プロトコル開始")
     print("=" * 60)
     
     tests_passed = 0
@@ -71,7 +71,7 @@ def main():
     print(f"検証結果: {tests_passed}/{total_tests} テスト成功")
     
     if tests_passed == total_tests:
-        print("🎯 SS級GPU-MFDFA環境: 完全検証成功")
+        print("🎯 SS級GPU環境: 完全検証成功")
         print("「既知の良好な状態 (Known-Good State)」確立")
         return 0
     else:
