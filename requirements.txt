@@ -1,28 +1,48 @@
-# requirements.txt
+# requirements.txt - RAPIDS環境用
 
-# 高度計量経済モデル
+# 基本数値計算・科学計算
+scipy
+sympy
+psutil
+memory-profiler
+
+# データ処理・ファイルI/O
+pyarrow
+polars
+
+# 並列処理
+pathos
+
+# 統計・時系列解析
+statsmodels
 pmdarima
 arch
 hmmlearn
 
-# 高性能機械学習
+# 機械学習
 lightgbm
+xgboost
 
-# 時間幾何学・カオス理論
-fathom
-MFDFA
-nolds
+# 信号処理・ウェーブレット
+PyWavelets
 
-# 信号分解・解析
-EMD-signal
-emd
-
-# 情報流・因果性
-PyCausality
+# 統計・相関解析
+dcor
 
 # PyTorch
 torch
 torchvision
 
-# 開発用（バージョン制約で依存関係解決を支援）
+# エントロピー計算
+entropy
+
+# 追加したライブラリ
+MFDFA
+nolds
+PyCausality
+EMD-signal
+emd
+tqdm
+
+# 開発用
 jupyterlab>=4.0,<5.0

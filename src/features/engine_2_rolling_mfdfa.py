@@ -123,7 +123,7 @@ logging.basicConfig(
     format='%(asctime)s - 🚀SS級GPU-MFDFA🚀 - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('ss_grade_gpu_mfdfa.log', encoding='utf-8')
+        logging.FileHandler('feature_value_2_rolling_mfdfa.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -149,21 +149,48 @@ class GPUSystemConfig:
         
         device = cuda.get_current_device()
         
-        # メモリ情報取得
-        meminfo = cuda.current_context().get_memory_info()
-        total_memory = meminfo.total / (1024**3)  # GB
-        free_memory = meminfo.free / (1024**3)    # GB
+        # メモリ情報取得（RMM互換性対応）
+        try:
+            meminfo = cuda.current_context().get_memory_info()
+            total_memory = meminfo.total / (1024**3)  # GB
+            free_memory = meminfo.free / (1024**3)    # GB
+        except NotImplementedError:
+            # RMMが実装していない場合の代替手段
+            import cupy as cp
+            total_memory = cp.cuda.Device().mem_info[1] / (1024**3)  # GB
+            free_memory = cp.cuda.Device().mem_info[0] / (1024**3)   # GB
         
+        # デバイス属性の安全な取得
+        try:
+            memory_bandwidth = getattr(device, 'MEMORY_BANDWIDTH', 0) / (1024**3)
+        except:
+            memory_bandwidth = 0.0
+
+        try:
+            multiprocessor_count = getattr(device, 'MULTIPROCESSOR_COUNT', 0)
+        except:
+            multiprocessor_count = 0
+
+        try:
+            max_threads_per_mp = getattr(device, 'MAX_THREADS_PER_MULTIPROCESSOR', 0)
+        except:
+            max_threads_per_mp = 0
+
+        try:
+            warp_size = getattr(device, 'WARP_SIZE', 32)
+        except:
+            warp_size = 32
+
         return cls(
-            device_count=cuda.device_count,
+            device_count=len(cuda.gpus),
             device_name=device.name.decode('utf-8'),
             compute_capability=device.compute_capability,
             total_memory_gb=total_memory,
             free_memory_gb=free_memory,
-            memory_bandwidth_gb_s=device.MEMORY_BANDWIDTH / (1024**3),
-            multiprocessor_count=device.MULTIPROCESSOR_COUNT,
-            max_threads_per_multiprocessor=device.MAX_THREADS_PER_MULTIPROCESSOR,
-            warp_size=device.WARP_SIZE
+            memory_bandwidth_gb_s=memory_bandwidth,
+            multiprocessor_count=multiprocessor_count,
+            max_threads_per_multiprocessor=max_threads_per_mp,
+            warp_size=warp_size
         )
 
 class CUDAMemoryManager:
@@ -179,8 +206,12 @@ class CUDAMemoryManager:
     
     def get_available_memory_gb(self) -> float:
         """安全な使用可能VRAMサイズ取得"""
-        meminfo = cuda.current_context().get_memory_info()
-        free_gb = meminfo.free / (1024**3)
+        try:
+            meminfo = cuda.current_context().get_memory_info()
+            free_gb = meminfo.free / (1024**3)
+        except NotImplementedError:
+            import cupy as cp
+            free_gb = cp.cuda.Device().mem_info[0] / (1024**3)
         safe_available = max(0.5, free_gb - self.safety_margin_gb)  # 最低500MB確保
         return safe_available
     
@@ -344,7 +375,7 @@ class OptimizedDataLoader:
     def __init__(self, memory_manager: CUDAMemoryManager):
         self.memory_manager = memory_manager
         self.supported_formats = {'.parquet', '.csv', '.feather', '.arrow'}
-        self.temp_dir = Path(tempfile.gettempdir()) / "ss_grade_gpu_mfdfa"
+        self.temp_dir = Path(tempfile.gettempdir()) / "feature_value_2_rolling_mfdfa"
         self.temp_dir.mkdir(exist_ok=True, parents=True)
     
     def analyze_data_structure(self, file_path: Path) -> Dict[str, Any]:
@@ -547,6 +578,79 @@ class OptimizedDataLoader:
             logger.info("一時ファイルクリーンアップ完了")
         except Exception as e:
             logger.warning(f"一時ファイルクリーンアップエラー: {e}")
+
+class MultiTimeframeDataLoader:
+    """マルチ時間軸データローダー"""
+    
+    def __init__(self, data_loader: OptimizedDataLoader):
+        self.data_loader = data_loader
+    
+    def load_and_separate_timeframes(self, 
+                                   file_path: Path,
+                                   target_timeframes: List[str] = None) -> Dict[str, dask_cudf.DataFrame]:
+        """
+        マルチ時間軸データの読み込みと分離
+        
+        Args:
+            file_path: 入力ファイルパス
+            target_timeframes: 対象時間軸リスト
+            
+        Returns:
+            Dict[str, dask_cudf.DataFrame]: 時間軸別DataFrame
+        """
+        
+        logger.info(f"マルチ時間軸データ読み込み: {file_path}")
+        
+        # データ構造分析
+        analysis = self.data_loader.analyze_data_structure(file_path)
+        
+        # 全データ読み込み
+        full_ddf = self.data_loader.create_optimized_dask_dataframe(file_path, analysis)
+        
+        # カラム名の正規化
+        if 'timestamp' in full_ddf.columns:
+            full_ddf = full_ddf.rename(columns={'timestamp': 'datetime'})
+        
+        # 利用可能な時間軸確認
+        available_timeframes = full_ddf['timeframe'].unique().compute()
+        logger.info(f"利用可能な時間軸: {available_timeframes}")
+        
+        # 対象時間軸の決定
+        if target_timeframes is None:
+            target_timeframes = ['M1', 'M5', 'M15', 'H1', 'H4']  # デフォルト
+        
+        # 利用可能な時間軸でフィルタ
+        valid_timeframes = [tf for tf in target_timeframes if tf in available_timeframes]
+        
+        if not valid_timeframes:
+            raise ValueError(f"指定された時間軸が見つかりません: {target_timeframes}")
+        
+        logger.info(f"処理対象時間軸: {valid_timeframes}")
+        
+        # 時間軸別にデータ分離
+        timeframe_ddfs = {}
+        for tf in valid_timeframes:
+            logger.debug(f"時間軸{tf}のデータ分離中...")
+            
+            # 該当時間軸のデータを抽出
+            tf_ddf = full_ddf[full_ddf['timeframe'] == tf].copy()
+            
+            # timeframe列を除去（不要になるため）
+            tf_ddf = tf_ddf.drop('timeframe', axis=1)
+            
+            # 時間順にソート
+            tf_ddf = tf_ddf.sort_values('datetime')
+            
+            # データ検証
+            tf_sample = tf_ddf.head(100)
+            if len(tf_sample) == 0:
+                logger.warning(f"時間軸{tf}にデータが存在しません")
+                continue
+            
+            timeframe_ddfs[tf] = tf_ddf
+            logger.debug(f"時間軸{tf}: {tf_ddf.npartitions}パーティション")
+        
+        return timeframe_ddfs            
 
 def initialize_ss_grade_environment() -> Tuple[CUDAMemoryManager, DaskGPUClusterManager, OptimizedDataLoader]:
     """SS級GPU環境の完全初期化"""
@@ -1848,9 +1952,12 @@ class TimeframeResampler:
     """高効率時間軸リサンプリングエンジン"""
     
     def __init__(self):
+        # データに含まれる時間軸をそのまま利用（リサンプリング不要）
         self.supported_timeframes = {
-            '1T': '1min', '5T': '5min', '15T': '15min', 
-            '1H': '1H', '4H': '4H'
+            'tick': 'tick', 'M0.5': '30S', 'M1': '1min', 'M3': '3min', 
+            'M5': '5min', 'M8': '8min', 'M15': '15min', 'M30': '30min',
+            'H1': '1H', 'H4': '4H', 'H6': '6H', 'H12': '12H',
+            'D1': '1D', 'W1': '1W', 'MN': '1M'
         }
     
     def create_resampling_tasks(self, 
@@ -2123,9 +2230,10 @@ Dask-cuDF完全統合実行エンジン
 """
 
 import dask
-from dask import delayed, compute
+from dask.delayed import delayed
+from dask.base import compute
 from dask.distributed import Client, as_completed, wait, progress
-from dask.diagnostics import ProgressBar
+from dask.diagnostics.progress import ProgressBar
 import cudf
 import dask_cudf
 from typing import List, Dict, Tuple, Optional, Any, Union
@@ -2147,7 +2255,11 @@ class MultiTimeframeGPUEngine:
         self.spacetime_integrator = spacetime_integrator
         self.memory_manager = memory_manager
         self.cluster_manager = cluster_manager
-        self.supported_timeframes = ['1T', '5T', '15T', '1H', '4H']
+        # 実際のデータに合わせた時間軸
+        self.supported_timeframes = [
+            'tick', 'M0.5', 'M1', 'M3', 'M5', 'M8', 'M15', 'M30', 
+            'H1', 'H4', 'H6', 'H12', 'D1', 'W1', 'MN'
+        ]
         
     def create_timeframe_resampling_tasks(self, 
                                         base_ddf: dask_cudf.DataFrame,
@@ -2497,13 +2609,13 @@ class SSGradeGPUMFDFAEngine:
         logger.info("SS級GPU-MFDFA統合エンジン初期化完了")
     
     def execute_complete_pipeline(self,
-                                input_file_path: Union[str, Path],
-                                target_timeframes: List[str] = None,
-                                window_size: int = 1000,
-                                max_q_values: int = 15,
-                                selected_columns: Optional[List[str]] = None,
-                                output_path: Optional[Path] = None,
-                                progress_callback: Optional[Callable] = None) -> cudf.DataFrame:
+                            input_file_path: Union[str, Path],
+                            target_timeframes: List[str] = None,
+                            window_size: int = 1000,
+                            max_q_values: int = 15,
+                            selected_columns: Optional[List[str]] = None,
+                            output_path: Optional[Path] = None,
+                            progress_callback: Optional[Callable] = None) -> cudf.DataFrame:
         """
         SS級GPU-MFDFA完全パイプライン実行
         
@@ -2522,7 +2634,10 @@ class SSGradeGPUMFDFAEngine:
         
         input_path = Path(input_file_path)
         if target_timeframes is None:
-            target_timeframes = ['1T', '5T', '15T', '1H', '4H']
+            target_timeframes = [
+                'tick', 'M0.5', 'M1', 'M3', 'M5', 'M8', 'M15', 'M30', 
+                'H1', 'H4', 'H6', 'H12', 'D1', 'W1', 'MN'
+            ]
         
         logger.info("SS級GPU-MFDFA完全パイプライン開始")
         logger.info(f"入力: {input_path}")
@@ -2552,24 +2667,27 @@ class SSGradeGPUMFDFAEngine:
                 update_progress("データ構造分析中...", 0)
                 data_analysis = self.data_loader.analyze_data_structure(input_path)
                 
-                # Step 2: 最適化Dask-cuDF作成
-                update_progress("最適化Dask-cuDFデータフレーム作成中...")
-                base_ddf = self.data_loader.create_optimized_dask_dataframe(
-                    input_path, data_analysis, selected_columns
+                # Step 2: マルチ時間軸データ読み込みと分離
+                update_progress("マルチ時間軸データ読み込み・分離中...")
+                multi_loader = MultiTimeframeDataLoader(self.data_loader)
+                timeframe_ddfs = multi_loader.load_and_separate_timeframes(
+                    input_path, target_timeframes
                 )
                 
-                logger.info(f"Dask-cuDF作成完了: {base_ddf.npartitions}パーティション")
+                logger.info(f"時間軸別データ分離完了: {list(timeframe_ddfs.keys())}")
                 
-                # Step 3: 時間軸リサンプリングタスク
-                update_progress("時間軸リサンプリング設定中...")
-                timeframe_ddfs = self.multiframe_engine.create_timeframe_resampling_tasks(
-                    base_ddf, target_timeframes
-                )
-                
+                # Step 3: 時間軸リサンプリングは不要（既に分離済み）
+                update_progress("時間軸データ検証中...")
+                for tf, ddf in timeframe_ddfs.items():
+                    logger.info(f"時間軸{tf}: {ddf.npartitions}パーティション")
+                            
                 # Step 4: 適応的q値最適化
                 update_progress("量子インスパイアードq値最適化中...")
                 
                 # サンプルデータでq値最適化
+                # ベースとなる時間軸のDataFrameを取得
+                base_timeframe = list(timeframe_ddfs.keys())[0]
+                base_ddf = timeframe_ddfs[base_timeframe]
                 sample_partition = base_ddf.get_partition(0).compute()
                 if len(sample_partition) > 0 and 'close' in sample_partition.columns:
                     sample_prices = sample_partition['close'].dropna().values
@@ -2890,23 +3008,37 @@ def create_interactive_execution_config() -> ExecutionConfig:
         output_path = Path(output_path_str)
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = input_path.parent / f"ss_grade_mfdfa_result_{timestamp}.parquet"
+        output_path = input_path.parent / f"feature_value_2_rolling_mfdfa_{timestamp}.parquet"
     
     # 時間軸選択
-    available_timeframes = ['1T', '5T', '15T', '1H', '4H']
-    print(f"\n対象時間軸選択 (利用可能: {available_timeframes}):")
-    print("すべて選択する場合は Enter キーを押してください")
-    print("カスタム選択する場合はカンマ区切りで入力してください (例: 1T,5T,1H)")
+    available_timeframes = [
+        'tick', 'M0.5', 'M1', 'M3', 'M5', 'M8', 'M15', 'M30', 
+        'H1', 'H4', 'H6', 'H12', 'D1', 'W1', 'MN'
+    ]
+    default_timeframes = ['M1', 'M5', 'M15', 'H1', 'H4']  # 推奨デフォルト
+    
+    print(f"\n対象時間軸選択:")
+    print(f"利用可能: {available_timeframes}")
+    print(f"推奨デフォルト: {default_timeframes}")
+    print("すべて選択する場合は 'all' と入力")
+    print("デフォルトを使用する場合は Enter キーを押してください")
+    print("カスタム選択する場合はカンマ区切りで入力してください (例: M1,M5,H1)")
     
     timeframes_input = input("時間軸選択: ").strip()
     if not timeframes_input:
+        timeframes = default_timeframes
+        print(f"デフォルト時間軸を使用: {timeframes}")
+    elif timeframes_input.lower() == 'all':
         timeframes = available_timeframes
+        print(f"すべての時間軸を使用: {len(timeframes)}種類")
     else:
-        selected = [tf.strip().upper() for tf in timeframes_input.split(',')]
+        selected = [tf.strip() for tf in timeframes_input.split(',')]
         timeframes = [tf for tf in selected if tf in available_timeframes]
         if not timeframes:
             print("有効な時間軸が見つかりません。デフォルトを使用します。")
-            timeframes = available_timeframes
+            timeframes = default_timeframes
+        else:
+            print(f"選択された時間軸: {timeframes}")
     
     # ウィンドウサイズ設定
     while True:
@@ -3348,8 +3480,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--timeframes',
         type=str,
-        default='1T,5T,15T,1H,4H',
-        help='対象時間軸 (カンマ区切り, デフォルト: 1T,5T,15T,1H,4H)'
+        default='tick,M0.5,M1,M3,M5,M8,M15,M30,H1,H4,H6,H12,D1,W1,MN',
+        help='対象時間軸 (カンマ区切り, デフォルト: 全15種類)'
     )
     
     parser.add_argument(
@@ -3401,7 +3533,11 @@ def validate_system_requirements() -> bool:
     issues = []
     
     # CUDA可用性チェック
-    if not cuda.is_available():
+    try:
+        cuda.detect()
+        if len(cuda.gpus) == 0:
+            issues.append("CUDA対応GPUが検出されません")
+    except Exception:
         issues.append("CUDA対応GPUが検出されません")
     
     # GPU要件チェック
@@ -3428,8 +3564,10 @@ def validate_system_requirements() -> bool:
     # メモリチェック
     import psutil
     available_ram = psutil.virtual_memory().available / (1024**3)
-    if available_ram < 16:
-        issues.append(f"RAM不足: {available_ram:.1f}GB (推奨: 16GB以上)")
+    if available_ram < 8:
+        issues.append(f"RAM不足: {available_ram:.1f}GB (最低: 8GB以上)")
+    elif available_ram < 12:
+        issues.append(f"RAM警告: {available_ram:.1f}GB (推奨: 12GB以上、処理速度が制限される可能性)")
     
     if issues:
         print("システム要件に以下の問題があります:")
@@ -3881,10 +4019,14 @@ if __name__ == "__main__":
     try:
         import cupy as cp
         import cudf
-        if not cuda.is_available():
+        try:
+            cuda.detect()
+            if len(cuda.gpus) == 0:
+                raise RuntimeError("CUDA対応GPU未検出")
+        except Exception:
             raise RuntimeError("CUDA対応GPU未検出")
         
-        print(f"GPU検出: {cuda.get_device_name(0)}")
+        print(f"GPU検出: {cuda.get_current_device().name.decode('utf-8')}")
         print("SS級GPU-MFDFA システム起動準備完了")
         
     except ImportError as e:
