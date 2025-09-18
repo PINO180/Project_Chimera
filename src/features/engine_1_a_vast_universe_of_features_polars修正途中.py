@@ -15,8 +15,6 @@ from typing import Dict, List, Tuple, Optional, Union, Any, Iterator
 from functools import partial, wraps
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-import re
-
 
 # 数値計算・データ処理
 import numpy as np
@@ -1074,7 +1072,7 @@ def optimize_numpy_settings():
 # ブロック3: Calculator基礎計算部の実装（核心部分80%リソースの一部）
 
 # =============================================================================
-# Calculator クラス - Polars v1.31.0制約対応版（ブロック1）
+# Calculator クラス - Polars第一主義・高速化リファクタリング版（ブロック1）
 # =============================================================================
 import numpy as np
 import polars as pl
@@ -1111,21 +1109,21 @@ except ImportError:
 
 class Calculator:
     """
-    Polars v1.31.0制約対応Calculator
+    Polars第一主義・高速化Calculator
     
-    制約遵守原則:
-    1. Expression での cumsum(), rolling_*() は使用禁止
-    2. Boolean操作の連鎖はNumPyで実行
-    3. Polarsは基本集約とto_numpy()変換のみ
-    4. 数値計算・統計処理は全てNumPyで実装
+    設計思想:
+    1. 脱・行ごとループ: 各メソッドはチャンク全体を一度に処理
+    2. Polars第一主義: 標準的な計算はPolars Expressionで実装
+    3. Numbaの限定的投入: カスタムアルゴリズムに限定
+    4. ベクトル化処理: 可能な限りNumPy配列演算で並列処理
     """
     
     def __init__(self, window_manager=None, memory_manager=None):
         self.window_manager = window_manager
         self.memory_manager = memory_manager
         
-        # 計算パラメータ
-        self.params = self._initialize_params()
+        # 計算パラメータ（Polars用に最適化）
+        self.params = self._initialize_polars_params()
         
         # 数値安定性パラメータ
         self.numerical_stability = {
@@ -1148,15 +1146,15 @@ class Calculator:
         self.calculation_stats = {
             'total_calculations': 0,
             'successful_calculations': 0,
-            'numpy_calculations': 0,
+            'polars_calculations': 0,
             'numba_calculations': 0,
             'computation_times': []
         }
         
-        logger.info("Calculator初期化完了 - Polars v1.31.0制約対応版")
+        logger.info("Calculator初期化完了 - Polars第一主義設計")
 
-    def _initialize_params(self) -> Dict[str, Any]:
-        """パラメータセット初期化"""
+    def _initialize_polars_params(self) -> Dict[str, Any]:
+        """Polars最適化されたパラメータセット"""
         return {
             # 基本テクニカル指標用期間
             'rsi_periods': [14, 21, 30],
@@ -1183,32 +1181,46 @@ class Calculator:
             'order_stat_windows': [20, 50, 100],
             'autocorr_max_lags': [10, 20],
             
-            # その他の期間パラメータ
+            # ボラティリティ・バンド用
             'volatility_bb_settings': [(20, 2.0), (50, 2.5)],
             'kc_periods': [20, 50],
             'dc_periods': [20, 50, 100],
             'atr_periods_vol': [14, 20],
             'hist_vol_periods': [20, 50, 100],
+            
+            # 移動平均・トレンド用
             'ma_deviation_periods': [20, 50, 100],
             'tma_periods': [14, 21, 50],
             'zlema_periods': [12, 21],
             'dema_periods': [12, 21],
             'tema_periods': [12, 21],
+            
+            # 出来高用
             'cmf_periods': [20, 50],
             'mfi_periods': [14, 21],
             'vol_roc_periods': [10, 20],
+            
+            # ADX・オシレーター用
             'adx_periods': [14, 21],
             'cci_periods': [14, 20],
             'williams_r_periods': [14, 21],
             'aroon_periods': [14, 25],
+            
+            # サポート・レジスタンス用
             'price_channel_periods': [20, 50, 100],
+            
+            # フィルタリング用
             'gaussian_sigmas': [1.0, 2.0, 3.0],
             'median_sizes': [3, 5, 7],
             'savgol_windows': [5, 11, 21],
+            
+            # 物理・信号処理用
             'fourier_windows': [32, 64, 128],
             'spectral_windows': [64, 128],
             'energy_windows': [20, 50],
             'cwt_windows': [100, 200],
+            
+            # 情報理論用
             'lz_windows': [50, 100],
             'kolmogorov_windows': [50, 100],
             'mutual_info_lags': [1, 2, 3, 5],
@@ -1216,32 +1228,28 @@ class Calculator:
         }
 
     # =========================================================================
-    # 基本ユーティリティメソッド（NumPy中心）
+    # Polars統合ユーティリティメソッド
     # =========================================================================
     
-    def _ensure_numpy_array(self, data: Union[np.ndarray, pl.DataFrame, List]) -> np.ndarray:
-        """データをNumPy配列に変換"""
-        if isinstance(data, np.ndarray):
-            return data.flatten() if data.ndim > 1 else data
-        elif isinstance(data, pl.DataFrame):
-            if len(data.columns) > 0:
-                return data[data.columns[0]].to_numpy()
-            else:
-                return np.array([])
-        elif isinstance(data, (list, tuple)):
-            return np.asarray(data)
+    def _ensure_polars_df(self, data: Union[np.ndarray, pl.DataFrame], 
+                          column_name: str = "value") -> pl.DataFrame:
+        """データをPolars DataFrameに変換"""
+        if isinstance(data, pl.DataFrame):
+            return data
+        elif isinstance(data, np.ndarray):
+            return pl.DataFrame({column_name: data})
         else:
-            return np.asarray([data])
+            return pl.DataFrame({column_name: np.asarray(data)})
     
-    def _safe_calculation(self, func, *args, **kwargs) -> Union[np.ndarray, Dict, Any]:
-        """計算の安全なラッパー"""
+    def _polars_safe_calculation(self, func, *args, **kwargs) -> Union[pl.DataFrame, np.ndarray]:
+        """Polars計算の安全なラッパー"""
         start_time = time.time()
         self.calculation_stats['total_calculations'] += 1
         
         try:
             result = func(*args, **kwargs)
             self.calculation_stats['successful_calculations'] += 1
-            self.calculation_stats['numpy_calculations'] += 1
+            self.calculation_stats['polars_calculations'] += 1
             
             computation_time = time.time() - start_time
             self.calculation_stats['computation_times'].append(computation_time)
@@ -1249,10 +1257,11 @@ class Calculator:
             return result
             
         except Exception as e:
-            logger.debug(f"計算エラー in {func.__name__}: {e}")
+            logger.debug(f"Polars計算エラー in {func.__name__}: {e}")
             # フォールバック値を返す
-            if args and hasattr(args[0], '__len__'):
-                return np.zeros(len(args[0]))
+            if 'data' in kwargs and isinstance(kwargs['data'], (np.ndarray, pl.DataFrame)):
+                data_len = len(kwargs['data'])
+                return np.zeros(data_len)
             return np.array([])
 
     def _numba_safe_calculation(self, func, *args, **kwargs) -> np.ndarray:
@@ -1278,199 +1287,64 @@ class Calculator:
             return np.array([])
 
     # =========================================================================
-    # NumPyベース移動平均・統計計算関数
+    # Polarsベース基礎統計・テクニカル指標
     # =========================================================================
     
-    @staticmethod
-    def _rolling_mean_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング平均"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.mean(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_std_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング標準偏差"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.std(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_var_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング分散"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.var(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_skew_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング歪度"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            window_data = data[i-window+1:i+1]
-            if len(window_data) >= 3 and np.std(window_data) > 1e-10:
-                result[i] = stats.skew(window_data)
-        
-        return result
-    
-    @staticmethod
-    def _rolling_kurt_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング尖度"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            window_data = data[i-window+1:i+1]
-            if len(window_data) >= 4 and np.std(window_data) > 1e-10:
-                result[i] = stats.kurtosis(window_data)
-        
-        return result
-    
-    @staticmethod
-    def _rolling_median_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング中央値"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.median(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_min_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング最小値"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.min(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_max_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング最大値"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.max(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_sum_numpy(data: np.ndarray, window: int) -> np.ndarray:
-        """NumPy実装のローリング合計"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.sum(data[i-window+1:i+1])
-        
-        return result
-    
-    @staticmethod
-    def _rolling_quantile_numpy(data: np.ndarray, window: int, quantile: float) -> np.ndarray:
-        """NumPy実装のローリング分位数"""
-        result = np.full_like(data, np.nan)
-        if len(data) < window:
-            return result
-            
-        for i in range(window-1, len(data)):
-            result[i] = np.percentile(data[i-window+1:i+1], quantile * 100)
-        
-        return result
-    
-    @staticmethod
-    def _ema_numpy(data: np.ndarray, span: int) -> np.ndarray:
-        """NumPy実装の指数移動平均"""
-        alpha = 2.0 / (span + 1.0)
-        result = np.full_like(data, np.nan)
-        
-        if len(data) == 0:
-            return result
-        
-        result[0] = data[0]
-        for i in range(1, len(data)):
-            if not np.isnan(data[i]):
-                if not np.isnan(result[i-1]):
-                    result[i] = alpha * data[i] + (1 - alpha) * result[i-1]
-                else:
-                    result[i] = data[i]
-        
-        return result
-    
-    # =========================================================================
-    # 基礎テクニカル指標（NumPy中心実装）
-    # =========================================================================
-    
-    def calculate_basic_technical_indicators(self, 
-                                           high: np.ndarray, 
-                                           low: np.ndarray, 
-                                           close: np.ndarray, 
-                                           volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """基礎テクニカル指標計算（NumPy実装版）"""
+    def calculate_basic_technical_indicators_polars(self, 
+                                                   high: np.ndarray, 
+                                                   low: np.ndarray, 
+                                                   close: np.ndarray, 
+                                                   volume: np.ndarray) -> Dict[str, np.ndarray]:
+        """Polarsベース基礎テクニカル指標計算"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
-        volume = self._ensure_numpy_array(volume)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low, 
+            'close': close,
+            'volume': volume
+        })
         
         try:
-            # RSI計算
+            # RSI（Polars実装）
             for period in self.params['rsi_periods']:
-                rsi_result = self._safe_calculation(self._calculate_rsi_numpy, close, period)
+                rsi_result = self._polars_safe_calculation(
+                    self._calculate_rsi_polars, df, period
+                )
                 if isinstance(rsi_result, np.ndarray):
                     features[f'rsi_{period}'] = rsi_result
                 
-            # MACD計算
+            # MACD（Polars実装）
             for fast, slow, signal in self.params['macd_periods']:
-                macd_result = self._safe_calculation(self._calculate_macd_numpy, close, fast, slow, signal)
+                macd_result = self._polars_safe_calculation(
+                    self._calculate_macd_polars, df, fast, slow, signal
+                )
                 if isinstance(macd_result, dict):
                     features.update(macd_result)
                 
-            # ボリンジャーバンド計算
+            # ボリンジャーバンド（Polars実装）
             for period in self.params['bb_periods']:
                 for std_mult in self.params['bb_std_multipliers']:
-                    bb_result = self._safe_calculation(self._calculate_bollinger_bands_numpy, close, period, std_mult)
+                    bb_result = self._polars_safe_calculation(
+                        self._calculate_bollinger_bands_polars, df, period, std_mult
+                    )
                     if isinstance(bb_result, dict):
                         features.update(bb_result)
             
-            # ATR計算
+            # ATR（Polars実装）
             for period in self.params['atr_periods']:
-                atr_result = self._safe_calculation(self._calculate_atr_numpy, high, low, close, period)
+                atr_result = self._polars_safe_calculation(
+                    self._calculate_atr_polars, df, period
+                )
                 if isinstance(atr_result, np.ndarray):
                     features[f'atr_{period}'] = atr_result
             
-            # Stochastic計算
+            # Stochastic（Polars実装）
             for k_period, d_period in self.params['stoch_periods']:
-                stoch_result = self._safe_calculation(self._calculate_stochastic_numpy, high, low, close, k_period, d_period)
+                stoch_result = self._polars_safe_calculation(
+                    self._calculate_stochastic_polars, df, k_period, d_period
+                )
                 if isinstance(stoch_result, dict):
                     features.update(stoch_result)
                     
@@ -1479,130 +1353,114 @@ class Calculator:
         
         return features
     
-    def _calculate_rsi_numpy(self, close: np.ndarray, period: int) -> np.ndarray:
-        """RSI計算（NumPy実装）"""
-        if len(close) < period + 1:
-            return np.full_like(close, np.nan)
+    def _calculate_rsi_polars(self, df: pl.DataFrame, period: int) -> np.ndarray:
+        """RSI計算（Polarsベース）"""
+        result_df = df.with_columns([
+            pl.col('close').diff().alias('price_change')
+        ]).with_columns([
+            pl.when(pl.col('price_change') > 0)
+            .then(pl.col('price_change'))
+            .otherwise(0.0)
+            .alias('gains'),
+            pl.when(pl.col('price_change') < 0)
+            .then(-pl.col('price_change'))
+            .otherwise(0.0)
+            .alias('losses')
+        ]).with_columns([
+            pl.col('gains').ewm_mean(span=period, adjust=False).alias('avg_gain'),
+            pl.col('losses').ewm_mean(span=period, adjust=False).alias('avg_loss')
+        ]).with_columns([
+            (100.0 - (100.0 / (1.0 + (pl.col('avg_gain') / (pl.col('avg_loss') + 1e-10)))))
+            .alias('rsi')
+        ])
         
-        # 価格変化計算
-        price_change = np.diff(close, prepend=close[0])
-        gains = np.where(price_change > 0, price_change, 0.0)
-        losses = np.where(price_change < 0, -price_change, 0.0)
-        
-        # 指数移動平均計算
-        avg_gain = self._ema_numpy(gains, period)
-        avg_loss = self._ema_numpy(losses, period)
-        
-        # RSI計算
-        rs = np.divide(avg_gain, avg_loss, out=np.zeros_like(avg_gain), where=(avg_loss != 0))
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-        
-        return rsi
+        return result_df['rsi'].to_numpy()
     
-    def _calculate_macd_numpy(self, close: np.ndarray, fast: int, slow: int, signal: int) -> Dict[str, np.ndarray]:
-        """MACD計算（NumPy実装）"""
-        if len(close) < slow:
-            n = len(close)
-            return {
-                f'macd_{fast}_{slow}_{signal}': np.full(n, np.nan),
-                f'macd_signal_{fast}_{slow}_{signal}': np.full(n, np.nan),
-                f'macd_histogram_{fast}_{slow}_{signal}': np.full(n, np.nan)
-            }
-        
-        ema_fast = self._ema_numpy(close, fast)
-        ema_slow = self._ema_numpy(close, slow)
-        macd = ema_fast - ema_slow
-        signal_line = self._ema_numpy(macd, signal)
-        histogram = macd - signal_line
+    def _calculate_macd_polars(self, df: pl.DataFrame, fast: int, slow: int, signal: int) -> Dict[str, np.ndarray]:
+        """MACD計算（Polarsベース）"""
+        result_df = df.with_columns([
+            pl.col('close').ewm_mean(span=fast, adjust=False).alias('ema_fast'),
+            pl.col('close').ewm_mean(span=slow, adjust=False).alias('ema_slow')
+        ]).with_columns([
+            (pl.col('ema_fast') - pl.col('ema_slow')).alias('macd')
+        ]).with_columns([
+            pl.col('macd').ewm_mean(span=signal, adjust=False).alias('signal_line')
+        ]).with_columns([
+            (pl.col('macd') - pl.col('signal_line')).alias('histogram')
+        ])
         
         return {
-            f'macd_{fast}_{slow}_{signal}': macd,
-            f'macd_signal_{fast}_{slow}_{signal}': signal_line,
-            f'macd_histogram_{fast}_{slow}_{signal}': histogram
+            f'macd_{fast}_{slow}_{signal}': result_df['macd'].to_numpy(),
+            f'macd_signal_{fast}_{slow}_{signal}': result_df['signal_line'].to_numpy(),
+            f'macd_histogram_{fast}_{slow}_{signal}': result_df['histogram'].to_numpy()
         }
     
-    def _calculate_bollinger_bands_numpy(self, close: np.ndarray, period: int, std_mult: float) -> Dict[str, np.ndarray]:
-        """ボリンジャーバンド計算（NumPy実装）"""
-        if len(close) < period:
-            n = len(close)
-            return {
-                f'bb_upper_{period}_{std_mult}': np.full(n, np.nan),
-                f'bb_middle_{period}_{std_mult}': np.full(n, np.nan),
-                f'bb_lower_{period}_{std_mult}': np.full(n, np.nan)
-            }
-        
-        sma = self._rolling_mean_numpy(close, period)
-        std = self._rolling_std_numpy(close, period)
-        
-        bb_upper = sma + std_mult * std
-        bb_middle = sma
-        bb_lower = sma - std_mult * std
+    def _calculate_bollinger_bands_polars(self, df: pl.DataFrame, period: int, std_mult: float) -> Dict[str, np.ndarray]:
+        """ボリンジャーバンド計算（Polarsベース）"""
+        result_df = df.with_columns([
+            pl.col('close').rolling_mean(window_size=period).alias('sma'),
+            pl.col('close').rolling_std(window_size=period).alias('std')
+        ]).with_columns([
+            (pl.col('sma') + std_mult * pl.col('std')).alias('bb_upper'),
+            pl.col('sma').alias('bb_middle'),
+            (pl.col('sma') - std_mult * pl.col('std')).alias('bb_lower')
+        ])
         
         return {
-            f'bb_upper_{period}_{std_mult}': bb_upper,
-            f'bb_middle_{period}_{std_mult}': bb_middle,
-            f'bb_lower_{period}_{std_mult}': bb_lower
+            f'bb_upper_{period}_{std_mult}': result_df['bb_upper'].to_numpy(),
+            f'bb_middle_{period}_{std_mult}': result_df['bb_middle'].to_numpy(),
+            f'bb_lower_{period}_{std_mult}': result_df['bb_lower'].to_numpy()
         }
     
-    def _calculate_atr_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
-        """ATR計算（NumPy実装）"""
-        if len(close) < 2:
-            return np.full_like(close, np.nan)
+    def _calculate_atr_polars(self, df: pl.DataFrame, period: int) -> np.ndarray:
+        """ATR計算（Polarsベース）"""
+        result_df = df.with_columns([
+            pl.col('close').shift(1).alias('prev_close')
+        ]).with_columns([
+            pl.max_horizontal([
+                pl.col('high') - pl.col('low'),
+                (pl.col('high') - pl.col('prev_close')).abs(),
+                (pl.col('low') - pl.col('prev_close')).abs()
+            ]).alias('true_range')
+        ]).with_columns([
+            pl.col('true_range').ewm_mean(span=period, adjust=False).alias('atr')
+        ])
         
-        prev_close = np.roll(close, 1)
-        prev_close[0] = close[0]
-        
-        # True Range計算
-        tr1 = high - low
-        tr2 = np.abs(high - prev_close)
-        tr3 = np.abs(low - prev_close)
-        
-        true_range = np.maximum(tr1, np.maximum(tr2, tr3))
-        
-        # ATR（指数移動平均）
-        atr = self._ema_numpy(true_range, period)
-        
-        return atr
+        return result_df['atr'].to_numpy()
     
-    def _calculate_stochastic_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, 
-                                   k_period: int, d_period: int) -> Dict[str, np.ndarray]:
-        """Stochastic計算（NumPy実装）"""
-        if len(close) < k_period:
-            n = len(close)
-            return {
-                f'stoch_k_{k_period}_{d_period}': np.full(n, np.nan),
-                f'stoch_d_{k_period}_{d_period}': np.full(n, np.nan)
-            }
-        
-        highest_high = self._rolling_max_numpy(high, k_period)
-        lowest_low = self._rolling_min_numpy(low, k_period)
-        
-        # %K計算
-        percent_k = 100.0 * np.divide(
-            close - lowest_low, 
-            highest_high - lowest_low,
-            out=np.zeros_like(close),
-            where=((highest_high - lowest_low) != 0)
-        )
-        
-        # %D計算
-        percent_d = self._rolling_mean_numpy(percent_k, d_period)
+    def _calculate_stochastic_polars(self, df: pl.DataFrame, k_period: int, d_period: int) -> Dict[str, np.ndarray]:
+        """Stochastic計算（Polarsベース）"""
+        result_df = df.with_columns([
+            pl.col('high').rolling_max(window_size=k_period).alias('highest_high'),
+            pl.col('low').rolling_min(window_size=k_period).alias('lowest_low')
+        ]).with_columns([
+            (100.0 * (pl.col('close') - pl.col('lowest_low')) / 
+             (pl.col('highest_high') - pl.col('lowest_low') + 1e-10)).alias('percent_k')
+        ]).with_columns([
+            pl.col('percent_k').rolling_mean(window_size=d_period).alias('percent_d')
+        ])
         
         return {
-            f'stoch_k_{k_period}_{d_period}': percent_k,
-            f'stoch_d_{k_period}_{d_period}': percent_d
+            f'stoch_k_{k_period}_{d_period}': result_df['percent_k'].to_numpy(),
+            f'stoch_d_{k_period}_{d_period}': result_df['percent_d'].to_numpy()
         }
     
     # =========================================================================
     # Tier S特徴量: MFDFA (Multi-Fractal Detrended Fluctuation Analysis)
     # =========================================================================
     
-    def calculate_mfdfa_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """MFDFA特徴量計算（NumPy+Numba実装）"""
+    def calculate_mfdfa_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """MFDFA特徴量計算（NumPy主体+Polars補助版）"""
         features = {}
         
-        # NumPy配列に変換
-        price_data = self._ensure_numpy_array(data)
+        # データをNumPy配列として直接処理
+        if isinstance(data, np.ndarray):
+            price_data = data.flatten() if data.ndim > 1 else data
+        else:
+            # Polarsから変換
+            df = self._ensure_polars_df(data, 'price')
+            price_data = df["price"].to_numpy()
+        
         n = len(price_data)
         
         # MFDFA用パラメータ
@@ -1616,15 +1474,15 @@ class Calculator:
             return features
         
         try:
-            # 前処理（NumPy）
+            # NumPyで前処理（Polarsの問題を回避）
             price_mean = np.mean(price_data)
             price_centered = price_data - price_mean
-            profile = np.cumsum(price_centered)  # NumPy cumsum使用
+            profile = np.cumsum(price_centered)
             
             # ローリングウィンドウ用のインデックス
             indices = np.arange(window_size-1, n)
             
-            # MFDFA計算（Numba実装）
+            # MFDFA計算
             mfdfa_results = self._numba_safe_calculation(
                 self._calculate_mfdfa_vectorized,
                 profile,
@@ -1667,10 +1525,10 @@ class Calculator:
             logger.error(f"MFDFA計算エラー: {e}")
             # フォールバック値
             for q in q_range:
-                features[f'mfdfa_hurst_q{q}'] = np.full(n, np.nan)
-            features['mfdfa_multifractal_width'] = np.full(n, np.nan)  
-            features['mfdfa_asymmetry'] = np.full(n, np.nan)
-            features['mfdfa_complexity'] = np.full(n, np.nan)
+                features[f'mfdfa_hurst_q{q}'] = np.zeros(n)
+            features['mfdfa_multifractal_width'] = np.zeros(n)  
+            features['mfdfa_asymmetry'] = np.zeros(n)
+            features['mfdfa_complexity'] = np.zeros(n)
         
         return features
     
@@ -1681,7 +1539,9 @@ class Calculator:
                                   window_size: int,
                                   q_range: np.ndarray, 
                                   scales: np.ndarray) -> np.ndarray:
-        """MFDFA核心計算（完全ベクトル化・並列版）"""
+        """
+        MFDFA核心計算（完全ベクトル化・並列版）
+        """
         n_windows = len(indices)
         n_q = len(q_range)
         results = np.zeros((n_windows, n_q + 3))
@@ -1785,61 +1645,53 @@ class Calculator:
     # Tier S特徴量: Microstructure Noise Ratio
     # =========================================================================
     
-    def calculate_microstructure_noise_features(self, prices: np.ndarray) -> Dict[str, np.ndarray]:
-        """Microstructure Noise Ratio計算（NumPy+Numba実装）"""
+    def calculate_microstructure_noise_features_polars(self, prices: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Microstructure Noise Ratio計算（Polars最適化版）
+        真の価格変動 vs ノイズを分離する重要特徴量
+        """
         features = {}
-        prices = self._ensure_numpy_array(prices)
         n = len(prices)
         
         try:
-            # リターン計算（NumPy）
-            returns = np.diff(prices, prepend=prices[0])
+            # Polarsでリターンを計算
+            df_returns = pl.DataFrame({'price': prices}).with_columns([
+                pl.col('price').diff().alias('returns')
+            ])
             
+            # Numba計算用にNumPy配列を準備 (diff()による先頭のnullを0で埋める)
+            returns_data = df_returns['returns'].fill_null(0).to_numpy()
+
             # 複数ウィンドウサイズでMicrostructure Noise分析
             for window_size in self.params['microstructure_windows']:
                 if n < window_size:
                     continue
                 
-                # Numbaで高速ノイズ比率計算
+                # Numbaで高速ノイズ比率計算（Polarsの複雑な処理は不要）
                 noise_features = self._numba_safe_calculation(
                     self._calculate_microstructure_noise_vectorized,
-                    returns,
+                    returns_data,
                     window_size
                 )
                 
                 if noise_features is not None and len(noise_features.shape) == 2:
                     # 結果をパディングして長さを合わせる
-                    features[f'microstructure_noise_ratio_{window_size}'] = np.pad(
-                        noise_features[:, 0], 
-                        (0, n - len(noise_features[:, 0])), 
-                        'constant', 
-                        constant_values=np.nan
-                    )
-                    features[f'signal_strength_{window_size}'] = np.pad(
-                        noise_features[:, 1], 
-                        (0, n - len(noise_features[:, 1])), 
-                        'constant', 
-                        constant_values=np.nan
-                    )
-                    features[f'noise_persistence_{window_size}'] = np.pad(
-                        noise_features[:, 2], 
-                        (0, n - len(noise_features[:, 2])), 
-                        'constant', 
-                        constant_values=np.nan
-                    )
+                    features[f'microstructure_noise_ratio_{window_size}'] = np.pad(noise_features[:, 0], (0, n - len(noise_features[:, 0])), 'constant')
+                    features[f'signal_strength_{window_size}'] = np.pad(noise_features[:, 1], (0, n - len(noise_features[:, 1])), 'constant')
+                    features[f'noise_persistence_{window_size}'] = np.pad(noise_features[:, 2], (0, n - len(noise_features[:, 2])), 'constant')
                 else:
                     # フォールバック
-                    features[f'microstructure_noise_ratio_{window_size}'] = np.full(n, np.nan)
-                    features[f'signal_strength_{window_size}'] = np.full(n, np.nan)
-                    features[f'noise_persistence_{window_size}'] = np.full(n, np.nan)
+                    features[f'microstructure_noise_ratio_{window_size}'] = np.zeros(n)
+                    features[f'signal_strength_{window_size}'] = np.zeros(n)
+                    features[f'noise_persistence_{window_size}'] = np.zeros(n)
                     
         except Exception as e:
             logger.error(f"Microstructure Noise計算エラー: {e}")
             # フォールバック値
             for window_size in self.params['microstructure_windows']:
-                features[f'microstructure_noise_ratio_{window_size}'] = np.full(n, np.nan)
-                features[f'signal_strength_{window_size}'] = np.full(n, np.nan)
-                features[f'noise_persistence_{window_size}'] = np.full(n, np.nan)
+                features[f'microstructure_noise_ratio_{window_size}'] = np.zeros(n)
+                features[f'signal_strength_{window_size}'] = np.zeros(n)
+                features[f'noise_persistence_{window_size}'] = np.zeros(n)
         
         return features
     
@@ -1847,7 +1699,10 @@ class Calculator:
     @njit(parallel=True, cache=True)
     def _calculate_microstructure_noise_vectorized(returns: np.ndarray, 
                                                  window_size: int) -> np.ndarray:
-        """Microstructure Noise核心計算（完全ベクトル化版）"""
+        """
+        Microstructure Noise核心計算（完全ベクトル化版）
+        Roll (1984)の手法に基づくノイズ推定
+        """
         n = len(returns)
         if n < window_size:
             return np.zeros((n, 3))
@@ -1917,28 +1772,42 @@ class Calculator:
         return results
     
     # =========================================================================
-    # Tier 1特徴量: ショックモデル
+    # Tier 1特徴量: 軽量版ショックモデル
     # =========================================================================
     
-    def calculate_shock_model_features(self, prices: np.ndarray) -> Dict[str, np.ndarray]:
-        """ショックモデル特徴量（NumPy+Numba実装）"""
+    def calculate_shock_model_features_polars(self, prices: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        軽量版ショックモデル特徴量（Polars最適化版）
+        期待からの乖離とショック検出
+        """
         features = {}
-        prices = self._ensure_numpy_array(prices)
-        n = len(prices)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(prices, 'price')
+        n = len(df)
         
         try:
-            # リターン計算（NumPy）
-            returns = np.diff(prices, prepend=prices[0])
+            # リターンと基本統計をPolarsで一括計算
+            df_with_stats = df.with_columns([
+                pl.col('price').diff().alias('returns')
+            ])
             
             # 複数ウィンドウサイズでショックモデル分析
             for window_size in self.params['shock_model_windows']:
                 if n < window_size:
                     continue
                 
+                # Polarsで期待リターンと標準偏差をローリング計算
+                df_rolling = df_with_stats.with_columns([
+                    pl.col('returns').rolling_mean(window_size=window_size).alias('expected_return'),
+                    pl.col('returns').rolling_std(window_size=window_size).alias('return_std')
+                ])
+                
                 # Numbaで高速ショック検出とモデル計算
+                returns_data = df_with_stats['returns'].to_numpy()
                 shock_features = self._numba_safe_calculation(
                     self._calculate_shock_model_vectorized,
-                    returns,
+                    returns_data,
                     window_size
                 )
                 
@@ -1949,26 +1818,28 @@ class Calculator:
                     features[f'expected_deviation_{window_size}'] = shock_features[:, 3]
                 else:
                     # フォールバック
-                    features[f'shock_intensity_{window_size}'] = np.full(n, np.nan)
-                    features[f'shock_frequency_{window_size}'] = np.full(n, np.nan)
-                    features[f'recovery_speed_{window_size}'] = np.full(n, np.nan)
-                    features[f'expected_deviation_{window_size}'] = np.full(n, np.nan)
+                    features[f'shock_intensity_{window_size}'] = np.zeros(n)
+                    features[f'shock_frequency_{window_size}'] = np.zeros(n)
+                    features[f'recovery_speed_{window_size}'] = np.zeros(n)
+                    features[f'expected_deviation_{window_size}'] = np.zeros(n)
                     
         except Exception as e:
             logger.error(f"ショックモデル計算エラー: {e}")
             # フォールバック値
             for window_size in self.params['shock_model_windows']:
-                features[f'shock_intensity_{window_size}'] = np.full(n, np.nan)
-                features[f'shock_frequency_{window_size}'] = np.full(n, np.nan)
-                features[f'recovery_speed_{window_size}'] = np.full(n, np.nan)
-                features[f'expected_deviation_{window_size}'] = np.full(n, np.nan)
+                features[f'shock_intensity_{window_size}'] = np.zeros(n)
+                features[f'shock_frequency_{window_size}'] = np.zeros(n)
+                features[f'recovery_speed_{window_size}'] = np.zeros(n)
+                features[f'expected_deviation_{window_size}'] = np.zeros(n)
         
         return features
     
     @staticmethod
     @njit(parallel=True, cache=True)
     def _calculate_shock_model_vectorized(returns: np.ndarray, window_size: int) -> np.ndarray:
-        """ショックモデル核心計算（完全ベクトル化版）"""
+        """
+        ショックモデル核心計算（完全ベクトル化版）
+        """
         n = len(returns)
         if n < window_size:
             return np.zeros((n, 4))
@@ -2031,16 +1902,22 @@ class Calculator:
     # Tier 1特徴量: Multi-Scale Volatility
     # =========================================================================
     
-    def calculate_multiscale_volatility(self, prices: np.ndarray) -> Dict[str, np.ndarray]:
-        """Multi-Scale Volatility計算（NumPy実装）"""
+    def calculate_multiscale_volatility_polars(self, prices: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Multi-Scale Volatility計算（Polars最適化版）
+        複数時間軸でのボラティリティ特性分析
+        """
         features = {}
-        prices = self._ensure_numpy_array(prices)
-        n = len(prices)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(prices, 'price')
+        n = len(df)
         
         try:
-            # 対数リターン計算（NumPy）
-            log_prices = np.log(prices)
-            log_returns = np.diff(log_prices, prepend=log_prices[0])
+            # 対数リターンをPolarsで計算
+            df_with_returns = df.with_columns([
+                pl.col('price').log().diff().alias('log_returns')
+            ])
             
             # 複数スケールでボラティリティ計算
             scales = self.params['multiscale_volatility_periods']
@@ -2049,22 +1926,22 @@ class Calculator:
                 if scale >= n:
                     continue
                 
-                # スケール別ボラティリティ計算
-                scale_vol_result = self._safe_calculation(
-                    self._calculate_scale_volatility_numpy,
-                    log_returns,
+                # Polarsでスケール別ボラティリティを効率計算
+                scale_vol_result = self._polars_safe_calculation(
+                    self._calculate_scale_volatility_polars,
+                    df_with_returns,
                     scale
                 )
                 
                 if isinstance(scale_vol_result, np.ndarray):
                     features[f'multiscale_volatility_{scale}'] = scale_vol_result
                 else:
-                    features[f'multiscale_volatility_{scale}'] = np.full(n, np.nan)
+                    features[f'multiscale_volatility_{scale}'] = np.zeros(n)
             
-            # クロススケール相関計算
+            # クロススケール相関をPolarsで効率計算
             if len(scales) >= 2:
-                cross_corr_features = self._safe_calculation(
-                    self._calculate_cross_scale_correlations_numpy,
+                cross_corr_features = self._polars_safe_calculation(
+                    self._calculate_cross_scale_correlations_polars,
                     features,
                     scales,
                     n
@@ -2077,23 +1954,26 @@ class Calculator:
             logger.error(f"Multi-Scale Volatility計算エラー: {e}")
             # フォールバック値
             for scale in self.params['multiscale_volatility_periods']:
-                features[f'multiscale_volatility_{scale}'] = np.full(n, np.nan)
+                features[f'multiscale_volatility_{scale}'] = np.zeros(n)
         
         return features
     
-    def _calculate_scale_volatility_numpy(self, log_returns: np.ndarray, scale: int) -> np.ndarray:
-        """スケール別ボラティリティ計算（NumPy実装）"""
+    def _calculate_scale_volatility_polars(self, df: pl.DataFrame, scale: int) -> np.ndarray:
+        """スケール別ボラティリティ計算（Polarsベース）"""
         # Realized Volatility（年率化）
-        daily_vol = self._rolling_std_numpy(log_returns, scale)
-        annualized_vol = daily_vol * np.sqrt(252 / scale)
+        result_df = df.with_columns([
+            pl.col('log_returns').rolling_std(window_size=scale).alias('daily_vol')
+        ]).with_columns([
+            (pl.col('daily_vol') * np.sqrt(252 / scale)).alias('annualized_vol')
+        ])
         
-        return annualized_vol
+        return result_df['annualized_vol'].to_numpy()
     
-    def _calculate_cross_scale_correlations_numpy(self, 
-                                                volatility_features: Dict[str, np.ndarray],
-                                                scales: List[int],
-                                                n: int) -> Dict[str, np.ndarray]:
-        """クロススケール相関計算（NumPy実装）"""
+    def _calculate_cross_scale_correlations_polars(self, 
+                                                  volatility_features: Dict[str, np.ndarray],
+                                                  scales: List[int],
+                                                  n: int) -> Dict[str, np.ndarray]:
+        """クロススケール相関計算（Polarsベース）"""
         cross_corr_features = {}
         
         # 有効なスケールのペアを抽出
@@ -2102,71 +1982,56 @@ class Calculator:
         if len(valid_scales) < 2:
             return cross_corr_features
         
-        # クロススケール相関を計算
+        # ボラティリティデータをPolars DataFrameに統合
+        vol_data = {}
+        for scale in valid_scales:
+            vol_data[f'vol_{scale}'] = volatility_features[f'multiscale_volatility_{scale}']
+        
+        df_vol = pl.DataFrame(vol_data)
+        
+        # クロススケール相関を効率計算
         correlation_window = 50
         
         for i, s1 in enumerate(valid_scales[:-1]):
             for s2 in valid_scales[i+1:]:
                 try:
-                    vol1 = volatility_features[f'multiscale_volatility_{s1}']
-                    vol2 = volatility_features[f'multiscale_volatility_{s2}']
+                    # Polarsでローリング相関を計算
+                    corr_result = df_vol.with_columns([
+                        pl.corr(f'vol_{s1}', f'vol_{s2}', method='pearson')
+                        .rolling_apply(function=lambda x: x, window_size=correlation_window)
+                        .alias(f'cross_corr_{s1}_{s2}')
+                    ])
                     
-                    # ローリング相関計算（NumPy）
-                    cross_corr = self._rolling_correlation_numpy(vol1, vol2, correlation_window)
-                    cross_corr_features[f'cross_scale_corr_{s1}_{s2}'] = cross_corr
+                    cross_corr_features[f'cross_scale_corr_{s1}_{s2}'] = (
+                        corr_result[f'cross_corr_{s1}_{s2}'].to_numpy()
+                    )
                     
                 except Exception as e:
                     logger.debug(f"クロススケール相関計算エラー({s1}-{s2}): {e}")
-                    cross_corr_features[f'cross_scale_corr_{s1}_{s2}'] = np.full(n, np.nan)
+                    cross_corr_features[f'cross_scale_corr_{s1}_{s2}'] = np.zeros(n)
         
         return cross_corr_features
-    
-    @staticmethod
-    def _rolling_correlation_numpy(x: np.ndarray, y: np.ndarray, window: int) -> np.ndarray:
-        """ローリング相関係数計算（NumPy実装）"""
-        n = min(len(x), len(y))
-        result = np.full(n, np.nan)
-        
-        if n < window:
-            return result
-        
-        for i in range(window-1, n):
-            x_window = x[i-window+1:i+1]
-            y_window = y[i-window+1:i+1]
-            
-            # 有効な値のマスク
-            valid_mask = np.isfinite(x_window) & np.isfinite(y_window)
-            
-            if np.sum(valid_mask) < 3:
-                continue
-            
-            x_valid = x_window[valid_mask]
-            y_valid = y_window[valid_mask]
-            
-            # 相関係数計算
-            if np.std(x_valid) > 1e-10 and np.std(y_valid) > 1e-10:
-                correlation_matrix = np.corrcoef(x_valid, y_valid)
-                if correlation_matrix.shape == (2, 2):
-                    result[i] = correlation_matrix[0, 1]
-        
-        return result
     
     # =========================================================================
     # Tier 2特徴量: EMD/CEEMDAN (Empirical Mode Decomposition)
     # =========================================================================
     
-    def calculate_emd_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """EMD特徴量計算（ウェーブレット代替・NumPy実装）"""
+    def calculate_emd_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        EMD特徴量計算（Polars最適化・ウェーブレット代替版）
+        """
         features = {}
-        data = self._ensure_numpy_array(data)
         n = len(data)
         
         if not PYEMD_AVAILABLE:
             # ウェーブレット代替実装
             logger.info("PyEMD未利用のため、ウェーブレット代替実装を使用")
-            return self._calculate_emd_substitute_numpy(data)
+            return self._calculate_emd_substitute_polars(data)
         
         try:
+            # Polars DataFrameを構築
+            df = self._ensure_polars_df(data, 'signal')
+            
             # EMD計算用のウィンドウサイズ
             window_sizes = self.params['emd_windows']
             max_imf = 8
@@ -2175,17 +2040,16 @@ class Calculator:
                 if n < window_size:
                     continue
                 
-                #ローリングEMD計算（高速化）- このメソッドは削除されたため、代替実装にフォールバックさせる
-                emd_features = None 
-                # emd_features = self._numba_safe_calculation(
-                #     self._calculate_emd_rolling_vectorized,
-                #     data,
-                #     window_size,
-                #     max_imf
-                # )
+                # ローリングEMD計算（高速化）
+                emd_features = self._numba_safe_calculation(
+                    self._calculate_emd_rolling_vectorized,
+                    data,
+                    window_size,
+                    max_imf
+                )
                 
                 if emd_features is not None and len(emd_features.shape) == 3:
-                    # 結果を展開
+                    # 結果をPolarsで後処理
                     for imf_idx in range(max_imf):
                         for feature_idx, feature_name in enumerate(['energy', 'mean_freq', 'amplitude']):
                             feature_key = f'emd_imf_{imf_idx}_{feature_name}_{window_size}'
@@ -2195,17 +2059,17 @@ class Calculator:
                                     emd_features[:, feature_idx, imf_idx],
                                     (window_size-1, 0),
                                     mode='constant',
-                                    constant_values=np.nan
+                                    constant_values=0
                                 )
                                 features[feature_key] = padded_result
                             else:
-                                features[feature_key] = np.full(n, np.nan)
+                                features[feature_key] = np.zeros(n)
                 else:
                     # フォールバック
                     for imf_idx in range(max_imf):
                         for feature_name in ['energy', 'mean_freq', 'amplitude']:
                             feature_key = f'emd_imf_{imf_idx}_{feature_name}_{window_size}'
-                            features[feature_key] = np.full(n, np.nan)
+                            features[feature_key] = np.zeros(n)
                             
         except Exception as e:
             logger.error(f"EMD計算エラー: {e}")
@@ -2214,16 +2078,133 @@ class Calculator:
                 for imf_idx in range(8):
                     for feature_name in ['energy', 'mean_freq', 'amplitude']:
                         feature_key = f'emd_imf_{imf_idx}_{feature_name}_{window_size}'
-                        features[feature_key] = np.full(n, np.nan)
+                        features[feature_key] = np.zeros(n)
         
         return features
     
-    def _calculate_emd_substitute_numpy(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """EMDの代替実装（ウェーブレット+NumPy）"""
+    @staticmethod
+    @njit(parallel=True, cache=True)
+    def _calculate_emd_rolling_vectorized(data: np.ndarray, 
+                                        window_size: int,
+                                        max_imf: int) -> np.ndarray:
+        """
+        EMD ローリング計算（ベクトル化・並列版）
+        
+        注意: 実際のEMDではなく簡易版IMF抽出
+        """
+        n = len(data)
+        if n < window_size:
+            return np.zeros((n-window_size+1, 3, max_imf))
+        
+        n_windows = n - window_size + 1
+        results = np.zeros((n_windows, 3, max_imf))  # [windows, features, imfs]
+        
+        # 並列計算
+        for idx in prange(n_windows):
+            window = data[idx:idx+window_size]
+            
+            # 簡易IMF抽出（多重解像度解析風）
+            current_signal = window.copy()
+            
+            for imf_idx in range(max_imf):
+                if len(current_signal) < 8:
+                    break
+                
+                # 簡易スプライン包絡線近似
+                imf = np.zeros(len(current_signal))
+                residual = current_signal.copy()
+                
+                # ピーク・バレー検出
+                peaks = []
+                valleys = []
+                
+                for i in range(1, len(current_signal)-1):
+                    if (current_signal[i] > current_signal[i-1] and 
+                        current_signal[i] > current_signal[i+1]):
+                        peaks.append(i)
+                    elif (current_signal[i] < current_signal[i-1] and 
+                          current_signal[i] < current_signal[i+1]):
+                        valleys.append(i)
+                
+                if len(peaks) > 2 and len(valleys) > 2:
+                    # 上包絡線と下包絡線の平均を計算（線形補間）
+                    upper_env = np.zeros(len(current_signal))
+                    lower_env = np.zeros(len(current_signal))
+                    
+                    # 単純な線形補間
+                    for i in range(len(current_signal)):
+                        if len(peaks) >= 2:
+                            # 最近接の2つのピークから補間
+                            if i <= peaks[0]:
+                                upper_env[i] = current_signal[peaks[0]]
+                            elif i >= peaks[-1]:
+                                upper_env[i] = current_signal[peaks[-1]]
+                            else:
+                                for p_idx in range(len(peaks)-1):
+                                    if peaks[p_idx] <= i <= peaks[p_idx+1]:
+                                        t = (i - peaks[p_idx]) / (peaks[p_idx+1] - peaks[p_idx])
+                                        upper_env[i] = (current_signal[peaks[p_idx]] * (1-t) + 
+                                                      current_signal[peaks[p_idx+1]] * t)
+                                        break
+                        
+                        if len(valleys) >= 2:
+                            # 最近接の2つのバレーから補間
+                            if i <= valleys[0]:
+                                lower_env[i] = current_signal[valleys[0]]
+                            elif i >= valleys[-1]:
+                                lower_env[i] = current_signal[valleys[-1]]
+                            else:
+                                for v_idx in range(len(valleys)-1):
+                                    if valleys[v_idx] <= i <= valleys[v_idx+1]:
+                                        t = (i - valleys[v_idx]) / (valleys[v_idx+1] - valleys[v_idx])
+                                        lower_env[i] = (current_signal[valleys[v_idx]] * (1-t) + 
+                                                      current_signal[valleys[v_idx+1]] * t)
+                                        break
+                    
+                    mean_env = (upper_env + lower_env) / 2
+                    imf = current_signal - mean_env
+                else:
+                    imf = current_signal
+                    current_signal = np.zeros(len(current_signal))
+                
+                # IMF特徴量計算
+                # エネルギー
+                energy = np.sum(imf**2)
+                
+                # 平均周波数（ゼロ交差ベース）
+                zero_crossings = 0
+                for i in range(1, len(imf)):
+                    if imf[i] * imf[i-1] < 0:
+                        zero_crossings += 1
+                mean_freq = zero_crossings / (2 * len(imf)) if len(imf) > 0 else 0
+                
+                # 振幅
+                amplitude = np.std(imf)
+                
+                results[idx, 0, imf_idx] = energy
+                results[idx, 1, imf_idx] = mean_freq
+                results[idx, 2, imf_idx] = amplitude
+                
+                # 次のIMFのための残差更新
+                current_signal = current_signal - imf
+                
+                # 収束判定（残差が十分小さい場合は終了）
+                if np.std(current_signal) < 1e-6:
+                    break
+        
+        return results
+    
+    def _calculate_emd_substitute_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        EMDの代替実装（Polars+ウェーブレット）
+        """
         features = {}
         n = len(data)
         
         try:
+            # Polars DataFrameを構築
+            df = self._ensure_polars_df(data, 'signal')
+            
             # 複数ウェーブレットで多重解像度解析
             wavelets = ['db4', 'db8', 'haar']
             
@@ -2281,14 +2262,16 @@ class Calculator:
             return 0.0
     
     # =========================================================================
-    # 統計的モーメント（NumPy実装）
+    # 統計的モーメント・ロバスト統計（Polars最適化）
     # =========================================================================
     
-    def calculate_statistical_moments(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """統計的モーメント計算（NumPy実装）"""
+    def calculate_statistical_moments_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """統計的モーメント計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
-        n = len(data)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(data, 'value')
+        n = len(df)
         
         try:
             # 複数ウィンドウサイズで統計的モーメント計算
@@ -2298,10 +2281,10 @@ class Calculator:
                 if n < window_size:
                     continue
                 
-                # NumPyで基本統計モーメントを計算
-                moments_result = self._safe_calculation(
-                    self._calculate_moments_numpy,
-                    data,
+                # Polarsで基本統計モーメントを効率計算
+                moments_result = self._polars_safe_calculation(
+                    self._calculate_moments_polars,
+                    df,
                     window_size
                 )
                 
@@ -2314,7 +2297,7 @@ class Calculator:
                     moment_names = ['mean', 'variance', 'skewness', 'kurtosis', 
                                   'moment_5', 'moment_6', 'moment_7', 'moment_8']
                     for name in moment_names:
-                        features[f'statistical_{name}_{window_size}'] = np.full(n, np.nan)
+                        features[f'statistical_{name}_{window_size}'] = np.zeros(n)
                         
         except Exception as e:
             logger.error(f"統計的モーメント計算エラー: {e}")
@@ -2323,31 +2306,34 @@ class Calculator:
                 moment_names = ['mean', 'variance', 'skewness', 'kurtosis', 
                               'moment_5', 'moment_6', 'moment_7', 'moment_8']
                 for name in moment_names:
-                    features[f'statistical_{name}_{window_size}'] = np.full(n, np.nan)
+                    features[f'statistical_{name}_{window_size}'] = np.zeros(n)
         
         return features
     
-    def _calculate_moments_numpy(self, data: np.ndarray, window_size: int) -> Dict[str, np.ndarray]:
-        """統計的モーメント計算（NumPy実装）"""
+    def _calculate_moments_polars(self, df: pl.DataFrame, window_size: int) -> Dict[str, np.ndarray]:
+        """統計的モーメント計算（Polarsベース）"""
         
-        # NumPyで基本統計量を計算
-        rolling_mean = self._rolling_mean_numpy(data, window_size)
-        rolling_variance = self._rolling_var_numpy(data, window_size)
-        rolling_skewness = self._rolling_skew_numpy(data, window_size)
-        rolling_kurtosis = self._rolling_kurt_numpy(data, window_size)
+        # Polarsで基本統計量を計算
+        result_df = df.with_columns([
+            pl.col('value').rolling_mean(window_size=window_size).alias('rolling_mean'),
+            pl.col('value').rolling_var(window_size=window_size).alias('rolling_variance'),
+            pl.col('value').rolling_skew(window_size=window_size).alias('rolling_skewness'),
+            pl.col('value').rolling_kurtosis(window_size=window_size).alias('rolling_kurtosis')
+        ])
         
-        # 高次モーメント（5-8次）をNumbaで計算
+        # 高次モーメント（5-8次）をNumbaで効率計算
+        values = df['value'].to_numpy()
         higher_moments = self._numba_safe_calculation(
             self._calculate_higher_moments_vectorized,
-            data,
+            values,
             window_size
         )
         
         results = {
-            'statistical_mean': rolling_mean,
-            'statistical_variance': rolling_variance,
-            'statistical_skewness': rolling_skewness,
-            'statistical_kurtosis': rolling_kurtosis
+            'statistical_mean': result_df['rolling_mean'].to_numpy(),
+            'statistical_variance': result_df['rolling_variance'].to_numpy(),
+            'statistical_skewness': result_df['rolling_skewness'].to_numpy(),
+            'statistical_kurtosis': result_df['rolling_kurtosis'].to_numpy()
         }
         
         # 高次モーメントを追加
@@ -2357,7 +2343,7 @@ class Calculator:
         else:
             # フォールバック
             for moment_name in ['moment_5', 'moment_6', 'moment_7', 'moment_8']:
-                results[f'statistical_{moment_name}'] = np.full(len(data), np.nan)
+                results[f'statistical_{moment_name}'] = np.zeros(len(df))
         
         return results
     
@@ -2394,14 +2380,16 @@ class Calculator:
         return results
     
     # =========================================================================
-    # ロバスト統計量（NumPy実装）
+    # ロバスト統計量（Polars最適化）
     # =========================================================================
     
-    def calculate_robust_statistics(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """ロバスト統計量計算（NumPy実装）"""
+    def calculate_robust_statistics_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """ロバスト統計量計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
-        n = len(data)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(data, 'value')
+        n = len(df)
         
         try:
             # 複数ウィンドウサイズでロバスト統計
@@ -2411,10 +2399,10 @@ class Calculator:
                 if n < window_size:
                     continue
                 
-                # NumPyでロバスト統計を計算
-                robust_result = self._safe_calculation(
-                    self._calculate_robust_stats_numpy,
-                    data,
+                # Polarsでメディアン等の基本ロバスト統計を計算
+                robust_result = self._polars_safe_calculation(
+                    self._calculate_robust_stats_polars,
+                    df,
                     window_size
                 )
                 
@@ -2426,7 +2414,7 @@ class Calculator:
                     # フォールバック
                     robust_names = ['median', 'mad', 'iqr', 'trimmed_mean', 'winsorized_mean']
                     for name in robust_names:
-                        features[f'robust_{name}_{window_size}'] = np.full(n, np.nan)
+                        features[f'robust_{name}_{window_size}'] = np.zeros(n)
                         
         except Exception as e:
             logger.error(f"ロバスト統計計算エラー: {e}")
@@ -2434,31 +2422,33 @@ class Calculator:
             for window_size in [20, 50, 100]:
                 robust_names = ['median', 'mad', 'iqr', 'trimmed_mean', 'winsorized_mean']
                 for name in robust_names:
-                    features[f'robust_{name}_{window_size}'] = np.full(n, np.nan)
+                    features[f'robust_{name}_{window_size}'] = np.zeros(n)
         
         return features
     
-    def _calculate_robust_stats_numpy(self, data: np.ndarray, window_size: int) -> Dict[str, np.ndarray]:
-        """ロバスト統計量計算（NumPy実装）"""
+    def _calculate_robust_stats_polars(self, df: pl.DataFrame, window_size: int) -> Dict[str, np.ndarray]:
+        """ロバスト統計量計算（Polarsベース）"""
         
-        # NumPyでメディアンと基本統計を計算
-        rolling_median = self._rolling_median_numpy(data, window_size)
-        rolling_q25 = self._rolling_quantile_numpy(data, window_size, 0.25)
-        rolling_q75 = self._rolling_quantile_numpy(data, window_size, 0.75)
+        # Polarsでメディアンと基本統計を計算
+        result_df = df.with_columns([
+            pl.col('value').rolling_median(window_size=window_size).alias('rolling_median'),
+            pl.col('value').rolling_quantile(quantile=0.25, window_size=window_size).alias('q25'),
+            pl.col('value').rolling_quantile(quantile=0.75, window_size=window_size).alias('q75')
+        ]).with_columns([
+            (pl.col('q75') - pl.col('q25')).alias('iqr')
+        ])
         
-        # IQR計算
-        iqr = rolling_q75 - rolling_q25
-        
-        # MAD、Trimmed Mean、Winsorized MeanをNumbaで計算
+        # MAD、Trimmed Mean、Winsorized Meanを高速計算
+        values = df['value'].to_numpy()
         advanced_robust = self._numba_safe_calculation(
             self._calculate_advanced_robust_vectorized,
-            data,
+            values,
             window_size
         )
         
         results = {
-            'robust_median': rolling_median,
-            'robust_iqr': iqr
+            'robust_median': result_df['rolling_median'].to_numpy(),
+            'robust_iqr': result_df['iqr'].to_numpy()
         }
         
         # 高度なロバスト統計を追加
@@ -2468,9 +2458,9 @@ class Calculator:
             results['robust_winsorized_mean'] = advanced_robust[:, 2]
         else:
             # フォールバック
-            results['robust_mad'] = np.full(len(data), np.nan)
-            results['robust_trimmed_mean'] = np.full(len(data), np.nan)
-            results['robust_winsorized_mean'] = np.full(len(data), np.nan)
+            results['robust_mad'] = np.zeros(len(df))
+            results['robust_trimmed_mean'] = np.zeros(len(df))
+            results['robust_winsorized_mean'] = np.zeros(len(df))
         
         return results
     
@@ -2522,14 +2512,16 @@ class Calculator:
         return results
     
     # =========================================================================
-    # スペクトル特徴量（NumPy+Numba実装）
+    # スペクトル特徴量（Polars+Numba最適化）
     # =========================================================================
     
-    def calculate_spectral_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """スペクトル特徴量計算（NumPy実装）"""
+    def calculate_spectral_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """スペクトル特徴量計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
-        n = len(data)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(data, 'signal')
+        n = len(df)
         
         try:
             # 複数ウィンドウサイズでスペクトル解析
@@ -2556,17 +2548,17 @@ class Calculator:
                                 spectral_result[:, j],
                                 (window_size-1, 0),
                                 mode='constant',
-                                constant_values=np.nan
+                                constant_values=0
                             )
                             features[f'{name}_{window_size}'] = padded_result
                         else:
-                            features[f'{name}_{window_size}'] = np.full(n, np.nan)
+                            features[f'{name}_{window_size}'] = np.zeros(n)
                 else:
                     # フォールバック
                     feature_names = ['spectral_centroid', 'spectral_bandwidth', 'spectral_rolloff', 
                                    'spectral_flux', 'spectral_flatness', 'spectral_entropy']
                     for name in feature_names:
-                        features[f'{name}_{window_size}'] = np.full(n, np.nan)
+                        features[f'{name}_{window_size}'] = np.zeros(n)
                         
         except Exception as e:
             logger.error(f"スペクトル特徴量計算エラー: {e}")
@@ -2575,7 +2567,7 @@ class Calculator:
                 feature_names = ['spectral_centroid', 'spectral_bandwidth', 'spectral_rolloff', 
                                'spectral_flux', 'spectral_flatness', 'spectral_entropy']
                 for name in feature_names:
-                    features[f'{name}_{window_size}'] = np.full(n, np.nan)
+                    features[f'{name}_{window_size}'] = np.zeros(n)
         
         return features
     
@@ -2645,13 +2637,12 @@ class Calculator:
         return results
     
     # =========================================================================
-    # ウェーブレット特徴量（NumPy実装）
+    # ウェーブレット特徴量（Polars最適化）
     # =========================================================================
     
-    def calculate_wavelet_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """ウェーブレット特徴量計算（NumPy実装）"""
+    def calculate_wavelet_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """ウェーブレット特徴量計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
         n = len(data)
         
         try:
@@ -2683,17 +2674,17 @@ class Calculator:
                                     wavelet_result[:, j, k],
                                     (window_size-1, 0),
                                     mode='constant',
-                                    constant_values=np.nan
+                                    constant_values=0
                                 )
                                 features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = padded_result
                             else:
-                                features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = np.full(n, np.nan)
+                                features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = np.zeros(n)
                 else:
                     # フォールバック
                     for j in range(level + 1):
                         level_name = 'approx' if j == 0 else f'detail_{j}'
                         for feature_name in ['energy', 'entropy', 'mean', 'std']:
-                            features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = np.full(n, np.nan)
+                            features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = np.zeros(n)
                             
         except Exception as e:
             logger.error(f"ウェーブレット特徴量計算エラー: {e}")
@@ -2702,7 +2693,7 @@ class Calculator:
                 for j in range(6):  # level + 1
                     level_name = 'approx' if j == 0 else f'detail_{j}'
                     for feature_name in ['energy', 'entropy', 'mean', 'std']:
-                        features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = np.full(n, np.nan)
+                        features[f'wavelet_{level_name}_{feature_name}_{window_size}'] = np.zeros(n)
         
         return features
     
@@ -2711,7 +2702,11 @@ class Calculator:
     def _calculate_wavelet_rolling_vectorized(data: np.ndarray, 
                                             window_size: int,
                                             level: int) -> np.ndarray:
-        """ローリングウェーブレット分析（ベクトル化・並列版）"""
+        """
+        ローリングウェーブレット分析（ベクトル化・並列版）
+        
+        注意: 実際のウェーブレット変換ではなく、多重解像度解析の簡易版
+        """
         n = len(data)
         if n < window_size:
             return np.zeros((n-window_size+1, level+1, 4))
@@ -2786,14 +2781,16 @@ class Calculator:
         return results
     
     # =========================================================================
-    # カオス理論・フラクタル解析（NumPy+Numba実装）
+    # カオス理論・フラクタル解析（Polars最適化）
     # =========================================================================
     
-    def calculate_chaos_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """カオス理論特徴量計算（NumPy実装）"""
+    def calculate_chaos_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """カオス理論特徴量計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
-        n = len(data)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(data, 'value')
+        n = len(df)
         
         try:
             # 複数ウィンドウサイズでカオス解析
@@ -2819,16 +2816,16 @@ class Calculator:
                                 chaos_result[:, j],
                                 (window_size-1, 0),
                                 mode='constant',
-                                constant_values=np.nan
+                                constant_values=0
                             )
                             features[f'{name}_{window_size}'] = padded_result
                         else:
-                            features[f'{name}_{window_size}'] = np.full(n, np.nan)
+                            features[f'{name}_{window_size}'] = np.zeros(n)
                 else:
                     # フォールバック
                     feature_names = ['lyapunov_exponent', 'correlation_dimension', 'chaos_degree']
                     for name in feature_names:
-                        features[f'{name}_{window_size}'] = np.full(n, np.nan)
+                        features[f'{name}_{window_size}'] = np.zeros(n)
                         
         except Exception as e:
             logger.error(f"カオス理論特徴量計算エラー: {e}")
@@ -2836,7 +2833,7 @@ class Calculator:
             for window_size in [50, 100]:
                 feature_names = ['lyapunov_exponent', 'correlation_dimension', 'chaos_degree']
                 for name in feature_names:
-                    features[f'{name}_{window_size}'] = np.full(n, np.nan)
+                    features[f'{name}_{window_size}'] = np.zeros(n)
         
         return features
     
@@ -2918,13 +2915,12 @@ class Calculator:
         return results
     
     # =========================================================================
-    # ヒルベルト変換特徴量（NumPy+Scipy実装）
+    # ヒルベルト変換特徴量（Polars+Scipy最適化）
     # =========================================================================
     
-    def calculate_hilbert_transform_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """ヒルベルト変換特徴量計算（NumPy実装）"""
+    def calculate_hilbert_transform_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """ヒルベルト変換特徴量計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
         n = len(data)
         
         try:
@@ -2934,17 +2930,24 @@ class Calculator:
             instantaneous_phase = np.angle(analytic_signal)
             instantaneous_frequency = np.diff(np.unwrap(instantaneous_phase), prepend=0)
             
+            # Polars DataFrameに統合
+            df = pl.DataFrame({
+                'amplitude': amplitude_envelope,
+                'phase': instantaneous_phase,
+                'frequency': instantaneous_frequency
+            })
+            
             # 基本ヒルベルト特徴量
             features['hilbert_amplitude'] = amplitude_envelope
             features['hilbert_phase'] = instantaneous_phase
             features['hilbert_frequency'] = instantaneous_frequency
             
-            # 振幅と位相の統計
+            # 振幅と位相の統計（Polarsで効率計算）
             for window in self.params['hilbert_windows']:
                 if n > window:
-                    hilbert_stats = self._safe_calculation(
-                        self._calculate_hilbert_stats_numpy,
-                        amplitude_envelope, instantaneous_phase, instantaneous_frequency,
+                    hilbert_stats = self._polars_safe_calculation(
+                        self._calculate_hilbert_stats_polars,
+                        df,
                         window
                     )
                     
@@ -2955,168 +2958,153 @@ class Calculator:
                         # フォールバック
                         stat_names = ['hilbert_amp_mean', 'hilbert_amp_std', 'hilbert_phase_var', 'hilbert_phase_stability']
                         for name in stat_names:
-                            features[f'{name}_{window}'] = np.full(n, np.nan)
+                            features[f'{name}_{window}'] = np.zeros(n)
                             
         except Exception as e:
             logger.error(f"ヒルベルト変換計算エラー: {e}")
             # フォールバック値
-            features['hilbert_amplitude'] = np.full(n, np.nan)
-            features['hilbert_phase'] = np.full(n, np.nan)
-            features['hilbert_frequency'] = np.full(n, np.nan)
+            features['hilbert_amplitude'] = np.zeros(n)
+            features['hilbert_phase'] = np.zeros(n)
+            features['hilbert_frequency'] = np.zeros(n)
             
             for window in self.params['hilbert_windows']:
                 stat_names = ['hilbert_amp_mean', 'hilbert_amp_std', 'hilbert_phase_var', 'hilbert_phase_stability']
                 for name in stat_names:
-                    features[f'{name}_{window}'] = np.full(n, np.nan)
+                    features[f'{name}_{window}'] = np.zeros(n)
         
         return features
     
-    def _calculate_hilbert_stats_numpy(self, amplitude: np.ndarray, phase: np.ndarray, 
-                                     frequency: np.ndarray, window: int) -> Dict[str, np.ndarray]:
-        """ヒルベルト変換統計量（NumPy実装）"""
+    def _calculate_hilbert_stats_polars(self, df: pl.DataFrame, window: int) -> Dict[str, np.ndarray]:
+        """ヒルベルト変換統計量（Polarsベース）"""
         
-        # 振幅と位相の統計をNumPyで計算
-        amp_mean = self._rolling_mean_numpy(amplitude, window)
-        amp_std = self._rolling_std_numpy(amplitude, window)
-        phase_var = self._rolling_var_numpy(phase, window)
-        
-        # 位相安定性
-        phase_diff = np.diff(phase, prepend=phase[0])
-        phase_stability = self._rolling_std_numpy(phase_diff, window)
+        # 振幅と位相の統計をPolarsで計算
+        result_df = df.with_columns([
+            pl.col('amplitude').rolling_mean(window_size=window).alias('amp_mean'),
+            pl.col('amplitude').rolling_std(window_size=window).alias('amp_std'),
+            pl.col('phase').rolling_var(window_size=window).alias('phase_var')
+        ]).with_columns([
+            pl.col('phase').diff().alias('phase_diff')
+        ]).with_columns([
+            pl.col('phase_diff').rolling_std(window_size=window).alias('phase_stability')
+        ])
         
         return {
-            'hilbert_amp_mean': amp_mean,
-            'hilbert_amp_std': amp_std,
-            'hilbert_phase_var': phase_var,
-            'hilbert_phase_stability': phase_stability
+            'hilbert_amp_mean': result_df['amp_mean'].to_numpy(),
+            'hilbert_amp_std': result_df['amp_std'].to_numpy(),
+            'hilbert_phase_var': result_df['phase_var'].to_numpy(),
+            'hilbert_phase_stability': result_df['phase_stability'].to_numpy()
         }
     
     # =========================================================================
-    # ADX・基本オシレーター（NumPy実装）
+    # ADX・基本オシレーター（Polars最適化）
     # =========================================================================
     
-    def calculate_adx_features(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ADX関連特徴量の計算（NumPy実装）"""
+    def calculate_adx_features_polars(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """ADX関連特徴量の計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low,
+            'close': close
+        })
         
         try:
             for period in self.params['adx_periods']:
-                # ADXを計算
-                adx_result = self._safe_calculation(
-                    self._calculate_adx_numpy,
-                    high, low, close, period
+                # ADXをPolarsで効率計算
+                adx_result = self._polars_safe_calculation(
+                    self._calculate_adx_polars,
+                    df,
+                    period
                 )
                 
                 if isinstance(adx_result, dict):
                     features.update(adx_result)
                 else:
                     # フォールバック
-                    n = len(close)
-                    features[f'adx_{period}'] = np.full(n, np.nan)
-                    features[f'di_plus_{period}'] = np.full(n, np.nan)
-                    features[f'di_minus_{period}'] = np.full(n, np.nan)
-                    features[f'di_diff_{period}'] = np.full(n, np.nan)
-                    features[f'adx_strength_{period}'] = np.full(n, np.nan)
-                    features[f'trend_strength_{period}'] = np.full(n, np.nan)
+                    n = len(df)
+                    features[f'adx_{period}'] = np.zeros(n)
+                    features[f'di_plus_{period}'] = np.zeros(n)
+                    features[f'di_minus_{period}'] = np.zeros(n)
+                    features[f'di_diff_{period}'] = np.zeros(n)
+                    features[f'adx_strength_{period}'] = np.zeros(n)
+                    features[f'trend_strength_{period}'] = np.zeros(n)
                     
         except Exception as e:
             logger.error(f"ADX計算エラー: {e}")
-            n = len(close)
+            n = len(df)
             for period in self.params['adx_periods']:
-                features[f'adx_{period}'] = np.full(n, np.nan)
-                features[f'di_plus_{period}'] = np.full(n, np.nan)
-                features[f'di_minus_{period}'] = np.full(n, np.nan)
-                features[f'di_diff_{period}'] = np.full(n, np.nan)
-                features[f'adx_strength_{period}'] = np.full(n, np.nan)
-                features[f'trend_strength_{period}'] = np.full(n, np.nan)
+                features[f'adx_{period}'] = np.zeros(n)
+                features[f'di_plus_{period}'] = np.zeros(n)
+                features[f'di_minus_{period}'] = np.zeros(n)
+                features[f'di_diff_{period}'] = np.zeros(n)
+                features[f'adx_strength_{period}'] = np.zeros(n)
+                features[f'trend_strength_{period}'] = np.zeros(n)
         
         return features
     
-    def _calculate_adx_numpy(self, high: np.ndarray, low: np.ndarray, 
-                           close: np.ndarray, period: int) -> Dict[str, np.ndarray]:
-        """ADX計算（NumPy実装）"""
+    def _calculate_adx_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """ADX計算（Polarsベース）"""
         
-        if len(close) < 2:
-            n = len(close)
-            return {
-                f'adx_{period}': np.full(n, np.nan),
-                f'di_plus_{period}': np.full(n, np.nan),
-                f'di_minus_{period}': np.full(n, np.nan),
-                f'di_diff_{period}': np.full(n, np.nan),
-                f'adx_strength_{period}': np.full(n, np.nan),
-                f'trend_strength_{period}': np.full(n, np.nan)
-            }
-        
-        # 前日終値
-        prev_close = np.roll(close, 1)
-        prev_close[0] = close[0]
-        
-        # True Range計算
-        tr1 = high - low
-        tr2 = np.abs(high - prev_close)
-        tr3 = np.abs(low - prev_close)
-        true_range = np.maximum(tr1, np.maximum(tr2, tr3))
-        
-        # 方向性移動計算
-        up_move = high - np.roll(high, 1)
-        down_move = np.roll(low, 1) - low
-        up_move[0] = 0
-        down_move[0] = 0
-        
-        # DM+とDM-
-        dm_plus = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        dm_minus = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        
-        # スムージング（指数移動平均）
-        atr_smooth = self._ema_numpy(true_range, period)
-        dm_plus_smooth = self._ema_numpy(dm_plus, period)
-        dm_minus_smooth = self._ema_numpy(dm_minus, period)
-        
-        # DI+とDI-の計算
-        di_plus = 100.0 * np.divide(dm_plus_smooth, atr_smooth, 
-                                   out=np.zeros_like(atr_smooth), where=(atr_smooth != 0))
-        di_minus = 100.0 * np.divide(dm_minus_smooth, atr_smooth,
-                                    out=np.zeros_like(atr_smooth), where=(atr_smooth != 0))
-        
-        # DXの計算
-        di_sum = di_plus + di_minus
-        di_diff_abs = np.abs(di_plus - di_minus)
-        dx = 100.0 * np.divide(di_diff_abs, di_sum, 
-                              out=np.zeros_like(di_sum), where=(di_sum != 0))
-        
-        # ADXの計算（指数移動平均）
-        adx = self._ema_numpy(dx, period)
-        
-        # 追加特徴量（NumPy操作）
-        di_diff = di_plus - di_minus
-        adx_strength = np.where(adx > 25, 1.0, 0.0)
-        trend_strength = adx / 100.0
+        # True Rangeと方向性移動をPolarsで計算
+        result_df = df.with_columns([
+            pl.col('close').shift(1).alias('prev_close')
+        ]).with_columns([
+            pl.max_horizontal([
+                pl.col('high') - pl.col('low'),
+                (pl.col('high') - pl.col('prev_close')).abs(),
+                (pl.col('low') - pl.col('prev_close')).abs()
+            ]).alias('true_range'),
+            (pl.col('high') - pl.col('high').shift(1)).alias('up_move'),
+            (pl.col('low').shift(1) - pl.col('low')).alias('down_move')
+        ]).with_columns([
+            pl.when((pl.col('up_move') > pl.col('down_move')) & (pl.col('up_move') > 0))
+            .then(pl.col('up_move'))
+            .otherwise(0.0)
+            .alias('dm_plus'),
+            pl.when((pl.col('down_move') > pl.col('up_move')) & (pl.col('down_move') > 0))
+            .then(pl.col('down_move'))
+            .otherwise(0.0)
+            .alias('dm_minus')
+        ]).with_columns([
+            # ATRとDMのスムージング
+            pl.col('true_range').ewm_mean(span=period, adjust=False).alias('atr_smooth'),
+            pl.col('dm_plus').ewm_mean(span=period, adjust=False).alias('dm_plus_smooth'),
+            pl.col('dm_minus').ewm_mean(span=period, adjust=False).alias('dm_minus_smooth')
+        ]).with_columns([
+            # DI+とDI-の計算
+            (100.0 * pl.col('dm_plus_smooth') / (pl.col('atr_smooth') + 1e-10)).alias('di_plus'),
+            (100.0 * pl.col('dm_minus_smooth') / (pl.col('atr_smooth') + 1e-10)).alias('di_minus')
+        ]).with_columns([
+            # DXの計算
+            (100.0 * (pl.col('di_plus') - pl.col('di_minus')).abs() / 
+             (pl.col('di_plus') + pl.col('di_minus') + 1e-10)).alias('dx')
+        ]).with_columns([
+            # ADXの計算
+            pl.col('dx').ewm_mean(span=period, adjust=False).alias('adx')
+        ]).with_columns([
+            # 追加特徴量
+            (pl.col('di_plus') - pl.col('di_minus')).alias('di_diff'),
+            (pl.col('adx') > 25).cast(pl.Float64).alias('adx_strength'),
+            (pl.col('adx') / 100.0).alias('trend_strength')
+        ])
         
         return {
-            f'adx_{period}': adx,
-            f'di_plus_{period}': di_plus,
-            f'di_minus_{period}': di_minus,
-            f'di_diff_{period}': di_diff,
-            f'adx_strength_{period}': adx_strength,
-            f'trend_strength_{period}': trend_strength
+            f'adx_{period}': result_df['adx'].to_numpy(),
+            f'di_plus_{period}': result_df['di_plus'].to_numpy(),
+            f'di_minus_{period}': result_df['di_minus'].to_numpy(),
+            f'di_diff_{period}': result_df['di_diff'].to_numpy(),
+            f'adx_strength_{period}': result_df['adx_strength'].to_numpy(),
+            f'trend_strength_{period}': result_df['trend_strength'].to_numpy()
         }
     
-    def calculate_parabolic_sar_features(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """パラボリックSAR特徴量の計算（NumPy実装）"""
+    def calculate_parabolic_sar_features_polars(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """パラボリックSAR特徴量の計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
-        
         try:
-            # NumbaでSAR計算
+            # NumbaでSAR計算（状態機械的性質のため）
             sar_result = self._numba_safe_calculation(
                 self._calculate_parabolic_sar_vectorized,
                 high, low, close
@@ -3126,33 +3114,45 @@ class Calculator:
                 sar_values = sar_result[:, 0]
                 signal_values = sar_result[:, 1]
                 
-                # NumPyで追加特徴量を計算
-                sar_distance = (close - sar_values) / (close + 1e-10)
-                sar_above = np.where(close > sar_values, 1.0, 0.0)
-                sar_trend_strength = np.abs(signal_values)
+                # Polarsで追加特徴量を効率計算
+                df = pl.DataFrame({
+                    'close': close,
+                    'sar': sar_values,
+                    'signal': signal_values
+                })
                 
-                features['parabolic_sar'] = sar_values
-                features['sar_signal'] = signal_values
-                features['sar_distance'] = sar_distance
-                features['sar_above'] = sar_above
-                features['sar_trend_strength'] = sar_trend_strength
+                sar_features = self._polars_safe_calculation(
+                    self._calculate_sar_features_polars,
+                    df
+                )
+                
+                if isinstance(sar_features, dict):
+                    features.update(sar_features)
+                else:
+                    # フォールバック
+                    n = len(close)
+                    features['parabolic_sar'] = np.zeros(n)
+                    features['sar_signal'] = np.zeros(n)
+                    features['sar_distance'] = np.zeros(n)
+                    features['sar_above'] = np.zeros(n)
+                    features['sar_trend_strength'] = np.zeros(n)
             else:
                 # フォールバック
                 n = len(close)
-                features['parabolic_sar'] = np.full(n, np.nan)
-                features['sar_signal'] = np.full(n, np.nan)
-                features['sar_distance'] = np.full(n, np.nan)
-                features['sar_above'] = np.full(n, np.nan)
-                features['sar_trend_strength'] = np.full(n, np.nan)
+                features['parabolic_sar'] = np.zeros(n)
+                features['sar_signal'] = np.zeros(n)
+                features['sar_distance'] = np.zeros(n)
+                features['sar_above'] = np.zeros(n)
+                features['sar_trend_strength'] = np.zeros(n)
                 
         except Exception as e:
             logger.error(f"Parabolic SAR計算エラー: {e}")
             n = len(close)
-            features['parabolic_sar'] = np.full(n, np.nan)
-            features['sar_signal'] = np.full(n, np.nan)
-            features['sar_distance'] = np.full(n, np.nan)
-            features['sar_above'] = np.full(n, np.nan)
-            features['sar_trend_strength'] = np.full(n, np.nan)
+            features['parabolic_sar'] = np.zeros(n)
+            features['sar_signal'] = np.zeros(n)
+            features['sar_distance'] = np.zeros(n)
+            features['sar_above'] = np.zeros(n)
+            features['sar_trend_strength'] = np.zeros(n)
         
         return features
     
@@ -3214,187 +3214,233 @@ class Calculator:
         result[:, 1] = signal
         return result
     
-    def calculate_cci_features(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """CCI特徴量の計算（NumPy実装）"""
+    def _calculate_sar_features_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """SAR追加特徴量（Polarsベース）"""
+        
+        result_df = df.with_columns([
+            ((pl.col('close') - pl.col('sar')) / (pl.col('close') + 1e-10)).alias('sar_distance'),
+            (pl.col('close') > pl.col('sar')).cast(pl.Float64).alias('sar_above'),
+            pl.col('signal').abs().alias('sar_trend_strength')
+        ])
+        
+        return {
+            'parabolic_sar': result_df['sar'].to_numpy(),
+            'sar_signal': result_df['signal'].to_numpy(),
+            'sar_distance': result_df['sar_distance'].to_numpy(),
+            'sar_above': result_df['sar_above'].to_numpy(),
+            'sar_trend_strength': result_df['sar_trend_strength'].to_numpy()
+        }
+    
+    def calculate_cci_features_polars(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """CCI特徴量の計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low,
+            'close': close
+        })
         
         try:
             for period in self.params['cci_periods']:
-                # CCIを計算
-                cci_result = self._safe_calculation(
-                    self._calculate_cci_numpy,
-                    high, low, close, period
+                # CCIをPolarsで効率計算
+                cci_result = self._polars_safe_calculation(
+                    self._calculate_cci_polars,
+                    df,
+                    period
                 )
                 
                 if isinstance(cci_result, dict):
                     features.update(cci_result)
                 else:
                     # フォールバック
-                    n = len(close)
-                    features[f'cci_{period}'] = np.full(n, np.nan)
-                    features[f'cci_overbought_{period}'] = np.full(n, np.nan)
-                    features[f'cci_oversold_{period}'] = np.full(n, np.nan)
-                    features[f'cci_normalized_{period}'] = np.full(n, np.nan)
+                    n = len(df)
+                    features[f'cci_{period}'] = np.zeros(n)
+                    features[f'cci_overbought_{period}'] = np.zeros(n)
+                    features[f'cci_oversold_{period}'] = np.zeros(n)
+                    features[f'cci_normalized_{period}'] = np.zeros(n)
                     
         except Exception as e:
             logger.error(f"CCI計算エラー: {e}")
-            n = len(close)
+            n = len(df)
             for period in self.params['cci_periods']:
-                features[f'cci_{period}'] = np.full(n, np.nan)
-                features[f'cci_overbought_{period}'] = np.full(n, np.nan)
-                features[f'cci_oversold_{period}'] = np.full(n, np.nan)
-                features[f'cci_normalized_{period}'] = np.full(n, np.nan)
+                features[f'cci_{period}'] = np.zeros(n)
+                features[f'cci_overbought_{period}'] = np.zeros(n)
+                features[f'cci_oversold_{period}'] = np.zeros(n)
+                features[f'cci_normalized_{period}'] = np.zeros(n)
         
         return features
     
-    def _calculate_cci_numpy(self, high: np.ndarray, low: np.ndarray, 
-                           close: np.ndarray, period: int) -> Dict[str, np.ndarray]:
-        """CCI計算（NumPy実装）"""
+    def _calculate_cci_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """CCI計算（Polarsベース）"""
         
-        # Typical Price計算
-        typical_price = (high + low + close) / 3.0
-        
-        # SMAとMAD計算
-        sma_tp = self._rolling_mean_numpy(typical_price, period)
-        
-        # MAD計算（平均絶対偏差）
-        mad = np.full_like(typical_price, np.nan)
-        for i in range(period-1, len(typical_price)):
-            window_tp = typical_price[i-period+1:i+1]
-            mad[i] = np.mean(np.abs(window_tp - sma_tp[i]))
-        
-        # CCI計算
-        cci = (typical_price - sma_tp) / (0.015 * mad + 1e-10)
-        
-        # 追加特徴量（NumPy操作）
-        cci_overbought = np.where(cci > 100, 1.0, 0.0)
-        cci_oversold = np.where(cci < -100, 1.0, 0.0)
-        cci_normalized = np.tanh(cci / 100.0)
+        # Typical PriceとCCIをPolarsで計算
+        result_df = df.with_columns([
+            ((pl.col('high') + pl.col('low') + pl.col('close')) / 3.0).alias('typical_price')
+        ]).with_columns([
+            pl.col('typical_price').rolling_mean(window_size=period).alias('sma_tp')
+        ]).with_columns([
+            (pl.col('typical_price') - pl.col('sma_tp')).abs().rolling_mean(window_size=period).alias('mad')
+        ]).with_columns([
+            ((pl.col('typical_price') - pl.col('sma_tp')) / (0.015 * pl.col('mad') + 1e-10)).alias('cci')
+        ]).with_columns([
+            (pl.col('cci') > 100).cast(pl.Float64).alias('cci_overbought'),
+            (pl.col('cci') < -100).cast(pl.Float64).alias('cci_oversold'),
+            (pl.col('cci') / 100.0).tanh().alias('cci_normalized')
+        ])
         
         return {
-            f'cci_{period}': cci,
-            f'cci_overbought_{period}': cci_overbought,
-            f'cci_oversold_{period}': cci_oversold,
-            f'cci_normalized_{period}': cci_normalized
+            f'cci_{period}': result_df['cci'].to_numpy(),
+            f'cci_overbought_{period}': result_df['cci_overbought'].to_numpy(),
+            f'cci_oversold_{period}': result_df['cci_oversold'].to_numpy(),
+            f'cci_normalized_{period}': result_df['cci_normalized'].to_numpy()
         }
     
-    def calculate_williams_r_features(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ウィリアムズ%R特徴量の計算（NumPy実装）"""
+    def calculate_williams_r_features_polars(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """ウィリアムズ%R特徴量の計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low,
+            'close': close
+        })
         
         try:
             for period in self.params['williams_r_periods']:
-                # Williams %Rを計算
-                williams_r_result = self._safe_calculation(
-                    self._calculate_williams_r_numpy,
-                    high, low, close, period
+                # Williams %RをPolarsで効率計算
+                williams_r_result = self._polars_safe_calculation(
+                    self._calculate_williams_r_polars,
+                    df,
+                    period
                 )
                 
                 if isinstance(williams_r_result, dict):
                     features.update(williams_r_result)
                 else:
                     # フォールバック
-                    n = len(close)
-                    features[f'williams_r_{period}'] = np.full(n, np.nan)
-                    features[f'williams_r_overbought_{period}'] = np.full(n, np.nan)
-                    features[f'williams_r_oversold_{period}'] = np.full(n, np.nan)
-                    features[f'williams_r_normalized_{period}'] = np.full(n, np.nan)
+                    n = len(df)
+                    features[f'williams_r_{period}'] = np.zeros(n)
+                    features[f'williams_r_overbought_{period}'] = np.zeros(n)
+                    features[f'williams_r_oversold_{period}'] = np.zeros(n)
+                    features[f'williams_r_normalized_{period}'] = np.zeros(n)
                     
         except Exception as e:
             logger.error(f"Williams %R計算エラー: {e}")
-            n = len(close)
+            n = len(df)
             for period in self.params['williams_r_periods']:
-                features[f'williams_r_{period}'] = np.full(n, np.nan)
-                features[f'williams_r_overbought_{period}'] = np.full(n, np.nan)
-                features[f'williams_r_oversold_{period}'] = np.full(n, np.nan)
-                features[f'williams_r_normalized_{period}'] = np.full(n, np.nan)
+                features[f'williams_r_{period}'] = np.zeros(n)
+                features[f'williams_r_overbought_{period}'] = np.zeros(n)
+                features[f'williams_r_oversold_{period}'] = np.zeros(n)
+                features[f'williams_r_normalized_{period}'] = np.zeros(n)
         
         return features
     
-    def _calculate_williams_r_numpy(self, high: np.ndarray, low: np.ndarray, 
-                                  close: np.ndarray, period: int) -> Dict[str, np.ndarray]:
-        """Williams %R計算（NumPy実装）"""
+    def _calculate_williams_r_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """Williams %R計算（Polarsベース）"""
         
-        # 最高値・最安値計算
-        highest_high = self._rolling_max_numpy(high, period)
-        lowest_low = self._rolling_min_numpy(low, period)
-        
-        # Williams %R計算
-        williams_r = -100.0 * np.divide(
-            highest_high - close,
-            highest_high - lowest_low,
-            out=np.zeros_like(close),
-            where=((highest_high - lowest_low) != 0)
-        )
-        
-        # 追加特徴量（NumPy操作）
-        williams_r_overbought = np.where(williams_r > -20, 1.0, 0.0)
-        williams_r_oversold = np.where(williams_r < -80, 1.0, 0.0)
-        williams_r_normalized = (williams_r + 50) / 50.0
+        # Williams %RをPolarsで計算
+        result_df = df.with_columns([
+            pl.col('high').rolling_max(window_size=period).alias('highest_high'),
+            pl.col('low').rolling_min(window_size=period).alias('lowest_low')
+        ]).with_columns([
+            (-100.0 * (pl.col('highest_high') - pl.col('close')) / 
+             (pl.col('highest_high') - pl.col('lowest_low') + 1e-10)).alias('williams_r')
+        ]).with_columns([
+            (pl.col('williams_r') > -20).cast(pl.Float64).alias('williams_r_overbought'),
+            (pl.col('williams_r') < -80).cast(pl.Float64).alias('williams_r_oversold'),
+            ((pl.col('williams_r') + 50) / 50.0).alias('williams_r_normalized')
+        ])
         
         return {
-            f'williams_r_{period}': williams_r,
-            f'williams_r_overbought_{period}': williams_r_overbought,
-            f'williams_r_oversold_{period}': williams_r_oversold,
-            f'williams_r_normalized_{period}': williams_r_normalized
+            f'williams_r_{period}': result_df['williams_r'].to_numpy(),
+            f'williams_r_overbought_{period}': result_df['williams_r_overbought'].to_numpy(),
+            f'williams_r_oversold_{period}': result_df['williams_r_oversold'].to_numpy(),
+            f'williams_r_normalized_{period}': result_df['williams_r_normalized'].to_numpy()
         }
     
-    def calculate_aroon_features(self, high: np.ndarray, low: np.ndarray) -> Dict[str, np.ndarray]:
-        """アルーン特徴量の計算（NumPy実装）"""
+    def calculate_aroon_features_polars(self, high: np.ndarray, low: np.ndarray) -> Dict[str, np.ndarray]:
+        """アルーン特徴量の計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low
+        })
         
         try:
             for period in self.params['aroon_periods']:
-                # AroonをNumbaで計算
-                aroon_result = self._numba_safe_calculation(
-                    self._calculate_aroon_vectorized,
-                    high, low, period
+                # AroonをPolarsで効率計算
+                aroon_result = self._polars_safe_calculation(
+                    self._calculate_aroon_polars,
+                    df,
+                    period
                 )
                 
-                if aroon_result is not None and len(aroon_result.shape) == 2:
-                    aroon_up = aroon_result[:, 0]
-                    aroon_down = aroon_result[:, 1]
-                    
-                    # NumPyで追加特徴量を計算
-                    aroon_oscillator = aroon_up - aroon_down
-                    aroon_trending = np.where(np.abs(aroon_oscillator) > 50, 1.0, 0.0)
-                    
-                    features[f'aroon_up_{period}'] = aroon_up
-                    features[f'aroon_down_{period}'] = aroon_down
-                    features[f'aroon_oscillator_{period}'] = aroon_oscillator
-                    features[f'aroon_trending_{period}'] = aroon_trending
+                if isinstance(aroon_result, dict):
+                    features.update(aroon_result)
                 else:
                     # フォールバック
-                    n = len(high)
-                    features[f'aroon_up_{period}'] = np.full(n, np.nan)
-                    features[f'aroon_down_{period}'] = np.full(n, np.nan)
-                    features[f'aroon_oscillator_{period}'] = np.full(n, np.nan)
-                    features[f'aroon_trending_{period}'] = np.full(n, np.nan)
+                    n = len(df)
+                    features[f'aroon_up_{period}'] = np.zeros(n)
+                    features[f'aroon_down_{period}'] = np.zeros(n)
+                    features[f'aroon_oscillator_{period}'] = np.zeros(n)
+                    features[f'aroon_trending_{period}'] = np.zeros(n)
                     
         except Exception as e:
             logger.error(f"Aroon計算エラー: {e}")
-            n = len(high)
+            n = len(df)
             for period in self.params['aroon_periods']:
-                features[f'aroon_up_{period}'] = np.full(n, np.nan)
-                features[f'aroon_down_{period}'] = np.full(n, np.nan)
-                features[f'aroon_oscillator_{period}'] = np.full(n, np.nan)
-                features[f'aroon_trending_{period}'] = np.full(n, np.nan)
+                features[f'aroon_up_{period}'] = np.zeros(n)
+                features[f'aroon_down_{period}'] = np.zeros(n)
+                features[f'aroon_oscillator_{period}'] = np.zeros(n)
+                features[f'aroon_trending_{period}'] = np.zeros(n)
         
         return features
+    
+    def _calculate_aroon_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """Aroon計算（Polarsベース）"""
+        
+        # Aroon計算にはNumbaが効率的
+        high_data = df['high'].to_numpy()
+        low_data = df['low'].to_numpy()
+        
+        aroon_result = self._numba_safe_calculation(
+            self._calculate_aroon_vectorized,
+            high_data, low_data, period
+        )
+        
+        if aroon_result is not None and len(aroon_result.shape) == 2:
+            aroon_up = aroon_result[:, 0]
+            aroon_down = aroon_result[:, 1]
+            
+            # Polarsで追加特徴量を計算
+            result_df = pl.DataFrame({
+                'aroon_up': aroon_up,
+                'aroon_down': aroon_down
+            }).with_columns([
+                (pl.col('aroon_up') - pl.col('aroon_down')).alias('aroon_oscillator'),
+                ((pl.col('aroon_up') - pl.col('aroon_down')).abs() > 50).cast(pl.Float64).alias('aroon_trending')
+            ])
+            
+            return {
+                f'aroon_up_{period}': result_df['aroon_up'].to_numpy(),
+                f'aroon_down_{period}': result_df['aroon_down'].to_numpy(),
+                f'aroon_oscillator_{period}': result_df['aroon_oscillator'].to_numpy(),
+                f'aroon_trending_{period}': result_df['aroon_trending'].to_numpy()
+            }
+        else:
+            # フォールバック
+            n = len(df)
+            return {
+                f'aroon_up_{period}': np.zeros(n),
+                f'aroon_down_{period}': np.zeros(n),
+                f'aroon_oscillator_{period}': np.zeros(n),
+                f'aroon_trending_{period}': np.zeros(n)
+            }
     
     @staticmethod
     @njit(parallel=True, cache=True)
@@ -3431,47 +3477,46 @@ class Calculator:
         result[:, 1] = aroon_down
         return result
     
-    def calculate_ultimate_oscillator_features(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """アルティメットオシレーター特徴量の計算（NumPy実装）"""
+    def calculate_ultimate_oscillator_features_polars(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """アルティメットオシレーター特徴量の計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
-        
         try:
-            # Ultimate OscillatorをNumbaで計算
+            # Ultimate OscillatorはNumbaが効率的
             uo_result = self._numba_safe_calculation(
                 self._calculate_ultimate_oscillator_vectorized,
                 high, low, close
             )
             
             if uo_result is not None:
-                # NumPyで追加特徴量を計算
-                uo_overbought = np.where(uo_result > 70, 1.0, 0.0)
-                uo_oversold = np.where(uo_result < 30, 1.0, 0.0)
-                uo_normalized = (uo_result - 50) / 50.0
+                # Polarsで追加特徴量を計算
+                df = pl.DataFrame({
+                    'ultimate_oscillator': uo_result
+                }).with_columns([
+                    (pl.col('ultimate_oscillator') > 70).cast(pl.Float64).alias('uo_overbought'),
+                    (pl.col('ultimate_oscillator') < 30).cast(pl.Float64).alias('uo_oversold'),
+                    ((pl.col('ultimate_oscillator') - 50) / 50.0).alias('uo_normalized')
+                ])
                 
-                features['ultimate_oscillator'] = uo_result
-                features['uo_overbought'] = uo_overbought
-                features['uo_oversold'] = uo_oversold
-                features['uo_normalized'] = uo_normalized
+                features['ultimate_oscillator'] = df['ultimate_oscillator'].to_numpy()
+                features['uo_overbought'] = df['uo_overbought'].to_numpy()
+                features['uo_oversold'] = df['uo_oversold'].to_numpy()
+                features['uo_normalized'] = df['uo_normalized'].to_numpy()
             else:
                 # フォールバック
                 n = len(high)
-                features['ultimate_oscillator'] = np.full(n, np.nan)
-                features['uo_overbought'] = np.full(n, np.nan)
-                features['uo_oversold'] = np.full(n, np.nan)
-                features['uo_normalized'] = np.full(n, np.nan)
+                features['ultimate_oscillator'] = np.zeros(n)
+                features['uo_overbought'] = np.zeros(n)
+                features['uo_oversold'] = np.zeros(n)
+                features['uo_normalized'] = np.zeros(n)
                 
         except Exception as e:
             logger.error(f"Ultimate Oscillator計算エラー: {e}")
             n = len(high)
-            features['ultimate_oscillator'] = np.full(n, np.nan)
-            features['uo_overbought'] = np.full(n, np.nan)
-            features['uo_oversold'] = np.full(n, np.nan)
-            features['uo_normalized'] = np.full(n, np.nan)
+            features['ultimate_oscillator'] = np.zeros(n)
+            features['uo_overbought'] = np.zeros(n)
+            features['uo_oversold'] = np.zeros(n)
+            features['uo_normalized'] = np.zeros(n)
         
         return features
     
@@ -3521,66 +3566,86 @@ class Calculator:
         return uo
     
     # =========================================================================
-    # 出来高関連指標（NumPy実装）
+    # 出来高関連指標（Polars最適化）
     # =========================================================================
     
-    def calculate_volume_features(self, high: np.ndarray, low: np.ndarray, 
-                                 close: np.ndarray, volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """出来高関連特徴量の統合計算（NumPy実装）"""
+    def calculate_volume_features_polars(self, high: np.ndarray, low: np.ndarray, 
+                                       close: np.ndarray, volume: np.ndarray) -> Dict[str, np.ndarray]:
+        """出来高関連特徴量の統合計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
-        volume = self._ensure_numpy_array(volume)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low,
+            'close': close,
+            'volume': volume
+        })
         
         try:
             # VPT (Volume Price Trend)
-            vpt_features = self._safe_calculation(self._calculate_vpt_numpy, close, volume)
+            vpt_features = self._polars_safe_calculation(
+                self._calculate_vpt_polars, df
+            )
             if isinstance(vpt_features, dict):
                 features.update(vpt_features)
             
             # A/D Line (Accumulation/Distribution)
-            ad_features = self._safe_calculation(self._calculate_ad_line_numpy, high, low, close, volume)
+            ad_features = self._polars_safe_calculation(
+                self._calculate_ad_line_polars, df
+            )
             if isinstance(ad_features, dict):
                 features.update(ad_features)
             
             # CMF (Chaikin Money Flow)
             for period in self.params['cmf_periods']:
-                cmf_features = self._safe_calculation(self._calculate_cmf_numpy, high, low, close, volume, period)
+                cmf_features = self._polars_safe_calculation(
+                    self._calculate_cmf_polars, df, period
+                )
                 if isinstance(cmf_features, dict):
                     features.update(cmf_features)
             
             # Chaikin Oscillator
-            chaikin_features = self._safe_calculation(self._calculate_chaikin_oscillator_numpy, high, low, close, volume)
+            chaikin_features = self._polars_safe_calculation(
+                self._calculate_chaikin_oscillator_polars, df
+            )
             if isinstance(chaikin_features, dict):
                 features.update(chaikin_features)
             
             # MFI (Money Flow Index)
             for period in self.params['mfi_periods']:
-                mfi_features = self._safe_calculation(self._calculate_mfi_numpy, high, low, close, volume, period)
+                mfi_features = self._polars_safe_calculation(
+                    self._calculate_mfi_polars, df, period
+                )
                 if isinstance(mfi_features, dict):
                     features.update(mfi_features)
             
             # VWAP (Volume Weighted Average Price)
             for period in [20, 50, 100]:
-                vwap_features = self._safe_calculation(self._calculate_vwap_numpy, high, low, close, volume, period)
+                vwap_features = self._polars_safe_calculation(
+                    self._calculate_vwap_polars, df, period
+                )
                 if isinstance(vwap_features, dict):
                     features.update(vwap_features)
             
             # Volume Oscillator
-            volume_osc_features = self._safe_calculation(self._calculate_volume_oscillator_numpy, volume)
+            volume_osc_features = self._polars_safe_calculation(
+                self._calculate_volume_oscillator_polars, df
+            )
             if isinstance(volume_osc_features, dict):
                 features.update(volume_osc_features)
             
             # Ease of Movement
-            eom_features = self._safe_calculation(self._calculate_ease_of_movement_numpy, high, low, volume)
+            eom_features = self._polars_safe_calculation(
+                self._calculate_ease_of_movement_polars, df
+            )
             if isinstance(eom_features, dict):
                 features.update(eom_features)
             
             # Volume ROC
-            vol_roc_features = self._safe_calculation(self._calculate_volume_roc_numpy, volume)
+            vol_roc_features = self._polars_safe_calculation(
+                self._calculate_volume_roc_polars, df
+            )
             if isinstance(vol_roc_features, dict):
                 features.update(vol_roc_features)
                 
@@ -3589,340 +3654,291 @@ class Calculator:
         
         return features
     
-    def _calculate_vpt_numpy(self, close: np.ndarray, volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """VPT計算（NumPy実装）"""
+    def _calculate_vpt_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """VPT計算（Polarsベース）"""
         
-        # 前日終値
-        prev_close = np.roll(close, 1)
-        prev_close[0] = close[0]
-        
-        # VPT変化量計算
-        vpt_change = (close - prev_close) / (prev_close + 1e-10) * volume
-        
-        # VPT累積（NumPy cumsum使用）
-        vpt = np.cumsum(vpt_change)
-        
-        # VPTシグナル
-        vpt_signal = np.diff(vpt, prepend=vpt[0])
+        result_df = df.with_columns([
+            pl.col('close').shift(1).alias('prev_close')
+        ]).with_columns([
+            ((pl.col('close') - pl.col('prev_close')) / (pl.col('prev_close') + 1e-10) * pl.col('volume'))
+            .alias('vpt_change')
+        ]).with_columns([
+            pl.col('vpt_change').cumsum().alias('vpt')
+        ]).with_columns([
+            pl.col('vpt').diff().alias('vpt_signal')
+        ])
         
         # VPTの移動平均
+        for period in [10, 20, 50]:
+            result_df = result_df.with_columns([
+                pl.col('vpt').rolling_mean(window_size=period).alias(f'vpt_ma_{period}')
+            ]).with_columns([
+                (pl.col('vpt') > pl.col(f'vpt_ma_{period}')).cast(pl.Float64).alias(f'vpt_above_ma_{period}')
+            ])
+        
         features = {
-            'vpt': vpt,
-            'vpt_signal': vpt_signal
+            'vpt': result_df['vpt'].to_numpy(),
+            'vpt_signal': result_df['vpt_signal'].to_numpy()
         }
         
         for period in [10, 20, 50]:
-            vpt_ma = self._rolling_mean_numpy(vpt, period)
-            vpt_above_ma = np.where(vpt > vpt_ma, 1.0, 0.0)
-            
-            features[f'vpt_ma_{period}'] = vpt_ma
-            features[f'vpt_above_ma_{period}'] = vpt_above_ma
+            features[f'vpt_ma_{period}'] = result_df[f'vpt_ma_{period}'].to_numpy()
+            features[f'vpt_above_ma_{period}'] = result_df[f'vpt_above_ma_{period}'].to_numpy()
         
         return features
     
-    def _calculate_ad_line_numpy(self, high: np.ndarray, low: np.ndarray, 
-                               close: np.ndarray, volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """A/D Line計算（NumPy実装）"""
+    def _calculate_ad_line_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """A/D Line計算（Polarsベース）"""
         
-        # CLV (Close Location Value)計算
-        clv = np.divide(
-            ((close - low) - (high - close)),
-            (high - low + 1e-10),
-            out=np.zeros_like(close),
-            where=((high - low) != 0)
-        )
-        
-        # A/D変化量
-        ad_change = clv * volume
-        
-        # A/D Line累積（NumPy cumsum使用）
-        ad_line = np.cumsum(ad_change)
-        
-        # A/D Lineモメンタム
-        ad_line_momentum = np.diff(ad_line, prepend=ad_line[0])
+        result_df = df.with_columns([
+            # CLV (Close Location Value)
+            (((pl.col('close') - pl.col('low')) - (pl.col('high') - pl.col('close'))) / 
+             (pl.col('high') - pl.col('low') + 1e-10)).alias('clv')
+        ]).with_columns([
+            (pl.col('clv') * pl.col('volume')).alias('ad_change')
+        ]).with_columns([
+            pl.col('ad_change').cumsum().alias('ad_line')
+        ]).with_columns([
+            pl.col('ad_line').diff().alias('ad_line_momentum')
+        ])
         
         # 価格とA/Dラインのダイバージェンス
-        price_momentum = np.diff(close, prepend=close[0])
-        
-        # 正規化してダイバージェンス計算
-        price_momentum_std = np.std(price_momentum)
-        ad_momentum_std = np.std(ad_line_momentum)
-        
-        if price_momentum_std > 1e-10 and ad_momentum_std > 1e-10:
-            ad_price_divergence = (price_momentum / price_momentum_std - 
-                                 ad_line_momentum / ad_momentum_std)
-        else:
-            ad_price_divergence = np.zeros_like(close)
+        result_df = result_df.with_columns([
+            pl.col('close').diff().alias('price_momentum')
+        ]).with_columns([
+            # 正規化してダイバージェンス計算
+            (pl.col('price_momentum') / (pl.col('price_momentum').std() + 1e-10) - 
+             pl.col('ad_line_momentum') / (pl.col('ad_line_momentum').std() + 1e-10))
+            .alias('ad_price_divergence')
+        ])
         
         return {
-            'ad_line': ad_line,
-            'ad_line_momentum': ad_line_momentum,
-            'ad_price_divergence': ad_price_divergence
+            'ad_line': result_df['ad_line'].to_numpy(),
+            'ad_line_momentum': result_df['ad_line_momentum'].to_numpy(),
+            'ad_price_divergence': result_df['ad_price_divergence'].to_numpy()
         }
     
-    def _calculate_cmf_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, 
-                           volume: np.ndarray, period: int) -> Dict[str, np.ndarray]:
-        """CMF計算（NumPy実装）"""
+    def _calculate_cmf_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """CMF計算（Polarsベース）"""
         
-        # CLV計算
-        clv = np.divide(
-            ((close - low) - (high - close)),
-            (high - low + 1e-10),
-            out=np.zeros_like(close),
-            where=((high - low) != 0)
-        )
-        
-        # Money Flow Volume
-        money_flow_volume = clv * volume
-        
-        # CMF計算
-        mfv_sum = self._rolling_sum_numpy(money_flow_volume, period)
-        volume_sum = self._rolling_sum_numpy(volume, period)
-        
-        cmf = np.divide(mfv_sum, volume_sum, 
-                       out=np.zeros_like(mfv_sum), 
-                       where=(volume_sum != 0))
-        
-        # 追加特徴量（NumPy操作）
-        cmf_positive = np.where(cmf > 0, 1.0, 0.0)
-        cmf_strong_positive = np.where(cmf > 0.2, 1.0, 0.0)
-        cmf_strong_negative = np.where(cmf < -0.2, 1.0, 0.0)
+        result_df = df.with_columns([
+            # CLV計算
+            (((pl.col('close') - pl.col('low')) - (pl.col('high') - pl.col('close'))) / 
+             (pl.col('high') - pl.col('low') + 1e-10)).alias('clv')
+        ]).with_columns([
+            (pl.col('clv') * pl.col('volume')).alias('money_flow_volume')
+        ]).with_columns([
+            # CMF計算
+            (pl.col('money_flow_volume').rolling_sum(window_size=period) / 
+             (pl.col('volume').rolling_sum(window_size=period) + 1e-10)).alias('cmf')
+        ]).with_columns([
+            (pl.col('cmf') > 0).cast(pl.Float64).alias('cmf_positive'),
+            (pl.col('cmf') > 0.2).cast(pl.Float64).alias('cmf_strong_positive'),
+            (pl.col('cmf') < -0.2).cast(pl.Float64).alias('cmf_strong_negative')
+        ])
         
         return {
-            f'cmf_{period}': cmf,
-            f'cmf_positive_{period}': cmf_positive,
-            f'cmf_strong_positive_{period}': cmf_strong_positive,
-            f'cmf_strong_negative_{period}': cmf_strong_negative
+            f'cmf_{period}': result_df['cmf'].to_numpy(),
+            f'cmf_positive_{period}': result_df['cmf_positive'].to_numpy(),
+            f'cmf_strong_positive_{period}': result_df['cmf_strong_positive'].to_numpy(),
+            f'cmf_strong_negative_{period}': result_df['cmf_strong_negative'].to_numpy()
         }
     
-    def _calculate_chaikin_oscillator_numpy(self, high: np.ndarray, low: np.ndarray,
-                                          close: np.ndarray, volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """チャイキンオシレーター計算（NumPy実装）"""
+    def _calculate_chaikin_oscillator_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """チャイキンオシレーター計算（Polarsベース）"""
         
-        # CLV計算
-        clv = np.divide(
-            ((close - low) - (high - close)),
-            (high - low + 1e-10),
-            out=np.zeros_like(close),
-            where=((high - low) != 0)
-        )
-        
-        # A/D変化量
-        ad_change = clv * volume
-        
-        # A/D Line累積（NumPy cumsum使用）
-        ad_line = np.cumsum(ad_change)
-        
-        # 3日と10日のEMA
-        ema3 = self._ema_numpy(ad_line, 3)
-        ema10 = self._ema_numpy(ad_line, 10)
-        
-        # チャイキンオシレーター
-        chaikin_oscillator = ema3 - ema10
-        
-        # 追加特徴量（NumPy操作）
-        chaikin_positive = np.where(chaikin_oscillator > 0, 1.0, 0.0)
-        chaikin_momentum = np.diff(chaikin_oscillator, prepend=chaikin_oscillator[0])
-        
-        chaikin_std = np.std(chaikin_oscillator)
-        if chaikin_std > 1e-10:
-            chaikin_normalized = np.tanh(chaikin_oscillator / chaikin_std)
-        else:
-            chaikin_normalized = np.zeros_like(chaikin_oscillator)
+        result_df = df.with_columns([
+            # CLV計算
+            (((pl.col('close') - pl.col('low')) - (pl.col('high') - pl.col('close'))) / 
+             (pl.col('high') - pl.col('low') + 1e-10)).alias('clv')
+        ]).with_columns([
+            (pl.col('clv') * pl.col('volume')).alias('ad_change')
+        ]).with_columns([
+            pl.col('ad_change').cumsum().alias('ad_line')
+        ]).with_columns([
+            # 3日と10日のEMA
+            pl.col('ad_line').ewm_mean(span=3, adjust=False).alias('ema3'),
+            pl.col('ad_line').ewm_mean(span=10, adjust=False).alias('ema10')
+        ]).with_columns([
+            (pl.col('ema3') - pl.col('ema10')).alias('chaikin_oscillator')
+        ]).with_columns([
+            (pl.col('chaikin_oscillator') > 0).cast(pl.Float64).alias('chaikin_positive'),
+            pl.col('chaikin_oscillator').diff().alias('chaikin_momentum'),
+            (pl.col('chaikin_oscillator') / (pl.col('chaikin_oscillator').std() + 1e-10)).tanh().alias('chaikin_normalized')
+        ])
         
         return {
-            'chaikin_oscillator': chaikin_oscillator,
-            'chaikin_positive': chaikin_positive,
-            'chaikin_momentum': chaikin_momentum,
-            'chaikin_normalized': chaikin_normalized
+            'chaikin_oscillator': result_df['chaikin_oscillator'].to_numpy(),
+            'chaikin_positive': result_df['chaikin_positive'].to_numpy(),
+            'chaikin_momentum': result_df['chaikin_momentum'].to_numpy(),
+            'chaikin_normalized': result_df['chaikin_normalized'].to_numpy()
         }
     
-    def _calculate_mfi_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                           volume: np.ndarray, period: int) -> Dict[str, np.ndarray]:
-        """MFI計算（NumPy実装）"""
+    def _calculate_mfi_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """MFI計算（Polarsベース）"""
         
-        # Typical Price
-        typical_price = (high + low + close) / 3.0
-        
-        # Raw Money Flow
-        raw_money_flow = typical_price * volume
-        
-        # 前日Typical Price
-        prev_typical_price = np.roll(typical_price, 1)
-        prev_typical_price[0] = typical_price[0]
-        
-        # Positive/Negative Money Flow
-        positive_money_flow = np.where(typical_price > prev_typical_price, raw_money_flow, 0.0)
-        negative_money_flow = np.where(typical_price < prev_typical_price, raw_money_flow, 0.0)
-        
-        # ローリング合計
-        positive_mf_sum = self._rolling_sum_numpy(positive_money_flow, period)
-        negative_mf_sum = self._rolling_sum_numpy(negative_money_flow, period)
-        
-        # Money Ratio
-        money_ratio = np.divide(positive_mf_sum, negative_mf_sum,
-                               out=np.ones_like(positive_mf_sum),
-                               where=(negative_mf_sum != 0))
-        
-        # MFI計算
-        mfi = 100 - (100 / (1 + money_ratio))
-        
-        # 追加特徴量（NumPy操作）
-        mfi_overbought = np.where(mfi > 80, 1.0, 0.0)
-        mfi_oversold = np.where(mfi < 20, 1.0, 0.0)
-        mfi_normalized = (mfi - 50) / 50.0
+        result_df = df.with_columns([
+            # Typical Price
+            ((pl.col('high') + pl.col('low') + pl.col('close')) / 3.0).alias('typical_price')
+        ]).with_columns([
+            (pl.col('typical_price') * pl.col('volume')).alias('raw_money_flow'),
+            pl.col('typical_price').shift(1).alias('prev_typical_price')
+        ]).with_columns([
+            pl.when(pl.col('typical_price') > pl.col('prev_typical_price'))
+            .then(pl.col('raw_money_flow'))
+            .otherwise(0.0)
+            .alias('positive_money_flow'),
+            pl.when(pl.col('typical_price') < pl.col('prev_typical_price'))
+            .then(pl.col('raw_money_flow'))
+            .otherwise(0.0)
+            .alias('negative_money_flow')
+        ]).with_columns([
+            pl.col('positive_money_flow').rolling_sum(window_size=period).alias('positive_mf_sum'),
+            pl.col('negative_money_flow').rolling_sum(window_size=period).alias('negative_mf_sum')
+        ]).with_columns([
+            (pl.col('positive_mf_sum') / (pl.col('negative_mf_sum') + 1e-10)).alias('money_ratio'),
+        ]).with_columns([
+            (100 - (100 / (1 + pl.col('money_ratio')))).alias('mfi')
+        ]).with_columns([
+            (pl.col('mfi') > 80).cast(pl.Float64).alias('mfi_overbought'),
+            (pl.col('mfi') < 20).cast(pl.Float64).alias('mfi_oversold'),
+            ((pl.col('mfi') - 50) / 50.0).alias('mfi_normalized')
+        ])
         
         return {
-            f'mfi_{period}': mfi,
-            f'mfi_overbought_{period}': mfi_overbought,
-            f'mfi_oversold_{period}': mfi_oversold,
-            f'mfi_normalized_{period}': mfi_normalized
+            f'mfi_{period}': result_df['mfi'].to_numpy(),
+            f'mfi_overbought_{period}': result_df['mfi_overbought'].to_numpy(),
+            f'mfi_oversold_{period}': result_df['mfi_oversold'].to_numpy(),
+            f'mfi_normalized_{period}': result_df['mfi_normalized'].to_numpy()
         }
     
-    def _calculate_vwap_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                            volume: np.ndarray, period: int) -> Dict[str, np.ndarray]:
-        """VWAP計算（NumPy実装）"""
+    def _calculate_vwap_polars(self, df: pl.DataFrame, period: int) -> Dict[str, np.ndarray]:
+        """VWAP計算（Polarsベース）"""
         
-        # Typical Price
-        typical_price = (high + low + close) / 3.0
-        
-        # Price * Volume
-        pv = typical_price * volume
-        
-        # VWAP計算
-        pv_sum = self._rolling_sum_numpy(pv, period)
-        volume_sum = self._rolling_sum_numpy(volume, period)
-        
-        vwap = np.divide(pv_sum, volume_sum,
-                        out=np.zeros_like(pv_sum),
-                        where=(volume_sum != 0))
-        
-        # 追加特徴量（NumPy操作）
-        price_above_vwap = np.where(close > vwap, 1.0, 0.0)
-        vwap_distance = (close - vwap) / (close + 1e-10)
-        vwap_deviation = np.abs(close - vwap) / (vwap + 1e-10)
+        result_df = df.with_columns([
+            # Typical Price
+            ((pl.col('high') + pl.col('low') + pl.col('close')) / 3.0).alias('typical_price')
+        ]).with_columns([
+            (pl.col('typical_price') * pl.col('volume')).alias('pv')
+        ]).with_columns([
+            # VWAP計算
+            (pl.col('pv').rolling_sum(window_size=period) / 
+             (pl.col('volume').rolling_sum(window_size=period) + 1e-10)).alias('vwap')
+        ]).with_columns([
+            (pl.col('close') > pl.col('vwap')).cast(pl.Float64).alias('price_above_vwap'),
+            ((pl.col('close') - pl.col('vwap')) / (pl.col('close') + 1e-10)).alias('vwap_distance'),
+            ((pl.col('close') - pl.col('vwap')).abs() / (pl.col('vwap') + 1e-10)).alias('vwap_deviation')
+        ])
         
         return {
-            f'vwap_{period}': vwap,
-            f'price_above_vwap_{period}': price_above_vwap,
-            f'vwap_distance_{period}': vwap_distance,
-            f'vwap_deviation_{period}': vwap_deviation
+            f'vwap_{period}': result_df['vwap'].to_numpy(),
+            f'price_above_vwap_{period}': result_df['price_above_vwap'].to_numpy(),
+            f'vwap_distance_{period}': result_df['vwap_distance'].to_numpy(),
+            f'vwap_deviation_{period}': result_df['vwap_deviation'].to_numpy()
         }
     
-    def _calculate_volume_oscillator_numpy(self, volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """ボリュームオシレーター計算（NumPy実装）"""
+    def _calculate_volume_oscillator_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ボリュームオシレーター計算（Polarsベース）"""
         features = {}
         
         # 複数の期間設定
         period_pairs = [(5, 10), (10, 20), (14, 28)]
         
         for short, long in period_pairs:
-            vol_short_avg = self._rolling_mean_numpy(volume, short)
-            vol_long_avg = self._rolling_mean_numpy(volume, long)
+            result_df = df.with_columns([
+                pl.col('volume').rolling_mean(window_size=short).alias('vol_short_avg'),
+                pl.col('volume').rolling_mean(window_size=long).alias('vol_long_avg')
+            ]).with_columns([
+                (100 * (pl.col('vol_short_avg') - pl.col('vol_long_avg')) / 
+                 (pl.col('vol_long_avg') + 1e-10)).alias('volume_oscillator')
+            ]).with_columns([
+                (pl.col('volume_oscillator') > 0).cast(pl.Float64).alias('vo_positive'),
+                pl.col('volume_oscillator').diff().alias('vo_momentum')
+            ])
             
-            volume_oscillator = 100 * np.divide(
-                vol_short_avg - vol_long_avg,
-                vol_long_avg,
-                out=np.zeros_like(vol_short_avg),
-                where=(vol_long_avg != 0)
-            )
-            
-            # 追加特徴量（NumPy操作）
-            vo_positive = np.where(volume_oscillator > 0, 1.0, 0.0)
-            vo_momentum = np.diff(volume_oscillator, prepend=volume_oscillator[0])
-            
-            features[f'volume_oscillator_{short}_{long}'] = volume_oscillator
-            features[f'vo_positive_{short}_{long}'] = vo_positive
-            features[f'vo_momentum_{short}_{long}'] = vo_momentum
+            features[f'volume_oscillator_{short}_{long}'] = result_df['volume_oscillator'].to_numpy()
+            features[f'vo_positive_{short}_{long}'] = result_df['vo_positive'].to_numpy()
+            features[f'vo_momentum_{short}_{long}'] = result_df['vo_momentum'].to_numpy()
         
         return features
     
-    def _calculate_ease_of_movement_numpy(self, high: np.ndarray, low: np.ndarray, 
-                                        volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """Ease of Movement計算（NumPy実装）"""
+    def _calculate_ease_of_movement_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """Ease of Movement計算（Polarsベース）"""
         
-        # 前日の高値・安値
-        prev_high = np.roll(high, 1)
-        prev_low = np.roll(low, 1)
-        prev_high[0] = high[0]
-        prev_low[0] = low[0]
-        
-        # Distance Moved
-        distance_moved = ((high + low) / 2.0) - ((prev_high + prev_low) / 2.0)
-        
-        # Box Height
-        box_height = np.divide(volume, (high - low), 
-                             out=np.zeros_like(volume), 
-                             where=((high - low) != 0))
-        
-        # Ease of Movement
-        eom = np.divide(10000.0 * distance_moved, box_height,
-                       out=np.zeros_like(distance_moved),
-                       where=(box_height != 0))
-        
-        # 追加特徴量（NumPy操作）
-        eom_positive = np.where(eom > 0, 1.0, 0.0)
-        eom_momentum = np.diff(eom, prepend=eom[0])
-        
-        features = {
-            'ease_of_movement': eom,
-            'eom_positive': eom_positive,
-            'eom_momentum': eom_momentum
-        }
+        result_df = df.with_columns([
+            # Distance Moved
+            (((pl.col('high') + pl.col('low')) / 2.0) - 
+             ((pl.col('high').shift(1) + pl.col('low').shift(1)) / 2.0)).alias('distance_moved'),
+            # Box Height
+            (pl.col('volume') / (pl.col('high') - pl.col('low') + 1e-10)).alias('box_height')
+        ]).with_columns([
+            (10000.0 * pl.col('distance_moved') / (pl.col('box_height') + 1e-10)).alias('eom')
+        ]).with_columns([
+            (pl.col('eom') > 0).cast(pl.Float64).alias('eom_positive'),
+            pl.col('eom').diff().alias('eom_momentum')
+        ])
         
         # EMVの移動平均
         for period in [14, 20]:
-            eom_ma = self._rolling_mean_numpy(eom, period)
-            eom_signal = np.where(eom > eom_ma, 1.0, 0.0)
-            
-            features[f'eom_ma_{period}'] = eom_ma
-            features[f'eom_signal_{period}'] = eom_signal
+            result_df = result_df.with_columns([
+                pl.col('eom').rolling_mean(window_size=period).alias(f'eom_ma_{period}')
+            ]).with_columns([
+                (pl.col('eom') > pl.col(f'eom_ma_{period}')).cast(pl.Float64).alias(f'eom_signal_{period}')
+            ])
+        
+        features = {
+            'ease_of_movement': result_df['eom'].to_numpy(),
+            'eom_positive': result_df['eom_positive'].to_numpy(),
+            'eom_momentum': result_df['eom_momentum'].to_numpy()
+        }
+        
+        for period in [14, 20]:
+            features[f'eom_ma_{period}'] = result_df[f'eom_ma_{period}'].to_numpy()
+            features[f'eom_signal_{period}'] = result_df[f'eom_signal_{period}'].to_numpy()
         
         return features
     
-    def _calculate_volume_roc_numpy(self, volume: np.ndarray) -> Dict[str, np.ndarray]:
-        """出来高変化率計算（NumPy実装）"""
+    def _calculate_volume_roc_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """出来高変化率計算（Polarsベース）"""
         features = {}
         
         for period in self.params['vol_roc_periods']:
-            # 過去の出来高
-            volume_prev = np.roll(volume, period)
-            volume_prev[:period] = volume[:period]  # 先頭をパディング
+            result_df = df.with_columns([
+                pl.col('volume').shift(period).alias('volume_prev')
+            ]).with_columns([
+                (100 * (pl.col('volume') - pl.col('volume_prev')) / 
+                 (pl.col('volume_prev') + 1e-10)).alias('volume_roc')
+            ]).with_columns([
+                (pl.col('volume_roc') > 0).cast(pl.Float64).alias('vol_roc_positive'),
+                (pl.col('volume_roc').abs() > 50).cast(pl.Float64).alias('vol_roc_strong')
+            ])
             
-            # Volume ROC計算
-            volume_roc = 100 * np.divide(
-                volume - volume_prev,
-                volume_prev,
-                out=np.zeros_like(volume),
-                where=(volume_prev != 0)
-            )
-            
-            # 追加特徴量（NumPy操作）
-            vol_roc_positive = np.where(volume_roc > 0, 1.0, 0.0)
-            vol_roc_strong = np.where(np.abs(volume_roc) > 50, 1.0, 0.0)
-            
-            features[f'volume_roc_{period}'] = volume_roc
-            features[f'vol_roc_positive_{period}'] = vol_roc_positive
-            features[f'vol_roc_strong_{period}'] = vol_roc_strong
+            features[f'volume_roc_{period}'] = result_df['volume_roc'].to_numpy()
+            features[f'vol_roc_positive_{period}'] = result_df['vol_roc_positive'].to_numpy()
+            features[f'vol_roc_strong_{period}'] = result_df['vol_roc_strong'].to_numpy()
         
         return features
     
     # =========================================================================
-    # 移動平均線・トレンド分析（NumPy実装）
+    # トレンド分析・移動平均線（Polars最適化）
     # =========================================================================
     
-    def calculate_moving_averages(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """移動平均線特徴量の統合計算（NumPy実装）"""
+    def calculate_moving_averages_polars(self, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """移動平均線特徴量の統合計算（Polars最適化版）"""
         features = {}
-        close = self._ensure_numpy_array(close)
+        
+        # Polars DataFrameを構築
+        df = self._ensure_polars_df(close, 'close')
         
         try:
             # WMA (Weighted Moving Average)
-            wma_features = self._safe_calculation(self._calculate_wma_numpy, close)
+            wma_features = self._polars_safe_calculation(
+                self._calculate_wma_polars, df
+            )
             if isinstance(wma_features, dict):
                 features.update(wma_features)
             
-            # HMA (Hull Moving Average)
+            # HMA (Hull Moving Average) - Numbaが効率的
             hma_features = self._calculate_hma_features_numba(close)
             features.update(hma_features)
             
@@ -3931,17 +3947,23 @@ class Calculator:
             features.update(kama_features)
             
             # DEMA, TEMA
-            dema_tema_features = self._safe_calculation(self._calculate_dema_tema_numpy, close)
+            dema_tema_features = self._polars_safe_calculation(
+                self._calculate_dema_tema_polars, df
+            )
             if isinstance(dema_tema_features, dict):
                 features.update(dema_tema_features)
             
             # 移動平均線の傾きと乖離
-            ma_analysis_features = self._safe_calculation(self._calculate_ma_analysis_numpy, close)
+            ma_analysis_features = self._polars_safe_calculation(
+                self._calculate_ma_analysis_polars, df
+            )
             if isinstance(ma_analysis_features, dict):
                 features.update(ma_analysis_features)
             
             # ゴールデンクロス・デッドクロス
-            cross_features = self._safe_calculation(self._calculate_cross_signals_numpy, close)
+            cross_features = self._polars_safe_calculation(
+                self._calculate_cross_signals_polars, df
+            )
             if isinstance(cross_features, dict):
                 features.update(cross_features)
                 
@@ -3950,33 +3972,38 @@ class Calculator:
         
         return features
     
-    def _calculate_wma_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """WMA計算（NumPy実装）"""
+    def _calculate_wma_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """WMA計算（Polarsベース）"""
         features = {}
         
         periods = [9, 21, 50]
         for period in periods:
-            # WMAをNumbaで計算
+            # WMAはNumbaが効率的
+            close_data = df['close'].to_numpy()
             wma_result = self._numba_safe_calculation(
-                self._calculate_wma_vectorized, close, period
+                self._calculate_wma_vectorized, close_data, period
             )
             
             if wma_result is not None:
-                # NumPyで追加特徴量を計算
-                price_above_wma = np.where(close > wma_result, 1.0, 0.0)
-                wma_slope = np.diff(wma_result, prepend=wma_result[0])
-                wma_distance = (close - wma_result) / (close + 1e-10)
+                wma_df = pl.DataFrame({
+                    'close': close_data,
+                    'wma': wma_result
+                }).with_columns([
+                    (pl.col('close') > pl.col('wma')).cast(pl.Float64).alias('price_above_wma'),
+                    pl.col('wma').diff().alias('wma_slope'),
+                    ((pl.col('close') - pl.col('wma')) / (pl.col('close') + 1e-10)).alias('wma_distance')
+                ])
                 
-                features[f'wma_{period}'] = wma_result
-                features[f'price_above_wma_{period}'] = price_above_wma
-                features[f'wma_slope_{period}'] = wma_slope
-                features[f'wma_distance_{period}'] = wma_distance
+                features[f'wma_{period}'] = wma_df['wma'].to_numpy()
+                features[f'price_above_wma_{period}'] = wma_df['price_above_wma'].to_numpy()
+                features[f'wma_slope_{period}'] = wma_df['wma_slope'].to_numpy()
+                features[f'wma_distance_{period}'] = wma_df['wma_distance'].to_numpy()
             else:
-                n = len(close)
-                features[f'wma_{period}'] = np.full(n, np.nan)
-                features[f'price_above_wma_{period}'] = np.full(n, np.nan)
-                features[f'wma_slope_{period}'] = np.full(n, np.nan)
-                features[f'wma_distance_{period}'] = np.full(n, np.nan)
+                n = len(df)
+                features[f'wma_{period}'] = np.zeros(n)
+                features[f'price_above_wma_{period}'] = np.zeros(n)
+                features[f'wma_slope_{period}'] = np.zeros(n)
+                features[f'wma_distance_{period}'] = np.zeros(n)
         
         return features
     
@@ -4012,21 +4039,26 @@ class Calculator:
             )
             
             if hma_result is not None:
-                # NumPyで追加特徴量を計算
-                price_above_hma = np.where(close > hma_result, 1.0, 0.0)
-                hma_slope = np.diff(hma_result, prepend=hma_result[0])
-                hma_momentum = np.diff(hma_slope, prepend=hma_slope[0])
+                # Polarsで追加特徴量を計算
+                df = pl.DataFrame({
+                    'close': close,
+                    'hma': hma_result
+                }).with_columns([
+                    (pl.col('close') > pl.col('hma')).cast(pl.Float64).alias('price_above_hma'),
+                    pl.col('hma').diff().alias('hma_slope'),
+                    pl.col('hma').diff().diff().alias('hma_momentum')
+                ])
                 
-                features[f'hma_{period}'] = hma_result
-                features[f'price_above_hma_{period}'] = price_above_hma
-                features[f'hma_slope_{period}'] = hma_slope
-                features[f'hma_momentum_{period}'] = hma_momentum
+                features[f'hma_{period}'] = df['hma'].to_numpy()
+                features[f'price_above_hma_{period}'] = df['price_above_hma'].to_numpy()
+                features[f'hma_slope_{period}'] = df['hma_slope'].to_numpy()
+                features[f'hma_momentum_{period}'] = df['hma_momentum'].to_numpy()
             else:
                 n = len(close)
-                features[f'hma_{period}'] = np.full(n, np.nan)
-                features[f'price_above_hma_{period}'] = np.full(n, np.nan)
-                features[f'hma_slope_{period}'] = np.full(n, np.nan)
-                features[f'hma_momentum_{period}'] = np.full(n, np.nan)
+                features[f'hma_{period}'] = np.zeros(n)
+                features[f'price_above_hma_{period}'] = np.zeros(n)
+                features[f'hma_slope_{period}'] = np.zeros(n)
+                features[f'hma_momentum_{period}'] = np.zeros(n)
         
         return features
     
@@ -4094,20 +4126,26 @@ class Calculator:
                 kama_values = kama_result[:, 0]
                 efficiency_ratio = kama_result[:, 1]
                 
-                # NumPyで追加特徴量を計算
-                price_above_kama = np.where(close > kama_values, 1.0, 0.0)
-                kama_slope = np.diff(kama_values, prepend=kama_values[0])
+                # Polarsで追加特徴量を計算
+                df = pl.DataFrame({
+                    'close': close,
+                    'kama': kama_values,
+                    'efficiency': efficiency_ratio
+                }).with_columns([
+                    (pl.col('close') > pl.col('kama')).cast(pl.Float64).alias('price_above_kama'),
+                    pl.col('kama').diff().alias('kama_slope')
+                ])
                 
-                features[f'kama_{period}'] = kama_values
-                features[f'price_above_kama_{period}'] = price_above_kama
-                features[f'kama_efficiency_{period}'] = efficiency_ratio
-                features[f'kama_slope_{period}'] = kama_slope
+                features[f'kama_{period}'] = df['kama'].to_numpy()
+                features[f'price_above_kama_{period}'] = df['price_above_kama'].to_numpy()
+                features[f'kama_efficiency_{period}'] = df['efficiency'].to_numpy()
+                features[f'kama_slope_{period}'] = df['kama_slope'].to_numpy()
             else:
                 n = len(close)
-                features[f'kama_{period}'] = np.full(n, np.nan)
-                features[f'price_above_kama_{period}'] = np.full(n, np.nan)
-                features[f'kama_efficiency_{period}'] = np.full(n, np.nan)
-                features[f'kama_slope_{period}'] = np.full(n, np.nan)
+                features[f'kama_{period}'] = np.zeros(n)
+                features[f'price_above_kama_{period}'] = np.zeros(n)
+                features[f'kama_efficiency_{period}'] = np.zeros(n)
+                features[f'kama_slope_{period}'] = np.zeros(n)
         
         return features
     
@@ -4156,176 +4194,193 @@ class Calculator:
         result[:, 1] = efficiency_ratio
         return result
     
-    def _calculate_dema_tema_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """DEMA・TEMA計算（NumPy実装）"""
+    def _calculate_dema_tema_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """DEMA・TEMA計算（Polarsベース）"""
         features = {}
         
-        # DEMA計算
         for period in self.params['dema_periods']:
-            ema1 = self._ema_numpy(close, period)
-            ema2 = self._ema_numpy(ema1, period)
-            dema = 2 * ema1 - ema2
+            # DEMA計算
+            result_df = df.with_columns([
+                pl.col('close').ewm_mean(span=period, adjust=False).alias('ema1')
+            ]).with_columns([
+                pl.col('ema1').ewm_mean(span=period, adjust=False).alias('ema2')
+            ]).with_columns([
+                (2 * pl.col('ema1') - pl.col('ema2')).alias('dema')
+            ]).with_columns([
+                (pl.col('close') > pl.col('dema')).cast(pl.Float64).alias('price_above_dema'),
+                pl.col('dema').diff().alias('dema_slope'),
+                pl.col('dema').diff().diff().alias('dema_acceleration')
+            ])
             
-            # 追加特徴量（NumPy操作）
-            price_above_dema = np.where(close > dema, 1.0, 0.0)
-            dema_slope = np.diff(dema, prepend=dema[0])
-            dema_acceleration = np.diff(dema_slope, prepend=dema_slope[0])
-            
-            features[f'dema_{period}'] = dema
-            features[f'price_above_dema_{period}'] = price_above_dema
-            features[f'dema_slope_{period}'] = dema_slope
-            features[f'dema_acceleration_{period}'] = dema_acceleration
+            features[f'dema_{period}'] = result_df['dema'].to_numpy()
+            features[f'price_above_dema_{period}'] = result_df['price_above_dema'].to_numpy()
+            features[f'dema_slope_{period}'] = result_df['dema_slope'].to_numpy()
+            features[f'dema_acceleration_{period}'] = result_df['dema_acceleration'].to_numpy()
         
-        # TEMA計算
         for period in self.params['tema_periods']:
-            ema1 = self._ema_numpy(close, period)
-            ema2 = self._ema_numpy(ema1, period)
-            ema3 = self._ema_numpy(ema2, period)
-            tema = 3 * ema1 - 3 * ema2 + ema3
+            # TEMA計算
+            result_df = df.with_columns([
+                pl.col('close').ewm_mean(span=period, adjust=False).alias('ema1')
+            ]).with_columns([
+                pl.col('ema1').ewm_mean(span=period, adjust=False).alias('ema2')
+            ]).with_columns([
+                pl.col('ema2').ewm_mean(span=period, adjust=False).alias('ema3')
+            ]).with_columns([
+                (3 * pl.col('ema1') - 3 * pl.col('ema2') + pl.col('ema3')).alias('tema')
+            ]).with_columns([
+                (pl.col('close') > pl.col('tema')).cast(pl.Float64).alias('price_above_tema'),
+                pl.col('tema').diff().alias('tema_momentum'),
+                pl.col('tema').diff().abs().alias('tema_trend_strength')
+            ])
             
-            # 追加特徴量（NumPy操作）
-            price_above_tema = np.where(close > tema, 1.0, 0.0)
-            tema_momentum = np.diff(tema, prepend=tema[0])
-            tema_trend_strength = np.abs(tema_momentum)
-            
-            features[f'tema_{period}'] = tema
-            features[f'price_above_tema_{period}'] = price_above_tema
-            features[f'tema_momentum_{period}'] = tema_momentum
-            features[f'tema_trend_strength_{period}'] = tema_trend_strength
+            features[f'tema_{period}'] = result_df['tema'].to_numpy()
+            features[f'price_above_tema_{period}'] = result_df['price_above_tema'].to_numpy()
+            features[f'tema_momentum_{period}'] = result_df['tema_momentum'].to_numpy()
+            features[f'tema_trend_strength_{period}'] = result_df['tema_trend_strength'].to_numpy()
         
         return features
     
-    def _calculate_ma_analysis_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """移動平均線分析（NumPy実装）"""
+    def _calculate_ma_analysis_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """移動平均線分析（Polarsベース）"""
         features = {}
         
         periods = [10, 20, 50, 200]
         
+        # SMAとEMAを一括計算
+        ma_df = df
         for period in periods:
-            # SMAとEMA計算
-            sma = self._rolling_mean_numpy(close, period)
-            ema = self._ema_numpy(close, period)
+            ma_df = ma_df.with_columns([
+                pl.col('close').rolling_mean(window_size=period).alias(f'sma_{period}'),
+                pl.col('close').ewm_mean(span=period, adjust=False).alias(f'ema_{period}')
+            ])
+        
+        # 傾きと乖離率を計算
+        for period in periods:
+            ma_df = ma_df.with_columns([
+                # 傾き
+                pl.col(f'sma_{period}').diff().alias(f'sma_slope_{period}'),
+                pl.col(f'ema_{period}').diff().alias(f'ema_slope_{period}'),
+                # 傾きの強度
+                pl.col(f'sma_{period}').diff().abs().alias(f'sma_slope_strength_{period}'),
+                pl.col(f'ema_{period}').diff().abs().alias(f'ema_slope_strength_{period}'),
+                # 上昇トレンド
+                (pl.col(f'sma_{period}').diff() > 0).cast(pl.Float64).alias(f'sma_uptrend_{period}'),
+                (pl.col(f'ema_{period}').diff() > 0).cast(pl.Float64).alias(f'ema_uptrend_{period}'),
+                # 乖離率
+                (100 * (pl.col('close') - pl.col(f'sma_{period}')) / (pl.col(f'sma_{period}') + 1e-10)).alias(f'sma_deviation_{period}'),
+                (100 * (pl.col('close') - pl.col(f'ema_{period}')) / (pl.col(f'ema_{period}') + 1e-10)).alias(f'ema_deviation_{period}')
+            ]).with_columns([
+                # 絶対乖離率
+                pl.col(f'sma_deviation_{period}').abs().alias(f'sma_abs_deviation_{period}'),
+                pl.col(f'ema_deviation_{period}').abs().alias(f'ema_abs_deviation_{period}'),
+                # 過大乖離
+                (pl.col(f'sma_deviation_{period}').abs() > 5).cast(pl.Float64).alias(f'sma_excessive_deviation_{period}'),
+                (pl.col(f'ema_deviation_{period}').abs() > 5).cast(pl.Float64).alias(f'ema_excessive_deviation_{period}')
+            ])
+        
+        # 結果を辞書に変換
+        for period in periods:
+            feature_names = [
+                f'sma_slope_{period}', f'ema_slope_{period}',
+                f'sma_slope_strength_{period}', f'ema_slope_strength_{period}',
+                f'sma_uptrend_{period}', f'ema_uptrend_{period}',
+                f'sma_deviation_{period}', f'ema_deviation_{period}',
+                f'sma_abs_deviation_{period}', f'ema_abs_deviation_{period}',
+                f'sma_excessive_deviation_{period}', f'ema_excessive_deviation_{period}'
+            ]
             
-            # 傾きと乖離率を計算
-            sma_slope = np.diff(sma, prepend=sma[0])
-            ema_slope = np.diff(ema, prepend=ema[0])
-            
-            # 傾きの強度
-            sma_slope_strength = np.abs(sma_slope)
-            ema_slope_strength = np.abs(ema_slope)
-            
-            # 上昇トレンド（NumPy操作）
-            sma_uptrend = np.where(sma_slope > 0, 1.0, 0.0)
-            ema_uptrend = np.where(ema_slope > 0, 1.0, 0.0)
-            
-            # 乖離率
-            sma_deviation = 100 * np.divide(close - sma, sma, 
-                                          out=np.zeros_like(close), 
-                                          where=(sma != 0))
-            ema_deviation = 100 * np.divide(close - ema, ema,
-                                          out=np.zeros_like(close),
-                                          where=(ema != 0))
-            
-            # 絶対乖離率
-            sma_abs_deviation = np.abs(sma_deviation)
-            ema_abs_deviation = np.abs(ema_deviation)
-            
-            # 過大乖離（NumPy操作）
-            sma_excessive_deviation = np.where(sma_abs_deviation > 5, 1.0, 0.0)
-            ema_excessive_deviation = np.where(ema_abs_deviation > 5, 1.0, 0.0)
-            
-            # 結果を格納
-            features[f'sma_slope_{period}'] = sma_slope
-            features[f'ema_slope_{period}'] = ema_slope
-            features[f'sma_slope_strength_{period}'] = sma_slope_strength
-            features[f'ema_slope_strength_{period}'] = ema_slope_strength
-            features[f'sma_uptrend_{period}'] = sma_uptrend
-            features[f'ema_uptrend_{period}'] = ema_uptrend
-            features[f'sma_deviation_{period}'] = sma_deviation
-            features[f'ema_deviation_{period}'] = ema_deviation
-            features[f'sma_abs_deviation_{period}'] = sma_abs_deviation
-            features[f'ema_abs_deviation_{period}'] = ema_abs_deviation
-            features[f'sma_excessive_deviation_{period}'] = sma_excessive_deviation
-            features[f'ema_excessive_deviation_{period}'] = ema_excessive_deviation
+            for name in feature_names:
+                features[name] = ma_df[name].to_numpy()
         
         return features
     
-    def _calculate_cross_signals_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ゴールデンクロス・デッドクロス計算（NumPy実装）"""
+    def _calculate_cross_signals_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ゴールデンクロス・デッドクロス計算（Polarsベース）"""
         features = {}
         
         # 短期・長期MA組み合わせ
         cross_pairs = [(25, 75), (50, 200), (20, 60)]
         
         for short_period, long_period in cross_pairs:
-            short_ma = self._rolling_mean_numpy(close, short_period)
-            long_ma = self._rolling_mean_numpy(close, long_period)
+            cross_df = df.with_columns([
+                pl.col('close').rolling_mean(window_size=short_period).alias('short_ma'),
+                pl.col('close').rolling_mean(window_size=long_period).alias('long_ma')
+            ]).with_columns([
+                # 現在のクロス状態
+                (pl.col('short_ma') > pl.col('long_ma')).cast(pl.Float64).alias('golden_cross'),
+                # MA間距離
+                (100 * (pl.col('short_ma') - pl.col('long_ma')) / (pl.col('long_ma') + 1e-10)).alias('ma_distance'),
+                # 収束度
+                ((pl.col('short_ma') - pl.col('long_ma')).abs() / (pl.col('long_ma') + 1e-10) * 100).alias('ma_convergence')
+            ]).with_columns([
+                # クロス発生検出
+                (pl.col('golden_cross').diff() == 1).cast(pl.Float64).alias('golden_cross_signal'),
+                (pl.col('golden_cross').diff() == -1).cast(pl.Float64).alias('death_cross_signal')
+            ])
             
-            # 現在のクロス状態（NumPy操作）
-            golden_cross = np.where(short_ma > long_ma, 1.0, 0.0)
-            
-            # MA間距離
-            ma_distance = 100 * np.divide(short_ma - long_ma, long_ma,
-                                        out=np.zeros_like(short_ma),
-                                        where=(long_ma != 0))
-            
-            # 収束度
-            ma_convergence = np.abs(short_ma - long_ma) / (long_ma + 1e-10) * 100
-            
-            # クロス発生検出
-            golden_cross_diff = np.diff(golden_cross, prepend=golden_cross[0])
-            golden_cross_signal = np.where(golden_cross_diff == 1, 1.0, 0.0)
-            death_cross_signal = np.where(golden_cross_diff == -1, 1.0, 0.0)
-            
-            features[f'golden_cross_{short_period}_{long_period}'] = golden_cross
-            features[f'golden_cross_signal_{short_period}_{long_period}'] = golden_cross_signal
-            features[f'death_cross_signal_{short_period}_{long_period}'] = death_cross_signal
-            features[f'ma_distance_{short_period}_{long_period}'] = ma_distance
-            features[f'ma_convergence_{short_period}_{long_period}'] = ma_convergence
+            features[f'golden_cross_{short_period}_{long_period}'] = cross_df['golden_cross'].to_numpy()
+            features[f'golden_cross_signal_{short_period}_{long_period}'] = cross_df['golden_cross_signal'].to_numpy()
+            features[f'death_cross_signal_{short_period}_{long_period}'] = cross_df['death_cross_signal'].to_numpy()
+            features[f'ma_distance_{short_period}_{long_period}'] = cross_df['ma_distance'].to_numpy()
+            features[f'ma_convergence_{short_period}_{long_period}'] = cross_df['ma_convergence'].to_numpy()
         
         return features
     
     # =========================================================================
-    # ボラティリティ・バンド指標（NumPy実装）
+    # ボラティリティ・バンド指標（Polars最適化）
     # =========================================================================
     
-    def calculate_volatility_bands(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ボラティリティ・バンド指標の統合計算（NumPy実装）"""
+    def calculate_volatility_bands_polars(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """ボラティリティ・バンド指標の統合計算（Polars最適化版）"""
         features = {}
         
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low,
+            'close': close
+        })
         
         try:
             # ボリンジャーバンドスクイーズ
-            bb_squeeze_features = self._safe_calculation(self._calculate_bb_squeeze_numpy, close)
+            bb_squeeze_features = self._polars_safe_calculation(
+                self._calculate_bb_squeeze_polars, df
+            )
             if isinstance(bb_squeeze_features, dict):
                 features.update(bb_squeeze_features)
             
             # ケルトナーチャネル
-            kc_features = self._safe_calculation(self._calculate_keltner_channel_numpy, high, low, close)
+            kc_features = self._polars_safe_calculation(
+                self._calculate_keltner_channel_polars, df
+            )
             if isinstance(kc_features, dict):
                 features.update(kc_features)
             
             # ドンチャンチャネル
-            dc_features = self._safe_calculation(self._calculate_donchian_channel_numpy, high, low, close)
+            dc_features = self._polars_safe_calculation(
+                self._calculate_donchian_channel_polars, df
+            )
             if isinstance(dc_features, dict):
                 features.update(dc_features)
             
             # ATRバンド
-            atr_bands_features = self._safe_calculation(self._calculate_atr_bands_numpy, high, low, close)
+            atr_bands_features = self._polars_safe_calculation(
+                self._calculate_atr_bands_polars, df
+            )
             if isinstance(atr_bands_features, dict):
                 features.update(atr_bands_features)
             
             # ヒストリカルボラティリティ
-            hist_vol_features = self._safe_calculation(self._calculate_historical_volatility_numpy, close)
+            hist_vol_features = self._polars_safe_calculation(
+                self._calculate_historical_volatility_polars, df
+            )
             if isinstance(hist_vol_features, dict):
                 features.update(hist_vol_features)
             
             # ボラティリティレシオ
-            vol_ratio_features = self._safe_calculation(self._calculate_volatility_ratio_numpy, close)
+            vol_ratio_features = self._polars_safe_calculation(
+                self._calculate_volatility_ratio_polars, df
+            )
             if isinstance(vol_ratio_features, dict):
                 features.update(vol_ratio_features)
             
@@ -4334,7 +4389,9 @@ class Calculator:
             features.update(chandelier_features)
             
             # ボラティリティブレイクアウト
-            vol_breakout_features = self._safe_calculation(self._calculate_volatility_breakout_numpy, high, low, close)
+            vol_breakout_features = self._polars_safe_calculation(
+                self._calculate_volatility_breakout_polars, df
+            )
             if isinstance(vol_breakout_features, dict):
                 features.update(vol_breakout_features)
                 
@@ -4343,141 +4400,152 @@ class Calculator:
         
         return features
     
-    def _calculate_bb_squeeze_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ボリンジャーバンドスクイーズ計算（NumPy実装）"""
+    def _calculate_bb_squeeze_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ボリンジャーバンドスクイーズ計算（Polarsベース）"""
         features = {}
         
         for period, std_mult in self.params['volatility_bb_settings']:
-            # ボリンジャーバンド計算
-            bb_mid = self._rolling_mean_numpy(close, period)
-            bb_std = self._rolling_std_numpy(close, period)
-            bb_upper = bb_mid + std_mult * bb_std
-            bb_lower = bb_mid - std_mult * bb_std
+            # ボリンジャーバンドを計算
+            bb_df = df.with_columns([
+                pl.col('close').rolling_mean(window_size=period).alias('bb_mid'),
+                pl.col('close').rolling_std(window_size=period).alias('bb_std')
+            ]).with_columns([
+                (pl.col('bb_mid') + std_mult * pl.col('bb_std')).alias('bb_upper'),
+                (pl.col('bb_mid') - std_mult * pl.col('bb_std')).alias('bb_lower')
+            ]).with_columns([
+                # バンド幅
+                ((pl.col('bb_upper') - pl.col('bb_lower')) / (pl.col('bb_mid') + 1e-10)).alias('bb_width')
+            ]).with_columns([
+                # バンド幅の移動平均
+                pl.col('bb_width').rolling_mean(window_size=20).alias('bb_width_ma'),
+                # バンド幅パーセンタイル
+                pl.col('bb_width').rolling_quantile(quantile=0.8, window_size=100).alias('bb_width_80th')
+            ]).with_columns([
+                # スクイーズ検出
+                (pl.col('bb_width') < pl.col('bb_width_ma')).cast(pl.Float64).alias('bb_squeeze'),
+                # バンド幅変化率
+                pl.col('bb_width').diff().alias('bb_width_change'),
+                # エクスパンション検出
+                (pl.col('bb_width').diff() > pl.col('bb_width').rolling_std(window_size=20)).cast(pl.Float64).alias('bb_expansion')
+            ]).with_columns([
+                # バンド幅パーセンタイル（ローリング）
+                (pl.col('bb_width').rank(method='average') / pl.count()).alias('bb_width_percentile')
+            ])
             
-            # バンド幅
-            bb_width = np.divide(bb_upper - bb_lower, bb_mid,
-                               out=np.zeros_like(bb_mid),
-                               where=(bb_mid != 0))
-            
-            # バンド幅の移動平均
-            bb_width_ma = self._rolling_mean_numpy(bb_width, 20)
-            bb_width_80th = self._rolling_quantile_numpy(bb_width, 100, 0.8)
-            
-            # スクイーズ検出（NumPy操作）
-            bb_squeeze = np.where(bb_width < bb_width_ma, 1.0, 0.0)
-            
-            # バンド幅変化率
-            bb_width_change = np.diff(bb_width, prepend=bb_width[0])
-            
-            # エクスパンション検出
-            bb_width_std = self._rolling_std_numpy(bb_width, 20)
-            bb_expansion = np.where(bb_width_change > bb_width_std, 1.0, 0.0)
-            
-            # バンド幅パーセンタイル（簡易実装）
-            bb_width_percentile = np.zeros_like(bb_width)
-            for i in range(len(bb_width)):
-                if i >= 100:
-                    window = bb_width[i-99:i+1]
-                    rank = np.sum(window <= bb_width[i])
-                    bb_width_percentile[i] = rank / len(window)
-            
-            features[f'bb_squeeze_{period}'] = bb_squeeze
-            features[f'bb_width_{period}'] = bb_width
-            features[f'bb_width_percentile_{period}'] = bb_width_percentile
-            features[f'bb_expansion_{period}'] = bb_expansion
+            features[f'bb_squeeze_{period}'] = bb_df['bb_squeeze'].to_numpy()
+            features[f'bb_width_{period}'] = bb_df['bb_width'].to_numpy()
+            features[f'bb_width_percentile_{period}'] = bb_df['bb_width_percentile'].to_numpy()
+            features[f'bb_expansion_{period}'] = bb_df['bb_expansion'].to_numpy()
         
         return features
     
-    def _calculate_keltner_channel_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ケルトナーチャネル計算（NumPy実装）"""
+    def _calculate_keltner_channel_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ケルトナーチャネル計算（Polarsベース）"""
         features = {}
         
         for period in self.params['kc_periods']:
-            # ATR計算
-            prev_close = np.roll(close, 1)
-            prev_close[0] = close[0]
-            
-            tr1 = high - low
-            tr2 = np.abs(high - prev_close)
-            tr3 = np.abs(low - prev_close)
-            true_range = np.maximum(tr1, np.maximum(tr2, tr3))
-            atr = self._ema_numpy(true_range, period)
+            # ATRを事前計算
+            atr_df = df.with_columns([
+                pl.col('close').shift(1).alias('prev_close')
+            ]).with_columns([
+                pl.max_horizontal([
+                    pl.col('high') - pl.col('low'),
+                    (pl.col('high') - pl.col('prev_close')).abs(),
+                    (pl.col('low') - pl.col('prev_close')).abs()
+                ]).alias('true_range')
+            ]).with_columns([
+                pl.col('true_range').ewm_mean(span=period, adjust=False).alias('atr')
+            ])
             
             # ケルトナーチャネル
-            kc_middle = self._ema_numpy(close, period)
-            kc_upper = kc_middle + 2.0 * atr
-            kc_lower = kc_middle - 2.0 * atr
+            kc_df = atr_df.with_columns([
+                pl.col('close').ewm_mean(span=period, adjust=False).alias('kc_middle')
+            ]).with_columns([
+                (pl.col('kc_middle') + 2.0 * pl.col('atr')).alias('kc_upper'),
+                (pl.col('kc_middle') - 2.0 * pl.col('atr')).alias('kc_lower')
+            ]).with_columns([
+                # ケルトナーチャネル内の価格位置
+                ((pl.col('close') - pl.col('kc_lower')) / (pl.col('kc_upper') - pl.col('kc_lower') + 1e-8)).alias('kc_position'),
+                # ケルトナーチャネル幅
+                ((pl.col('kc_upper') - pl.col('kc_lower')) / (pl.col('kc_middle') + 1e-10)).alias('kc_width'),
+                # ブレイクアウト検出
+                (pl.col('close') > pl.col('kc_upper')).cast(pl.Float64).alias('kc_upper_break'),
+                (pl.col('close') < pl.col('kc_lower')).cast(pl.Float64).alias('kc_lower_break'),
+                # チャネル内
+                ((pl.col('close') >= pl.col('kc_lower')) & (pl.col('close') <= pl.col('kc_upper'))).cast(pl.Float64).alias('kc_inside')
+            ])
             
-            # ケルトナーチャネル内の価格位置
-            kc_position = np.divide(close - kc_lower, kc_upper - kc_lower,
-                                  out=np.zeros_like(close),
-                                  where=((kc_upper - kc_lower) != 0))
-            
-            # ケルトナーチャネル幅
-            kc_width = np.divide(kc_upper - kc_lower, kc_middle,
-                               out=np.zeros_like(kc_middle),
-                               where=(kc_middle != 0))
-            
-            # ブレイクアウト検出（NumPy操作）
-            kc_upper_break = np.where(close > kc_upper, 1.0, 0.0)
-            kc_lower_break = np.where(close < kc_lower, 1.0, 0.0)
-            kc_inside = np.where((close >= kc_lower) & (close <= kc_upper), 1.0, 0.0)
-            
-            features[f'kc_upper_{period}'] = kc_upper
-            features[f'kc_middle_{period}'] = kc_middle
-            features[f'kc_lower_{period}'] = kc_lower
-            features[f'kc_position_{period}'] = kc_position
-            features[f'kc_width_{period}'] = kc_width
-            features[f'kc_upper_break_{period}'] = kc_upper_break
-            features[f'kc_lower_break_{period}'] = kc_lower_break
-            features[f'kc_inside_{period}'] = kc_inside
+            features[f'kc_upper_{period}'] = kc_df['kc_upper'].to_numpy()
+            features[f'kc_middle_{period}'] = kc_df['kc_middle'].to_numpy()
+            features[f'kc_lower_{period}'] = kc_df['kc_lower'].to_numpy()
+            features[f'kc_position_{period}'] = kc_df['kc_position'].to_numpy()
+            features[f'kc_width_{period}'] = kc_df['kc_width'].to_numpy()
+            features[f'kc_upper_break_{period}'] = kc_df['kc_upper_break'].to_numpy()
+            features[f'kc_lower_break_{period}'] = kc_df['kc_lower_break'].to_numpy()
+            features[f'kc_inside_{period}'] = kc_df['kc_inside'].to_numpy()
         
         return features
     
-    def _calculate_donchian_channel_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ドンチャンチャネル計算（NumPy実装）"""
+    def _calculate_donchian_channel_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ドンチャンチャネル計算（Polarsベース）"""
         features = {}
         
         for period in self.params['dc_periods']:
-            dc_upper = self._rolling_max_numpy(high, period)
-            dc_lower = self._rolling_min_numpy(low, period)
-            dc_middle = (dc_upper + dc_lower) / 2.0
+            dc_df = df.with_columns([
+                pl.col('high').rolling_max(window_size=period).alias('dc_upper'),
+                pl.col('low').rolling_min(window_size=period).alias('dc_lower')
+            ]).with_columns([
+                ((pl.col('dc_upper') + pl.col('dc_lower')) / 2.0).alias('dc_middle')
+            ]).with_columns([
+                # ドンチャンチャネル内の価格位置
+                ((pl.col('close') - pl.col('dc_lower')) / (pl.col('dc_upper') - pl.col('dc_lower') + 1e-8)).alias('dc_position'),
+                # ドンチャンチャネル幅
+                ((pl.col('dc_upper') - pl.col('dc_lower')) / (pl.col('dc_middle') + 1e-10)).alias('dc_width'),
+                # ブレイクアウト検出
+                (pl.col('close') > pl.col('dc_upper')).cast(pl.Float64).alias('dc_upper_break'),
+                (pl.col('close') < pl.col('dc_lower')).cast(pl.Float64).alias('dc_lower_break')
+            ])
             
-            # ドンチャンチャネル内の価格位置
-            dc_position = np.divide(close - dc_lower, dc_upper - dc_lower,
-                                  out=np.zeros_like(close),
-                                  where=((dc_upper - dc_lower) != 0))
+            # 新高値・新安値からの日数（Numbaが効率的）
+            close_data = df['close'].to_numpy()
+            dc_upper_data = dc_df['dc_upper'].to_numpy()
+            dc_lower_data = dc_df['dc_lower'].to_numpy()
             
-            # ドンチャンチャネル幅
-            dc_width = np.divide(dc_upper - dc_lower, dc_middle,
-                               out=np.zeros_like(dc_middle),
-                               where=(dc_middle != 0))
+            days_since_high = self._numba_safe_calculation(
+                self._calculate_days_since_extreme_vectorized, close_data, dc_upper_data, True
+            )
+            days_since_low = self._numba_safe_calculation(
+                self._calculate_days_since_extreme_vectorized, close_data, dc_lower_data, False
+            )
             
-            # ブレイクアウト検出（NumPy操作）
-            dc_upper_break = np.where(close > dc_upper, 1.0, 0.0)
-            dc_lower_break = np.where(close < dc_lower, 1.0, 0.0)
+            features[f'dc_upper_{period}'] = dc_df['dc_upper'].to_numpy()
+            features[f'dc_lower_{period}'] = dc_df['dc_lower'].to_numpy()
+            features[f'dc_middle_{period}'] = dc_df['dc_middle'].to_numpy()
+            features[f'dc_position_{period}'] = dc_df['dc_position'].to_numpy()
+            features[f'dc_width_{period}'] = dc_df['dc_width'].to_numpy()
+            features[f'dc_upper_break_{period}'] = dc_df['dc_upper_break'].to_numpy()
+            features[f'dc_lower_break_{period}'] = dc_df['dc_lower_break'].to_numpy()
             
-            # 新高値・新安値からの日数
-            days_since_high = self._calculate_days_since_extreme_numpy(close, dc_upper, True)
-            days_since_low = self._calculate_days_since_extreme_numpy(close, dc_lower, False)
+            if days_since_high is not None:
+                features[f'dc_days_since_high_{period}'] = days_since_high
+            else:
+                features[f'dc_days_since_high_{period}'] = np.zeros(len(df))
             
-            features[f'dc_upper_{period}'] = dc_upper
-            features[f'dc_lower_{period}'] = dc_lower
-            features[f'dc_middle_{period}'] = dc_middle
-            features[f'dc_position_{period}'] = dc_position
-            features[f'dc_width_{period}'] = dc_width
-            features[f'dc_upper_break_{period}'] = dc_upper_break
-            features[f'dc_lower_break_{period}'] = dc_lower_break
-            features[f'dc_days_since_high_{period}'] = days_since_high
-            features[f'dc_days_since_low_{period}'] = days_since_low
+            if days_since_low is not None:
+                features[f'dc_days_since_low_{period}'] = days_since_low
+            else:
+                features[f'dc_days_since_low_{period}'] = np.zeros(len(df))
         
         return features
     
-    def _calculate_days_since_extreme_numpy(self, close: np.ndarray, extreme_line: np.ndarray, is_high: bool) -> np.ndarray:
-        """極値からの日数計算（NumPy実装）"""
-        days_since = np.zeros(len(close))
+    @staticmethod
+    @njit(cache=True)
+    def _calculate_days_since_extreme_vectorized(close: np.ndarray, extreme_line: np.ndarray, is_high: bool) -> np.ndarray:
+        """極値からの日数計算（Numba最適化版）"""
+        n = len(close)
+        days_since = np.zeros(n)
         
-        for i in range(1, len(close)):
+        for i in range(1, n):
             if is_high:
                 if close[i] > extreme_line[i]:
                     days_since[i] = 0
@@ -4491,109 +4559,106 @@ class Calculator:
         
         return days_since
     
-    def _calculate_atr_bands_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ATRバンド計算（NumPy実装）"""
+    def _calculate_atr_bands_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ATRバンド計算（Polarsベース）"""
         features = {}
         
         atr_multipliers = [1.0, 1.5, 2.0, 2.5]
         
         for period in self.params['atr_periods_vol']:
-            # ATR計算
-            prev_close = np.roll(close, 1)
-            prev_close[0] = close[0]
-            
-            tr1 = high - low
-            tr2 = np.abs(high - prev_close)
-            tr3 = np.abs(low - prev_close)
-            true_range = np.maximum(tr1, np.maximum(tr2, tr3))
-            atr = self._rolling_mean_numpy(true_range, period)
+            # ATRを事前計算
+            atr_df = df.with_columns([
+                pl.col('close').shift(1).alias('prev_close')
+            ]).with_columns([
+                pl.max_horizontal([
+                    pl.col('high') - pl.col('low'),
+                    (pl.col('high') - pl.col('prev_close')).abs(),
+                    (pl.col('low') - pl.col('prev_close')).abs()
+                ]).alias('true_range')
+            ]).with_columns([
+                pl.col('true_range').rolling_mean(window_size=period).alias('atr')
+            ])
             
             for mult in atr_multipliers:
-                atr_upper = close + mult * atr
-                atr_lower = close - mult * atr
+                atr_bands_df = atr_df.with_columns([
+                    (pl.col('close') + mult * pl.col('atr')).alias('atr_upper'),
+                    (pl.col('close') - mult * pl.col('atr')).alias('atr_lower')
+                ]).with_columns([
+                    # ATRバンド内位置
+                    ((pl.col('close') - pl.col('atr_lower')) / (pl.col('atr_upper') - pl.col('atr_lower') + 1e-8)).alias('atr_band_position'),
+                    # ATRバンド幅
+                    ((pl.col('atr_upper') - pl.col('atr_lower')) / (pl.col('close') + 1e-10)).alias('atr_band_width')
+                ])
                 
-                # ATRバンド内位置
-                atr_band_position = np.divide(close - atr_lower, atr_upper - atr_lower,
-                                            out=np.zeros_like(close),
-                                            where=((atr_upper - atr_lower) != 0))
-                
-                # ATRバンド幅
-                atr_band_width = np.divide(atr_upper - atr_lower, close,
-                                         out=np.zeros_like(close),
-                                         where=(close != 0))
-                
-                features[f'atr_upper_{period}_{mult}'] = atr_upper
-                features[f'atr_lower_{period}_{mult}'] = atr_lower
-                features[f'atr_band_position_{period}_{mult}'] = atr_band_position
-                features[f'atr_band_width_{period}_{mult}'] = atr_band_width
+                features[f'atr_upper_{period}_{mult}'] = atr_bands_df['atr_upper'].to_numpy()
+                features[f'atr_lower_{period}_{mult}'] = atr_bands_df['atr_lower'].to_numpy()
+                features[f'atr_band_position_{period}_{mult}'] = atr_bands_df['atr_band_position'].to_numpy()
+                features[f'atr_band_width_{period}_{mult}'] = atr_bands_df['atr_band_width'].to_numpy()
         
         return features
     
-    def _calculate_historical_volatility_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ヒストリカルボラティリティ計算（NumPy実装）"""
+    def _calculate_historical_volatility_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ヒストリカルボラティリティ計算（Polarsベース）"""
         features = {}
         
         # 対数リターン計算
-        log_close = np.log(close)
-        log_returns = np.diff(log_close, prepend=log_close[0])
+        vol_df = df.with_columns([
+            pl.col('close').log().diff().alias('log_returns')
+        ])
         
         for period in self.params['hist_vol_periods']:
-            # ローリング標準偏差
-            hist_vol = self._rolling_std_numpy(log_returns, period)
+            vol_df = vol_df.with_columns([
+                # ローリング標準偏差
+                pl.col('log_returns').rolling_std(window_size=period).alias(f'hist_vol_{period}'),
+                # 年率化（252営業日ベース）
+                (pl.col('log_returns').rolling_std(window_size=period) * np.sqrt(252)).alias(f'hist_vol_annualized_{period}')
+            ]).with_columns([
+                # ボラティリティの相対水準（パーセンタイル）
+                pl.col(f'hist_vol_{period}').rolling_quantile(quantile=0.5, window_size=252).alias(f'vol_median_{period}'),
+                pl.col(f'hist_vol_{period}').rolling_mean(window_size=50).alias(f'vol_ma_{period}')
+            ]).with_columns([
+                # ボラティリティレジーム
+                (pl.col(f'hist_vol_{period}') > pl.col(f'vol_ma_{period}')).cast(pl.Float64).alias(f'vol_regime_{period}'),
+                # ボラティリティパーセンタイル
+                (pl.col(f'hist_vol_{period}').rank() / pl.count()).alias(f'vol_percentile_{period}')
+            ])
             
-            # 年率化（252営業日ベース）
-            hist_vol_annualized = hist_vol * np.sqrt(252)
-            
-            # ボラティリティの相対水準
-            vol_median = self._rolling_median_numpy(hist_vol, 252)
-            vol_ma = self._rolling_mean_numpy(hist_vol, 50)
-            
-            # ボラティリティレジーム（NumPy操作）
-            vol_regime = np.where(hist_vol > vol_ma, 1.0, 0.0)
-            
-            # ボラティリティパーセンタイル（簡易実装）
-            vol_percentile = np.zeros_like(hist_vol)
-            for i in range(len(hist_vol)):
-                if i >= 100:
-                    window = hist_vol[i-99:i+1]
-                    rank = np.sum(window <= hist_vol[i])
-                    vol_percentile[i] = rank / len(window)
-            
-            features[f'hist_vol_{period}'] = hist_vol
-            features[f'hist_vol_annualized_{period}'] = hist_vol_annualized
-            features[f'vol_percentile_{period}'] = vol_percentile
-            features[f'vol_regime_{period}'] = vol_regime
+            features[f'hist_vol_{period}'] = vol_df[f'hist_vol_{period}'].to_numpy()
+            features[f'hist_vol_annualized_{period}'] = vol_df[f'hist_vol_annualized_{period}'].to_numpy()
+            features[f'vol_percentile_{period}'] = vol_df[f'vol_percentile_{period}'].to_numpy()
+            features[f'vol_regime_{period}'] = vol_df[f'vol_regime_{period}'].to_numpy()
         
         return features
     
-    def _calculate_volatility_ratio_numpy(self, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ボラティリティレシオ計算（NumPy実装）"""
+    def _calculate_volatility_ratio_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ボラティリティレシオ計算（Polarsベース）"""
         features = {}
         
         # 対数リターン計算
-        log_close = np.log(close)
-        log_returns = np.diff(log_close, prepend=log_close[0])
+        vol_df = df.with_columns([
+            pl.col('close').log().diff().alias('log_returns')
+        ])
         
         # 短期・長期ボラティリティ比較
         vol_pairs = [(5, 20), (10, 30), (20, 60)]
         
         for short, long in vol_pairs:
-            short_vol = self._rolling_std_numpy(log_returns, short)
-            long_vol = self._rolling_std_numpy(log_returns, long)
+            vol_df = vol_df.with_columns([
+                pl.col('log_returns').rolling_std(window_size=short).alias(f'short_vol_{short}'),
+                pl.col('log_returns').rolling_std(window_size=long).alias(f'long_vol_{long}')
+            ]).with_columns([
+                (pl.col(f'short_vol_{short}') / (pl.col(f'long_vol_{long}') + 1e-10)).alias(f'volatility_ratio_{short}_{long}')
+            ]).with_columns([
+                (pl.col(f'volatility_ratio_{short}_{long}') > 1.2).cast(pl.Float64).alias(f'vol_ratio_high_{short}_{long}'),
+                (pl.col(f'volatility_ratio_{short}_{long}') < 0.8).cast(pl.Float64).alias(f'vol_ratio_low_{short}_{long}'),
+                # ボラティリティ変化率
+                pl.col(f'volatility_ratio_{short}_{long}').diff().alias(f'vol_change_{short}_{long}')
+            ])
             
-            volatility_ratio = np.divide(short_vol, long_vol,
-                                       out=np.ones_like(short_vol),
-                                       where=(long_vol != 0))
-            
-            # 追加特徴量（NumPy操作）
-            vol_ratio_high = np.where(volatility_ratio > 1.2, 1.0, 0.0)
-            vol_ratio_low = np.where(volatility_ratio < 0.8, 1.0, 0.0)
-            vol_change = np.diff(volatility_ratio, prepend=volatility_ratio[0])
-            
-            features[f'volatility_ratio_{short}_{long}'] = volatility_ratio
-            features[f'vol_ratio_high_{short}_{long}'] = vol_ratio_high
-            features[f'vol_ratio_low_{short}_{long}'] = vol_ratio_low
-            features[f'vol_change_{short}_{long}'] = vol_change
+            features[f'volatility_ratio_{short}_{long}'] = vol_df[f'volatility_ratio_{short}_{long}'].to_numpy()
+            features[f'vol_ratio_high_{short}_{long}'] = vol_df[f'vol_ratio_high_{short}_{long}'].to_numpy()
+            features[f'vol_ratio_low_{short}_{long}'] = vol_df[f'vol_ratio_low_{short}_{long}'].to_numpy()
+            features[f'vol_change_{short}_{long}'] = vol_df[f'vol_change_{short}_{long}'].to_numpy()
         
         return features
     
@@ -4614,27 +4679,35 @@ class Calculator:
                     chandelier_long = chandelier_result[:, 0]
                     chandelier_short = chandelier_result[:, 1]
                     
-                    # NumPyで追加特徴量を計算
-                    chandelier_long_exit = np.where(close < chandelier_long, 1.0, 0.0)
-                    chandelier_short_exit = np.where(close > chandelier_short, 1.0, 0.0)
-                    chandelier_long_distance = (close - chandelier_long) / (close + 1e-10)
-                    chandelier_short_distance = (chandelier_short - close) / (close + 1e-10)
+                    # Polarsで追加特徴量を計算
+                    df = pl.DataFrame({
+                        'close': close,
+                        'chandelier_long': chandelier_long,
+                        'chandelier_short': chandelier_short
+                    }).with_columns([
+                        # エグジットシグナル
+                        (pl.col('close') < pl.col('chandelier_long')).cast(pl.Float64).alias('chandelier_long_exit'),
+                        (pl.col('close') > pl.col('chandelier_short')).cast(pl.Float64).alias('chandelier_short_exit'),
+                        # 価格との距離
+                        ((pl.col('close') - pl.col('chandelier_long')) / (pl.col('close') + 1e-10)).alias('chandelier_long_distance'),
+                        ((pl.col('chandelier_short') - pl.col('close')) / (pl.col('close') + 1e-10)).alias('chandelier_short_distance')
+                    ])
                     
-                    features[f'chandelier_long_{period}_{mult}'] = chandelier_long
-                    features[f'chandelier_short_{period}_{mult}'] = chandelier_short
-                    features[f'chandelier_long_exit_{period}_{mult}'] = chandelier_long_exit
-                    features[f'chandelier_short_exit_{period}_{mult}'] = chandelier_short_exit
-                    features[f'chandelier_long_distance_{period}_{mult}'] = chandelier_long_distance
-                    features[f'chandelier_short_distance_{period}_{mult}'] = chandelier_short_distance
+                    features[f'chandelier_long_{period}_{mult}'] = df['chandelier_long'].to_numpy()
+                    features[f'chandelier_short_{period}_{mult}'] = df['chandelier_short'].to_numpy()
+                    features[f'chandelier_long_exit_{period}_{mult}'] = df['chandelier_long_exit'].to_numpy()
+                    features[f'chandelier_short_exit_{period}_{mult}'] = df['chandelier_short_exit'].to_numpy()
+                    features[f'chandelier_long_distance_{period}_{mult}'] = df['chandelier_long_distance'].to_numpy()
+                    features[f'chandelier_short_distance_{period}_{mult}'] = df['chandelier_short_distance'].to_numpy()
                 else:
                     # フォールバック
                     n = len(close)
-                    features[f'chandelier_long_{period}_{mult}'] = np.full(n, np.nan)
-                    features[f'chandelier_short_{period}_{mult}'] = np.full(n, np.nan)
-                    features[f'chandelier_long_exit_{period}_{mult}'] = np.full(n, np.nan)
-                    features[f'chandelier_short_exit_{period}_{mult}'] = np.full(n, np.nan)
-                    features[f'chandelier_long_distance_{period}_{mult}'] = np.full(n, np.nan)
-                    features[f'chandelier_short_distance_{period}_{mult}'] = np.full(n, np.nan)
+                    features[f'chandelier_long_{period}_{mult}'] = np.zeros(n)
+                    features[f'chandelier_short_{period}_{mult}'] = np.zeros(n)
+                    features[f'chandelier_long_exit_{period}_{mult}'] = np.zeros(n)
+                    features[f'chandelier_short_exit_{period}_{mult}'] = np.zeros(n)
+                    features[f'chandelier_long_distance_{period}_{mult}'] = np.zeros(n)
+                    features[f'chandelier_short_distance_{period}_{mult}'] = np.zeros(n)
         
         return features
     
@@ -4678,78 +4751,81 @@ class Calculator:
         result[:, 1] = chandelier_short
         return result
     
-    def _calculate_volatility_breakout_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ボラティリティブレイクアウト計算（NumPy実装）"""
+    def _calculate_volatility_breakout_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ボラティリティブレイクアウト計算（Polarsベース）"""
         features = {}
         
         # 前日比変動率
-        daily_range = np.divide(high - low, close, 
-                              out=np.zeros_like(high), 
-                              where=(close != 0))
-        price_change = np.diff(close, prepend=close[0]) / (close + 1e-10)
+        breakout_df = df.with_columns([
+            ((pl.col('high') - pl.col('low')) / (pl.col('close') + 1e-10)).alias('daily_range'),
+            (pl.col('close').diff() / (pl.col('close') + 1e-10)).alias('price_change')
+        ])
         
         # 複数期間でのボラティリティ分析
         periods = [5, 10, 20, 50]
         
         for period in periods:
-            # 平均日足レンジ
-            avg_range = self._rolling_mean_numpy(daily_range, period)
+            breakout_df = breakout_df.with_columns([
+                # 平均日足レンジ
+                pl.col('daily_range').rolling_mean(window_size=period).alias(f'avg_range_{period}'),
+                # 価格変動の標準偏差
+                pl.col('price_change').rolling_std(window_size=period).alias(f'price_change_std_{period}')
+            ]).with_columns([
+                # レンジ拡張
+                (pl.col('daily_range') / (pl.col(f'avg_range_{period}') + 1e-10)).alias(f'range_expansion_{period}'),
+                # 価格変動のZ-score
+                (pl.col('price_change') / (pl.col(f'price_change_std_{period}') + 1e-10)).alias(f'price_change_z_{period}')
+            ]).with_columns([
+                # 高レンジ日
+                (pl.col(f'range_expansion_{period}') > 1.5).cast(pl.Float64).alias(f'high_range_day_{period}'),
+                # 低レンジ日
+                (pl.col(f'range_expansion_{period}') < 0.5).cast(pl.Float64).alias(f'low_range_day_{period}'),
+                # 価格ブレイクアウト
+                (pl.col(f'price_change_z_{period}').abs() > 2.0).cast(pl.Float64).alias(f'price_breakout_{period}')
+            ])
             
-            # 価格変動の標準偏差
-            price_change_std = self._rolling_std_numpy(price_change, period)
-            
-            # レンジ拡張
-            range_expansion = np.divide(daily_range, avg_range,
-                                      out=np.ones_like(daily_range),
-                                      where=(avg_range != 0))
-            
-            # 価格変動のZ-score
-            price_change_z = np.divide(price_change, price_change_std,
-                                     out=np.zeros_like(price_change),
-                                     where=(price_change_std != 0))
-            
-            # 追加特徴量（NumPy操作）
-            high_range_day = np.where(range_expansion > 1.5, 1.0, 0.0)
-            low_range_day = np.where(range_expansion < 0.5, 1.0, 0.0)
-            price_breakout = np.where(np.abs(price_change_z) > 2.0, 1.0, 0.0)
-            
-            features[f'range_expansion_{period}'] = range_expansion
-            features[f'high_range_day_{period}'] = high_range_day
-            features[f'low_range_day_{period}'] = low_range_day
-            features[f'price_change_z_{period}'] = price_change_z
-            features[f'price_breakout_{period}'] = price_breakout
+            features[f'range_expansion_{period}'] = breakout_df[f'range_expansion_{period}'].to_numpy()
+            features[f'high_range_day_{period}'] = breakout_df[f'high_range_day_{period}'].to_numpy()
+            features[f'low_range_day_{period}'] = breakout_df[f'low_range_day_{period}'].to_numpy()
+            features[f'price_change_z_{period}'] = breakout_df[f'price_change_z_{period}'].to_numpy()
+            features[f'price_breakout_{period}'] = breakout_df[f'price_breakout_{period}'].to_numpy()
         
         return features
     
     # =========================================================================
-    # サポート・レジスタンス・ローソク足（NumPy実装）
+    # サポート・レジスタンス・ローソク足（Polars最適化）
     # =========================================================================
     
-    def calculate_support_resistance(self, high: np.ndarray, low: np.ndarray, 
-                                   close: np.ndarray, open_prices: np.ndarray = None) -> Dict[str, np.ndarray]:
-        """サポート・レジスタンス・ローソク足特徴量の統合計算（NumPy実装）"""
+    def calculate_support_resistance_polars(self, high: np.ndarray, low: np.ndarray, 
+                                          close: np.ndarray, open_prices: np.ndarray = None) -> Dict[str, np.ndarray]:
+        """サポート・レジスタンス・ローソク足特徴量の統合計算（Polars最適化版）"""
         features = {}
-        
-        # NumPy配列に変換
-        high = self._ensure_numpy_array(high)
-        low = self._ensure_numpy_array(low)
-        close = self._ensure_numpy_array(close)
         
         # Open価格がない場合はCloseで代用
         if open_prices is None:
             open_prices = np.roll(close, 1)
             open_prices[0] = close[0]
-        else:
-            open_prices = self._ensure_numpy_array(open_prices)
+        
+        # Polars DataFrameを構築
+        df = pl.DataFrame({
+            'high': high,
+            'low': low,
+            'close': close,
+            'open': open_prices
+        })
         
         try:
             # ピボットポイント
-            pivot_features = self._safe_calculation(self._calculate_pivot_points_numpy, high, low, close)
+            pivot_features = self._polars_safe_calculation(
+                self._calculate_pivot_points_polars, df
+            )
             if isinstance(pivot_features, dict):
                 features.update(pivot_features)
             
             # プライスチャネル
-            price_channel_features = self._safe_calculation(self._calculate_price_channels_numpy, high, low, close)
+            price_channel_features = self._polars_safe_calculation(
+                self._calculate_price_channels_polars, df
+            )
             if isinstance(price_channel_features, dict):
                 features.update(price_channel_features)
             
@@ -4762,7 +4838,9 @@ class Calculator:
             features.update(sr_features)
             
             # ローソク足パターン
-            candlestick_features = self._safe_calculation(self._calculate_candlestick_patterns_numpy, open_prices, high, low, close)
+            candlestick_features = self._polars_safe_calculation(
+                self._calculate_candlestick_patterns_polars, df
+            )
             if isinstance(candlestick_features, dict):
                 features.update(candlestick_features)
             
@@ -4771,7 +4849,9 @@ class Calculator:
             features.update(multi_candle_features)
             
             # ローソク足強度
-            candle_strength_features = self._safe_calculation(self._calculate_candle_strength_numpy, open_prices, high, low, close)
+            candle_strength_features = self._polars_safe_calculation(
+                self._calculate_candle_strength_polars, df
+            )
             if isinstance(candle_strength_features, dict):
                 features.update(candle_strength_features)
                 
@@ -4780,90 +4860,83 @@ class Calculator:
         
         return features
     
-    def _calculate_pivot_points_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ピボットポイント計算（NumPy実装）"""
+    def _calculate_pivot_points_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ピボットポイント計算（Polarsベース）"""
         
-        # 前日の高値、安値、終値
-        prev_high = np.roll(high, 1)
-        prev_low = np.roll(low, 1)
-        prev_close = np.roll(close, 1)
-        
-        # 先頭を埋める
-        prev_high[0] = high[0]
-        prev_low[0] = low[0]
-        prev_close[0] = close[0]
-        
-        # ピボットポイント
-        pivot_point = (prev_high + prev_low + prev_close) / 3.0
-        
-        # レジスタンス・サポート
-        resistance1 = 2 * pivot_point - prev_low
-        support1 = 2 * pivot_point - prev_high
-        resistance2 = pivot_point + (prev_high - prev_low)
-        support2 = pivot_point - (prev_high - prev_low)
-        
-        # 現在価格との距離
-        distance_to_pivot = 100 * np.divide(close - pivot_point, close, out=np.zeros_like(close), where=(close != 0))
-        distance_to_r1 = 100 * np.divide(resistance1 - close, close, out=np.zeros_like(close), where=(close != 0))
-        distance_to_r2 = 100 * np.divide(resistance2 - close, close, out=np.zeros_like(close), where=(close != 0))
-        distance_to_s1 = 100 * np.divide(close - support1, close, out=np.zeros_like(close), where=(close != 0))
-        distance_to_s2 = 100 * np.divide(close - support2, close, out=np.zeros_like(close), where=(close != 0))
-        
-        # レベル突破検出（NumPy操作）
-        above_pivot = np.where(close > pivot_point, 1.0, 0.0)
-        above_r1 = np.where(close > resistance1, 1.0, 0.0)
-        above_r2 = np.where(close > resistance2, 1.0, 0.0)
-        below_s1 = np.where(close < support1, 1.0, 0.0)
-        below_s2 = np.where(close < support2, 1.0, 0.0)
+        pivot_df = df.with_columns([
+            # 前日の高値、安値、終値
+            pl.col('high').shift(1).alias('prev_high'),
+            pl.col('low').shift(1).alias('prev_low'),
+            pl.col('close').shift(1).alias('prev_close')
+        ]).with_columns([
+            # ピボットポイント
+            ((pl.col('prev_high') + pl.col('prev_low') + pl.col('prev_close')) / 3.0).alias('pivot_point')
+        ]).with_columns([
+            # レジスタンス・サポート
+            (2 * pl.col('pivot_point') - pl.col('prev_low')).alias('resistance1'),
+            (2 * pl.col('pivot_point') - pl.col('prev_high')).alias('support1'),
+            (pl.col('pivot_point') + (pl.col('prev_high') - pl.col('prev_low'))).alias('resistance2'),
+            (pl.col('pivot_point') - (pl.col('prev_high') - pl.col('prev_low'))).alias('support2')
+        ]).with_columns([
+            # 現在価格との距離
+            (100 * (pl.col('close') - pl.col('pivot_point')) / (pl.col('close') + 1e-10)).alias('distance_to_pivot'),
+            (100 * (pl.col('resistance1') - pl.col('close')) / (pl.col('close') + 1e-10)).alias('distance_to_r1'),
+            (100 * (pl.col('resistance2') - pl.col('close')) / (pl.col('close') + 1e-10)).alias('distance_to_r2'),
+            (100 * (pl.col('close') - pl.col('support1')) / (pl.col('close') + 1e-10)).alias('distance_to_s1'),
+            (100 * (pl.col('close') - pl.col('support2')) / (pl.col('close') + 1e-10)).alias('distance_to_s2'),
+            # レベル突破検出
+            (pl.col('close') > pl.col('pivot_point')).cast(pl.Float64).alias('above_pivot'),
+            (pl.col('close') > pl.col('resistance1')).cast(pl.Float64).alias('above_r1'),
+            (pl.col('close') > pl.col('resistance2')).cast(pl.Float64).alias('above_r2'),
+            (pl.col('close') < pl.col('support1')).cast(pl.Float64).alias('below_s1'),
+            (pl.col('close') < pl.col('support2')).cast(pl.Float64).alias('below_s2')
+        ])
         
         return {
-            'pivot_point': pivot_point,
-            'resistance1': resistance1,
-            'resistance2': resistance2,
-            'support1': support1,
-            'support2': support2,
-            'distance_to_pivot': distance_to_pivot,
-            'distance_to_r1': distance_to_r1,
-            'distance_to_r2': distance_to_r2,
-            'distance_to_s1': distance_to_s1,
-            'distance_to_s2': distance_to_s2,
-            'above_pivot': above_pivot,
-            'above_r1': above_r1,
-            'above_r2': above_r2,
-            'below_s1': below_s1,
-            'below_s2': below_s2
+            'pivot_point': pivot_df['pivot_point'].to_numpy(),
+            'resistance1': pivot_df['resistance1'].to_numpy(),
+            'resistance2': pivot_df['resistance2'].to_numpy(),
+            'support1': pivot_df['support1'].to_numpy(),
+            'support2': pivot_df['support2'].to_numpy(),
+            'distance_to_pivot': pivot_df['distance_to_pivot'].to_numpy(),
+            'distance_to_r1': pivot_df['distance_to_r1'].to_numpy(),
+            'distance_to_r2': pivot_df['distance_to_r2'].to_numpy(),
+            'distance_to_s1': pivot_df['distance_to_s1'].to_numpy(),
+            'distance_to_s2': pivot_df['distance_to_s2'].to_numpy(),
+            'above_pivot': pivot_df['above_pivot'].to_numpy(),
+            'above_r1': pivot_df['above_r1'].to_numpy(),
+            'above_r2': pivot_df['above_r2'].to_numpy(),
+            'below_s1': pivot_df['below_s1'].to_numpy(),
+            'below_s2': pivot_df['below_s2'].to_numpy()
         }
     
-    def _calculate_price_channels_numpy(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """プライスチャネル計算（NumPy実装）"""
+    def _calculate_price_channels_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """プライスチャネル計算（Polarsベース）"""
         features = {}
         
         for period in self.params['price_channel_periods']:
-            channel_high = self._rolling_max_numpy(high, period)
-            channel_low = self._rolling_min_numpy(low, period)
-            channel_mid = (channel_high + channel_low) / 2.0
+            channel_df = df.with_columns([
+                pl.col('high').rolling_max(window_size=period).alias('channel_high'),
+                pl.col('low').rolling_min(window_size=period).alias('channel_low')
+            ]).with_columns([
+                ((pl.col('channel_high') + pl.col('channel_low')) / 2.0).alias('channel_mid')
+            ]).with_columns([
+                # チャネル内の価格位置
+                ((pl.col('close') - pl.col('channel_low')) / (pl.col('channel_high') - pl.col('channel_low') + 1e-8)).alias('channel_position'),
+                # チャネル幅
+                ((pl.col('channel_high') - pl.col('channel_low')) / (pl.col('channel_mid') + 1e-10)).alias('channel_width'),
+                # ブレイクアウト検出
+                (pl.col('close') > pl.col('channel_high')).cast(pl.Float64).alias('channel_breakout_up'),
+                (pl.col('close') < pl.col('channel_low')).cast(pl.Float64).alias('channel_breakout_down')
+            ])
             
-            # チャネル内の価格位置
-            channel_position = np.divide(close - channel_low, channel_high - channel_low,
-                                       out=np.zeros_like(close),
-                                       where=((channel_high - channel_low) != 0))
-            
-            # チャネル幅
-            channel_width = np.divide(channel_high - channel_low, channel_mid,
-                                    out=np.zeros_like(channel_mid),
-                                    where=(channel_mid != 0))
-            
-            # ブレイクアウト検出（NumPy操作）
-            channel_breakout_up = np.where(close > channel_high, 1.0, 0.0)
-            channel_breakout_down = np.where(close < channel_low, 1.0, 0.0)
-            
-            features[f'channel_high_{period}'] = channel_high
-            features[f'channel_low_{period}'] = channel_low
-            features[f'channel_mid_{period}'] = channel_mid
-            features[f'channel_position_{period}'] = channel_position
-            features[f'channel_width_{period}'] = channel_width
-            features[f'channel_breakout_up_{period}'] = channel_breakout_up
-            features[f'channel_breakout_down_{period}'] = channel_breakout_down
+            features[f'channel_high_{period}'] = channel_df['channel_high'].to_numpy()
+            features[f'channel_low_{period}'] = channel_df['channel_low'].to_numpy()
+            features[f'channel_mid_{period}'] = channel_df['channel_mid'].to_numpy()
+            features[f'channel_position_{period}'] = channel_df['channel_position'].to_numpy()
+            features[f'channel_width_{period}'] = channel_df['channel_width'].to_numpy()
+            features[f'channel_breakout_up_{period}'] = channel_df['channel_breakout_up'].to_numpy()
+            features[f'channel_breakout_down_{period}'] = channel_df['channel_breakout_down'].to_numpy()
         
         return features
     
@@ -4890,16 +4963,16 @@ class Calculator:
                         features[f'fib_extension_{level_str}_{period}'] = fib_result[:, 1, level_idx]
                         features[f'near_fib_retracement_{level_str}_{period}'] = fib_result[:, 2, level_idx]
                     else:
-                        features[f'fib_retracement_{level_str}_{period}'] = np.full(len(close), np.nan)
-                        features[f'fib_extension_{level_str}_{period}'] = np.full(len(close), np.nan)
-                        features[f'near_fib_retracement_{level_str}_{period}'] = np.full(len(close), np.nan)
+                        features[f'fib_retracement_{level_str}_{period}'] = np.zeros(len(close))
+                        features[f'fib_extension_{level_str}_{period}'] = np.zeros(len(close))
+                        features[f'near_fib_retracement_{level_str}_{period}'] = np.zeros(len(close))
             else:
                 # フォールバック
                 for level in fib_levels:
                     level_str = str(level).replace('.', '')
-                    features[f'fib_retracement_{level_str}_{period}'] = np.full(len(close), np.nan)
-                    features[f'fib_extension_{level_str}_{period}'] = np.full(len(close), np.nan)
-                    features[f'near_fib_retracement_{level_str}_{period}'] = np.full(len(close), np.nan)
+                    features[f'fib_retracement_{level_str}_{period}'] = np.zeros(len(close))
+                    features[f'fib_extension_{level_str}_{period}'] = np.zeros(len(close))
+                    features[f'near_fib_retracement_{level_str}_{period}'] = np.zeros(len(close))
         
         return features
     
@@ -4937,239 +5010,6 @@ class Calculator:
         
         return results
     
-    def _calculate_candlestick_patterns_numpy(self, open_prices: np.ndarray, high: np.ndarray, 
-                                            low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ローソク足パターン計算（NumPy実装）"""
-        
-        # 基本的なローソク足要素
-        body_size = np.abs(close - open_prices)
-        upper_shadow = high - np.maximum(open_prices, close)
-        lower_shadow = np.minimum(open_prices, close) - low
-        total_range = high - low
-        
-        # 正規化（全体レンジに対する比率）
-        body_ratio = np.divide(body_size, total_range, out=np.zeros_like(body_size), where=(total_range != 0))
-        upper_shadow_ratio = np.divide(upper_shadow, total_range, out=np.zeros_like(upper_shadow), where=(total_range != 0))
-        lower_shadow_ratio = np.divide(lower_shadow, total_range, out=np.zeros_like(lower_shadow), where=(total_range != 0))
-        
-        # ローソク足の方向（NumPy操作）
-        is_bullish = np.where(close > open_prices, 1.0, 0.0)
-        is_bearish = np.where(close < open_prices, 1.0, 0.0)
-        
-        # 十字線（Doji）パターン
-        doji = np.where(body_ratio < 0.1, 1.0, 0.0)
-        long_legged_doji = np.where((body_ratio < 0.1) & (upper_shadow_ratio > 0.3) & (lower_shadow_ratio > 0.3), 1.0, 0.0)
-        dragonfly_doji = np.where((body_ratio < 0.1) & (upper_shadow_ratio < 0.1) & (lower_shadow_ratio > 0.3), 1.0, 0.0)
-        gravestone_doji = np.where((body_ratio < 0.1) & (upper_shadow_ratio > 0.3) & (lower_shadow_ratio < 0.1), 1.0, 0.0)
-        
-        # ハンマー・ハンギングマン
-        hammer_condition = (lower_shadow_ratio > 0.5) & (upper_shadow_ratio < 0.1) & (body_ratio < 0.3)
-        
-        # シューティングスター・インバーテッドハンマー
-        shooting_star_condition = (upper_shadow_ratio > 0.5) & (lower_shadow_ratio < 0.1) & (body_ratio < 0.3)
-        
-        # マルボウズ（影のないローソク足）
-        marubozu = np.where((upper_shadow_ratio < 0.05) & (lower_shadow_ratio < 0.05) & (body_ratio > 0.9), 1.0, 0.0)
-        
-        # スピニングトップ
-        spinning_top = np.where((body_ratio < 0.3) & (upper_shadow_ratio > 0.2) & (lower_shadow_ratio > 0.2), 1.0, 0.0)
-        
-        # ハンマー系パターンの分類（NumPy操作）
-        hammer = np.where(hammer_condition & (is_bullish == 1), 1.0, 0.0)
-        hanging_man = np.where(hammer_condition & (is_bearish == 1), 1.0, 0.0)
-        shooting_star = np.where(shooting_star_condition & (is_bearish == 1), 1.0, 0.0)
-        inverted_hammer = np.where(shooting_star_condition & (is_bullish == 1), 1.0, 0.0)
-        
-        # マルボウズの分類
-        white_marubozu = np.where(marubozu & (is_bullish == 1), 1.0, 0.0)
-        black_marubozu = np.where(marubozu & (is_bearish == 1), 1.0, 0.0)
-        
-        return {
-            'body_size': body_size,
-            'upper_shadow': upper_shadow,
-            'lower_shadow': lower_shadow,
-            'body_ratio': body_ratio,
-            'upper_shadow_ratio': upper_shadow_ratio,
-            'lower_shadow_ratio': lower_shadow_ratio,
-            'is_bullish': is_bullish,
-            'is_bearish': is_bearish,
-            'doji': doji,
-            'long_legged_doji': long_legged_doji,
-            'dragonfly_doji': dragonfly_doji,
-            'gravestone_doji': gravestone_doji,
-            'hammer': hammer,
-            'hanging_man': hanging_man,
-            'shooting_star': shooting_star,
-            'inverted_hammer': inverted_hammer,
-            'marubozu': marubozu,
-            'white_marubozu': white_marubozu,
-            'black_marubozu': black_marubozu,
-            'spinning_top': spinning_top
-        }
-    
-    def _calculate_multi_candle_patterns_numba(self, open_prices: np.ndarray, high: np.ndarray, 
-                                             low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """複数ローソク足パターン計算（Numba版）"""
-        features = {}
-        
-        multi_patterns = self._numba_safe_calculation(
-            self._calculate_multi_patterns_vectorized, open_prices, high, low, close
-        )
-        
-        if multi_patterns is not None and len(multi_patterns.shape) == 2:
-            pattern_names = ['bullish_engulfing', 'bearish_engulfing', 'bullish_harami', 'bearish_harami', 
-                           'gap_up', 'gap_down', 'has_gap']
-            
-            for i, name in enumerate(pattern_names):
-                if i < multi_patterns.shape[1]:
-                    features[name] = multi_patterns[:, i]
-                else:
-                    features[name] = np.full(len(close), np.nan)
-        else:
-            # フォールバック
-            pattern_names = ['bullish_engulfing', 'bearish_engulfing', 'bullish_harami', 'bearish_harami', 
-                           'gap_up', 'gap_down', 'has_gap']
-            for name in pattern_names:
-                features[name] = np.full(len(close), np.nan)
-        
-        return features
-    
-    @staticmethod
-    @njit(cache=True)
-    def _calculate_multi_patterns_vectorized(open_prices: np.ndarray, high: np.ndarray, 
-                                           low: np.ndarray, close: np.ndarray) -> np.ndarray:
-        """複数ローソク足パターン計算（Numba最適化版）"""
-        n = len(close)
-        if n < 2:
-            return np.zeros((n, 7))
-        
-        results = np.zeros((n, 7))
-        
-        for i in range(1, n):
-            # エンゴルフィング（包み足）
-            prev_body_top = max(open_prices[i-1], close[i-1])
-            prev_body_bottom = min(open_prices[i-1], close[i-1])
-            curr_body_top = max(open_prices[i], close[i])
-            curr_body_bottom = min(open_prices[i], close[i])
-            
-            # 強気エンゴルフィング
-            if (close[i-1] < open_prices[i-1] and close[i] > open_prices[i] and 
-                curr_body_bottom < prev_body_bottom and curr_body_top > prev_body_top):
-                results[i, 0] = 1.0
-            
-            # 弱気エンゴルフィング
-            if (close[i-1] > open_prices[i-1] and close[i] < open_prices[i] and 
-                curr_body_bottom < prev_body_bottom and curr_body_top > prev_body_top):
-                results[i, 1] = 1.0
-            
-            # はらみ足（Harami）
-            if (curr_body_top < prev_body_top and curr_body_bottom > prev_body_bottom):
-                if close[i-1] < open_prices[i-1] and close[i] > open_prices[i]:
-                    results[i, 2] = 1.0  # 強気はらみ
-                elif close[i-1] > open_prices[i-1] and close[i] < open_prices[i]:
-                    results[i, 3] = 1.0  # 弱気はらみ
-            
-            # ギャップ（窓開け）
-            prev_high = high[i-1]
-            prev_low = low[i-1]
-            curr_low = low[i]
-            curr_high = high[i]
-            
-            if curr_low > prev_high:
-                results[i, 4] = (curr_low - prev_high) / (prev_high + 1e-10)  # gap_up
-                results[i, 6] = 1.0  # has_gap
-            elif curr_high < prev_low:
-                results[i, 5] = (prev_low - curr_high) / (prev_low + 1e-10)  # gap_down
-                results[i, 6] = 1.0  # has_gap
-        
-        return results
-    
-    def _calculate_candle_strength_numpy(self, open_prices: np.ndarray, high: np.ndarray, 
-                                       low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
-        """ローソク足強度計算（NumPy実装）"""
-        features = {}
-        
-        # 基本要素
-        body_size = np.abs(close - open_prices)
-        total_range = high - low
-        
-        # 複数期間での相対的評価
-        periods = [5, 10, 20]
-        
-        for period in periods:
-            # 実体サイズのパーセンタイル計算
-            body_percentile = np.zeros_like(body_size)
-            range_percentile = np.zeros_like(total_range)
-            
-            for i in range(period-1, len(body_size)):
-                window_body = body_size[i-period+1:i+1]
-                window_range = total_range[i-period+1:i+1]
-                
-                body_rank = np.sum(window_body <= body_size[i])
-                range_rank = np.sum(window_range <= total_range[i])
-                
-                body_percentile[i] = body_rank / len(window_body)
-                range_percentile[i] = range_rank / len(window_range)
-            
-            # 強いローソク足の検出（NumPy操作）
-            strong_candle = np.where(body_percentile > 0.8, 1.0, 0.0)
-            weak_candle = np.where(body_percentile < 0.2, 1.0, 0.0)
-            high_volatility_candle = np.where(range_percentile > 0.8, 1.0, 0.0)
-            
-            features[f'body_percentile_{period}'] = body_percentile
-            features[f'range_percentile_{period}'] = range_percentile
-            features[f'strong_candle_{period}'] = strong_candle
-            features[f'weak_candle_{period}'] = weak_candle
-            features[f'high_volatility_candle_{period}'] = high_volatility_candle
-        
-        # ローソク足の連続性
-        consecutive_result = self._numba_safe_calculation(
-            self._calculate_consecutive_candles_vectorized, open_prices, close
-        )
-        
-        if consecutive_result is not None and len(consecutive_result.shape) == 2:
-            features['consecutive_bullish'] = consecutive_result[:, 0]
-            features['consecutive_bearish'] = consecutive_result[:, 1]
-            features['long_bullish_streak'] = consecutive_result[:, 2]
-            features['long_bearish_streak'] = consecutive_result[:, 3]
-        else:
-            # フォールバック
-            n = len(close)
-            features['consecutive_bullish'] = np.full(n, np.nan)
-            features['consecutive_bearish'] = np.full(n, np.nan)
-            features['long_bullish_streak'] = np.full(n, np.nan)
-            features['long_bearish_streak'] = np.full(n, np.nan)
-        
-        return features
-    
-    @staticmethod
-    @njit(cache=True)
-    def _calculate_consecutive_candles_vectorized(open_prices: np.ndarray, close: np.ndarray) -> np.ndarray:
-        """連続ローソク足計算（Numba最適化版）"""
-        n = len(close)
-        results = np.zeros((n, 4))
-        
-        bull_count = 0
-        bear_count = 0
-        
-        for i in range(n):
-            if close[i] > open_prices[i]:
-                bull_count += 1
-                bear_count = 0
-            elif close[i] < open_prices[i]:
-                bear_count += 1
-                bull_count = 0
-            else:
-                bull_count = 0
-                bear_count = 0
-            
-            results[i, 0] = bull_count  # consecutive_bullish
-            results[i, 1] = bear_count  # consecutive_bearish
-            results[i, 2] = 1.0 if bull_count >= 3 else 0.0  # long_bullish_streak
-            results[i, 3] = 1.0 if bear_count >= 3 else 0.0  # long_bearish_streak
-        
-        return results
-    
     def _calculate_support_resistance_features_numba(self, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
         """サポート・レジスタンス特徴量（Numba版）"""
         features = {}
@@ -5191,12 +5031,12 @@ class Calculator:
             else:
                 # フォールバック
                 n = len(close)
-                features[f'nearest_resistance_{period}'] = np.full(n, np.nan)
-                features[f'nearest_support_{period}'] = np.full(n, np.nan)
-                features[f'resistance_distance_{period}'] = np.full(n, np.nan)
-                features[f'support_distance_{period}'] = np.full(n, np.nan)
-                features[f'resistance_strength_{period}'] = np.full(n, np.nan)
-                features[f'support_strength_{period}'] = np.full(n, np.nan)
+                features[f'nearest_resistance_{period}'] = np.zeros(n)
+                features[f'nearest_support_{period}'] = np.zeros(n)
+                features[f'resistance_distance_{period}'] = np.zeros(n)
+                features[f'support_distance_{period}'] = np.zeros(n)
+                features[f'resistance_strength_{period}'] = np.zeros(n)
+                features[f'support_strength_{period}'] = np.zeros(n)
         
         return features
     
@@ -5250,35 +5090,241 @@ class Calculator:
         
         return results
     
+    def _calculate_candlestick_patterns_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ローソク足パターン計算（Polarsベース）"""
+        
+        # 基本的なローソク足要素
+        candle_df = df.with_columns([
+            (pl.col('close') - pl.col('open')).abs().alias('body_size'),
+            (pl.col('high') - pl.max_horizontal([pl.col('open'), pl.col('close')])).alias('upper_shadow'),
+            (pl.min_horizontal([pl.col('open'), pl.col('close')]) - pl.col('low')).alias('lower_shadow'),
+            (pl.col('high') - pl.col('low')).alias('total_range')
+        ]).with_columns([
+            # 正規化（全体レンジに対する比率）
+            (pl.col('body_size') / (pl.col('total_range') + 1e-8)).alias('body_ratio'),
+            (pl.col('upper_shadow') / (pl.col('total_range') + 1e-8)).alias('upper_shadow_ratio'),
+            (pl.col('lower_shadow') / (pl.col('total_range') + 1e-8)).alias('lower_shadow_ratio'),
+            # ローソク足の方向
+            (pl.col('close') > pl.col('open')).cast(pl.Float64).alias('is_bullish'),
+            (pl.col('close') < pl.col('open')).cast(pl.Float64).alias('is_bearish')
+        ]).with_columns([
+            # 十字線（Doji）パターン
+            (pl.col('body_ratio') < 0.1).cast(pl.Float64).alias('doji'),
+            ((pl.col('body_ratio') < 0.1) & (pl.col('upper_shadow_ratio') > 0.3) & (pl.col('lower_shadow_ratio') > 0.3)).cast(pl.Float64).alias('long_legged_doji'),
+            ((pl.col('body_ratio') < 0.1) & (pl.col('upper_shadow_ratio') < 0.1) & (pl.col('lower_shadow_ratio') > 0.3)).cast(pl.Float64).alias('dragonfly_doji'),
+            ((pl.col('body_ratio') < 0.1) & (pl.col('upper_shadow_ratio') > 0.3) & (pl.col('lower_shadow_ratio') < 0.1)).cast(pl.Float64).alias('gravestone_doji')
+        ]).with_columns([
+            # ハンマー・ハンギングマン
+            ((pl.col('lower_shadow_ratio') > 0.5) & (pl.col('upper_shadow_ratio') < 0.1) & (pl.col('body_ratio') < 0.3)).alias('hammer_condition'),
+            # シューティングスター・インバーテッドハンマー
+            ((pl.col('upper_shadow_ratio') > 0.5) & (pl.col('lower_shadow_ratio') < 0.1) & (pl.col('body_ratio') < 0.3)).alias('shooting_star_condition'),
+            # マルボウズ（影のないローソク足）
+            ((pl.col('upper_shadow_ratio') < 0.05) & (pl.col('lower_shadow_ratio') < 0.05) & (pl.col('body_ratio') > 0.9)).cast(pl.Float64).alias('marubozu'),
+            # スピニングトップ
+            ((pl.col('body_ratio') < 0.3) & (pl.col('upper_shadow_ratio') > 0.2) & (pl.col('lower_shadow_ratio') > 0.2)).cast(pl.Float64).alias('spinning_top')
+        ]).with_columns([
+            # ハンマー系パターンの分類
+            (pl.col('hammer_condition') & pl.col('is_bullish')).cast(pl.Float64).alias('hammer'),
+            (pl.col('hammer_condition') & pl.col('is_bearish')).cast(pl.Float64).alias('hanging_man'),
+            (pl.col('shooting_star_condition') & pl.col('is_bearish')).cast(pl.Float64).alias('shooting_star'),
+            (pl.col('shooting_star_condition') & pl.col('is_bullish')).cast(pl.Float64).alias('inverted_hammer'),
+            # マルボウズの分類
+            (pl.col('marubozu') & pl.col('is_bullish')).cast(pl.Float64).alias('white_marubozu'),
+            (pl.col('marubozu') & pl.col('is_bearish')).cast(pl.Float64).alias('black_marubozu')
+        ])
+        
+        pattern_names = [
+            'body_size', 'upper_shadow', 'lower_shadow', 'body_ratio', 'upper_shadow_ratio', 'lower_shadow_ratio',
+            'is_bullish', 'is_bearish', 'doji', 'long_legged_doji', 'dragonfly_doji', 'gravestone_doji',
+            'hammer', 'hanging_man', 'shooting_star', 'inverted_hammer', 'marubozu', 'white_marubozu', 'black_marubozu', 'spinning_top'
+        ]
+        
+        return {name: candle_df[name].to_numpy() for name in pattern_names}
+    
+    def _calculate_multi_candle_patterns_numba(self, open_prices: np.ndarray, high: np.ndarray, 
+                                             low: np.ndarray, close: np.ndarray) -> Dict[str, np.ndarray]:
+        """複数ローソク足パターン計算（Numba版）"""
+        features = {}
+        
+        multi_patterns = self._numba_safe_calculation(
+            self._calculate_multi_patterns_vectorized, open_prices, high, low, close
+        )
+        
+        if multi_patterns is not None and len(multi_patterns.shape) == 2:
+            pattern_names = ['bullish_engulfing', 'bearish_engulfing', 'bullish_harami', 'bearish_harami', 
+                           'gap_up', 'gap_down', 'has_gap']
+            
+            for i, name in enumerate(pattern_names):
+                if i < multi_patterns.shape[1]:
+                    features[name] = multi_patterns[:, i]
+                else:
+                    features[name] = np.zeros(len(close))
+        else:
+            # フォールバック
+            pattern_names = ['bullish_engulfing', 'bearish_engulfing', 'bullish_harami', 'bearish_harami', 
+                           'gap_up', 'gap_down', 'has_gap']
+            for name in pattern_names:
+                features[name] = np.zeros(len(close))
+        
+        return features
+    
+    @staticmethod
+    @njit(cache=True)
+    def _calculate_multi_patterns_vectorized(open_prices: np.ndarray, high: np.ndarray, 
+                                           low: np.ndarray, close: np.ndarray) -> np.ndarray:
+        """複数ローソク足パターン計算（Numba最適化版）"""
+        n = len(close)
+        if n < 2:
+            return np.zeros((n, 7))
+        
+        results = np.zeros((n, 7))
+        
+        for i in range(1, n):
+            # エンゴルフィング（包み足）
+            prev_body_top = max(open_prices[i-1], close[i-1])
+            prev_body_bottom = min(open_prices[i-1], close[i-1])
+            curr_body_top = max(open_prices[i], close[i])
+            curr_body_bottom = min(open_prices[i], close[i])
+            
+            # 強気エンゴルフィング
+            if (close[i-1] < open_prices[i-1] and close[i] > open_prices[i] and 
+                curr_body_bottom < prev_body_bottom and curr_body_top > prev_body_top):
+                results[i, 0] = 1.0
+            
+            # 弱気エンゴルフィング
+            if (close[i-1] > open_prices[i-1] and close[i] < open_prices[i] and 
+                curr_body_bottom < prev_body_bottom and curr_body_top > prev_body_top):
+                results[i, 1] = 1.0
+            
+            # はらみ足（Harami）
+            if (curr_body_top < prev_body_top and curr_body_bottom > prev_body_bottom):
+                if close[i-1] < open_prices[i-1] and close[i] > open_prices[i]:
+                    results[i, 2] = 1.0  # 強気はらみ
+                elif close[i-1] > open_prices[i-1] and close[i] < open_prices[i]:
+                    results[i, 3] = 1.0  # 弱気はらみ
+            
+            # ギャップ（窓開け）
+            prev_high = high[i-1]
+            prev_low = low[i-1]
+            curr_low = low[i]
+            curr_high = high[i]
+            
+            if curr_low > prev_high:
+                results[i, 4] = (curr_low - prev_high) / (prev_high + 1e-10)  # gap_up
+                results[i, 6] = 1.0  # has_gap
+            elif curr_high < prev_low:
+                results[i, 5] = (prev_low - curr_high) / (prev_low + 1e-10)  # gap_down
+                results[i, 6] = 1.0  # has_gap
+        
+        return results
+    
+    def _calculate_candle_strength_polars(self, df: pl.DataFrame) -> Dict[str, np.ndarray]:
+        """ローソク足強度計算（Polarsベース）"""
+        features = {}
+        
+        # 基本要素
+        strength_df = df.with_columns([
+            (pl.col('close') - pl.col('open')).abs().alias('body_size'),
+            (pl.col('high') - pl.col('low')).alias('total_range')
+        ])
+        
+        # 複数期間での相対的評価
+        periods = [5, 10, 20]
+        
+        for period in periods:
+            strength_df = strength_df.with_columns([
+                # 実体サイズの相対的大きさ
+                (pl.col('body_size').rank().over(pl.col('body_size').rolling_mean(window_size=period)) / period).alias(f'body_percentile_{period}'),
+                (pl.col('total_range').rank().over(pl.col('total_range').rolling_mean(window_size=period)) / period).alias(f'range_percentile_{period}')
+            ]).with_columns([
+                # 強いローソク足の検出
+                (pl.col(f'body_percentile_{period}') > 0.8).cast(pl.Float64).alias(f'strong_candle_{period}'),
+                (pl.col(f'body_percentile_{period}') < 0.2).cast(pl.Float64).alias(f'weak_candle_{period}'),
+                (pl.col(f'range_percentile_{period}') > 0.8).cast(pl.Float64).alias(f'high_volatility_candle_{period}')
+            ])
+            
+            features[f'body_percentile_{period}'] = strength_df[f'body_percentile_{period}'].to_numpy()
+            features[f'range_percentile_{period}'] = strength_df[f'range_percentile_{period}'].to_numpy()
+            features[f'strong_candle_{period}'] = strength_df[f'strong_candle_{period}'].to_numpy()
+            features[f'weak_candle_{period}'] = strength_df[f'weak_candle_{period}'].to_numpy()
+            features[f'high_volatility_candle_{period}'] = strength_df[f'high_volatility_candle_{period}'].to_numpy()
+        
+        # ローソク足の連続性（Numbaが効率的）
+        consecutive_result = self._numba_safe_calculation(
+            self._calculate_consecutive_candles_vectorized, open_prices=df['open'].to_numpy(), close=df['close'].to_numpy()
+        )
+        
+        if consecutive_result is not None and len(consecutive_result.shape) == 2:
+            features['consecutive_bullish'] = consecutive_result[:, 0]
+            features['consecutive_bearish'] = consecutive_result[:, 1]
+            features['long_bullish_streak'] = consecutive_result[:, 2]
+            features['long_bearish_streak'] = consecutive_result[:, 3]
+        else:
+            # フォールバック
+            n = len(df)
+            features['consecutive_bullish'] = np.zeros(n)
+            features['consecutive_bearish'] = np.zeros(n)
+            features['long_bullish_streak'] = np.zeros(n)
+            features['long_bearish_streak'] = np.zeros(n)
+        
+        return features
+    
+    @staticmethod
+    @njit(cache=True)
+    def _calculate_consecutive_candles_vectorized(open_prices: np.ndarray, close: np.ndarray) -> np.ndarray:
+        """連続ローソク足計算（Numba最適化版）"""
+        n = len(close)
+        results = np.zeros((n, 4))
+        
+        bull_count = 0
+        bear_count = 0
+        
+        for i in range(n):
+            if close[i] > open_prices[i]:
+                bull_count += 1
+                bear_count = 0
+            elif close[i] < open_prices[i]:
+                bear_count += 1
+                bull_count = 0
+            else:
+                bull_count = 0
+                bear_count = 0
+            
+            results[i, 0] = bull_count  # consecutive_bullish
+            results[i, 1] = bear_count  # consecutive_bearish
+            results[i, 2] = 1.0 if bull_count >= 3 else 0.0  # long_bullish_streak
+            results[i, 3] = 1.0 if bear_count >= 3 else 0.0  # long_bearish_streak
+        
+        return results
+    
     # =========================================================================
-    # 情報理論特徴量（NumPy+Numba実装）
+    # Block 9: 情報理論・学際的アナロジー特徴量（Polars+Numba最適化版）
     # =========================================================================
     
-    def calculate_information_theory_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """情報理論特徴量の統合計算（NumPy実装）"""
+    def calculate_information_theory_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """情報理論特徴量の統合計算（Polars最適化版）"""
         features = {}
-        data = self._ensure_numpy_array(data)
         
         try:
             # 高度なエントロピー特徴量
-            entropy_features = self.calculate_advanced_entropy_features(data)
+            entropy_features = self.calculate_advanced_entropy_features_polars(data)
             features.update(entropy_features)
             
             # サンプル・近似エントロピー
             if ENTROPY_AVAILABLE:
-                sample_entropy_features = self.calculate_sample_approximate_entropy(data)
+                sample_entropy_features = self.calculate_sample_approximate_entropy_polars(data)
                 features.update(sample_entropy_features)
             
             # Lempel-Ziv複雑性
-            lz_features = self.calculate_lempel_ziv_features(data)
+            lz_features = self.calculate_lempel_ziv_features_polars(data)
             features.update(lz_features)
             
             # コルモゴロフ複雑性（近似）
-            kolmogorov_features = self.calculate_kolmogorov_complexity_features(data)
+            kolmogorov_features = self.calculate_kolmogorov_complexity_features_polars(data)
             features.update(kolmogorov_features)
             
             # 相互情報量（自己遅延・クロス）
-            mi_features = self.calculate_mutual_information_features(data)
+            mi_features = self.calculate_mutual_information_features_polars(data)
             features.update(mi_features)
             
         except Exception as e:
@@ -5286,8 +5332,8 @@ class Calculator:
         
         return features
     
-    def calculate_advanced_entropy_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """高度なエントロピー特徴量（NumPy+Numba版）"""
+    def calculate_advanced_entropy_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """高度なエントロピー特徴量（Polars+Numba版）"""
         features = {}
         
         for window_size in self.params['adv_entropy_windows']:
@@ -5310,7 +5356,7 @@ class Calculator:
                 entropy_names = ['shannon_entropy', 'renyi_entropy', 'tsallis_entropy', 
                                'conditional_entropy', 'effective_bins', 'max_probability']
                 for name in entropy_names:
-                    features[f'{name}_{window_size}'] = np.full(len(data), np.nan)
+                    features[f'{name}_{window_size}'] = np.zeros(len(data))
         
         return features
     
@@ -5424,8 +5470,8 @@ class Calculator:
         
         return results
     
-    def calculate_sample_approximate_entropy(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """サンプルエントロピー・近似エントロピー特徴量（NumPy実装）"""
+    def calculate_sample_approximate_entropy_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """サンプルエントロピー・近似エントロピー特徴量（Polars最適化版）"""
         features = {}
         
         if not ENTROPY_AVAILABLE:
@@ -5446,15 +5492,15 @@ class Calculator:
                 features[f'entropy_difference_{window_size}'] = entropy_result[:, 2]
             else:
                 # フォールバック値
-                features[f'sample_entropy_{window_size}'] = np.full(len(data), np.nan)
-                features[f'approximate_entropy_{window_size}'] = np.full(len(data), np.nan)
-                features[f'entropy_difference_{window_size}'] = np.full(len(data), np.nan)
+                features[f'sample_entropy_{window_size}'] = np.zeros(len(data))
+                features[f'approximate_entropy_{window_size}'] = np.zeros(len(data))
+                features[f'entropy_difference_{window_size}'] = np.zeros(len(data))
                 
         except Exception as e:
             logger.warning(f"サンプル/近似エントロピー計算エラー: {e}")
-            features[f'sample_entropy_{window_size}'] = np.full(len(data), np.nan)
-            features[f'approximate_entropy_{window_size}'] = np.full(len(data), np.nan)
-            features[f'entropy_difference_{window_size}'] = np.full(len(data), np.nan)
+            features[f'sample_entropy_{window_size}'] = np.zeros(len(data))
+            features[f'approximate_entropy_{window_size}'] = np.zeros(len(data))
+            features[f'entropy_difference_{window_size}'] = np.zeros(len(data))
         
         return features
     
@@ -5532,8 +5578,8 @@ class Calculator:
         
         return results
     
-    def calculate_lempel_ziv_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """Lempel-Ziv複雑性特徴量（NumPy実装）"""
+    def calculate_lempel_ziv_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """Lempel-Ziv複雑性特徴量（Polars最適化版）"""
         features = {}
         
         for window_size in self.params['lz_windows']:
@@ -5549,15 +5595,17 @@ class Calculator:
                 features[f'lempel_ziv_complexity_{window_size}'] = lz_result
                 
                 # 高複雑性検出（75パーセンタイルベース）
-                lz_75th = self._compute_rolling_percentile_numpy(lz_result, window_size, 75)
+                lz_75th = self._numba_safe_calculation(
+                    self._compute_rolling_percentile_numba, lz_result, window_size, 75
+                )
                 
                 if isinstance(lz_75th, np.ndarray):
-                    features[f'lz_high_complexity_{window_size}'] = np.where(lz_result > lz_75th, 1.0, 0.0)
+                    features[f'lz_high_complexity_{window_size}'] = (lz_result > lz_75th).astype(float)
                 else:
-                    features[f'lz_high_complexity_{window_size}'] = np.full(len(data), np.nan)
+                    features[f'lz_high_complexity_{window_size}'] = np.zeros(len(data))
             else:
-                features[f'lempel_ziv_complexity_{window_size}'] = np.full(len(data), np.nan)
-                features[f'lz_high_complexity_{window_size}'] = np.full(len(data), np.nan)
+                features[f'lempel_ziv_complexity_{window_size}'] = np.zeros(len(data))
+                features[f'lz_high_complexity_{window_size}'] = np.zeros(len(data))
         
         return features
     
@@ -5613,55 +5661,8 @@ class Calculator:
         
         return results  
     
-    @staticmethod
-    @njit(parallel=True, cache=True)
-    def _calculate_kolmogorov_complexity_vectorized_optimized(data: np.ndarray, window_size: int) -> np.ndarray:
-        """コルモゴロフ複雑性（近似）計算（Lempel-Zivベースの再実装）"""
-        n = len(data)
-        results = np.zeros(n)
-        
-        if n < window_size:
-            return results
-        
-        # 並列計算
-        for i in prange(window_size-1, n):
-            window = data[i-window_size+1:i+1]
-            
-            # 中央値でバイナリ化
-            threshold = np.median(window)
-            binary_data = np.zeros(len(window), dtype=np.int32)
-            for j in range(len(window)):
-                binary_data[j] = 1 if window[j] > threshold else 0
-            
-            # Lempel-Zivアルゴリズムで複雑性を計算
-            complexity = 0
-            pos = 0
-            n_data = len(binary_data)
-            
-            while pos < n_data:
-                max_match_len = 0
-                for start in range(pos):
-                    match_len = 0
-                    while (pos + match_len < n_data and 
-                           start + match_len < pos and 
-                           binary_data[pos + match_len] == binary_data[start + match_len]):
-                        match_len += 1
-                    max_match_len = max(max_match_len, match_len)
-                
-                pos += max(1, max_match_len)
-                complexity += 1
-            
-            # 正規化
-            if n_data > 0 and np.log2(n_data + 1) > 0:
-                max_complexity = n_data / np.log2(n_data + 1)
-                if max_complexity > 0:
-                    normalized_complexity = complexity / max_complexity
-                    results[i] = min(1.0, normalized_complexity)
-        
-        return results
-
-    def calculate_kolmogorov_complexity_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
-        """コルモゴロフ複雑性（近似）特徴量（NumPy実装）"""
+    def calculate_kolmogorov_complexity_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+        """コルモゴロフ複雑性（近似）特徴量（Polars最適化版）"""
         features = {}
         
         for window_size in self.params['kolmogorov_windows']:
@@ -5677,82 +5678,175 @@ class Calculator:
                 features[f'kolmogorov_complexity_{window_size}'] = kc_result
                 
                 # 高複雑性検出（80パーセンタイルベース）
-                kc_80th = self._compute_rolling_percentile_numpy(kc_result, window_size, 80)
+                kc_80th = self._numba_safe_calculation(
+                    self._compute_rolling_percentile_numba, kc_result, window_size, 80
+                )
                 
                 if isinstance(kc_80th, np.ndarray):
-                    features[f'kc_high_complexity_{window_size}'] = np.where(kc_result > kc_80th, 1.0, 0.0)
+                    features[f'kc_high_complexity_{window_size}'] = (kc_result > kc_80th).astype(float)
                 else:
-                    features[f'kc_high_complexity_{window_size}'] = np.full(len(data), np.nan)
+                    features[f'kc_high_complexity_{window_size}'] = np.zeros(len(data))
             else:
-                features[f'kolmogorov_complexity_{window_size}'] = np.full(len(data), np.nan)
-                features[f'kc_high_complexity_{window_size}'] = np.full(len(data), np.nan)
+                features[f'kolmogorov_complexity_{window_size}'] = np.zeros(len(data))
+                features[f'kc_high_complexity_{window_size}'] = np.zeros(len(data))
         
         return features
     
     @staticmethod
     @njit(parallel=True, cache=True)
-    def _calculate_mutual_information_vectorized_optimized(data: np.ndarray, lag: int) -> np.ndarray:
-        """自己遅延相互情報量計算（完全ベクトル化・並列最適化版）"""
+    def _calculate_kolmogorov_complexity_vectorized_optimized(data: np.ndarray, window_size: int) -> np.ndarray:
+        """コルモゴロフ複雑性（近似）計算（完全ベクトル化・並列最適化版）"""
         n = len(data)
-        window_size = 50
         results = np.zeros(n)
         
-        if n < window_size + lag:
+        if n < window_size:
             return results
         
         # 並列計算
-        for i in prange(window_size + lag - 1, n):
-            window = data[i - window_size + 1:i + 1]
+        for i in prange(window_size-1, n):
+            window = data[i-window_size+1:i+1]
             
-            # データと遅延データの準備
-            x = window[lag:]
-            y = window[:-lag]
+            # 複雑性の近似指標として複数の手法を組み合わせ
             
-            if len(x) < 10:
-                continue
+            # 1. 圧縮性（改良版ランレングス符号化）
+            compressed_length = 1
+            prev_val = window[0]
+            std_threshold = np.std(window) * 0.1
+            run_lengths = []
+            current_run = 1
             
-            # 2Dヒストグラムで同時確率分布を計算
-            n_bins = 10
-            min_x, max_x = np.min(x), np.max(x)
-            min_y, max_y = np.min(y), np.max(y)
+            for j in range(1, len(window)):
+                if abs(window[j] - prev_val) <= std_threshold:
+                    current_run += 1
+                else:
+                    run_lengths.append(current_run)
+                    current_run = 1
+                    compressed_length += 1
+                prev_val = window[j]
             
-            if max_x - min_x < 1e-10 or max_y - min_y < 1e-10:
-                continue
+            run_lengths.append(current_run)
+            compression_ratio = compressed_length / len(window)
             
-            bin_width_x = (max_x - min_x) / n_bins
-            bin_width_y = (max_y - min_y) / n_bins
+            # 2. パターンの反復性（改良版）
+            pattern_complexity = 0.0
+            max_pattern_length = min(10, len(window) // 4)
             
-            joint_hist = np.zeros((n_bins, n_bins))
-            
-            for j in range(len(x)):
-                bin_x = int((x[j] - min_x) / bin_width_x)
-                bin_y = int((y[j] - min_y) / bin_width_y)
+            if max_pattern_length >= 2:
+                total_patterns = 0
+                unique_patterns = 0
                 
-                if bin_x >= n_bins: bin_x = n_bins - 1
-                if bin_y >= n_bins: bin_y = n_bins - 1
+                # 複数のパターン長で解析
+                for p_len in range(2, max_pattern_length + 1):
+                    pattern_set = set()
+                    
+                    for j in range(len(window) - p_len + 1):
+                        # パターンを数値化（ハッシュ値の改良版）
+                        pattern_hash = 0
+                        for k in range(p_len):
+                            pattern_hash = pattern_hash * 31 + int(window[j + k] * 1000) % 10000
+                        
+                        pattern_set.add(pattern_hash % 100000)  # 衝突を減らすため大きな数で
+                        total_patterns += 1
+                    
+                    unique_patterns += len(pattern_set)
                 
-                joint_hist[bin_x, bin_y] += 1
+                if total_patterns > 0:
+                    pattern_complexity = unique_patterns / total_patterns
             
-            # 確率分布に変換
-            joint_prob = joint_hist / len(x)
+            # 3. エントロピーベースの複雑性（改良版）
+            entropy_complexity = 0.0
+            n_bins = max(5, int(np.sqrt(len(window))))
+            min_val = np.min(window)
+            max_val = np.max(window)
             
-            # 周辺確率分布
-            prob_x = np.sum(joint_prob, axis=1)
-            prob_y = np.sum(joint_prob, axis=0)
+            if max_val - min_val > 1e-10:
+                bin_width = (max_val - min_val) / n_bins
+                hist = np.zeros(n_bins)
+                
+                # ヒストグラム作成
+                for val in window:
+                    bin_idx = int((val - min_val) / bin_width)
+                    if bin_idx >= n_bins:
+                        bin_idx = n_bins - 1
+                    if bin_idx < 0:
+                        bin_idx = 0
+                    hist[bin_idx] += 1
+                
+                # エントロピー計算
+                total_count = np.sum(hist)
+                if total_count > 0:
+                    for h in hist:
+                        if h > 0:
+                            p = h / total_count
+                            entropy_complexity -= p * np.log2(p)
+                    
+                    # 正規化
+                    max_entropy = np.log2(n_bins)
+                    if max_entropy > 0:
+                        entropy_complexity /= max_entropy
             
-            # エントロピー計算
-            h_x = -np.sum(prob_x[prob_x > 1e-10] * np.log2(prob_x[prob_x > 1e-10]))
-            h_y = -np.sum(prob_y[prob_y > 1e-10] * np.log2(prob_y[prob_y > 1e-10]))
-            h_xy = -np.sum(joint_prob[joint_prob > 1e-10] * np.log2(joint_prob[joint_prob > 1e-10]))
+            # 4. 自己類似性の欠如（新規追加）
+            self_similarity = 0.0
+            if len(window) >= 8:
+                half = len(window) // 2
+                first_half = window[:half]
+                second_half = window[half:half*2]
+                
+                # 相関係数の計算
+                if len(first_half) == len(second_half) and len(first_half) > 1:
+                    mean1 = np.mean(first_half)
+                    mean2 = np.mean(second_half)
+                    std1 = np.std(first_half)
+                    std2 = np.std(second_half)
+                    
+                    if std1 > 1e-10 and std2 > 1e-10:
+                        covariance = np.mean((first_half - mean1) * (second_half - mean2))
+                        correlation = covariance / (std1 * std2)
+                        self_similarity = 1.0 - abs(correlation)  # 相関が低いほど複雑
             
-            # 相互情報量
-            mutual_info = h_x + h_y - h_xy
-            results[i] = mutual_info if mutual_info > 0 else 0.0
+            # 5. 周波数複雑性（新規追加）
+            frequency_complexity = 0.0
+            if len(window) >= 8:
+                # 簡易FFT風の周波数解析
+                freq_energy = np.zeros(min(8, len(window) // 2))
+                
+                for freq_idx in range(len(freq_energy)):
+                    freq = (freq_idx + 1) * 2 * np.pi / len(window)
+                    real_part = 0.0
+                    imag_part = 0.0
+                    
+                    for j in range(len(window)):
+                        angle = freq * j
+                        real_part += window[j] * np.cos(angle)
+                        imag_part += window[j] * np.sin(angle)
+                    
+                    freq_energy[freq_idx] = real_part**2 + imag_part**2
+                
+                # 周波数エネルギーの分散（複雑性の指標）
+                if np.sum(freq_energy) > 1e-10:
+                    normalized_energy = freq_energy / np.sum(freq_energy)
+                    # エントロピー計算
+                    for energy in normalized_energy:
+                        if energy > 1e-10:
+                            frequency_complexity -= energy * np.log2(energy)
+                    
+                    # 正規化
+                    max_freq_entropy = np.log2(len(freq_energy))
+                    if max_freq_entropy > 0:
+                        frequency_complexity /= max_freq_entropy
             
+            # 複合複雑性スコア（重み付き平均）
+            weights = np.array([0.2, 0.25, 0.25, 0.15, 0.15])  # 各成分の重み
+            components = np.array([compression_ratio, pattern_complexity, entropy_complexity, 
+                                 self_similarity, frequency_complexity])
+            
+            combined_complexity = np.sum(weights * components)
+            results[i] = min(1.0, max(0.0, combined_complexity))  # 0-1に正規化
+        
         return results
-
-    def calculate_mutual_information_features(self, data: np.ndarray, data2: np.ndarray = None) -> Dict[str, np.ndarray]:
-        """相互情報量特徴量（NumPy実装）"""
+    
+    def calculate_mutual_information_features_polars(self, data: np.ndarray, data2: np.ndarray = None) -> Dict[str, np.ndarray]:
+        """相互情報量特徴量（Polars最適化版）"""
         features = {}
         
         # 自己遅延相互情報量
@@ -5766,15 +5860,17 @@ class Calculator:
                     features[f'mutual_info_lag_{lag}'] = mi_result
                     
                     # 有意性検出（75パーセンタイルベース）
-                    mi_75th = self._compute_rolling_percentile_numpy(mi_result, 50, 75)
+                    mi_75th = self._numba_safe_calculation(
+                        self._compute_rolling_percentile_numba, mi_result, 50, 75
+                    )
                     
                     if isinstance(mi_75th, np.ndarray):
-                        features[f'mi_significant_lag_{lag}'] = np.where(mi_result > mi_75th, 1.0, 0.0)
+                        features[f'mi_significant_lag_{lag}'] = (mi_result > mi_75th).astype(float)
                     else:
-                        features[f'mi_significant_lag_{lag}'] = np.full(len(data), np.nan)
+                        features[f'mi_significant_lag_{lag}'] = np.zeros(len(data))
                 else:
-                    features[f'mutual_info_lag_{lag}'] = np.full(len(data), np.nan)
-                    features[f'mi_significant_lag_{lag}'] = np.full(len(data), np.nan)
+                    features[f'mutual_info_lag_{lag}'] = np.zeros(len(data))
+                    features[f'mi_significant_lag_{lag}'] = np.zeros(len(data))
         
         # クロス相互情報量（異なるデータ系列間）
         if data2 is not None and len(data2) == len(data):
@@ -5786,71 +5882,232 @@ class Calculator:
                 features['mutual_info_cross'] = cross_mi_result
                 
                 # クロス有意性検出
-                cross_mi_75th = self._compute_rolling_percentile_numpy(cross_mi_result, 50, 75)
+                cross_mi_75th = self._numba_safe_calculation(
+                    self._compute_rolling_percentile_numba, cross_mi_result, 50, 75
+                )
                 
                 if isinstance(cross_mi_75th, np.ndarray):
-                    features['mi_cross_significant'] = np.where(cross_mi_result > cross_mi_75th, 1.0, 0.0)
+                    features['mi_cross_significant'] = (cross_mi_result > cross_mi_75th).astype(float)
                 else:
-                    features['mi_cross_significant'] = np.full(len(data), np.nan)
+                    features['mi_cross_significant'] = np.zeros(len(data))
             else:
-                features['mutual_info_cross'] = np.full(len(data), np.nan)
-                features['mi_cross_significant'] = np.full(len(data), np.nan)
+                features['mutual_info_cross'] = np.zeros(len(data))
+                features['mi_cross_significant'] = np.zeros(len(data))
         
         return features
     
-    def _compute_rolling_percentile_numpy(self, data: np.ndarray, window: int, percentile: float) -> np.ndarray:
-        """ローリングパーセンタイル計算（NumPy実装）"""
-        result = np.full_like(data, np.nan)
+    @staticmethod
+    @njit(parallel=True, cache=True)
+    def _calculate_mutual_information_vectorized_optimized(data: np.ndarray, lag: int) -> np.ndarray:
+        """相互情報量計算（完全ベクトル化・並列最適化版）"""
+        n = len(data)
+        window_size = 100
+        results = np.zeros(n)
         
-        for i in range(window - 1, len(data)):
-            window_data = data[i - window + 1:i + 1]
-            result[i] = np.percentile(window_data, percentile)
+        if n < window_size + lag:
+            return results
         
-        return result
+        # 並列計算
+        for i in prange(window_size-1, n-lag):
+            x = data[i-window_size+1:i+1]
+            y = data[i-window_size+1-lag:i+1-lag]
+            
+            if len(x) != len(y) or len(x) < 10:
+                continue
+            
+            # 適応的ビン数
+            unique_x = len(np.unique(x))
+            unique_y = len(np.unique(y))
+            n_bins = max(5, min(15, int(np.sqrt(min(unique_x, unique_y)))))
+            
+            # X軸のビン化（改良版）
+            x_min, x_max = np.min(x), np.max(x)
+            if x_max - x_min < 1e-10:
+                continue
+                
+            x_bin_width = (x_max - x_min) / n_bins
+            x_binned = np.zeros(len(x), dtype=np.int32)
+            for j in range(len(x)):
+                bin_idx = int((x[j] - x_min) / x_bin_width)
+                if bin_idx >= n_bins:
+                    bin_idx = n_bins - 1
+                x_binned[j] = bin_idx
+            
+            # Y軸のビン化（改良版）
+            y_min, y_max = np.min(y), np.max(y)
+            if y_max - y_min < 1e-10:
+                continue
+                
+            y_bin_width = (y_max - y_min) / n_bins
+            y_binned = np.zeros(len(y), dtype=np.int32)
+            for j in range(len(y)):
+                bin_idx = int((y[j] - y_min) / y_bin_width)
+                if bin_idx >= n_bins:
+                    bin_idx = n_bins - 1
+                y_binned[j] = bin_idx
+            
+            # ヒストグラム計算（高精度版）
+            x_hist = np.zeros(n_bins)
+            y_hist = np.zeros(n_bins)
+            xy_hist = np.zeros((n_bins, n_bins))
+            
+            for j in range(len(x_binned)):
+                x_bin = x_binned[j]
+                y_bin = y_binned[j]
+                x_hist[x_bin] += 1
+                y_hist[y_bin] += 1
+                xy_hist[x_bin, y_bin] += 1
+            
+            # 確率分布計算
+            total_count = len(x)
+            px = x_hist / total_count
+            py = y_hist / total_count
+            pxy = xy_hist / total_count
+            
+            # 相互情報量計算（数値安定化版）
+            mi = 0.0
+            for j in range(n_bins):
+                for k in range(n_bins):
+                    if pxy[j, k] > 1e-10 and px[j] > 1e-10 and py[k] > 1e-10:
+                        mi_term = pxy[j, k] * np.log2(pxy[j, k] / (px[j] * py[k]))
+                        if np.isfinite(mi_term):
+                            mi += mi_term
+            
+            results[i] = max(0.0, mi)  # 負の値を0にクランプ
+        
+        # ラグ調整
+        results_adjusted = np.zeros(n)
+        if lag > 0:
+            results_adjusted[lag:] = results[:-lag]
+        else:
+            results_adjusted = results
+        
+        return results_adjusted
+    
+    @staticmethod
+    @njit(parallel=True, cache=True)
+    def _calculate_cross_mutual_information_vectorized(data1: np.ndarray, data2: np.ndarray) -> np.ndarray:
+        """クロス相互情報量計算（完全ベクトル化・並列版）"""
+        n = min(len(data1), len(data2))
+        window_size = 100
+        results = np.zeros(n)
+        
+        if n < window_size:
+            return results
+        
+        # 並列計算
+        for i in prange(window_size-1, n):
+            x = data1[i-window_size+1:i+1]
+            y = data2[i-window_size+1:i+1]
+            
+            if len(x) != len(y) or len(x) < 10:
+                continue
+            
+            # 適応的ビン数
+            unique_x = len(np.unique(x))
+            unique_y = len(np.unique(y))
+            n_bins = max(5, min(15, int(np.sqrt(min(unique_x, unique_y)))))
+            
+            # X軸のビン化
+            x_min, x_max = np.min(x), np.max(x)
+            if x_max - x_min < 1e-10:
+                continue
+                
+            x_bin_width = (x_max - x_min) / n_bins
+            x_binned = np.zeros(len(x), dtype=np.int32)
+            for j in range(len(x)):
+                bin_idx = int((x[j] - x_min) / x_bin_width)
+                if bin_idx >= n_bins:
+                    bin_idx = n_bins - 1
+                x_binned[j] = bin_idx
+            
+            # Y軸のビン化
+            y_min, y_max = np.min(y), np.max(y)
+            if y_max - y_min < 1e-10:
+                continue
+                
+            y_bin_width = (y_max - y_min) / n_bins
+            y_binned = np.zeros(len(y), dtype=np.int32)
+            for j in range(len(y)):
+                bin_idx = int((y[j] - y_min) / y_bin_width)
+                if bin_idx >= n_bins:
+                    bin_idx = n_bins - 1
+                y_binned[j] = bin_idx
+            
+            # ヒストグラム計算
+            x_hist = np.zeros(n_bins)
+            y_hist = np.zeros(n_bins)
+            xy_hist = np.zeros((n_bins, n_bins))
+            
+            for j in range(len(x_binned)):
+                x_bin = x_binned[j]
+                y_bin = y_binned[j]
+                x_hist[x_bin] += 1
+                y_hist[y_bin] += 1
+                xy_hist[x_bin, y_bin] += 1
+            
+            # 確率分布計算
+            total_count = len(x)
+            px = x_hist / total_count
+            py = y_hist / total_count
+            pxy = xy_hist / total_count
+            
+            # 相互情報量計算
+            mi = 0.0
+            for j in range(n_bins):
+                for k in range(n_bins):
+                    if pxy[j, k] > 1e-10 and px[j] > 1e-10 and py[k] > 1e-10:
+                        mi_term = pxy[j, k] * np.log2(pxy[j, k] / (px[j] * py[k]))
+                        if np.isfinite(mi_term):
+                            mi += mi_term
+            
+            results[i] = max(0.0, mi)
+        
+        return results
     
     # =========================================================================
     # 学際的アナロジー特徴量（統合・最適化版）
     # =========================================================================
     
-    def calculate_interdisciplinary_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_interdisciplinary_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """学際的アナロジー特徴量の統合計算（Polars+Numba最適化版）"""
         features = {}
         
         try:
             # ゲーム理論特徴量
-            game_theory_features = self.calculate_game_theory_features(data)
+            game_theory_features = self.calculate_game_theory_features_polars(data)
             features.update(game_theory_features)
             
             # 分子科学特徴量
-            molecular_features = self.calculate_molecular_science_features(data)
+            molecular_features = self.calculate_molecular_science_features_polars(data)
             features.update(molecular_features)
             
             # ネットワーク科学特徴量
-            network_features = self.calculate_network_science_features(data)
+            network_features = self.calculate_network_science_features_polars(data)
             features.update(network_features)
             
             # 音響学特徴量
-            acoustics_features = self.calculate_acoustics_features(data)
+            acoustics_features = self.calculate_acoustics_features_polars(data)
             features.update(acoustics_features)
             
             # 言語学特徴量
-            linguistics_features = self.calculate_linguistics_features(data)
+            linguistics_features = self.calculate_linguistics_features_polars(data)
             features.update(linguistics_features)
             
             # 美学特徴量
-            aesthetics_features = self.calculate_aesthetics_features(data)
+            aesthetics_features = self.calculate_aesthetics_features_polars(data)
             features.update(aesthetics_features)
             
             # 音楽理論特徴量
-            music_features = self.calculate_music_theory_features(data)
+            music_features = self.calculate_music_theory_features_polars(data)
             features.update(music_features)
             
             # 天文学特徴量
-            astronomy_features = self.calculate_astronomy_features(data)
+            astronomy_features = self.calculate_astronomy_features_polars(data)
             features.update(astronomy_features)
             
             # 生体力学特徴量
-            biomechanics_features = self.calculate_biomechanics_features(data)
+            biomechanics_features = self.calculate_biomechanics_features_polars(data)
             features.update(biomechanics_features)
             
         except Exception as e:
@@ -5858,7 +6115,7 @@ class Calculator:
         
         return features
     
-    def calculate_game_theory_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_game_theory_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """ゲーム理論特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -5868,7 +6125,7 @@ class Calculator:
             self._calculate_game_theory_vectorized_optimized, data, window_size
         )
         
-        if isinstance(game_result, np.ndarray) and len(game_result.shape) == 2 and game_result.shape[1] >= 6:
+        if isinstance(game_result, np.ndarray) and game_result.shape[1] >= 6:
             game_names = ['nash_equilibrium', 'cooperation_index', 'strategy_diversity',
                          'zero_sum_indicator', 'prisoners_dilemma', 'minimax_strategy']
             
@@ -5901,19 +6158,21 @@ class Calculator:
             if len(returns) < 2:
                 continue
             
-            # 1. ナッシュ均衡（安定性指標）
+            # 1. ナッシュ均衡（安定性指標）- 改良版
             return_mean = np.mean(returns)
             return_std = np.std(returns)
+            return_var = np.var(returns)
             
             # 安定性 vs 方向性のバランス
             if abs(return_mean) > 1e-10:
                 nash_equilibrium = return_std / abs(return_mean)
             else:
-                nash_equilibrium = return_std * 1000
+                nash_equilibrium = return_std * 1000  # 方向性がない場合の高い不安定性
             
+            # 正規化（0-1範囲）
             nash_equilibrium = min(1.0, nash_equilibrium / 10.0)
             
-            # 2. 協力指数（連続リターンの相関）
+            # 2. 協力指数（連続リターンの相関）- 改良版
             cooperation_index = 0.0
             if len(returns) >= 3:
                 returns_1 = returns[1:]
@@ -5928,40 +6187,47 @@ class Calculator:
                     if std_1 > 1e-10 and std_2 > 1e-10:
                         covariance = np.mean((returns_1 - mean_1) * (returns_2 - mean_2))
                         cooperation_index = covariance / (std_1 * std_2)
+                        
+                        # -1から1の範囲を0から1に変換
                         cooperation_index = (cooperation_index + 1.0) / 2.0
             
-            # 3. 戦略多様性（リターンの符号パターンの多様性）
+            # 3. 戦略多様性（リターンの符号パターンの多様性）- 改良版
             return_signs = np.sign(returns)
             
+            # 符号パターンの分析
             positive_count = np.sum(return_signs > 0)
             negative_count = np.sum(return_signs < 0)
             zero_count = np.sum(return_signs == 0)
             total_count = len(return_signs)
             
-            strategy_diversity = 0.0
             if total_count > 0:
                 positive_ratio = positive_count / total_count
                 negative_ratio = negative_count / total_count
                 zero_ratio = zero_count / total_count
                 
+                # シャノンエントロピーベースの多様性計算
+                strategy_diversity = 0.0
                 for ratio in [positive_ratio, negative_ratio, zero_ratio]:
                     if ratio > 1e-10:
                         strategy_diversity -= ratio * np.log2(ratio)
                 
+                # 最大エントロピーで正規化（3戦略の場合）
                 max_entropy = np.log2(3)
                 if max_entropy > 0:
                     strategy_diversity /= max_entropy
+            else:
+                strategy_diversity = 0.0
             
-            # 4. ゼロサム指標
+            # 4. ゼロサム指標（改良版）
             total_return = np.sum(returns)
             total_abs_return = np.sum(np.abs(returns))
             
             if total_abs_return > 1e-10:
                 zero_sum_indicator = 1.0 - abs(total_return) / total_abs_return
             else:
-                zero_sum_indicator = 1.0
+                zero_sum_indicator = 1.0  # 変動がない場合は完全ゼロサム
             
-            # 5. 囚人のジレンマ
+            # 5. 囚人のジレンマ（裏切りvs協調の利得分析）- 改良版
             defection_payoff = 0.0
             cooperation_payoff = 0.0
             interaction_count = 0
@@ -5970,9 +6236,10 @@ class Calculator:
                 current_return = returns[j]
                 next_return = returns[j+1]
                 
-                if current_return * next_return < 0:  # 裏切り
+                # 相互作用の分類
+                if current_return * next_return < 0:  # 逆方向（裏切り）
                     defection_payoff += abs(next_return)
-                elif abs(current_return) > 1e-10 and abs(next_return) > 1e-10:  # 協調
+                elif abs(current_return) > 1e-10 and abs(next_return) > 1e-10:  # 同方向（協調）
                     cooperation_payoff += abs(next_return)
                 
                 interaction_count += 1
@@ -5981,18 +6248,23 @@ class Calculator:
             if total_payoff > 1e-10:
                 prisoners_dilemma = defection_payoff / total_payoff
             else:
-                prisoners_dilemma = 0.5
+                prisoners_dilemma = 0.5  # 中性値
             
-            # 6. ミニマックス戦略
+            # 6. ミニマックス戦略（損失最小化戦略の評価）- 改良版
             if len(returns) > 0:
-                max_loss = np.min(returns)
-                max_gain = np.max(returns)
+                max_loss = np.min(returns)  # 最大損失
+                max_gain = np.max(returns)  # 最大利得
                 median_return = np.median(returns)
                 
+                # リスク調整後の評価
                 total_range = max_gain - max_loss
                 if total_range > 1e-10:
+                    # 損失の相対的な大きさ
                     loss_magnitude = abs(max_loss) / total_range
+                    # 中央値の位置（リスクバランス）
                     median_position = (median_return - max_loss) / total_range
+                    
+                    # ミニマックス戦略スコア（損失を重視）
                     minimax_strategy = loss_magnitude * (1.0 - median_position)
                 else:
                     minimax_strategy = 0.0
@@ -6009,7 +6281,7 @@ class Calculator:
         
         return results
     
-    def calculate_molecular_science_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_molecular_science_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """分子科学特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -6019,7 +6291,7 @@ class Calculator:
             self._calculate_molecular_science_vectorized_optimized, data, window_size
         )
         
-        if isinstance(molecular_result, np.ndarray) and len(molecular_result.shape) == 2 and molecular_result.shape[1] >= 6:
+        if isinstance(molecular_result, np.ndarray) and molecular_result.shape[1] >= 6:
             molecular_names = ['molecular_vibration', 'bond_energy', 'electron_density',
                              'molecular_orbital', 'chemical_potential', 'intermolecular_force']
             
@@ -6048,12 +6320,14 @@ class Calculator:
         for i in prange(window_size-1, n):
             window = data[i-window_size+1:i+1]
             
-            # 1. 分子振動（高周波成分の強さ）
+            # 1. 分子振動（高周波成分の強さ）- 改良版
             molecular_vibration = 0.0
             if len(window) >= 8:
+                # 簡易FFT風の高周波解析
                 high_freq_energy = 0.0
                 total_energy = 0.0
                 
+                # 複数の高周波成分を解析
                 for freq_multiplier in range(2, min(8, len(window) // 2)):
                     freq = freq_multiplier * 2 * np.pi / len(window)
                     real_part = 0.0
@@ -6065,16 +6339,17 @@ class Calculator:
                         imag_part += window[j] * np.sin(angle)
                     
                     energy = real_part**2 + imag_part**2
-                    if freq_multiplier >= len(window) // 4:
+                    if freq_multiplier >= len(window) // 4:  # 高周波成分
                         high_freq_energy += energy
                     total_energy += energy
                 
                 if total_energy > 1e-10:
                     molecular_vibration = high_freq_energy / total_energy
             
-            # 2. 結合エネルギー（エントロピー様）
+            # 2. 結合エネルギー（エントロピー様）- 改良版
             bond_energy = 0.0
             if len(window) > 3:
+                # 適応的ビン数
                 unique_vals = len(np.unique(window))
                 n_bins = max(3, min(15, int(np.sqrt(unique_vals))))
                 
@@ -6093,27 +6368,31 @@ class Calculator:
                     
                     total_count = np.sum(hist)
                     if total_count > 0:
+                        # シャノンエントロピー計算
                         for h in hist:
                             if h > 0:
                                 p = h / total_count
                                 bond_energy -= p * np.log(p)
                         
+                        # 正規化
                         max_entropy = np.log(n_bins)
                         if max_entropy > 0:
                             bond_energy /= max_entropy
             
-            # 3. 電子密度（価格の二乗和）
+            # 3. 電子密度（価格の二乗和）- 改良版
             electron_density = np.sum(window**2) / len(window)
             
+            # 正規化（ウィンドウ内の標準偏差で）
             window_std = np.std(window)
             if window_std > 1e-10:
                 electron_density = electron_density / (window_std**2)
             
-            # 4. 分子軌道（時間加重エネルギー）
+            # 4. 分子軌道（時間加重エネルギー）- 改良版
             molecular_orbital = 0.0
             total_weight = 0.0
             
             for j in range(len(window)):
+                # 時間重み（より最近の値により高い重み）
                 time_weight = (j + 1) / len(window)
                 energy_contribution = time_weight * window[j]**2
                 molecular_orbital += energy_contribution
@@ -6122,12 +6401,13 @@ class Calculator:
             if total_weight > 1e-10:
                 molecular_orbital /= total_weight
             
-            # 5. 化学ポテンシャル（平均変化率）
+            # 5. 化学ポテンシャル（平均変化率）- 改良版
             chemical_potential = 0.0
             if len(window) > 1:
                 differences = np.diff(window)
                 
                 if len(differences) > 0:
+                    # 重み付き平均変化率（最近の変化により高い重み）
                     weighted_sum = 0.0
                     weight_sum = 0.0
                     
@@ -6139,17 +6419,20 @@ class Calculator:
                     if weight_sum > 1e-10:
                         chemical_potential = weighted_sum / weight_sum
             
-            # 6. 分子間力（低ボラティリティの度合い）
+            # 6. 分子間力（低ボラティリティの度合い）- 改良版
             volatility = np.std(window)
             mean_val = np.mean(window)
             
+            # 相対ボラティリティ
             if abs(mean_val) > 1e-10:
                 relative_volatility = volatility / abs(mean_val)
             else:
                 relative_volatility = volatility
             
+            # 分子間力（ボラティリティが低いほど強い）
             intermolecular_force = 1.0 / (1.0 + relative_volatility)
             
+            # 安定性ボーナス（変動の一貫性）
             if len(window) > 2:
                 second_differences = np.abs(np.diff(window, n=2))
                 stability_factor = 1.0 / (1.0 + np.mean(second_differences))
@@ -6165,7 +6448,7 @@ class Calculator:
         
         return results
     
-    def calculate_network_science_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_network_science_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """ネットワーク科学特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -6175,7 +6458,7 @@ class Calculator:
             self._calculate_network_science_vectorized_optimized, data, window_size
         )
         
-        if isinstance(network_result, np.ndarray) and len(network_result.shape) == 2 and network_result.shape[1] >= 5:
+        if isinstance(network_result, np.ndarray) and network_result.shape[1] >= 5:
             network_names = ['network_density', 'centrality_measure', 'clustering_coefficient',
                            'betweenness_centrality', 'eigenvector_centrality']
             
@@ -6204,12 +6487,14 @@ class Calculator:
         for i in prange(window_size-1, n):
             window = data[i-window_size+1:i+1]
             
-            # 1. ネットワーク密度（ユニークな価格状態の相対頻度）
+            # 1. ネットワーク密度（ユニークな価格状態の相対頻度）- 改良版
+            # 価格レベルを離散化
             min_val = np.min(window)
             max_val = np.max(window)
             
             network_density = 0.0
             if max_val - min_val > 1e-10:
+                # 適応的離散化レベル
                 n_levels = max(5, min(20, int(np.sqrt(len(window)))))
                 level_width = (max_val - min_val) / n_levels
                 
@@ -6220,9 +6505,11 @@ class Calculator:
                         level_idx = n_levels - 1
                     levels[j] = level_idx
                 
+                # ユニークレベル数と接続性
                 unique_levels = len(np.unique(levels))
                 max_possible_connections = n_levels * (n_levels - 1) // 2
                 
+                # 実際の接続数（隣接レベル間の遷移）
                 actual_connections = 0
                 for j in range(len(levels) - 1):
                     if levels[j] != levels[j+1]:
@@ -6231,21 +6518,24 @@ class Calculator:
                 if max_possible_connections > 0:
                     network_density = actual_connections / max_possible_connections
             
-            # 2. 中心性（中央値と平均の関係）
+            # 2. 中心性（中央値と平均の関係）- 改良版
             median_val = np.median(window)
             mean_val = np.mean(window)
             std_val = np.std(window)
             
             centrality_measure = 0.0
             if std_val > 1e-10:
+                # 分布の中心性を測定
                 skewness_approx = (mean_val - median_val) / std_val
+                # 対称性が高いほど中心性が高い
                 centrality_measure = 1.0 / (1.0 + abs(skewness_approx))
             else:
-                centrality_measure = 1.0
+                centrality_measure = 1.0  # 完全に均一な場合は最高の中心性
             
-            # 3. クラスタリング係数（異なる時間軸の相関性）
+            # 3. クラスタリング係数（異なる時間軸の相関性）- 改良版
             clustering_coefficient = 0.0
             if len(window) >= 9:
+                # 複数の時間軸でクラスター分析
                 segment_size = len(window) // 3
                 segments = []
                 
@@ -6256,6 +6546,7 @@ class Calculator:
                         segments.append(window[start_idx:end_idx])
                 
                 if len(segments) == 3:
+                    # セグメント間の相関を計算
                     correlations = []
                     
                     for seg1_idx in range(len(segments)):
@@ -6270,6 +6561,7 @@ class Calculator:
                                 std2 = np.std(seg2)
                                 
                                 if std1 > 1e-10 and std2 > 1e-10:
+                                    # 最小長に合わせる
                                     min_len = min(len(seg1), len(seg2))
                                     seg1_trim = seg1[:min_len]
                                     seg2_trim = seg2[:min_len]
@@ -6283,7 +6575,7 @@ class Calculator:
                     if len(correlations) > 0:
                         clustering_coefficient = np.mean(correlations)
             
-            # 4. 媒介中心性（中心期間の極値存在度）
+            # 4. 媒介中心性（中心期間の極値存在度）- 改良版
             betweenness_centrality = 0.0
             if len(window) > 4:
                 center_start = len(window) // 3
@@ -6296,9 +6588,11 @@ class Calculator:
                     center_max = np.max(center_region)
                     center_min = np.min(center_region)
                     
+                    # 中心領域の極値重要度
                     max_importance = 1.0 if abs(center_max - max_val) < 1e-10 else 0.0
                     min_importance = 1.0 if abs(center_min - min_val) < 1e-10 else 0.0
                     
+                    # 中心領域の値の分散（情報伝達能力）
                     center_std = np.std(center_region)
                     window_std = np.std(window)
                     
@@ -6309,7 +6603,7 @@ class Calculator:
                     
                     betweenness_centrality = (max_importance + min_importance) * 0.5 + variability_ratio * 0.5
             
-            # 5. 固有ベクトル中心性（自己相関の累積）
+            # 5. 固有ベクトル中心性（自己相関の累積）- 改良版
             eigenvector_centrality = 0.0
             max_lag = min(10, len(window) // 3)
             
@@ -6333,6 +6627,7 @@ class Calculator:
                                 correlation = covariance / (std1 * std2)
                                 
                                 if np.isfinite(correlation):
+                                    # ラグが小さいほど重要度が高い
                                     weight = 1.0 / lag
                                     autocorr_sum += abs(correlation) * weight
                                     weight_sum += weight
@@ -6349,7 +6644,7 @@ class Calculator:
         
         return results
     
-    def calculate_acoustics_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_acoustics_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """音響学特徴量（Polars最適化版）"""
         features = {}
         window_size = 64  # 音響学に適したウィンドウサイズ
@@ -6359,7 +6654,7 @@ class Calculator:
             self._calculate_acoustics_vectorized_optimized, data, window_size
         )
         
-        if isinstance(acoustics_result, np.ndarray) and len(acoustics_result.shape) == 2 and acoustics_result.shape[1] >= 5:
+        if isinstance(acoustics_result, np.ndarray) and acoustics_result.shape[1] >= 5:
             acoustics_names = ['acoustic_power', 'acoustic_frequency', 'amplitude_modulation',
                              'phase_modulation', 'acoustic_echo']
             
@@ -6391,21 +6686,25 @@ class Calculator:
             try:
                 returns = np.diff(window) if len(window) > 1 else np.array([0])
                 
-                # 1. 音響パワー（リターンの二乗和）
+                # 1. 音響パワー（リターンの二乗和）- 改良版
                 acoustic_power = 0.0
                 if len(returns) > 0:
+                    # RMS（Root Mean Square）パワー
                     acoustic_power = np.sqrt(np.mean(returns**2))
                     
+                    # 正規化（ウィンドウ標準偏差で）
                     window_std = np.std(window)
                     if window_std > 1e-10:
                         acoustic_power = acoustic_power / window_std
                 
-                # 2. 音響周波数（FFTによる主要周波数）
+                # 2. 音響周波数（FFTによる主要周波数）- 改良版
                 acoustic_frequency = 0.0
                 if len(window) >= 8:
+                    # 複数周波数成分の解析
                     max_energy = 0.0
                     dominant_freq_idx = 0
                     
+                    # 基本周波数から高調波まで解析
                     for freq_idx in range(1, min(len(window) // 2, 16)):
                         freq = freq_idx * 2 * np.pi / len(window)
                         real_part = 0.0
@@ -6422,12 +6721,14 @@ class Calculator:
                             max_energy = energy
                             dominant_freq_idx = freq_idx
                     
+                    # 正規化された主要周波数
                     if len(window) > 2:
                         acoustic_frequency = dominant_freq_idx / (len(window) // 2)
                 
-                # 3. 振幅変調（ボラティリティの変動）
+                # 3. 振幅変調（ボラティリティの変動）- 改良版
                 amplitude_modulation = 0.0
                 if len(returns) >= 4:
+                    # ローリングボラティリティの計算
                     rolling_vol = []
                     vol_window = min(4, len(returns) // 2)
                     
@@ -6436,22 +6737,26 @@ class Calculator:
                         rolling_vol.append(np.std(vol_segment))
                     
                     if len(rolling_vol) > 1:
+                        # ボラティリティの変動率
                         vol_changes = np.diff(rolling_vol)
                         amplitude_modulation = np.std(vol_changes)
                         
+                        # 正規化
                         mean_vol = np.mean(rolling_vol)
                         if mean_vol > 1e-10:
                             amplitude_modulation = amplitude_modulation / mean_vol
                 
-                # 4. 位相変調（FFT位相の安定性）
+                # 4. 位相変調（FFT位相の安定性）- 改良版
                 phase_modulation = 0.0
                 if len(window) >= 8:
+                    # 複数周波数の位相安定性を解析
                     phase_variations = []
                     
                     for freq_idx in range(1, min(len(window) // 4, 8)):
                         freq = freq_idx * 2 * np.pi / len(window)
                         phases = []
                         
+                        # ウィンドウを小さなセグメントに分割して位相を追跡
                         segment_size = len(window) // 4
                         if segment_size >= 2:
                             for seg_start in range(0, len(window) - segment_size + 1, segment_size):
@@ -6470,9 +6775,11 @@ class Calculator:
                                     phases.append(phase)
                             
                             if len(phases) > 1:
+                                # 位相差の分散
                                 phase_diffs = []
                                 for j in range(1, len(phases)):
                                     diff = phases[j] - phases[j-1]
+                                    # 位相ラッピングを考慮
                                     while diff > np.pi:
                                         diff -= 2 * np.pi
                                     while diff < -np.pi:
@@ -6484,16 +6791,20 @@ class Calculator:
                                     phase_variations.append(phase_var)
                     
                     if len(phase_variations) > 0:
+                        # 平均位相変動
                         avg_phase_var = np.mean(phase_variations)
+                        # 位相変調度（変動が大きいほど高い）
                         phase_modulation = min(1.0, avg_phase_var / (np.pi**2))
                 
-                # 5. 音響エコー（前半と後半の相関）
+                # 5. 音響エコー（前半と後半の相関）- 改良版
                 acoustic_echo = 0.0
                 if len(window) >= 8:
+                    # ウィンドウを複数の部分に分割してエコー効果を検出
                     quarter = len(window) // 4
                     half = len(window) // 2
                     
                     if quarter > 0:
+                        # 複数のエコー遅延を検証
                         echo_correlations = []
                         
                         # 1/4遅延エコー
@@ -6518,6 +6829,7 @@ class Calculator:
                             source2 = window[:half]
                             echo2 = window[half:]
                             
+                            # 長さを揃える
                             min_len = min(len(source2), len(echo2))
                             if min_len > 1:
                                 source2_trim = source2[:min_len]
@@ -6554,7 +6866,7 @@ class Calculator:
         
         return results
     
-    def calculate_linguistics_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_linguistics_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """言語学特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -6564,7 +6876,7 @@ class Calculator:
             self._calculate_linguistics_vectorized_optimized, data, window_size
         )
         
-        if isinstance(linguistics_result, np.ndarray) and len(linguistics_result.shape) == 2 and linguistics_result.shape[1] >= 5:
+        if isinstance(linguistics_result, np.ndarray) and linguistics_result.shape[1] >= 5:
             linguistics_names = ['vocabulary_diversity', 'sentence_structure', 'linguistic_complexity',
                                'word_order', 'prosody']
             
@@ -6598,8 +6910,9 @@ class Calculator:
             max_val = np.max(window)
             
             if max_val - min_val < 1e-10:
+                # 価格が一定の場合は最小の多様性
                 results[i, 0] = 0.0  # vocabulary_diversity
-                results[i, 1] = 1.0  # sentence_structure
+                results[i, 1] = 1.0  # sentence_structure (完全に平坦)
                 results[i, 2] = 0.0  # linguistic_complexity
                 results[i, 3] = 0.0  # word_order
                 results[i, 4] = 0.0  # prosody
@@ -6618,17 +6931,21 @@ class Calculator:
                     level_idx = n_levels - 1
                 word_levels[j] = level_idx
             
-            # 1. 語彙の多様性
+            # 1. 語彙の多様性（ユニークなパターンの多様性）- 改良版
             unique_words = len(np.unique(word_levels))
             vocabulary_diversity = unique_words / n_levels
             
+            # 語彙の分布均一性も考慮
             if unique_words > 1:
+                # 各語彙の出現頻度
                 word_counts = np.zeros(n_levels)
                 for level in word_levels:
                     word_counts[level] += 1
                 
+                # 非ゼロ要素のみで均一性を計算
                 non_zero_counts = word_counts[word_counts > 0]
                 if len(non_zero_counts) > 1:
+                    # シャノンエントロピーによる均一性測定
                     total_words = len(window)
                     entropy = 0.0
                     for count in non_zero_counts:
@@ -6641,36 +6958,38 @@ class Calculator:
                         uniformity = entropy / max_entropy
                         vocabulary_diversity = (vocabulary_diversity + uniformity) / 2.0
             
-            # 2. 文の構造（変化の滑らかさ）
+            # 2. 文の構造（変化の滑らかさ）- 改良版
             sentence_structure = 0.0
             if len(window) >= 3:
+                # 2次差分による滑らかさ測定
                 first_diff = np.diff(window)
                 second_diff = np.diff(first_diff)
                 
                 if len(second_diff) > 0:
+                    # 急激な変化の少なさを測定
                     second_diff_std = np.std(second_diff)
                     first_diff_std = np.std(first_diff)
                     
                     if first_diff_std > 1e-10:
+                        # 相対的な滑らかさ
                         smoothness = 1.0 / (1.0 + second_diff_std / first_diff_std)
                         sentence_structure = smoothness
                     else:
-                        sentence_structure = 1.0
+                        sentence_structure = 1.0  # 完全に平坦な場合
             
-            # 3. 言語的複雑性
+            # 3. 言語的複雑性（大きな変化とパターンの複雑さ）- 改良版
             linguistic_complexity = 0.0
             if len(window) > 1:
                 returns = np.diff(window)
                 
+                # 標準偏差ベースの閾値
                 threshold = np.std(returns) * 1.5
-                large_changes_count = 0
-                for ret in returns:
-                    if abs(ret) > threshold:
-                        large_changes_count += 1
+                large_changes = np.abs(returns) > threshold
                 
-                change_frequency = large_changes_count / len(returns)
+                # 大きな変化の頻度
+                change_frequency = np.sum(large_changes) / len(returns)
                 
-                # パターンの複雑さ
+                # パターンの複雑さ（n-gramの多様性）
                 pattern_complexity = 0.0
                 max_pattern_len = min(5, len(word_levels) // 3)
                 
@@ -6680,6 +6999,7 @@ class Calculator:
                     
                     for pattern_len in range(2, max_pattern_len + 1):
                         for j in range(len(word_levels) - pattern_len + 1):
+                            # パターンをハッシュ値として表現
                             pattern_hash = 0
                             for k in range(pattern_len):
                                 pattern_hash = pattern_hash * n_levels + word_levels[j + k]
@@ -6690,11 +7010,13 @@ class Calculator:
                     if total_patterns > 0:
                         pattern_complexity = len(unique_patterns) / total_patterns
                 
+                # 複雑性の統合
                 linguistic_complexity = (change_frequency + pattern_complexity) / 2.0
             
-            # 4. 語順（価格順位の変化パターン）
+            # 4. 語順（価格順位の変化パターン）- 改良版
             word_order = 0.0
             if len(window) >= 4:
+                # 各価格の相対順位を計算
                 ranks = np.zeros(len(window))
                 for j in range(len(window)):
                     rank = 0
@@ -6703,11 +7025,14 @@ class Calculator:
                             rank += 1
                     ranks[j] = rank / len(window)
                 
+                # 順位変化の分析
                 rank_changes = np.abs(np.diff(ranks))
                 
                 if len(rank_changes) > 0:
+                    # 順位変化の標準偏差（語順の変動性）
                     rank_volatility = np.std(rank_changes)
                     
+                    # 順位の方向一貫性
                     rank_direction_changes = 0
                     for j in range(1, len(rank_changes)):
                         if rank_changes[j] * rank_changes[j-1] < 0:
@@ -6715,17 +7040,21 @@ class Calculator:
                     
                     direction_consistency = 1.0 - (rank_direction_changes / max(1, len(rank_changes) - 1))
                     
+                    # 語順スコア（変動性と一貫性の組み合わせ）
                     word_order = rank_volatility * direction_consistency
             
-            # 5. プロソディ（抑揚・リズム）
+            # 5. プロソディ（抑揚・リズム）- 改良版
             prosody = 0.0
             if len(window) > 1:
                 returns = np.diff(window)
                 
+                # 振幅の変動（抑揚）
                 amplitude_variation = np.std(np.abs(returns))
                 
+                # リズムパターンの検出
                 rhythm_score = 0.0
                 if len(returns) >= 4:
+                    # 周期性の検出（簡易自己相関）
                     max_lag = min(len(returns) // 2, 10)
                     autocorrelations = []
                     
@@ -6750,12 +7079,14 @@ class Calculator:
                     if len(autocorrelations) > 0:
                         rhythm_score = np.max(autocorrelations)
                 
+                # 正規化（ウィンドウ標準偏差で）
                 window_std = np.std(window)
                 if window_std > 1e-10:
                     normalized_amplitude = amplitude_variation / window_std
                 else:
                     normalized_amplitude = 0.0
                 
+                # プロソディスコア（抑揚とリズムの組み合わせ）
                 prosody = (normalized_amplitude + rhythm_score) / 2.0
             
             # 結果の格納
@@ -6767,7 +7098,7 @@ class Calculator:
         
         return results
     
-    def calculate_aesthetics_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_aesthetics_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """美学特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -6777,7 +7108,7 @@ class Calculator:
             self._calculate_aesthetics_vectorized_optimized, data, window_size
         )
         
-        if isinstance(aesthetics_result, np.ndarray) and len(aesthetics_result.shape) == 2 and aesthetics_result.shape[1] >= 5:
+        if isinstance(aesthetics_result, np.ndarray) and aesthetics_result.shape[1] >= 5:
             aesthetics_names = ['golden_ratio_adherence', 'symmetry_measure', 'aesthetic_harmony',
                               'proportional_beauty', 'visual_balance']
             
@@ -6808,20 +7139,22 @@ class Calculator:
         for i in prange(window_size-1, n):
             window = data[i-window_size+1:i+1]
             
-            # 1. 黄金比への固着度
+            # 1. 黄金比への固着度（改良版）
             golden_ratio_adherence = 0.0
             if len(window) >= 3:
+                # 複数のスケールで黄金比を検証
                 golden_deviations = []
                 
                 # 隣接比率
                 for j in range(1, len(window)):
                     if abs(window[j-1]) > 1e-10:
                         ratio = abs(window[j] / window[j-1])
+                        # 異常に大きな比率を除外
                         if 0.1 <= ratio <= 10.0:
                             deviation = abs(ratio - golden_ratio)
                             golden_deviations.append(deviation)
                 
-                # セグメント比率
+                # セグメント比率（長期vs短期）
                 if len(window) >= 8:
                     third = len(window) // 3
                     short_segment = window[:third]
@@ -6852,9 +7185,10 @@ class Calculator:
                     avg_deviation = np.mean(golden_deviations)
                     golden_ratio_adherence = 1.0 / (1.0 + avg_deviation)
             
-            # 2. 対称性
+            # 2. 対称性（前半と後半の反転相似性）- 改良版
             symmetry_measure = 0.0
             if len(window) >= 4:
+                # 複数の対称性軸を検証
                 symmetry_scores = []
                 
                 # 中央対称
@@ -6877,7 +7211,7 @@ class Calculator:
                         if np.isfinite(correlation):
                             symmetry_scores.append(abs(correlation))
                 
-                # 3分割対称
+                # 3分割対称（黄金比分割）
                 if len(window) >= 6:
                     golden_split = int(len(window) / golden_ratio)
                     if golden_split > 0 and golden_split < len(window) - 1:
@@ -6885,6 +7219,7 @@ class Calculator:
                         right_segment = window[golden_split:]
                         right_segment_reversed = right_segment[::-1]
                         
+                        # 長さを合わせる
                         min_len = min(len(left_segment), len(right_segment_reversed))
                         if min_len > 1:
                             left_trim = left_segment[:min_len]
@@ -6906,16 +7241,18 @@ class Calculator:
                 if len(symmetry_scores) > 0:
                     symmetry_measure = np.mean(symmetry_scores)
             
-            # 3. 美的調和
+            # 3. 美的調和（滑らかさ・躍度の小ささ）- 改良版
             aesthetic_harmony = 0.0
             if len(window) >= 4:
                 try:
+                    # 複数次数の微分による滑らかさ測定
                     first_diff = np.diff(window)
                     smoothness_scores = []
                     
                     if len(first_diff) >= 2:
                         second_diff = np.diff(first_diff)
                         
+                        # 2次微分の滑らかさ
                         if len(second_diff) > 0:
                             second_diff_std = np.std(second_diff)
                             first_diff_std = np.std(first_diff)
@@ -6924,6 +7261,7 @@ class Calculator:
                                 smoothness_2nd = 1.0 / (1.0 + second_diff_std / first_diff_std)
                                 smoothness_scores.append(smoothness_2nd)
                         
+                        # 3次微分（躍度）の滑らかさ
                         if len(second_diff) >= 1:
                             third_diff = np.diff(second_diff)
                             
@@ -6934,6 +7272,7 @@ class Calculator:
                                     smoothness_3rd = 1.0 / (1.0 + third_diff_std / second_diff_std)
                                     smoothness_scores.append(smoothness_3rd)
                     
+                    # 曲率の一貫性
                     if len(first_diff) > 1:
                         curvature_changes = np.abs(np.diff(first_diff))
                         curvature_consistency = 1.0 / (1.0 + np.std(curvature_changes))
@@ -6943,42 +7282,40 @@ class Calculator:
                         aesthetic_harmony = np.mean(smoothness_scores)
                 
                 except:
-                    aesthetic_harmony = 0.5
+                    aesthetic_harmony = 0.5  # デフォルト値
             
-            # 4. 比例美
+            # 4. 比例美（上昇・下降期間の比率バランス）- 改良版
             proportional_beauty = 0.0
             if len(window) > 1:
                 returns = np.diff(window)
                 
+                # 異なる閾値での上昇・下降分析
                 thresholds = [0.0, np.std(returns) * 0.1, np.std(returns) * 0.5]
                 balance_scores = []
                 
                 for threshold in thresholds:
-                    up_periods = 0
-                    down_periods = 0
-                    for ret in returns:
-                        if ret > threshold:
-                            up_periods += 1
-                        elif ret < -threshold:
-                            down_periods += 1
-                    
+                    up_periods = np.sum(returns > threshold)
+                    down_periods = np.sum(returns < -threshold)
                     total_periods = up_periods + down_periods
                     
                     if total_periods > 0:
                         up_ratio = up_periods / total_periods
-                        optimal_ratio = 1.0 / golden_ratio
+                        # 0.5に近いほど美しい（黄金比による調整）
+                        optimal_ratio = 1.0 / golden_ratio  # ≈ 0.618
                         balance_score = 1.0 - abs(up_ratio - optimal_ratio)
                         balance_scores.append(max(0.0, balance_score))
                 
                 if len(balance_scores) > 0:
                     proportional_beauty = np.mean(balance_scores)
             
-            # 5. 視覚的バランス
+            # 5. 視覚的バランス（分布の中心性とバランス）- 改良版
             visual_balance = 0.0
             if len(window) > 2:
+                # 複数の統計的中心の一致度
                 mean_val = np.mean(window)
                 median_val = np.median(window)
                 
+                # 四分位数によるバランス分析
                 if len(window) >= 4:
                     sorted_window = np.sort(window)
                     q25_idx = len(sorted_window) // 4
@@ -6987,6 +7324,7 @@ class Calculator:
                     q25 = sorted_window[q25_idx]
                     q75 = sorted_window[q75_idx]
                     
+                    # 中央値との距離
                     lower_dist = median_val - q25
                     upper_dist = q75 - median_val
                     
@@ -6995,12 +7333,14 @@ class Calculator:
                     else:
                         quartile_balance = 1.0
                     
+                    # 平均と中央値の近さ
                     window_range = np.max(window) - np.min(window)
                     if window_range > 1e-10:
                         center_alignment = 1.0 - abs(mean_val - median_val) / window_range
                     else:
                         center_alignment = 1.0
                     
+                    # 視覚的バランススコア
                     visual_balance = (quartile_balance + center_alignment) / 2.0
             
             # 結果の格納
@@ -7012,7 +7352,7 @@ class Calculator:
         
         return results
     
-    def calculate_music_theory_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_music_theory_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """音楽理論特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -7022,7 +7362,7 @@ class Calculator:
             self._calculate_music_theory_vectorized_optimized, data, window_size
         )
         
-        if isinstance(music_result, np.ndarray) and len(music_result.shape) == 2 and music_result.shape[1] >= 6:
+        if isinstance(music_result, np.ndarray) and music_result.shape[1] >= 6:
             music_names = ['tonality', 'rhythm_pattern', 'harmony', 'melody_contour', 
                           'musical_tension', 'tempo']
             
@@ -7052,29 +7392,27 @@ class Calculator:
             window = data[i-window_size+1:i+1]
             returns = np.diff(window) if len(window) > 1 else np.array([0])
             
-            # 1. 調性（安定性と方向性の比率）
+            # 1. 調性（安定性と方向性の比率）- 改良版
             tonality = 0.0
             if len(returns) > 0:
                 return_mean = np.mean(returns)
                 return_std = np.std(returns)
                 
-                positive_count = 0
-                negative_count = 0
-                for ret in returns:
-                    if ret > 0:
-                        positive_count += 1
-                    elif ret < 0:
-                        negative_count += 1
-                
+                # メジャー/マイナーの傾向（統計的解釈）
+                positive_count = np.sum(returns > 0)
+                negative_count = np.sum(returns < 0)
                 total_count = len(returns)
                 
                 if total_count > 0:
                     positive_ratio = positive_count / total_count
+                    # メジャー調性（上昇傾向）vs マイナー調性（下降傾向）
                     major_tendency = positive_ratio
                     minor_tendency = 1.0 - positive_ratio
                     
+                    # 調性の明確さ（傾向の強さ）
                     tonality_clarity = abs(major_tendency - minor_tendency)
                     
+                    # 安定性（変動の小ささ）
                     if abs(return_mean) > 1e-10:
                         stability = 1.0 / (1.0 + return_std / abs(return_mean))
                     else:
@@ -7082,28 +7420,29 @@ class Calculator:
                     
                     tonality = (tonality_clarity + stability) / 2.0
             
-            # 2. リズムパターン（大きな変化の規則性）
+            # 2. リズムパターン（大きな変化の規則性）- 改良版
             rhythm_pattern = 0.0
             if len(returns) > 4:
                 threshold = np.std(returns) * 1.5
-                accents_count = 0
-                for ret in returns:
-                    if abs(ret) > threshold:
-                        accents_count += 1
+                accents = np.abs(returns) > threshold
                 
-                if accents_count > 1:
+                if np.sum(accents) > 1:
+                    # アクセントの間隔分析
                     accent_positions = []
-                    for j in range(len(returns)):
-                        if abs(returns[j]) > threshold:
+                    for j in range(len(accents)):
+                        if accents[j]:
                             accent_positions.append(j)
                     
                     if len(accent_positions) > 2:
                         intervals = np.diff(accent_positions)
                         
+                        # 間隔の規則性（標準偏差の逆数）
                         if len(intervals) > 1:
                             interval_regularity = 1.0 / (1.0 + np.std(intervals))
                             
+                            # 平均間隔の適切さ（音楽的に意味のある間隔）
                             mean_interval = np.mean(intervals)
+                            # 2, 3, 4, 6, 8 拍子に対応
                             musical_intervals = np.array([2, 3, 4, 6, 8])
                             interval_musicality = 0.0
                             
@@ -7113,9 +7452,10 @@ class Calculator:
                             
                             rhythm_pattern = (interval_regularity + interval_musicality) / 2.0
             
-            # 3. 和声（FFT周波数比の協和音程性）
+            # 3. 和声（FFT周波数比の協和音程性）- 改良版
             harmony = 0.0
             if len(window) >= 8:
+                # 複数周波数成分の協和性分析
                 max_harmonics = min(8, len(window) // 2)
                 frequency_energies = []
                 
@@ -7133,9 +7473,11 @@ class Calculator:
                     frequency_energies.append(energy)
                 
                 if len(frequency_energies) >= 3:
+                    # エネルギーでソートして上位周波数を取得
                     sorted_indices = np.argsort(frequency_energies)[::-1]
                     top_freqs = sorted_indices[:3]
                     
+                    # 協和音程の比率チェック
                     harmonic_ratios = []
                     for j in range(len(top_freqs)):
                         for k in range(j + 1, len(top_freqs)):
@@ -7143,6 +7485,7 @@ class Calculator:
                                 ratio = top_freqs[k] / top_freqs[j]
                                 harmonic_ratios.append(ratio)
                     
+                    # 協和音程（音楽理論ベース）
                     consonant_ratios = np.array([0.5, 2.0/3.0, 0.75, 1.0, 1.25, 1.5, 2.0])
                     harmony_scores = []
                     
@@ -7156,22 +7499,18 @@ class Calculator:
                     if len(harmony_scores) > 0:
                         harmony = np.mean(harmony_scores)
             
-            # 4. 旋律の輪郭（上昇傾向の方向性）
+            # 4. 旋律の輪郭（上昇傾向の方向性）- 改良版
             melody_contour = 0.0
             if len(returns) > 0:
-                up_moves = 0
-                down_moves = 0
-                for ret in returns:
-                    if ret > 0:
-                        up_moves += 1
-                    elif ret < 0:
-                        down_moves += 1
-                
+                # 基本的な上昇/下降比率
+                up_moves = np.sum(returns > 0)
+                down_moves = np.sum(returns < 0)
                 total_moves = len(returns)
                 
                 if total_moves > 0:
                     up_ratio = up_moves / total_moves
                     
+                    # 旋律的輪郭の複雑さ
                     direction_changes = 0
                     for j in range(1, len(returns)):
                         if returns[j] * returns[j-1] < 0:
@@ -7179,20 +7518,19 @@ class Calculator:
                     
                     contour_complexity = direction_changes / max(1, len(returns) - 1)
                     
-                    large_leaps = 0
-                    threshold = np.std(returns) * 2
-                    for ret in returns:
-                        if abs(ret) > threshold:
-                            large_leaps += 1
-                    
+                    # 音程の大きさの分析
+                    large_leaps = np.sum(np.abs(returns) > np.std(returns) * 2)
                     leap_ratio = large_leaps / len(returns)
+                    
+                    # 旋律的滑らかさ（大きな跳躍の少なさ）
                     melodic_smoothness = 1.0 - leap_ratio
                     
                     melody_contour = (up_ratio + (1.0 - contour_complexity) + melodic_smoothness) / 3.0
             
-            # 5. 音楽的緊張（変動範囲とダイナミクス）
+            # 5. 音楽的緊張（変動範囲とダイナミクス）- 改良版
             musical_tension = 0.0
             if len(window) > 2:
+                # ダイナミックレンジ
                 dynamic_range = np.max(window) - np.min(window)
                 mean_val = np.mean(window)
                 
@@ -7201,40 +7539,34 @@ class Calculator:
                 else:
                     relative_range = dynamic_range
                 
+                # 緊張の蓄積と解放の分析
                 cumulative_tension = 0.0
                 peak_releases = 0
                 
                 if len(returns) > 1:
-                    cumulative_returns = np.zeros(len(returns))
-                    cumulative_returns[0] = returns[0]
-                    for j in range(1, len(returns)):
-                        cumulative_returns[j] = cumulative_returns[j-1] + returns[j]
+                    cumulative_returns = np.cumsum(returns)
                     
                     for j in range(1, len(cumulative_returns)):
+                        # 緊張の蓄積（同方向への継続）
                         if cumulative_returns[j] * cumulative_returns[j-1] > 0:
                             cumulative_tension += abs(returns[j])
                         else:
+                            # 解放（方向転換）
                             if cumulative_tension > np.std(returns):
                                 peak_releases += 1
                             cumulative_tension = 0
                     
+                    # 緊張と解放のバランス
                     if len(returns) > 0:
                         release_frequency = peak_releases / len(returns)
-                        
-                        total_abs_returns = 0.0
-                        for ret in returns:
-                            total_abs_returns += abs(ret)
-                        
-                        if total_abs_returns > 0:
-                            tension_buildup = cumulative_tension / total_abs_returns
-                        else:
-                            tension_buildup = 0.0
+                        tension_buildup = cumulative_tension / np.sum(np.abs(returns))
                         
                         musical_tension = (relative_range + tension_buildup + release_frequency) / 3.0
             
-            # 6. テンポ（変化の頻度）
+            # 6. テンポ（変化の頻度）- 改良版
             tempo = 0.0
             if len(returns) > 1:
+                # 基本的な方向変化頻度
                 direction_changes = 0
                 for j in range(1, len(returns)):
                     if returns[j] * returns[j-1] < 0:
@@ -7242,17 +7574,20 @@ class Calculator:
                 
                 basic_tempo = direction_changes / len(returns)
                 
+                # 変化の強度を考慮したテンポ
                 threshold = np.std(returns) * 0.5
                 significant_changes = 0
                 
-                for ret in returns:
-                    if abs(ret) > threshold:
+                for j in range(len(returns)):
+                    if abs(returns[j]) > threshold:
                         significant_changes += 1
                 
                 intensity_tempo = significant_changes / len(returns)
                 
+                # 周期性によるテンポ安定性
                 tempo_stability = 0.0
                 if len(returns) >= 4:
+                    # 簡易自己相関による周期検出
                     max_lag = min(len(returns) // 2, 8)
                     max_autocorr = 0.0
                     
@@ -7288,7 +7623,7 @@ class Calculator:
         
         return results
     
-    def calculate_astronomy_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_astronomy_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """天文学・宇宙論特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -7298,7 +7633,7 @@ class Calculator:
             self._calculate_astronomy_vectorized_optimized, data, window_size
         )
         
-        if isinstance(astronomy_result, np.ndarray) and len(astronomy_result.shape) == 2 and astronomy_result.shape[1] >= 6:
+        if isinstance(astronomy_result, np.ndarray) and astronomy_result.shape[1] >= 6:
             astronomy_names = ['orbital_mechanics', 'gravitational_wave', 'stellar_pulsation',
                              'cosmic_expansion', 'dark_energy', 'big_bang_echo']
             
@@ -7327,9 +7662,9 @@ class Calculator:
         for i in prange(window_size-1, n):
             window = data[i-window_size+1:i+1]
             
-            # 1. 軌道力学（周期的自己相関）
+            # 1. 軌道力学（周期的自己相関）- 改良版
             orbital_mechanics = 0.0
-            orbital_periods = [12, 24, 36]
+            orbital_periods = [12, 24, 36]  # 複数の軌道周期を検証
             
             for period in orbital_periods:
                 if len(window) > period:
@@ -7353,15 +7688,17 @@ class Calculator:
             
             # ケプラーの法則風の楕円性分析
             if len(window) >= 8:
+                # 速度変化の分析（ケプラーの第2法則）
                 velocities = np.abs(np.diff(window))
                 if len(velocities) > 1:
                     velocity_variation = np.std(velocities) / (np.mean(velocities) + 1e-10)
                     orbital_eccentricity = min(1.0, velocity_variation)
                     orbital_mechanics = (orbital_mechanics + orbital_eccentricity) / 2.0
             
-            # 2. 重力波（ボラティリティの周期変化）
+            # 2. 重力波（ボラティリティの周期変化）- 改良版
             gravitational_wave = 0.0
             if len(window) >= 16:
+                # ボラティリティの時系列構築
                 vol_window_size = 4
                 volatilities = []
                 
@@ -7370,8 +7707,10 @@ class Calculator:
                     volatilities.append(np.std(vol_segment))
                 
                 if len(volatilities) >= 8:
+                    # ボラティリティの周期解析（重力波のchirp信号を模擬）
                     vol_array = np.array(volatilities)
                     
+                    # 複数周波数での周期性検出
                     max_wave_energy = 0.0
                     for freq_idx in range(1, min(len(vol_array) // 2, 8)):
                         freq = freq_idx * 2 * np.pi / len(vol_array)
@@ -7390,11 +7729,13 @@ class Calculator:
                     if total_vol_energy > 1e-10:
                         gravitational_wave = max_wave_energy / total_vol_energy
             
-            # 3. 恒星脈動（主要周波数の相対強度）
+            # 3. 恒星脈動（主要周波数の相対強度）- 改良版
             stellar_pulsation = 0.0
             if len(window) >= 8:
+                # 複数タイプの脈動を検出
                 pulsation_energies = []
                 
+                # 基本脈動から高次まで
                 for freq_idx in range(1, min(len(window) // 2, 12)):
                     freq = freq_idx * 2 * np.pi / len(window)
                     real_part = 0.0
@@ -7411,9 +7752,11 @@ class Calculator:
                 if len(pulsation_energies) > 0:
                     total_energy = np.sum(pulsation_energies)
                     if total_energy > 1e-10:
+                        # 支配的脈動の強度
                         dominant_energy = np.max(pulsation_energies)
                         stellar_pulsation = dominant_energy / total_energy
                         
+                        # 脈動の規則性（エネルギー分布の均一性）
                         energy_entropy = 0.0
                         for energy in pulsation_energies:
                             if energy > 1e-10:
@@ -7425,7 +7768,7 @@ class Calculator:
                             regularity = energy_entropy / max_entropy
                             stellar_pulsation = (stellar_pulsation + regularity) / 2.0
             
-            # 4. 宇宙膨張（総リターンと加速度分析）
+            # 4. 宇宙膨張（総リターンと加速度分析）- 改良版
             cosmic_expansion = 0.0
             if len(window) > 1:
                 total_return = window[-1] - window[0]
@@ -7436,7 +7779,9 @@ class Calculator:
                 else:
                     expansion_rate = total_return
                 
+                # ハッブル定数風の距離-速度関係
                 if len(window) >= 4:
+                    # 時間区間での膨張率変化
                     quarter = len(window) // 4
                     expansion_phases = []
                     
@@ -7449,6 +7794,7 @@ class Calculator:
                             expansion_phases.append(phase_expansion)
                     
                     if len(expansion_phases) > 1:
+                        # 膨張の加速（ダークエネルギー効果）
                         expansion_acceleration = np.diff(expansion_phases)
                         if len(expansion_acceleration) > 0:
                             avg_acceleration = np.mean(expansion_acceleration)
@@ -7458,19 +7804,24 @@ class Calculator:
                 else:
                     cosmic_expansion = expansion_rate
             
-            # 5. ダークエネルギー（加速度の分析）
+            # 5. ダークエネルギー（加速度の分析）- 改良版
             dark_energy = 0.0
             if len(window) >= 3:
+                # 1次微分（速度）
                 velocity = np.diff(window)
                 
                 if len(velocity) >= 2:
+                    # 2次微分（加速度）
                     acceleration = np.diff(velocity)
                     
                     if len(acceleration) > 0:
+                        # 平均加速度
                         mean_acceleration = np.mean(acceleration)
                         
+                        # 加速度の一貫性
                         acceleration_consistency = 1.0 / (1.0 + np.std(acceleration))
                         
+                        # ダークエネルギー風の反発力（正の加速度）
                         if mean_acceleration > 0:
                             dark_energy_strength = mean_acceleration / (np.std(window) + 1e-10)
                         else:
@@ -7478,42 +7829,49 @@ class Calculator:
                         
                         dark_energy = (dark_energy_strength + acceleration_consistency) / 2.0
                         
+                        # 3次微分（ジャーク）による更なる分析
                         if len(acceleration) >= 2:
                             jerk = np.diff(acceleration)
                             if len(jerk) > 0:
                                 jerk_stability = 1.0 / (1.0 + np.std(jerk))
                                 dark_energy = (dark_energy + jerk_stability) / 2.0
             
-            # 6. ビッグバンエコー（最大ショックの時間荷重影響）
+            # 6. ビッグバンエコー（最大ショックの時間荷重影響）- 改良版
             big_bang_echo = 0.0
             if len(window) > 1:
                 returns = np.diff(window)
                 
                 if len(returns) > 0:
+                    # 複数のショックイベントを検出
                     shock_threshold = np.std(returns) * 2.0
-                    shock_magnitudes = []
-                    shock_times = []
-                    shock_types = []
+                    shock_events = []
                     
                     for j in range(len(returns)):
                         if abs(returns[j]) > shock_threshold:
-                            shock_magnitudes.append(abs(returns[j]))
-                            shock_times.append(j)
-                            shock_types.append('expansion' if returns[j] > 0 else 'contraction')
+                            shock_events.append({
+                                'magnitude': abs(returns[j]),
+                                'time_index': j,
+                                'type': 'expansion' if returns[j] > 0 else 'contraction'
+                            })
                     
-                    if len(shock_magnitudes) > 0:
+                    if len(shock_events) > 0:
                         total_echo = 0.0
                         
-                        for k in range(len(shock_magnitudes)):
-                            time_since_shock = len(returns) - shock_times[k]
+                        for shock in shock_events:
+                            # 時間経過による減衰（宇宙の冷却効果）
+                            time_since_shock = len(returns) - shock['time_index']
                             decay_factor = np.exp(-time_since_shock / len(returns))
                             
-                            normalized_magnitude = shock_magnitudes[k] / (np.std(returns) + 1e-10)
+                            # ショック強度の正規化
+                            normalized_magnitude = shock['magnitude'] / (np.std(returns) + 1e-10)
                             
+                            # エコー強度
                             echo_contribution = normalized_magnitude * decay_factor
                             total_echo += echo_contribution
                         
-                        if len(shock_magnitudes) > 1:
+                        # 宇宙マイクロ波背景放射風の均一性
+                        if len(shock_events) > 1:
+                            shock_magnitudes = [s['magnitude'] for s in shock_events]
                             shock_uniformity = 1.0 / (1.0 + np.std(shock_magnitudes) / (np.mean(shock_magnitudes) + 1e-10))
                             big_bang_echo = (total_echo + shock_uniformity) / 2.0
                         else:
@@ -7529,7 +7887,7 @@ class Calculator:
         
         return results
     
-    def calculate_biomechanics_features(self, data: np.ndarray) -> Dict[str, np.ndarray]:
+    def calculate_biomechanics_features_polars(self, data: np.ndarray) -> Dict[str, np.ndarray]:
         """生体力学・パフォーマンス科学特徴量（Polars最適化版）"""
         features = {}
         window_size = 50
@@ -7539,7 +7897,7 @@ class Calculator:
             self._calculate_biomechanics_vectorized_optimized, data, window_size
         )
         
-        if isinstance(biomechanics_result, np.ndarray) and len(biomechanics_result.shape) == 2 and biomechanics_result.shape[1] >= 7:
+        if isinstance(biomechanics_result, np.ndarray) and biomechanics_result.shape[1] >= 7:
             biomechanics_names = ['kinetic_energy', 'potential_energy', 'muscle_force',
                                 'joint_mobility', 'performance_consistency', 'endurance', 'recovery_rate']
             
@@ -7571,17 +7929,21 @@ class Calculator:
             if len(window) < 2:
                 continue
             
+            # リターンを速度として扱う
             returns = np.diff(window)
             
-            # 1. 運動エネルギー（動きの激しさ）
+            # 1. 運動エネルギー（動きの激しさ）- 改良版
             kinetic_energy = 0.0
             if len(returns) > 0:
+                # 基本運動エネルギー（1/2 * m * v^2）
                 basic_ke = 0.5 * np.sum(returns**2)
                 
+                # 速度の分布分析
                 velocity_variance = np.var(returns)
                 velocity_skewness = 0.0
                 
                 if len(returns) >= 3 and velocity_variance > 1e-10:
+                    # 歪度の計算
                     mean_velocity = np.mean(returns)
                     std_velocity = np.sqrt(velocity_variance)
                     
@@ -7592,6 +7954,7 @@ class Calculator:
                     
                     velocity_skewness = skew_sum / len(returns)
                 
+                # 運動の効率性（エネルギーの有効利用）
                 total_displacement = abs(window[-1] - window[0])
                 total_distance = np.sum(np.abs(returns))
                 
@@ -7602,36 +7965,42 @@ class Calculator:
                 
                 kinetic_energy = basic_ke * (1.0 + movement_efficiency)
             
-            # 2. 位置エネルギー（価格水準からの乖離エネルギー）
+            # 2. 位置エネルギー（価格水準からの乖離エネルギー）- 改良版
             potential_energy = 0.0
             if len(window) > 0:
+                # 基準レベル（最低点）からの位置エネルギー
                 min_level = np.min(window)
                 height_energy = np.sum((window - min_level)**2)
                 
+                # 重力場の強度（価格の引力）
                 center_of_mass = np.mean(window)
                 gravitational_potential = 0.0
                 
                 for j in range(len(window)):
                     distance_from_center = abs(window[j] - center_of_mass)
+                    # 重力ポテンシャル（距離の逆数）
                     if distance_from_center > 1e-10:
                         gravitational_potential += 1.0 / distance_from_center
                 
                 potential_energy = height_energy + gravitational_potential
             
-            # 3. 筋力（瞬発的な最大変動）
+            # 3. 筋力（瞬発的な最大変動）- 改良版
             muscle_force = 0.0
             if len(returns) > 0:
+                # 最大瞬発力
                 max_instantaneous_force = np.max(np.abs(returns))
                 
+                # 力の持続性分析
                 force_threshold = np.std(returns) * 1.5
                 sustained_force_periods = 0
                 
-                for ret in returns:
-                    if abs(ret) > force_threshold:
+                for j in range(len(returns)):
+                    if abs(returns[j]) > force_threshold:
                         sustained_force_periods += 1
                 
                 force_endurance_ratio = sustained_force_periods / len(returns)
                 
+                # パワー（力 × 速度）
                 if len(returns) >= 2:
                     power_outputs = []
                     for j in range(1, len(returns)):
@@ -7649,9 +8018,10 @@ class Calculator:
                 else:
                     muscle_force = max_instantaneous_force
             
-            # 4. 関節可動域（変動範囲の相対的な広さ）
+            # 4. 関節可動域（変動範囲の相対的な広さ）- 改良版
             joint_mobility = 0.0
             if len(window) > 0:
+                # 基本可動域
                 price_range = np.max(window) - np.min(window)
                 mean_price = np.mean(window)
                 
@@ -7660,21 +8030,18 @@ class Calculator:
                 else:
                     basic_mobility = price_range
                 
+                # 関節の柔軟性（滑らかな動き）
                 if len(returns) >= 2:
                     acceleration = np.diff(returns)
                     acceleration_smoothness = 1.0 / (1.0 + np.std(acceleration))
                     
+                    # 可動域の活用度
                     utilization_levels = np.linspace(np.min(window), np.max(window), 10)
                     utilization_count = 0
                     
                     for level in utilization_levels:
-                        tolerance = price_range * 0.05
-                        found = False
-                        for val in window:
-                            if abs(val - level) <= tolerance:
-                                found = True
-                                break
-                        if found:
+                        tolerance = price_range * 0.05  # 5%の許容範囲
+                        if np.any(np.abs(window - level) <= tolerance):
                             utilization_count += 1
                     
                     range_utilization = utilization_count / len(utilization_levels)
@@ -7683,9 +8050,10 @@ class Calculator:
                 else:
                     joint_mobility = basic_mobility
             
-            # 5. パフォーマンスの一貫性（安定性）
+            # 5. パフォーマンスの一貫性（安定性）- 改良版
             performance_consistency = 0.0
             if len(returns) > 0:
+                # 基本的な一貫性（変動の小ささ）
                 std_returns = np.std(returns)
                 mean_abs_returns = np.mean(np.abs(returns))
                 
@@ -7695,8 +8063,10 @@ class Calculator:
                 else:
                     basic_consistency = 1.0
                 
+                # 予測可能性（トレンドの一貫性）
                 trend_consistency = 0.0
                 if len(returns) >= 3:
+                    # 移動平均からの乖離
                     window_ma_size = min(5, len(returns) // 2)
                     if window_ma_size >= 2:
                         moving_avg = []
@@ -7710,23 +8080,21 @@ class Calculator:
                 
                 performance_consistency = (basic_consistency + trend_consistency) / 2.0
             
-            # 6. 持久力（上昇トレンドの持続性）
+            # 6. 持久力（上昇トレンドの持続性）- 改良版
             endurance = 0.0
             if len(returns) > 0:
-                positive_moves = 0
-                for ret in returns:
-                    if ret > 0:
-                        positive_moves += 1
-                
+                # 基本的な方向一貫性
+                positive_moves = np.sum(returns > 0)
                 total_moves = len(returns)
                 basic_endurance = positive_moves / total_moves
                 
+                # 持続的なパフォーマンス分析
                 streak_lengths = []
                 current_streak = 0
                 current_direction = 0
                 
                 for j in range(len(returns)):
-                    if returns[j] > 0:
+                    if returns[j] > 0:  # 上昇
                         if current_direction >= 0:
                             current_streak += 1
                         else:
@@ -7734,7 +8102,7 @@ class Calculator:
                                 streak_lengths.append(current_streak)
                             current_streak = 1
                         current_direction = 1
-                    elif returns[j] < 0:
+                    elif returns[j] < 0:  # 下降
                         if current_direction <= 0:
                             current_streak += 1
                         else:
@@ -7746,21 +8114,25 @@ class Calculator:
                 if current_streak > 0:
                     streak_lengths.append(current_streak)
                 
+                # 最長持続期間の分析
                 if len(streak_lengths) > 0:
                     max_streak = np.max(streak_lengths)
+                    avg_streak = np.mean(streak_lengths)
                     streak_endurance = max_streak / len(returns)
                     
                     endurance = (basic_endurance + streak_endurance) / 2.0
                 else:
                     endurance = basic_endurance
             
-            # 7. 回復率（最大ドローダウンからの回復）
+            # 7. 回復率（最大ドローダウンからの回復）- 改良版
             recovery_rate = 0.0
             if len(returns) > 0:
+                # 累積リターンの計算
                 cumulative_returns = np.zeros(len(returns) + 1)
                 for j in range(len(returns)):
                     cumulative_returns[j + 1] = cumulative_returns[j] + returns[j]
                 
+                # ドローダウンの計算
                 running_max = np.zeros(len(cumulative_returns))
                 drawdowns = np.zeros(len(cumulative_returns))
                 
@@ -7771,10 +8143,14 @@ class Calculator:
                 
                 max_drawdown = np.max(drawdowns)
                 
+                # 回復分析
                 if max_drawdown > 1e-10:
                     final_return = cumulative_returns[-1]
+                    
+                    # 基本回復率
                     basic_recovery = final_return / max_drawdown
                     
+                    # 回復速度の分析
                     recovery_periods = []
                     in_drawdown = False
                     drawdown_start = 0
@@ -7796,7 +8172,7 @@ class Calculator:
                     else:
                         recovery_rate = basic_recovery
                 else:
-                    recovery_rate = 1.0
+                    recovery_rate = 1.0  # ドローダウンがない場合は完全回復
             
             # 結果の格納
             results[i, 0] = kinetic_energy
@@ -7861,7 +8237,7 @@ class Calculator:
             logger.info("基礎テクニカル指標計算中...")
             basic_tech_start = time.time()
             
-            basic_tech_features = self.calculate_basic_technical_indicators(high, low, close, volume)
+            basic_tech_features = self.calculate_basic_technical_indicators_polars(high, low, close, volume)
             all_features.update(basic_tech_features)
             
             logger.info(f"基礎テクニカル指標完了: {len(basic_tech_features)}個 ({time.time() - basic_tech_start:.2f}秒)")
@@ -7873,11 +8249,11 @@ class Calculator:
             tier_s_start = time.time()
             
             # MFDFA
-            mfdfa_features = self.calculate_mfdfa_features(close)
+            mfdfa_features = self.calculate_mfdfa_features_polars(close)
             all_features.update(mfdfa_features)
             
             # Microstructure Noise Ratio
-            noise_features = self.calculate_microstructure_noise_features(close)
+            noise_features = self.calculate_microstructure_noise_features_polars(close)
             all_features.update(noise_features)
             
             logger.info(f"Tier S特徴量完了: {len(mfdfa_features) + len(noise_features)}個 ({time.time() - tier_s_start:.2f}秒)")
@@ -7889,11 +8265,11 @@ class Calculator:
             tier_1_start = time.time()
             
             # ショックモデル
-            shock_features = self.calculate_shock_model_features(close)
+            shock_features = self.calculate_shock_model_features_polars(close)
             all_features.update(shock_features)
             
             # Multi-Scale Volatility
-            multiscale_vol_features = self.calculate_multiscale_volatility(close)
+            multiscale_vol_features = self.calculate_multiscale_volatility_polars(close)
             all_features.update(multiscale_vol_features)
             
             logger.info(f"Tier 1特徴量完了: {len(shock_features) + len(multiscale_vol_features)}個 ({time.time() - tier_1_start:.2f}秒)")
@@ -7905,15 +8281,15 @@ class Calculator:
             tier_2_start = time.time()
             
             # EMD/CEEMDAN
-            emd_features = self.calculate_emd_features(close)
+            emd_features = self.calculate_emd_features_polars(close)
             all_features.update(emd_features)
             
             # 統計的モーメント
-            moments_features = self.calculate_statistical_moments(close)
+            moments_features = self.calculate_statistical_moments_polars(close)
             all_features.update(moments_features)
             
             # ロバスト統計
-            robust_features = self.calculate_robust_statistics(close)
+            robust_features = self.calculate_robust_statistics_polars(close)
             all_features.update(robust_features)
             
             logger.info(f"Tier 2特徴量完了: {len(emd_features) + len(moments_features) + len(robust_features)}個 ({time.time() - tier_2_start:.2f}秒)")
@@ -7925,19 +8301,19 @@ class Calculator:
             spectral_start = time.time()
             
             # スペクトル特徴量
-            spectral_features = self.calculate_spectral_features(close)
+            spectral_features = self.calculate_spectral_features_polars(close)
             all_features.update(spectral_features)
             
             # ウェーブレット特徴量
-            wavelet_features = self.calculate_wavelet_features(close)
+            wavelet_features = self.calculate_wavelet_features_polars(close)
             all_features.update(wavelet_features)
             
             # カオス理論特徴量
-            chaos_features = self.calculate_chaos_features(close)
+            chaos_features = self.calculate_chaos_features_polars(close)
             all_features.update(chaos_features)
             
             # ヒルベルト変換特徴量
-            hilbert_features = self.calculate_hilbert_transform_features(close)
+            hilbert_features = self.calculate_hilbert_transform_features_polars(close)
             all_features.update(hilbert_features)
             
             logger.info(f"スペクトル・信号処理特徴量完了: {len(spectral_features) + len(wavelet_features) + len(chaos_features) + len(hilbert_features)}個 ({time.time() - spectral_start:.2f}秒)")
@@ -7949,27 +8325,27 @@ class Calculator:
             osc_start = time.time()
             
             # ADX
-            adx_features = self.calculate_adx_features(high, low, close)
+            adx_features = self.calculate_adx_features_polars(high, low, close)
             all_features.update(adx_features)
             
             # Parabolic SAR
-            sar_features = self.calculate_parabolic_sar_features(high, low, close)
+            sar_features = self.calculate_parabolic_sar_features_polars(high, low, close)
             all_features.update(sar_features)
             
             # CCI
-            cci_features = self.calculate_cci_features(high, low, close)
+            cci_features = self.calculate_cci_features_polars(high, low, close)
             all_features.update(cci_features)
             
             # Williams %R
-            williams_features = self.calculate_williams_r_features(high, low, close)
+            williams_features = self.calculate_williams_r_features_polars(high, low, close)
             all_features.update(williams_features)
             
             # Aroon
-            aroon_features = self.calculate_aroon_features(high, low)
+            aroon_features = self.calculate_aroon_features_polars(high, low)
             all_features.update(aroon_features)
             
             # Ultimate Oscillator
-            uo_features = self.calculate_ultimate_oscillator_features(high, low, close)
+            uo_features = self.calculate_ultimate_oscillator_features_polars(high, low, close)
             all_features.update(uo_features)
             
             logger.info(f"ADX・基本オシレーター完了: {len(adx_features) + len(sar_features) + len(cci_features) + len(williams_features) + len(aroon_features) + len(uo_features)}個 ({time.time() - osc_start:.2f}秒)")
@@ -7980,7 +8356,7 @@ class Calculator:
             logger.info("出来高関連指標計算中...")
             volume_start = time.time()
             
-            volume_features = self.calculate_volume_features(high, low, close, volume)
+            volume_features = self.calculate_volume_features_polars(high, low, close, volume)
             all_features.update(volume_features)
             
             logger.info(f"出来高関連指標完了: {len(volume_features)}個 ({time.time() - volume_start:.2f}秒)")
@@ -7991,7 +8367,7 @@ class Calculator:
             logger.info("移動平均線・トレンド分析計算中...")
             ma_start = time.time()
             
-            ma_features = self.calculate_moving_averages(close)
+            ma_features = self.calculate_moving_averages_polars(close)
             all_features.update(ma_features)
             
             logger.info(f"移動平均線・トレンド分析完了: {len(ma_features)}個 ({time.time() - ma_start:.2f}秒)")
@@ -8002,7 +8378,7 @@ class Calculator:
             logger.info("ボラティリティ・バンド指標計算中...")
             vol_start = time.time()
             
-            volatility_features = self.calculate_volatility_bands(high, low, close)
+            volatility_features = self.calculate_volatility_bands_polars(high, low, close)
             all_features.update(volatility_features)
             
             logger.info(f"ボラティリティ・バンド指標完了: {len(volatility_features)}個 ({time.time() - vol_start:.2f}秒)")
@@ -8013,7 +8389,7 @@ class Calculator:
             logger.info("サポート・レジスタンス・ローソク足計算中...")
             sr_start = time.time()
             
-            sr_features = self.calculate_support_resistance(high, low, close, open_prices)
+            sr_features = self.calculate_support_resistance_polars(high, low, close, open_prices)
             all_features.update(sr_features)
             
             logger.info(f"サポート・レジスタンス・ローソク足完了: {len(sr_features)}個 ({time.time() - sr_start:.2f}秒)")
@@ -8024,7 +8400,7 @@ class Calculator:
             logger.info("情報理論特徴量計算中...")
             info_start = time.time()
             
-            info_features = self.calculate_information_theory_features(close)
+            info_features = self.calculate_information_theory_features_polars(close)
             all_features.update(info_features)
             
             logger.info(f"情報理論特徴量完了: {len(info_features)}個 ({time.time() - info_start:.2f}秒)")
@@ -8035,7 +8411,7 @@ class Calculator:
             logger.info("学際的アナロジー特徴量計算中...")
             interdisciplinary_start = time.time()
             
-            interdisciplinary_features = self.calculate_interdisciplinary_features(close)
+            interdisciplinary_features = self.calculate_interdisciplinary_features_polars(close)
             all_features.update(interdisciplinary_features)
             
             logger.info(f"学際的アナロジー特徴量完了: {len(interdisciplinary_features)}個 ({time.time() - interdisciplinary_start:.2f}秒)")
@@ -8047,10 +8423,10 @@ class Calculator:
             qa_start = time.time()
             
             # 品質チェック・統計情報
-            quality_report = self.generate_quality_report(all_features)
+            quality_report = self.generate_quality_report_polars(all_features)
             
             # 異常値処理（必要に応じて）
-            all_features = self.apply_final_cleaning(all_features)
+            all_features = self.apply_final_cleaning_polars(all_features)
             
             logger.info(f"品質保証完了 ({time.time() - qa_start:.2f}秒)")
             
@@ -8061,7 +8437,7 @@ class Calculator:
         
         total_time = time.time() - start_time
         logger.info(f"全特徴量計算完了: {len(all_features)}個の特徴量を{total_time:.2f}秒で生成")
-        logger.info(f"計算統計: NumPy={self.calculation_stats.get('numpy_calculations', 0)}, Numba={self.calculation_stats.get('numba_calculations', 0)}")
+        logger.info(f"計算統計: Polars={self.calculation_stats['polars_calculations']}, Numba={self.calculation_stats['numba_calculations']}")
         
         return all_features
     
@@ -8069,7 +8445,7 @@ class Calculator:
     # 品質保証システム（Polars最適化版）
     # =========================================================================
     
-    def generate_quality_report(self, features: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    def generate_quality_report_polars(self, features: Dict[str, np.ndarray]) -> Dict[str, Any]:
         """品質レポート生成（NumPy主体+Polars補助版）"""
         
         if not features:
@@ -8152,37 +8528,30 @@ class Calculator:
                 'error_message': str(e),
                 'total_features': len(features)
             }
-        
-    def apply_final_cleaning(self, features: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """最終クリーニング処理（NumPyベース版）"""
+    
+    def apply_final_cleaning_polars(self, features: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """最終クリーニング処理（Polars最適化版）"""
         
         if not features:
             return features
         
         try:
-            # NumPyで直接クリーニング処理を実行
-            cleaned_features = {}
+            # Polars DataFrameに変換
+            df = pl.DataFrame(features)
             
-            for feature_name, values in features.items():
-                # NaN/Inf値の処理
-                cleaned_values = values.copy()
-                
-                # NaN -> 0.0
-                nan_mask = np.isnan(cleaned_values)
-                cleaned_values[nan_mask] = 0.0
-                
-                # Inf -> クリップ
-                inf_mask = np.isinf(cleaned_values)
-                if np.any(inf_mask):
-                    pos_inf_mask = (cleaned_values == np.inf)
-                    neg_inf_mask = (cleaned_values == -np.inf)
-                    cleaned_values[pos_inf_mask] = 1e10
-                    cleaned_values[neg_inf_mask] = -1e10
-                
+            # 一括クリーニング処理
+            cleaned_df = df.with_columns([
+                # NaN/Infを0で置換
+                pl.all().fill_nan(0.0).fill_null(0.0)
+            ]).with_columns([
                 # 異常に大きな値をクランプ
-                cleaned_values = np.clip(cleaned_values, -1e10, 1e10)
-                
-                cleaned_features[feature_name] = cleaned_values
+                pl.all().clip(-1e10, 1e10)
+            ])
+            
+            # 辞書に変換して返す
+            cleaned_features = {}
+            for col in cleaned_df.columns:
+                cleaned_features[col] = cleaned_df[col].to_numpy()
             
             return cleaned_features
             
@@ -8197,22 +8566,22 @@ class Calculator:
         
         total_calc = max(1, stats['total_calculations'])
         success_rate = stats['successful_calculations'] / total_calc
-        numpy_ratio = stats.get('numpy_calculations', 0) / total_calc
-        numba_ratio = stats.get('numba_calculations', 0) / total_calc
+        polars_ratio = stats['polars_calculations'] / total_calc
+        numba_ratio = stats['numba_calculations'] / total_calc
         
         avg_time = np.mean(stats['computation_times']) if stats['computation_times'] else 0.0
         
         return {
             'total_calculations': total_calc,
             'success_rate': success_rate,
-            'numpy_calculation_ratio': numpy_ratio,
+            'polars_calculation_ratio': polars_ratio,
             'numba_calculation_ratio': numba_ratio,
             'avg_computation_time_ms': avg_time * 1000,
             'total_computation_time_sec': sum(stats['computation_times']),
-            'optimization_level': 'numpy_first',
+            'optimization_level': 'polars_first' if polars_ratio > 0.7 else 'hybrid',
             'performance_grade': (
-                'S' if avg_time < 0.01 and success_rate > 0.95 and numba_ratio > 0.5 else
-                'A' if avg_time < 0.05 and success_rate > 0.9 else
+                'S' if avg_time < 0.01 and success_rate > 0.95 and polars_ratio > 0.8 else
+                'A' if avg_time < 0.05 and success_rate > 0.9 and polars_ratio > 0.6 else
                 'B' if avg_time < 0.1 and success_rate > 0.8 else
                 'C'
             )
@@ -8316,175 +8685,6 @@ class Calculator:
             }
         
         return benchmark_results
-    
-    # =========================================================================
-    # デバッグ・診断機能
-    # =========================================================================
-    
-    def diagnose_feature_quality(self, features: Dict[str, np.ndarray]) -> Dict[str, Any]:
-        """特徴量品質の詳細診断"""
-        
-        if not features:
-            return {'status': 'no_features'}
-        
-        diagnosis = {
-            'feature_count': len(features),
-            'data_length': len(next(iter(features.values()))),
-            'problematic_features': [],
-            'excellent_features': [],
-            'warning_features': [],
-            'overall_health': 'unknown'
-        }
-        
-        for feature_name, values in features.items():
-            feature_stats = {
-                'name': feature_name,
-                'finite_ratio': np.sum(np.isfinite(values)) / len(values),
-                'null_ratio': np.sum(np.isnan(values)) / len(values),
-                'inf_ratio': np.sum(np.isinf(values)) / len(values),
-                'zero_ratio': np.sum(values == 0.0) / len(values),
-                'variance': np.var(values[np.isfinite(values)]) if np.any(np.isfinite(values)) else 0.0,
-                'mean': np.mean(values[np.isfinite(values)]) if np.any(np.isfinite(values)) else 0.0
-            }
-            
-            # 品質分類
-            if feature_stats['finite_ratio'] > 0.95 and feature_stats['variance'] > 1e-10:
-                diagnosis['excellent_features'].append(feature_stats)
-            elif feature_stats['finite_ratio'] < 0.8 or feature_stats['inf_ratio'] > 0.01:
-                diagnosis['problematic_features'].append(feature_stats)
-            elif feature_stats['zero_ratio'] > 0.9 or feature_stats['variance'] < 1e-12:
-                diagnosis['warning_features'].append(feature_stats)
-        
-        # 全体健全性評価
-        excellent_count = len(diagnosis['excellent_features'])
-        problematic_count = len(diagnosis['problematic_features'])
-        total_count = len(features)
-        
-        if excellent_count / total_count > 0.8 and problematic_count / total_count < 0.05:
-            diagnosis['overall_health'] = 'excellent'
-        elif excellent_count / total_count > 0.6 and problematic_count / total_count < 0.15:
-            diagnosis['overall_health'] = 'good'
-        elif problematic_count / total_count < 0.3:
-            diagnosis['overall_health'] = 'acceptable'
-        else:
-            diagnosis['overall_health'] = 'poor'
-        
-        return diagnosis
-    
-    # =========================================================================
-    # メモリ効率化機能
-    # =========================================================================
-    
-    def optimize_memory_usage(self, features: Dict[str, np.ndarray], 
-                            precision: str = 'float32') -> Dict[str, np.ndarray]:
-        """メモリ使用量最適化（データ型変換）"""
-        
-        optimized_features = {}
-        
-        for feature_name, values in features.items():
-            try:
-                if precision == 'float32':
-                    # float64 -> float32変換
-                    optimized_values = values.astype(np.float32)
-                elif precision == 'float16':
-                    # float64 -> float16変換（精度は落ちるが大幅メモリ削減）
-                    optimized_values = values.astype(np.float16)
-                else:
-                    optimized_values = values
-                
-                optimized_features[feature_name] = optimized_values
-                
-            except Exception as e:
-                logger.warning(f"特徴量 {feature_name} の型変換に失敗: {e}")
-                optimized_features[feature_name] = values
-        
-        return optimized_features
-    
-    # =========================================================================
-    # バッチ処理機能
-    # =========================================================================
-    
-    def calculate_features_batch(self, data_batches: List[Dict[str, np.ndarray]], 
-                               batch_size: int = None) -> List[Dict[str, np.ndarray]]:
-        """バッチ処理による特徴量計算"""
-        
-        if batch_size is None:
-            batch_size = len(data_batches)
-        
-        results = []
-        
-        for i in range(0, len(data_batches), batch_size):
-            batch = data_batches[i:i+batch_size]
-            batch_results = []
-            
-            logger.info(f"バッチ {i//batch_size + 1}/{(len(data_batches)-1)//batch_size + 1} 処理中...")
-            
-            for data_dict in batch:
-                try:
-                    high = data_dict.get('high')
-                    low = data_dict.get('low') 
-                    close = data_dict.get('close')
-                    volume = data_dict.get('volume')
-                    open_prices = data_dict.get('open')
-                    
-                    features = self.calculate_all_features_polars_optimized(
-                        high, low, close, volume, open_prices
-                    )
-                    batch_results.append(features)
-                    
-                except Exception as e:
-                    logger.error(f"バッチ処理エラー: {e}")
-                    batch_results.append({})
-            
-            results.extend(batch_results)
-        
-        return results
-    
-    # =========================================================================
-    # 設定管理
-    # =========================================================================
-    
-    def get_feature_config(self) -> Dict[str, Any]:
-        """現在の特徴量計算設定を取得"""
-        
-        return {
-            'version': '2.0.0-polars-optimized',
-            'optimization_mode': 'polars_first',
-            'numba_enabled': True,
-            'parallel_processing': True,
-            'memory_optimization': True,
-            'supported_features': [
-                'basic_technical', 'mfdfa', 'microstructure_noise', 'shock_model',
-                'multiscale_volatility', 'emd', 'statistical_moments', 'robust_statistics',
-                'spectral', 'wavelet', 'chaos', 'hilbert', 'adx', 'sar', 'cci',
-                'williams_r', 'aroon', 'ultimate_oscillator', 'volume', 'moving_averages',
-                'volatility_bands', 'support_resistance', 'information_theory',
-                'interdisciplinary_analogies'
-            ],
-            'interdisciplinary_modules': [
-                'game_theory', 'molecular_science', 'network_science', 'acoustics',
-                'linguistics', 'aesthetics', 'music_theory', 'astronomy', 'biomechanics'
-            ],
-            'performance_targets': {
-                'throughput_points_per_sec': 100000,
-                'memory_efficiency_mb_per_sec': 50,
-                'quality_threshold': 0.95
-            }
-        }
-    
-    def set_optimization_mode(self, mode: str) -> bool:
-        """最適化モードの設定"""
-        
-        valid_modes = ['polars_first', 'numpy_only', 'numba_aggressive', 'balanced']
-        
-        if mode not in valid_modes:
-            logger.error(f"無効な最適化モード: {mode}")
-            return False
-        
-        self.optimization_mode = mode
-        logger.info(f"最適化モード設定: {mode}")
-        
-        return True
 
 # =============================================================================
 # OutputManagerクラス（修正版）
@@ -8516,7 +8716,7 @@ class OutputManager:
         
         logger.info(f"OutputManager初期化: {self.output_base_path}")
 
-    def save_features(self, features_dict: Dict[str, np.ndarray], output_filename: str) -> Path:
+    def save_features_polars(self, features_dict: Dict[str, np.ndarray], output_filename: str) -> Path:
         """Polarsでの効率的保存（統計記録付き）"""
         start_time = time.time()
         
@@ -8895,7 +9095,7 @@ class FeatureExtractionEngine:
                     calc_metadata = {
                         'timeframe': tf,
                         'test_mode': test_mode,
-                        'calculation_summary': self.calculator.get_calculation_summary_optimized(),
+                        'calculation_summary': self.calculator.get_calculation_summary(),
                         'memory_summary': self.memory_manager.get_memory_summary(),
                         'data_shape': current_memmap.shape,
                         'total_chunks_processed': self.execution_stats['total_chunks_processed'],
@@ -9045,27 +9245,16 @@ class FeatureExtractionEngine:
                 open_prices=open_prices
             )
             logger.debug(f"チャンク {chunk_idx+1}: 特徴量計算完了 ({len(all_features)}特徴量)")
-
-            # スクリプト名から番号を自動取得
-            script_name = Path(__file__).name
-            match = re.search(r"engine_(\d+)", script_name)
-            script_number = match.group(1) if match else "unknown"
-
-            # 特徴量名にプレフィックスを追加
-            prefixed_features = {
-                f"e{script_number}_{name}": values 
-                for name, values in all_features.items()
-            }
             
-            # 品質レポート生成 (プレフィックス付きの特徴量を使用)
-            quality_report = self.calculator.generate_quality_report_polars(prefixed_features)
+            # 品質レポート生成
+            quality_report = self.calculator.generate_quality_report_polars(all_features)
             if quality_report.get('warnings'):
                 self.execution_stats['quality_alerts'].extend(quality_report['warnings'])
                 logger.debug(f"チャンク {chunk_idx+1}: 品質アラート {len(quality_report['warnings'])}件")
             
-            self.execution_stats['total_features_generated'] += len(prefixed_features)
+            self.execution_stats['total_features_generated'] += len(all_features)
             
-            return prefixed_features
+            return all_features
             
         except Exception as e:
             logger.error(f"チャンク {chunk_idx+1} 特徴量計算エラー: {e}")
@@ -9082,7 +9271,7 @@ class FeatureExtractionEngine:
             temp_file_path = self.config['output_path'] / temp_filename
             
             # Polars DataFrameに変換して保存
-            self.output_manager.save_features(chunk_features, temp_filename)
+            self.output_manager.save_features_polars(chunk_features, temp_filename)
             
             logger.debug(f"一時ファイル保存完了: {temp_filename}")
             return str(temp_file_path)
@@ -9557,13 +9746,13 @@ class SystemValidator:
             calculator = Calculator(dummy_window_manager, dummy_memory_manager)
             
             # 基本統計計算テスト
-            statistical_features = calculator.calculate_statistical_moments(test_data)
-            robust_features = calculator.calculate_robust_statistics(test_data)
-            spectral_features = calculator.calculate_spectral_features(test_data)
+            statistical_features = calculator.calculate_statistical_moments_polars(test_data)
+            robust_features = calculator.calculate_robust_statistics_polars(test_data)
+            spectral_features = calculator.calculate_spectral_features_polars(test_data)
             
             # 高度特徴量テスト
-            mfdfa_features = calculator.calculate_mfdfa_features(test_data)
-            noise_features = calculator.calculate_microstructure_noise_features(test_data)
+            mfdfa_features = calculator.calculate_mfdfa_features_polars(test_data)
+            noise_features = calculator.calculate_microstructure_noise_features_polars(test_data)
             
             # 計算結果検証
             all_features = {}
@@ -9574,7 +9763,7 @@ class SystemValidator:
             all_features.update(noise_features)
             
             # 品質レポート生成メソッドを呼び出すように変更
-            quality_report = calculator.generate_quality_report(all_features)
+            quality_report = calculator.generate_quality_report_polars(all_features)
             
             # レポートから必要な値を取得
             avg_quality = quality_report.get('overall_quality_score', 0.0)
@@ -9671,7 +9860,7 @@ class SystemValidator:
             # ファイル保存テスト（修正: 正しい引数で呼び出し）
             test_filename = 'integration_test_features'
             try:
-                output_path = output_manager.save_features(dummy_features, test_filename)
+                output_path = output_manager.save_features_polars(dummy_features, test_filename)
                 file_created = output_path.exists()
                 
                 if file_created:

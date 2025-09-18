@@ -18,6 +18,8 @@ import os
 import sys
 import warnings
 from tqdm import tqdm
+import re
+from pathlib import Path
 
 # BLAS/LAPACK警告を抑制
 os.environ['PYTHONWARNINGS'] = 'ignore::RuntimeWarning'
@@ -2784,6 +2786,14 @@ class QuantitativeFeatureEngine:
                 feature_df = cudf.DataFrame(unified_features, index=df.index)
             else:
                 feature_df = pd.DataFrame(unified_features, index=df.index)
+
+            # スクリプト名から番号を自動取得
+            script_name = Path(__file__).name
+            match = re.search(r"engine_(\d+)", script_name)
+            script_number = match.group(1) if match else "unknown"
+
+            # プレフィックス追加
+            feature_df.columns = [f"e{script_number}_{col}" for col in feature_df.columns]
             
             print(f"🎯 Feature generation complete!")
             print(f"📈 Total features: {feature_df.shape[1]}")
