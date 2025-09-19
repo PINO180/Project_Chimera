@@ -8873,7 +8873,21 @@ class FeatureExtractionEngine:
             
             if not memmap_data:
                 raise RuntimeError("memmapデータ変換に失敗しました")
+
+            # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+            # ProgressTrackerの初期化のために総チャンク数を事前に計算
+            total_chunks_to_process = 0
+            for tf in target_timeframes:
+                if tf in memmap_data:
+                    memmap_array = memmap_data[tf]
+                    total_rows = memmap_array.shape[0]
+                    if test_mode:
+                        total_rows = min(10000, total_rows)
+                    total_chunks_to_process += (total_rows + self.chunk_size - 1) // self.chunk_size
             
+            self.progress_tracker = ProgressTracker(total_steps=total_chunks_to_process, feature_groups=["ChunkProcessing"])
+            # --- ▲▲▲ 修正箇所 ▲▲▲ ---
+
             for tf, memmap_array in memmap_data.items():
                 current_memmap = memmap_array
                 if test_mode:
@@ -8888,8 +8902,10 @@ class FeatureExtractionEngine:
                 monitor_thread = self.memory_manager.monitor_continuous(duration_seconds=3600)
                 
                 try:
-                    # チャンクベース処理の実行
-                    final_output_path = self._execute_chunk_based_processing(current_memmap, tf, test_mode)
+                    # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+                    # チャンクベース処理の実行（progress_trackerを引数に追加）
+                    final_output_path = self._execute_chunk_based_processing(current_memmap, tf, test_mode, self.progress_tracker)
+                    # --- ▲▲▲ 修正箇所 ▲▲▲ ---
                     
                     # 実行ごとのメタデータを準備し、リストに追加
                     calc_metadata = {
@@ -8903,7 +8919,7 @@ class FeatureExtractionEngine:
                     }
                     all_run_metadata.append(calc_metadata)
                     
-                    logger.info(f"タイムフレーム {tf} 処理完了: {self.execution_stats['total_chunks_processed']}チャンク処理")
+                    logger.info(f"タイムフレーム {tf} 処理完了")
                     
                 except Exception as e:
                     error_info = f"タイムフレーム {tf} 処理エラー: {e}"
@@ -8917,6 +8933,15 @@ class FeatureExtractionEngine:
             
             self.execution_stats['end_time'] = time.time()
             total_time = self.execution_stats['end_time'] - self.execution_stats['start_time']
+
+            # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+            # progress_trackerから最終サマリーを取得して統合
+            if self.progress_tracker:
+                performance_metrics = self.progress_tracker.get_performance_metrics()
+                self.execution_stats['total_features_generated'] = self.progress_tracker.success_count
+            else:
+                performance_metrics = {}
+            # --- ▲▲▲ 修正箇所 ▲▲▲ ---
             
             # 処理結果の集計
             processing_results = {
@@ -8924,11 +8949,12 @@ class FeatureExtractionEngine:
                 'total_features_generated': self.execution_stats['total_features_generated'],
                 'total_chunks_processed': self.execution_stats['total_chunks_processed'],
                 'data_points_processed': sum(arr.shape[0] for arr in memmap_data.values()),
-                'success_rate': (len(target_timeframes) - len(self.execution_stats['processing_errors'])) / len(target_timeframes),
+                'success_rate': performance_metrics.get('success_rate', 0) / 100,
                 'processing_errors': self.execution_stats['processing_errors'],
                 'target_timeframes': target_timeframes,
                 'test_mode': test_mode,
-                'chunk_size': self.chunk_size
+                'chunk_size': self.chunk_size,
+                'performance_metrics': performance_metrics
             }
             
             # タイムフレーム別メタデータの統合
@@ -8938,6 +8964,11 @@ class FeatureExtractionEngine:
             self.output_manager.save_final_summary_metadata(processing_results)
             self.output_manager.log_final_summary(processing_results)
             
+            # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+            if self.progress_tracker:
+                self.progress_tracker.log_final_summary()
+            # --- ▲▲▲ 修正箇所 ▲▲▲ ---
+
             self.memory_manager.log_memory_report()
             
             return processing_results
@@ -8952,7 +8983,8 @@ class FeatureExtractionEngine:
             self.memory_manager.force_garbage_collection()
     
     def _execute_chunk_based_processing(self, memmap_data: np.memmap, 
-                                      timeframe: str, test_mode: bool) -> str:
+                                      timeframe: str, test_mode: bool,
+                                      progress_tracker: ProgressTracker) -> str:
         """
         チャンクベース特徴量計算の実行
         メモリ効率を最大化した反復処理アーキテクチャ
@@ -8974,23 +9006,25 @@ class FeatureExtractionEngine:
             for chunk_idx in range(n_chunks):
                 start_row = chunk_idx * self.chunk_size
                 end_row = min(start_row + self.chunk_size, total_rows)
-                actual_chunk_size = end_row - start_row
                 
-                logger.info(f"チャンク {chunk_idx+1}/{n_chunks} 処理中: 行 {start_row:,}-{end_row:,} ({actual_chunk_size:,}行)")
-                
+                # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+                step_name = f"TF:{timeframe} Chunk:{chunk_idx+1}/{n_chunks}"
+                features_generated_count = 0
+                has_error_in_chunk = False
+                warning_message = None
+                # --- ▲▲▲ 修正箇所 ▲▲▲ ---
+
                 try:
                     # ステップ1: チャンクデータをメモリに読み込み
                     chunk_data = memmap_data[start_row:end_row].copy()
-                    logger.debug(f"チャンク {chunk_idx+1}: メモリ読み込み完了")
                     
                     # ステップ2: チャンクに対する特徴量計算
                     chunk_features = self._calculate_features_for_chunk(chunk_data, chunk_idx)
-                    logger.debug(f"チャンク {chunk_idx+1}: 特徴量計算完了 ({len(chunk_features)}特徴量)")
+                    features_generated_count = len(chunk_features)
                     
                     # ステップ3: 一時Parquetファイルとして保存
                     temp_file_path = self._save_chunk_to_temp_file(chunk_features, chunk_idx, timeframe, test_mode)
                     temp_files.append(temp_file_path)
-                    logger.debug(f"チャンク {chunk_idx+1}: 一時ファイル保存完了")
                     
                     # ステップ4: メモリ解放
                     del chunk_data, chunk_features
@@ -8998,16 +9032,27 @@ class FeatureExtractionEngine:
                     
                     self.execution_stats['total_chunks_processed'] += 1
                     
-                    # 進捗表示
-                    progress = (chunk_idx + 1) / n_chunks * 100
-                    logger.info(f"チャンク処理進捗: {progress:.1f}% ({chunk_idx+1}/{n_chunks})")
-                    
                 except Exception as e:
                     error_msg = f"チャンク {chunk_idx+1} 処理エラー: {e}"
                     logger.error(error_msg)
                     self.execution_stats['processing_errors'].append(error_msg)
+                    # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+                    has_error_in_chunk = True
+                    # --- ▲▲▲ 修正箇所 ▲▲▲ ---
                     continue
-            
+                
+                finally:
+                    # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+                    # 以前の進捗表示ロガーは削除
+                    # progress_tracker に進捗を更新
+                    progress_tracker.update_progress(
+                        step_name=step_name,
+                        features_generated=features_generated_count,
+                        has_error=has_error_in_chunk,
+                        warning_msg=warning_message
+                    )
+                    # --- ▲▲▲ 修正箇所 ▲▲▲ ---
+
             # ステップ5: 一時ファイルを最終的な1つのParquetファイルに結合
             final_output_path = self._combine_temp_files_to_final(temp_files, timeframe, test_mode)
             logger.info(f"最終ファイル結合完了: {final_output_path}")
