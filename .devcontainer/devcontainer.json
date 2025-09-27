@@ -47,7 +47,7 @@
     },
     // コンテナ初回起動時のみ実行されるコマンド
     // 例: pipで追加パッケージをインストールする
-    "postCreateCommand": "pip install -r requirements.txt",
+    "postCreateCommand": "pip install -r requirements.txt"
     //"features": {
     //    "ghcr.io/devcontainers/features/github-cli:1": {}
     //}
