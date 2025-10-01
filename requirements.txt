@@ -23,15 +23,18 @@ hmmlearn
 lightgbm
 xgboost
 
+# PyTorch
+torch
+torchvision
+
+#tensorflow
+tensorflow
+
 # 信号処理・ウェーブレット
 PyWavelets
 
 # 統計・相関解析
 dcor
-
-# PyTorch
-torch
-torchvision
 
 # エントロピー計算
 entropy
