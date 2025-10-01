@@ -1,0 +1,5 @@
+# gitpushに関して
+
+git add .
+git commit -m "update20251001"
+git push origin main
