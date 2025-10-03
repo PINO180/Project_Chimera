@@ -82,9 +82,9 @@ class MQL5BridgePublisherV2:
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.heartbeat_running = False
         
-        # コールバック
-        self.on_connection_lost: Optional[Callable] = None
-        self.on_connection_restored: Optional[Callable] = None
+        # コールバック（型付け改善）
+        self.on_connection_lost: Optional[Callable[[], None]] = None
+        self.on_connection_restored: Optional[Callable[[], None]] = None
         
         logger.info("MQL5BridgePublisherV2を初期化しました。")
     

@@ -14,9 +14,10 @@
     "containerEnv": {
         "TZ": "Asia/Tokyo"
     },
+    "remoteUser": "hephaestuszero",
     // CPU環境用の設定（GPUオプションは削除）
-    "remoteUser": "root",
     "runArgs": [
+        "--hostname=xxxxx18xx",
         "--memory=64g",
         "--memory-swap=64g",
         "--shm-size=2g"

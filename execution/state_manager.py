@@ -7,7 +7,7 @@ import pickle
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, TypedDict
 from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
@@ -28,6 +28,27 @@ class EventType(Enum):
     MODEL_PERFORMANCE_UPDATED = "MODEL_PERFORMANCE_UPDATED"
     SYSTEM_STARTED = "SYSTEM_STARTED"
     SYSTEM_STOPPED = "SYSTEM_STOPPED"
+
+
+# 型定義
+class BrokerPositionDict(TypedDict):
+    """ブローカーポジション情報の型定義"""
+    ticket: int
+    symbol: str
+    direction: str
+    lots: float
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    entry_time: str
+    unrealized_pnl: float
+
+
+class BrokerStateDict(TypedDict):
+    """ブローカー状態の型定義"""
+    equity: float
+    balance: float
+    positions: List[BrokerPositionDict]
 
 
 @dataclass
@@ -332,17 +353,12 @@ class StateManager:
     
     # ========== ブローカー整合性検証 ==========
     
-    def reconcile_with_broker(self, broker_state: Dict[str, Any]) -> Dict[str, Any]:
+    def reconcile_with_broker(self, broker_state: BrokerStateDict) -> Dict[str, Any]:
         """
         ローカル状態とブローカー状態の整合性検証
         
         Args:
             broker_state: ブローカーから取得した状態
-                {
-                    'equity': float,
-                    'balance': float,
-                    'positions': List[Dict]  # ポジション情報のリスト
-                }
         
         Returns:
             整合性検証結果

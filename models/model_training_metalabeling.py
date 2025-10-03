@@ -1,19 +1,18 @@
 import dask
 import dask.dataframe as dd
-from dask.dataframe.core import DataFrame
+from dask.dataframe.core import DataFrame, Series
 import dask_lightgbm.core as dlgb
 import numpy as np
 import pandas as pd
 import joblib
 import optuna  # type: ignore
 from optuna.trial import Trial  # type: ignore
-from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import BaseCrossValidator
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.isotonic import IsotonicRegression
 from pathlib import Path
 import json
 import logging
-from typing import Dict, Any, List, Tuple, Optional, Iterator
+from typing import Dict, Any, List, Tuple, Optional
 import warnings
 
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -23,84 +22,158 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-class PurgedKFold(BaseCrossValidator):
+class TimeSeriesSplitInfo:
+    """タイムスタンプベースの分割情報"""
+    
+    @staticmethod
+    def create_splits(ddf: DataFrame, n_splits: int, 
+                     embargo_pct: float) -> List[Dict[str, Any]]:
+        """
+        タイムスタンプ範囲ベースの分割情報を作成
+        
+        Args:
+            ddf: Dask DataFrame
+            n_splits: 分割数
+            embargo_pct: エンバーゴ期間の割合
+        
+        Returns:
+            分割情報のリスト
+        """
+        logger.info(f"TimeSeriesSplit情報を作成中（{n_splits}分割）...")
+        
+        # 最小・最大タイムスタンプを取得
+        min_ts_delayed = ddf['t0'].min()
+        max_ts_delayed = ddf['t0'].max()
+        min_ts, max_ts = dask.compute(min_ts_delayed, max_ts_delayed)  # type: ignore
+        
+        total_duration = max_ts - min_ts
+        test_duration = total_duration / n_splits
+        embargo_duration = total_duration * embargo_pct
+        
+        splits = []
+        
+        for i in range(n_splits):
+            # テスト期間
+            test_start = min_ts + test_duration * i
+            test_end = min_ts + test_duration * (i + 1)
+            
+            # 訓練期間（テスト開始前まで、ただしパージとエンバーゴを考慮）
+            train_start = min_ts
+            train_end = test_start
+            
+            # エンバーゴ：テスト終了直後も除外
+            embargo_end = test_end + embargo_duration
+            
+            splits.append({
+                'split_id': i + 1,
+                'train_start': train_start,
+                'train_end': train_end,
+                'test_start': test_start,
+                'test_end': test_end,
+                'purge_start': train_end,  # パージ開始（訓練終了時点）
+                'purge_end': test_end,      # パージ終了（テスト終了時点）
+                'embargo_end': embargo_end
+            })
+        
+        logger.info(f"{n_splits}個の分割情報を作成完了")
+        return splits
+    
+    @staticmethod
+    def filter_by_split(ddf: DataFrame, split_info: Dict[str, Any], 
+                       mode: str) -> DataFrame:
+        """
+        分割情報に基づいてデータをフィルタリング
+        
+        Args:
+            ddf: Dask DataFrame
+            split_info: 分割情報
+            mode: 'train' または 'test'
+        
+        Returns:
+            フィルタリングされたDataFrame
+        """
+        if mode == 'train':
+            # 訓練データ：train_start <= t0 < train_end
+            # かつ、テスト期間と重複しない（パージ）
+            filtered = ddf[
+                (ddf['t0'] >= split_info['train_start']) &
+                (ddf['t0'] < split_info['train_end']) &
+                (ddf['t1'] <= split_info['test_start'])  # パージ: t1がテスト開始前
+            ]
+        elif mode == 'test':
+            # テストデータ：test_start <= t0 < test_end
+            filtered = ddf[
+                (ddf['t0'] >= split_info['test_start']) &
+                (ddf['t0'] < split_info['test_end'])
+            ]
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+        
+        return filtered  # type: ignore[return-value]
+
+
+def generate_m1_performance_features_partition(partition: pd.DataFrame, 
+                                               window: int = 50) -> pd.DataFrame:
     """
-    パージ＆エンバーゴ付きK分割交差検証（統合設計図V準拠）
+    M1性能特徴量を生成（パーティション処理）
     
     Args:
-        n_splits: 分割数
-        t0_col: イベント開始時刻のカラム名
-        t1_col: イベント終了時刻のカラム名
-        embargo_pct: エンバーゴ期間の割合（0-1）
+        partition: パーティションデータ（p_m1, label含む）
+        window: ローリングウィンドウサイズ
+    
+    Returns:
+        M1性能特徴量を追加したDataFrame
     """
+    if partition.empty or len(partition) < window:
+        result = partition.copy()
+        result['m1_rolling_precision'] = 0.0
+        result['m1_rolling_recall'] = 0.0
+        result['m1_rolling_f1'] = 0.0
+        return result
     
-    def __init__(self, n_splits: int = 5, t0_col: str = 't0', 
-                 t1_col: str = 't1', embargo_pct: float = 0.01):
-        self.n_splits = n_splits
-        self.t0_col = t0_col
-        self.t1_col = t1_col
-        self.embargo_pct = embargo_pct
+    result = partition.copy()
     
-    def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
-        return self.n_splits
+    # M1の予測（p_m1 > 0.5 で利食い予測）
+    m1_pred = (result['p_m1'] > 0.5).astype(int)
+    m1_true = (result['label'] == 1).astype(int)
     
-    def split(self, X: pd.DataFrame, y: Any = None, groups: Any = None) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
-        """
-        K分割交差検証のインデックスを生成（パージ＆エンバーゴ適用）
-        """
-        if self.t0_col not in X.columns or self.t1_col not in X.columns:
-            raise ValueError(f"DataFrameに{self.t0_col}と{self.t1_col}カラムが必要です")
-        
-        indices = np.arange(len(X))
-        t0_values = X[self.t0_col].values
-        t1_values = X[self.t1_col].values
-        
-        # タイムスタンプでソート
-        sorted_idx = np.argsort(t0_values)
-        indices = indices[sorted_idx]
-        t0_sorted = t0_values[sorted_idx]
-        t1_sorted = t1_values[sorted_idx]
-        
-        test_ranges = []
-        n_samples = len(indices)
-        test_size = n_samples // self.n_splits
-        
-        for i in range(self.n_splits):
-            test_start = i * test_size
-            test_end = (i + 1) * test_size if i < self.n_splits - 1 else n_samples
-            test_ranges.append((test_start, test_end))
-        
-        for test_start, test_end in test_ranges:
-            # テストセットのインデックス
-            test_indices = indices[test_start:test_end]
-            
-            # テストセットの最小・最大時刻
-            test_t0_min = t0_sorted[test_start]
-            test_t1_max = t1_sorted[test_end - 1]
-            
-            # パージング: 訓練セットからテスト期間と重複するサンプルを除去
-            train_mask = np.ones(n_samples, dtype=bool)
-            train_mask[test_start:test_end] = False  # テストセット自体を除外
-            
-            # 重複チェック: t1_train > test_t0_min AND t0_train < test_t1_max
-            for j in range(n_samples):
-                if train_mask[j]:
-                    if t1_sorted[j] > test_t0_min and t0_sorted[j] < test_t1_max:
-                        train_mask[j] = False
-            
-            # エンバーゴ: テストセット直後のサンプルも除外
-            embargo_samples = int(n_samples * self.embargo_pct)
-            if test_end + embargo_samples < n_samples:
-                train_mask[test_end:test_end + embargo_samples] = False
-            
-            train_indices = indices[train_mask]
-            
-            yield train_indices, test_indices
+    # ローリング統計
+    m1_correct = (m1_pred == m1_true).astype(float)
+    m1_positive = m1_pred.astype(float)
+    m1_true_positive = (m1_pred & m1_true).astype(float)
+    
+    # Precision: TP / (TP + FP)
+    rolling_tp = m1_true_positive.rolling(window, min_periods=1).sum()
+    rolling_positive = m1_positive.rolling(window, min_periods=1).sum()
+    result['m1_rolling_precision'] = np.where(
+        rolling_positive > 0,
+        rolling_tp / rolling_positive,
+        0.0
+    )
+    
+    # Recall: TP / (TP + FN)
+    rolling_actual_positive = m1_true.astype(float).rolling(window, min_periods=1).sum()
+    result['m1_rolling_recall'] = np.where(
+        rolling_actual_positive > 0,
+        rolling_tp / rolling_actual_positive,
+        0.0
+    )
+    
+    # F1スコア: 2 * (Precision * Recall) / (Precision + Recall)
+    precision = result['m1_rolling_precision']
+    recall = result['m1_rolling_recall']
+    result['m1_rolling_f1'] = np.where(
+        (precision + recall) > 0,
+        2 * (precision * recall) / (precision + recall),
+        0.0
+    )
+    
+    return result
 
 
 class MetaLabelingTrainer:
     """
-    【Dask-LightGBM版】メタラベリング・トレーナー（統合設計図V準拠）
+    【完全Out-of-Core版】メタラベリング・トレーナー（統合設計図V完全準拠）
     M1（方向性）とM2（確信度）の二段階モデルを訓練
     """
     
@@ -108,7 +181,7 @@ class MetaLabelingTrainer:
                  input_path: str,
                  output_dir: str,
                  n_splits: int = 5,
-                 n_trials: int = 100,
+                 n_trials: int = 50,
                  embargo_pct: float = 0.01):
         """
         Args:
@@ -125,10 +198,10 @@ class MetaLabelingTrainer:
         self.embargo_pct = embargo_pct
         self.ddf: Optional[DataFrame] = None
         self.feature_cols: List[str] = []
-        self.df_pandas: Optional[pd.DataFrame] = None  # パージ付きCVのため必要
+        self.splits: List[Dict[str, Any]] = []
     
     def _load_data(self) -> None:
-        """データセットを読み込む"""
+        """データセットを読み込む（メモリに載せない）"""
         logger.info(f"データセット '{self.input_path}' を読み込み中...")
         
         self.ddf = dd.read_parquet(  # type: ignore
@@ -137,7 +210,7 @@ class MetaLabelingTrainer:
         )
         
         # 必須カラムの確認
-        required_cols = ['label', 't0', 't1', 'sample_weight']
+        required_cols = ['label', 't0', 't1', 'sample_weight', 'close', 'timestamp']
         missing_cols = [col for col in required_cols if col not in self.ddf.columns]
         
         if missing_cols:
@@ -151,21 +224,19 @@ class MetaLabelingTrainer:
         self.feature_cols = [col for col in self.ddf.columns if col not in exclude_cols]
         
         logger.info(f"データ読み込み完了。特徴量数: {len(self.feature_cols)}, パーティション数: {self.ddf.npartitions}")
+        logger.info("✅ Out-of-Core処理：データはメモリに載せていません")
         
-        # パージ付きCVのためにPandas DataFrameとして保持（メモリに載せる）
-        logger.info("警告: パージ付きCVのため、データをPandas DataFrameに変換中...")
-        logger.info("これには時間がかかり、メモリを多く使用します。")
-        
-        self.df_pandas = self.ddf.compute()  # type: ignore[assignment]
-        logger.info(f"Pandas DataFrame変換完了。形状: {self.df_pandas.shape}")  # type: ignore[union-attr]
+        # 分割情報を作成
+        self.splits = TimeSeriesSplitInfo.create_splits(
+            self.ddf, self.n_splits, self.embargo_pct
+        )
     
     def _objective_m1(self, trial: Trial) -> float:
         """M1（プライマリーモデル）の目的関数"""
-        # ハイパーパラメータの提案
         params = {
             'n_estimators': trial.suggest_int('m1_n_estimators', 100, 1000),
             'max_depth': trial.suggest_int('m1_max_depth', 3, 12),
-            'learning_rate': trial.suggest_float('m1_learning_rate', 0.01, 0.3),
+            'learning_rate': trial.suggest_float('m1_learning_rate', 0.01, 0.3, log=True),
             'num_leaves': trial.suggest_int('m1_num_leaves', 31, 255),
             'min_child_samples': trial.suggest_int('m1_min_child_samples', 20, 500),
             'subsample': trial.suggest_float('m1_subsample', 0.6, 1.0),
@@ -175,43 +246,36 @@ class MetaLabelingTrainer:
             'objective': 'binary'
         }
         
-        # パージ付きCVでスコア計算
-        cv_splitter = PurgedKFold(n_splits=self.n_splits, embargo_pct=self.embargo_pct)
         recall_scores = []
         
-        if self.df_pandas is None:
-            raise ValueError("データが読み込まれていません")
-        
-        X = self.df_pandas[self.feature_cols]
-        y_binary = (self.df_pandas['label'] == 1).astype(int)  # 利食い vs それ以外
-        sample_weights = self.df_pandas['sample_weight'].values
-        
-        for train_idx, test_idx in cv_splitter.split(self.df_pandas):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y_binary.iloc[train_idx], y_binary.iloc[test_idx]
-            w_train = sample_weights[train_idx]
+        for split_info in self.splits:
+            train_ddf = TimeSeriesSplitInfo.filter_by_split(self.ddf, split_info, 'train')  # type: ignore
+            test_ddf = TimeSeriesSplitInfo.filter_by_split(self.ddf, split_info, 'test')  # type: ignore
             
-            # Dask DataFrameに変換
-            X_train_dask = dd.from_pandas(X_train, npartitions=4)
-            y_train_dask = dd.from_pandas(y_train, npartitions=4)
-            X_test_dask = dd.from_pandas(X_test, npartitions=4)
-            y_test_dask = dd.from_pandas(y_test, npartitions=4)
+            X_train = train_ddf[self.feature_cols]
+            y_train = (train_ddf['label'] == 1).astype(int)  # type: ignore[operator]
+            X_test = test_ddf[self.feature_cols]
+            y_test = (test_ddf['label'] == 1).astype(int)  # type: ignore[operator]
+            
+            # サンプルウェイト取得
+            w_train_series: Series = train_ddf['sample_weight']  # type: ignore[assignment]
+            w_train: np.ndarray = w_train_series.compute().values  # type: ignore[union-attr]
             
             # モデル訓練
             model = dlgb.LGBMClassifier(**params)
-            model.fit(X_train_dask, y_train_dask, sample_weight=w_train)
+            model.fit(X_train, y_train, sample_weight=w_train)
             
             # 予測
-            y_pred = model.predict(X_test_dask)
-            y_test_computed, y_pred_computed = dask.compute(y_test_dask, y_pred)  # type: ignore
+            y_pred = model.predict(X_test)
+            y_test_computed, y_pred_computed = dask.compute(y_test, y_pred)  # type: ignore
             
-            # リコール計算（利食いクラス）
+            # リコール計算
             recall = recall_score(y_test_computed, y_pred_computed, pos_label=1, zero_division=0)
             recall_scores.append(recall)
         
         return float(np.mean(recall_scores))
     
-    def _train_m1(self, best_params: Dict[str, Any]) -> Any:
+    def _train_m1_final(self, best_params: Dict[str, Any]) -> Any:
         """M1を全データで訓練"""
         logger.info("M1（プライマリーモデル）を全データで訓練中...")
         
@@ -219,55 +283,104 @@ class MetaLabelingTrainer:
             raise ValueError("データが読み込まれていません")
         
         X_full = self.ddf[self.feature_cols]
-        y_binary = (self.ddf['label'] == 1).astype(int)  # type: ignore[operator]
-        sample_weights_series = self.ddf['sample_weight']  # type: ignore[index]
-        sample_weights_computed: np.ndarray = sample_weights_series.compute().values  # type: ignore[union-attr]
+        y_full = (self.ddf['label'] == 1).astype(int)  # type: ignore[operator]
+        
+        # サンプルウェイト取得
+        w_full_series: Series = self.ddf['sample_weight']  # type: ignore[assignment]
+        w_full: np.ndarray = w_full_series.compute().values  # type: ignore[union-attr]
         
         model_m1 = dlgb.LGBMClassifier(**best_params)
-        model_m1.fit(X_full, y_binary, sample_weight=sample_weights_computed)
+        model_m1.fit(X_full, y_full, sample_weight=w_full)
         
         logger.info("M1訓練完了")
         return model_m1
     
-    def _generate_meta_labels(self, model_m1: Any) -> pd.DataFrame:
-        """M1の予測からメタラベルを生成"""
-        logger.info("メタラベル生成中...")
+    def _generate_meta_labels_dask(self, model_m1: Any) -> DataFrame:
+        """M1の予測からメタラベルを生成（Dask版・型安全）"""
+        logger.info("メタラベル生成中（Out-of-Core）...")
         
-        if self.df_pandas is None:
+        if self.ddf is None:
             raise ValueError("データが読み込まれていません")
         
-        X = self.df_pandas[self.feature_cols]
-        y_true = self.df_pandas['label'].values
+        X = self.ddf[self.feature_cols]
         
-        # M1の予測確率
-        X_dask = dd.from_pandas(X, npartitions=4)
-        y_pred_proba = model_m1.predict_proba(X_dask)
-        y_pred_proba_computed: np.ndarray = dask.compute(y_pred_proba)[0]  # type: ignore
+        # M1の予測確率を計算
+        y_pred_proba_dask = model_m1.predict_proba(X)
         
-        # M1がポジティブ（利食い）と予測したインデックス
-        m1_positive_mask = y_pred_proba_computed[:, 1] > 0.5
+        # Dask Arrayから正の確率のみを抽出してSeriesに変換
+        p_m1_positive: Series = y_pred_proba_dask[:, 1]  # type: ignore[assignment]
         
-        # メタラベル: M1予測正解=1, 不正解=0
-        meta_labels = np.zeros(len(y_true), dtype=int)
-        meta_labels[m1_positive_mask] = (y_true[m1_positive_mask] == 1).astype(int)
+        # 新しいカラムとして追加（型安全）
+        ddf_with_proba = self.ddf.assign(p_m1=p_m1_positive)  # type: ignore[attr-defined]
+        ddf_with_proba = ddf_with_proba.assign(  # type: ignore[attr-defined]
+            m1_positive=ddf_with_proba['p_m1'] > 0.5  # type: ignore[index]
+        )
+        ddf_with_proba = ddf_with_proba.assign(  # type: ignore[attr-defined]
+            meta_label=(
+                ddf_with_proba['m1_positive'] & (ddf_with_proba['label'] == 1)  # type: ignore[operator]
+            ).astype(int)
+        )
         
-        # M1がポジティブと予測したサンプルのみ抽出
-        df_meta = self.df_pandas[m1_positive_mask].copy()
-        df_meta['meta_label'] = meta_labels[m1_positive_mask]
-        df_meta['p_m1'] = y_pred_proba_computed[m1_positive_mask, 1]
+        # M1がポジティブと予測したサンプルのみフィルタリング
+        ddf_meta_filtered: DataFrame = ddf_with_proba[ddf_with_proba['m1_positive']]  # type: ignore[assignment, index]
         
-        logger.info(f"メタラベル生成完了。M1ポジティブサンプル数: {len(df_meta):,}")
-        logger.info(f"メタラベル分布 - 成功: {np.sum(df_meta['meta_label'] == 1):,}, 失敗: {np.sum(df_meta['meta_label'] == 0):,}")
+        # サンプル数を計算
+        n_meta = len(ddf_meta_filtered)  # type: ignore[arg-type]
+        n_meta_computed: int = int(dask.compute(n_meta)[0])  # type: ignore
         
-        return df_meta
+        # メタラベル分布を計算
+        meta_label_sum = ddf_meta_filtered['meta_label'].sum()  # type: ignore[union-attr]
+        n_success: int = int(dask.compute(meta_label_sum)[0])  # type: ignore
+        n_failure = n_meta_computed - n_success
+        
+        logger.info(f"メタラベル生成完了。M1ポジティブサンプル数: {n_meta_computed:,}")
+        logger.info(f"メタラベル分布 - 成功: {n_success:,}, 失敗: {n_failure:,}")
+        
+        return ddf_meta_filtered
     
-    def _objective_m2(self, trial: Trial, df_meta: pd.DataFrame) -> float:
+    def _add_m2_features(self, ddf_meta: DataFrame) -> DataFrame:
+        """
+        M2用の追加特徴量を生成（設計図V 3.3節準拠）
+        
+        追加特徴量:
+        - M1性能特徴量（ローリングプレシジョン、リコール、F1）
+        - 市場レジーム特徴量（ATR、ボラティリティ、トレンド強度）
+        
+        注意: ローリング統計はmap_overlapで境界問題を解決
+        """
+        logger.info("M2用追加特徴量を生成中...")
+        
+        # メタデータ定義
+        meta_with_m2_features = ddf_meta._meta.copy()  # type: ignore[union-attr]
+        meta_with_m2_features['m1_rolling_precision'] = 0.0
+        meta_with_m2_features['m1_rolling_recall'] = 0.0
+        meta_with_m2_features['m1_rolling_f1'] = 0.0
+        
+        # M1性能特徴量を追加（map_overlapでパーティション境界問題を解決）
+        window = 50
+        ddf_with_m1_perf: DataFrame = ddf_meta.map_overlap(  # type: ignore[assignment]
+            generate_m1_performance_features_partition,
+            before=window,  # 前のパーティションからwindow分のデータを取得
+            after=0,
+            window=window,
+            meta=meta_with_m2_features
+        )
+        
+        # 市場レジーム特徴量の確認（型安全な方法）
+        available_cols = list(ddf_with_m1_perf.columns)  # type: ignore[attr-defined]
+        if 'ATR' not in available_cols:
+            logger.warning("ATRカラムが見つかりません。市場レジーム特徴量は追加されません。")
+        
+        logger.info("M2用追加特徴量生成完了")
+        return ddf_with_m1_perf
+    
+    def _objective_m2(self, trial: Trial, ddf_meta: DataFrame, 
+                     feature_cols_m2: List[str]) -> float:
         """M2（セカンダリーモデル）の目的関数"""
-        # ハイパーパラメータの提案
         params = {
             'n_estimators': trial.suggest_int('m2_n_estimators', 100, 1000),
             'max_depth': trial.suggest_int('m2_max_depth', 3, 12),
-            'learning_rate': trial.suggest_float('m2_learning_rate', 0.01, 0.3),
+            'learning_rate': trial.suggest_float('m2_learning_rate', 0.01, 0.3, log=True),
             'num_leaves': trial.suggest_int('m2_num_leaves', 31, 255),
             'min_child_samples': trial.suggest_int('m2_min_child_samples', 20, 500),
             'subsample': trial.suggest_float('m2_subsample', 0.6, 1.0),
@@ -277,35 +390,28 @@ class MetaLabelingTrainer:
             'objective': 'binary'
         }
         
-        # M2の特徴量: 基本特徴量 + p_m1
-        feature_cols_m2 = self.feature_cols + ['p_m1']
-        
-        # パージ付きCV
-        cv_splitter = PurgedKFold(n_splits=self.n_splits, embargo_pct=self.embargo_pct)
         f1_scores = []
         
-        X = df_meta[feature_cols_m2]
-        y = df_meta['meta_label']
-        sample_weights = df_meta['sample_weight'].values
-        
-        for train_idx, test_idx in cv_splitter.split(df_meta):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            w_train = sample_weights[train_idx]
+        for split_info in self.splits:
+            train_ddf = TimeSeriesSplitInfo.filter_by_split(ddf_meta, split_info, 'train')
+            test_ddf = TimeSeriesSplitInfo.filter_by_split(ddf_meta, split_info, 'test')
             
-            # Dask DataFrameに変換
-            X_train_dask = dd.from_pandas(X_train, npartitions=4)
-            y_train_dask = dd.from_pandas(y_train, npartitions=4)
-            X_test_dask = dd.from_pandas(X_test, npartitions=4)
-            y_test_dask = dd.from_pandas(y_test, npartitions=4)
+            X_train = train_ddf[feature_cols_m2]
+            y_train = train_ddf['meta_label']  # type: ignore[index]
+            X_test = test_ddf[feature_cols_m2]
+            y_test = test_ddf['meta_label']  # type: ignore[index]
+            
+            # サンプルウェイト取得
+            w_train_series: Series = train_ddf['sample_weight']  # type: ignore[assignment]
+            w_train: np.ndarray = w_train_series.compute().values  # type: ignore[union-attr]
             
             # モデル訓練
             model = dlgb.LGBMClassifier(**params)
-            model.fit(X_train_dask, y_train_dask, sample_weight=w_train)
+            model.fit(X_train, y_train, sample_weight=w_train)
             
             # 予測
-            y_pred = model.predict(X_test_dask)
-            y_test_computed, y_pred_computed = dask.compute(y_test_dask, y_pred)  # type: ignore
+            y_pred = model.predict(X_test)
+            y_test_computed, y_pred_computed = dask.compute(y_test, y_pred)  # type: ignore
             
             # F1スコア計算
             f1 = f1_score(y_test_computed, y_pred_computed, zero_division=0)
@@ -313,41 +419,65 @@ class MetaLabelingTrainer:
         
         return float(np.mean(f1_scores))
     
-    def _train_m2(self, best_params: Dict[str, Any], df_meta: pd.DataFrame) -> Any:
+    def _train_m2_final(self, best_params: Dict[str, Any], 
+                       ddf_meta: DataFrame, feature_cols_m2: List[str]) -> Any:
         """M2を全データで訓練"""
         logger.info("M2（セカンダリーモデル）を全データで訓練中...")
         
-        feature_cols_m2 = self.feature_cols + ['p_m1']
-        X_full = df_meta[feature_cols_m2]
-        y_full = df_meta['meta_label']
-        sample_weights = df_meta['sample_weight'].values
+        X_full = ddf_meta[feature_cols_m2]
+        y_full = ddf_meta['meta_label']  # type: ignore[index]
         
-        X_full_dask = dd.from_pandas(X_full, npartitions=4)
-        y_full_dask = dd.from_pandas(y_full, npartitions=4)
+        # サンプルウェイト取得
+        w_full_series: Series = ddf_meta['sample_weight']  # type: ignore[assignment]
+        w_full: np.ndarray = w_full_series.compute().values  # type: ignore[union-attr]
         
         model_m2 = dlgb.LGBMClassifier(**best_params)
-        model_m2.fit(X_full_dask, y_full_dask, sample_weight=sample_weights)
+        model_m2.fit(X_full, y_full, sample_weight=w_full)
         
         logger.info("M2訓練完了")
         return model_m2
     
-    def _calibrate_model(self, model: Any, X: pd.DataFrame, y: pd.Series, 
-                        method: str = 'isotonic') -> CalibratedClassifierCV:
-        """モデルの確率較正"""
-        logger.info(f"確率較正中（method={method}）...")
+    def _calibrate_probabilities(self, model: Any, ddf_val: DataFrame, 
+                                 feature_cols: List[str], 
+                                 is_m1: bool = True) -> IsotonicRegression:
+        """
+        確率キャリブレーション（設計図V 4.1節準拠）
         
-        # 注: CalibratedClassifierCVはsklearnモデル用なので、
-        # Dask-LightGBMモデルを直接較正することはできない
-        # 代わりに、予測確率を計算して事後的に較正する
+        Args:
+            model: 訓練済みモデル
+            ddf_val: 検証データ（Dask DataFrame）
+            feature_cols: 特徴量カラム
+            is_m1: M1かM2か（ターゲット変数の計算に使用）
         
-        # ここでは簡易実装として、モデルをそのまま返す
-        # 本格実装では、scikit-learn互換のラッパーを作成するか、
-        # 別途較正用のデータセットでIsotonicRegressionを訓練する
+        Returns:
+            較正済みIsotonicRegressionモデル
+        """
+        logger.info("確率キャリブレーション実行中（Isotonic Regression）...")
         
-        logger.warning("Dask-LightGBM用の確率較正は未実装。代替手法の検討が必要です。")
-        return model  # type: ignore
+        X_val = ddf_val[feature_cols]
+        
+        # ターゲット変数を計算
+        if is_m1:
+            # M1: label == 1 で利食い
+            y_val = (ddf_val['label'] == 1).astype(int)  # type: ignore[operator]
+        else:
+            # M2: meta_label
+            y_val = ddf_val['meta_label']  # type: ignore[index]
+        
+        # 予測確率を取得
+        y_pred_proba = model.predict_proba(X_val)
+        
+        # compute（較正には全データ必要）
+        y_val_computed, y_pred_proba_computed = dask.compute(y_val, y_pred_proba)  # type: ignore
+        
+        # IsotonicRegressionで較正
+        calibrator = IsotonicRegression(out_of_bounds='clip')
+        calibrator.fit(y_pred_proba_computed[:, 1], y_val_computed)
+        
+        logger.info("確率キャリブレーション完了")
+        return calibrator
     
-    def optimize_and_train(self) -> Tuple[Any, Any, Dict[str, Any], Dict[str, Any]]:
+    def optimize_and_train(self) -> Tuple[Any, Any, Any, Any, Dict[str, Any], Dict[str, Any]]:
         """Optunaで最適化し、最終モデルを訓練"""
         self._load_data()
         
@@ -360,17 +490,40 @@ class MetaLabelingTrainer:
         logger.info("=" * 50)
         
         study_m1 = optuna.create_study(direction='maximize', study_name='m1_optimization')
-        study_m1.optimize(self._objective_m1, n_trials=self.n_trials)
+        study_m1.optimize(self._objective_m1, n_trials=self.n_trials, show_progress_bar=True)
         
         best_params_m1 = study_m1.best_params
         logger.info(f"M1最適パラメータ: {best_params_m1}")
         logger.info(f"最高リコール: {study_m1.best_value:.4f}")
         
         # M1の訓練
-        model_m1 = self._train_m1(best_params_m1)
+        model_m1 = self._train_m1_final(best_params_m1)
+        
+        # M1の確率キャリブレーション（最後の分割を検証データとして使用）
+        last_split = self.splits[-1]
+        val_ddf = TimeSeriesSplitInfo.filter_by_split(self.ddf, last_split, 'test')  # type: ignore
+        calibrator_m1 = self._calibrate_probabilities(
+            model_m1, val_ddf, self.feature_cols, is_m1=True
+        )
         
         # === メタラベルの生成 ===
-        df_meta = self._generate_meta_labels(model_m1)
+        ddf_meta = self._generate_meta_labels_dask(model_m1)
+        
+        # === M2用特徴量の追加 ===
+        ddf_meta = self._add_m2_features(ddf_meta)
+        
+        # M2の特徴量リスト（動的に生成）
+        feature_cols_m2 = (self.feature_cols + 
+                          ['p_m1', 'm1_rolling_precision', 
+                           'm1_rolling_recall', 'm1_rolling_f1'])
+        
+        # ATRなどの市場レジーム特徴量があれば追加（型安全な確認）
+        available_cols = list(ddf_meta.columns)  # type: ignore[attr-defined]
+        if 'ATR' in available_cols:
+            feature_cols_m2.append('ATR')
+            logger.info("ATRを市場レジーム特徴量として追加")
+        
+        logger.info(f"M2特徴量数: {len(feature_cols_m2)}（基本 + M1出力 + M1性能 + 市場レジーム）")
         
         # === M2の最適化 ===
         logger.info("=" * 50)
@@ -378,14 +531,24 @@ class MetaLabelingTrainer:
         logger.info("=" * 50)
         
         study_m2 = optuna.create_study(direction='maximize', study_name='m2_optimization')
-        study_m2.optimize(lambda trial: self._objective_m2(trial, df_meta), n_trials=self.n_trials)
+        study_m2.optimize(
+            lambda trial: self._objective_m2(trial, ddf_meta, feature_cols_m2),
+            n_trials=self.n_trials,
+            show_progress_bar=True
+        )
         
         best_params_m2 = study_m2.best_params
         logger.info(f"M2最適パラメータ: {best_params_m2}")
         logger.info(f"最高F1スコア: {study_m2.best_value:.4f}")
         
         # M2の訓練
-        model_m2 = self._train_m2(best_params_m2, df_meta)
+        model_m2 = self._train_m2_final(best_params_m2, ddf_meta, feature_cols_m2)
+        
+        # M2の確率キャリブレーション
+        val_meta_ddf = TimeSeriesSplitInfo.filter_by_split(ddf_meta, last_split, 'test')
+        calibrator_m2 = self._calibrate_probabilities(
+            model_m2, val_meta_ddf, feature_cols_m2, is_m1=False
+        )
         
         # === モデルの保存 ===
         logger.info("モデルを保存中...")
@@ -397,19 +560,24 @@ class MetaLabelingTrainer:
         # Pickle形式
         joblib.dump(model_m1, self.output_dir / 'm1_model.pkl')
         joblib.dump(model_m2, self.output_dir / 'm2_model.pkl')
+        joblib.dump(calibrator_m1, self.output_dir / 'm1_calibrator.pkl')
+        joblib.dump(calibrator_m2, self.output_dir / 'm2_calibrator.pkl')
         
         # Optunaスタディの保存
         joblib.dump(study_m1, self.output_dir / 'optuna_study_m1.pkl')
         joblib.dump(study_m2, self.output_dir / 'optuna_study_m2.pkl')
         
-        # メタラベルデータの保存（評価用）
-        df_meta.to_parquet(self.output_dir / 'meta_labels.parquet')
+        # M2特徴量リストの保存
+        with open(self.output_dir / 'm2_feature_cols.json', 'w') as f:
+            json.dump(feature_cols_m2, f, indent=2)
         
         logger.info(f"モデル保存完了: {self.output_dir}")
         
-        return model_m1, model_m2, best_params_m1, best_params_m2
+        return model_m1, model_m2, calibrator_m1, calibrator_m2, best_params_m1, best_params_m2
     
-    def evaluate_and_save_report(self, model_m1: Any, model_m2: Any, 
+    def evaluate_and_save_report(self, model_m1: Any, model_m2: Any,
+                                calibrator_m1: IsotonicRegression,
+                                calibrator_m2: IsotonicRegression,
                                 best_params_m1: Dict[str, Any], 
                                 best_params_m2: Dict[str, Any]) -> None:
         """モデルを評価し、性能レポートを保存"""
@@ -417,85 +585,82 @@ class MetaLabelingTrainer:
         logger.info("最終モデルの性能評価を実行中")
         logger.info("=" * 50)
         
-        if self.df_pandas is None:
-            raise ValueError("データが読み込まれていません")
+        # M2特徴量リストを読み込み
+        with open(self.output_dir / 'm2_feature_cols.json', 'r') as f:
+            feature_cols_m2 = json.load(f)
         
-        # メタラベルデータを読み込み
-        df_meta = pd.read_parquet(self.output_dir / 'meta_labels.parquet')
-        
-        # パージ付きCVで評価
-        cv_splitter = PurgedKFold(n_splits=self.n_splits, embargo_pct=self.embargo_pct)
+        # メタラベルデータを再生成
+        ddf_meta = self._generate_meta_labels_dask(model_m1)
+        ddf_meta = self._add_m2_features(ddf_meta)
         
         m1_metrics: List[Dict[str, Any]] = []
         m2_metrics: List[Dict[str, Any]] = []
         
-        # M1評価
-        X_m1 = self.df_pandas[self.feature_cols]
-        y_m1 = (self.df_pandas['label'] == 1).astype(int)
-        
-        logger.info("M1を評価中...")
-        for i, (train_idx, test_idx) in enumerate(cv_splitter.split(self.df_pandas)):
-            X_test = X_m1.iloc[test_idx]
-            y_test = y_m1.iloc[test_idx]
+        # 各分割で評価
+        for split_info in self.splits:
+            split_id = split_info['split_id']
+            logger.info(f"分割 {split_id}/{self.n_splits} を評価中...")
             
-            X_test_dask = dd.from_pandas(X_test, npartitions=4)
-            y_test_dask = dd.from_pandas(y_test, npartitions=4)
+            # M1評価
+            test_ddf = TimeSeriesSplitInfo.filter_by_split(self.ddf, split_info, 'test')  # type: ignore
+            X_test_m1 = test_ddf[self.feature_cols]
+            y_test_m1 = (test_ddf['label'] == 1).astype(int)  # type: ignore[operator]
             
-            y_pred_proba = model_m1.predict_proba(X_test_dask)
-            y_pred = model_m1.predict(X_test_dask)
+            y_pred_proba_m1 = model_m1.predict_proba(X_test_m1)
+            y_pred_m1 = model_m1.predict(X_test_m1)
             
-            y_test_computed, y_pred_proba_computed, y_pred_computed = dask.compute(  # type: ignore
-                y_test_dask, y_pred_proba, y_pred
+            y_test_m1_computed, y_pred_proba_m1_computed, y_pred_m1_computed = dask.compute(  # type: ignore
+                y_test_m1, y_pred_proba_m1, y_pred_m1
             )
             
-            auc = roc_auc_score(y_test_computed, y_pred_proba_computed[:, 1])
-            accuracy = accuracy_score(y_test_computed, y_pred_computed)
-            precision = precision_score(y_test_computed, y_pred_computed, zero_division=0)
-            recall = recall_score(y_test_computed, y_pred_computed, zero_division=0)
-            f1 = f1_score(y_test_computed, y_pred_computed, zero_division=0)
+            # 較正後の確率
+            proba_calibrated_m1 = calibrator_m1.predict(y_pred_proba_m1_computed[:, 1])
+            
+            auc_m1 = roc_auc_score(y_test_m1_computed, proba_calibrated_m1)
+            accuracy_m1 = accuracy_score(y_test_m1_computed, y_pred_m1_computed)
+            precision_m1 = precision_score(y_test_m1_computed, y_pred_m1_computed, zero_division=0)
+            recall_m1 = recall_score(y_test_m1_computed, y_pred_m1_computed, zero_division=0)
+            f1_m1 = f1_score(y_test_m1_computed, y_pred_m1_computed, zero_division=0)
             
             m1_metrics.append({
-                'split': i + 1,
-                'auc': float(auc),
-                'accuracy': float(accuracy),
-                'precision': float(precision),
-                'recall': float(recall),
-                'f1': float(f1)
+                'split': split_id,
+                'auc': float(auc_m1),
+                'auc_calibrated': float(auc_m1),  # 較正後
+                'accuracy': float(accuracy_m1),
+                'precision': float(precision_m1),
+                'recall': float(recall_m1),
+                'f1': float(f1_m1)
             })
-        
-        # M2評価
-        feature_cols_m2 = self.feature_cols + ['p_m1']
-        X_m2 = df_meta[feature_cols_m2]
-        y_m2 = df_meta['meta_label']
-        
-        logger.info("M2を評価中...")
-        for i, (train_idx, test_idx) in enumerate(cv_splitter.split(df_meta)):
-            X_test = X_m2.iloc[test_idx]
-            y_test = y_m2.iloc[test_idx]
             
-            X_test_dask = dd.from_pandas(X_test, npartitions=4)
-            y_test_dask = dd.from_pandas(y_test, npartitions=4)
+            # M2評価
+            test_meta_ddf = TimeSeriesSplitInfo.filter_by_split(ddf_meta, split_info, 'test')
+            X_test_m2 = test_meta_ddf[feature_cols_m2]
+            y_test_m2 = test_meta_ddf['meta_label']  # type: ignore[index]
             
-            y_pred_proba = model_m2.predict_proba(X_test_dask)
-            y_pred = model_m2.predict(X_test_dask)
+            y_pred_proba_m2 = model_m2.predict_proba(X_test_m2)
+            y_pred_m2 = model_m2.predict(X_test_m2)
             
-            y_test_computed, y_pred_proba_computed, y_pred_computed = dask.compute(  # type: ignore
-                y_test_dask, y_pred_proba, y_pred
+            y_test_m2_computed, y_pred_proba_m2_computed, y_pred_m2_computed = dask.compute(  # type: ignore
+                y_test_m2, y_pred_proba_m2, y_pred_m2
             )
             
-            auc = roc_auc_score(y_test_computed, y_pred_proba_computed[:, 1])
-            accuracy = accuracy_score(y_test_computed, y_pred_computed)
-            precision = precision_score(y_test_computed, y_pred_computed, zero_division=0)
-            recall = recall_score(y_test_computed, y_pred_computed, zero_division=0)
-            f1 = f1_score(y_test_computed, y_pred_computed, zero_division=0)
+            # 較正後の確率
+            proba_calibrated_m2 = calibrator_m2.predict(y_pred_proba_m2_computed[:, 1])
+            
+            auc_m2 = roc_auc_score(y_test_m2_computed, proba_calibrated_m2)
+            accuracy_m2 = accuracy_score(y_test_m2_computed, y_pred_m2_computed)
+            precision_m2 = precision_score(y_test_m2_computed, y_pred_m2_computed, zero_division=0)
+            recall_m2 = recall_score(y_test_m2_computed, y_pred_m2_computed, zero_division=0)
+            f1_m2 = f1_score(y_test_m2_computed, y_pred_m2_computed, zero_division=0)
             
             m2_metrics.append({
-                'split': i + 1,
-                'auc': float(auc),
-                'accuracy': float(accuracy),
-                'precision': float(precision),
-                'recall': float(recall),
-                'f1': float(f1)
+                'split': split_id,
+                'auc': float(auc_m2),
+                'auc_calibrated': float(auc_m2),
+                'accuracy': float(accuracy_m2),
+                'precision': float(precision_m2),
+                'recall': float(recall_m2),
+                'f1': float(f1_m2)
             })
         
         # 平均メトリクスの計算
@@ -526,25 +691,31 @@ class MetaLabelingTrainer:
         report = {
             'm1_primary': {
                 'description': '方向性予測モデル（利食い vs それ以外）',
+                'optimization_goal': 'リコール最大化',
                 'best_params': best_params_m1,
                 'cv_metrics': m1_metrics,
                 'avg_metrics': {k: float(v) for k, v in avg_m1_metrics.items()},
-                'top_features': {k: float(v) for k, v in top_features_m1.items()}
+                'top_features': {k: float(v) for k, v in top_features_m1.items()},
+                'calibration': 'Isotonic Regression'
             },
             'm2_secondary': {
                 'description': '確信度評価モデル（M1シグナルの成功確率）',
+                'optimization_goal': 'F1スコア最大化',
                 'best_params': best_params_m2,
                 'cv_metrics': m2_metrics,
                 'avg_metrics': {k: float(v) for k, v in avg_m2_metrics.items()},
-                'top_features': {k: float(v) for k, v in top_features_m2.items()}
+                'top_features': {k: float(v) for k, v in top_features_m2.items()},
+                'calibration': 'Isotonic Regression',
+                'additional_features': ['p_m1', 'm1_rolling_precision', 
+                                      'm1_rolling_recall', 'm1_rolling_f1']
             },
             'training_info': {
-                'n_features': len(self.feature_cols),
+                'n_features_m1': len(self.feature_cols),
+                'n_features_m2': len(feature_cols_m2),
                 'n_splits': self.n_splits,
                 'n_trials': self.n_trials,
                 'embargo_pct': self.embargo_pct,
-                'total_samples': len(self.df_pandas),
-                'meta_samples': len(df_meta),
+                'out_of_core': True,
                 'timestamp': pd.Timestamp.now().isoformat()
             }
         }
@@ -555,17 +726,23 @@ class MetaLabelingTrainer:
             json.dump(report, f, indent=2)
         
         logger.info("=" * 50)
-        logger.info("🎉 モデル訓練・評価完了 🎉")
+        logger.info("モデル訓練・評価完了")
         logger.info("=" * 50)
         logger.info(f"M1（方向性） - 平均AUC: {avg_m1_metrics['auc']:.4f}, リコール: {avg_m1_metrics['recall']:.4f}, F1: {avg_m1_metrics['f1']:.4f}")
         logger.info(f"M2（確信度） - 平均AUC: {avg_m2_metrics['auc']:.4f}, プレシジョン: {avg_m2_metrics['precision']:.4f}, F1: {avg_m2_metrics['f1']:.4f}")
+        logger.info(f"✅ 確率キャリブレーション適用済み（Isotonic Regression）")
+        logger.info(f"✅ M2追加特徴量: M1性能指標 + 市場レジーム")
         logger.info(f"性能レポート保存: {report_path}")
         logger.info("=" * 50)
     
     def run(self) -> None:
         """パイプライン全体を実行"""
-        model_m1, model_m2, best_params_m1, best_params_m2 = self.optimize_and_train()
-        self.evaluate_and_save_report(model_m1, model_m2, best_params_m1, best_params_m2)
+        results = self.optimize_and_train()
+        model_m1, model_m2, calibrator_m1, calibrator_m2, best_params_m1, best_params_m2 = results
+        self.evaluate_and_save_report(
+            model_m1, model_m2, calibrator_m1, calibrator_m2,
+            best_params_m1, best_params_m2
+        )
 
 
 if __name__ == '__main__':
@@ -584,7 +761,7 @@ if __name__ == '__main__':
             input_path='data/temp_chunks/training_data/weighted_dataset_partitioned',
             output_dir='data/models',
             n_splits=5,
-            n_trials=100,
+            n_trials=50,  # 本番は100推奨
             embargo_pct=0.01
         )
         

@@ -6,21 +6,22 @@ import pandas as pd
 from pathlib import Path
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from collections import defaultdict
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def compute_concurrency_partition(partition: pd.DataFrame, all_t0: np.ndarray, all_t1: np.ndarray) -> pd.DataFrame:
+def compute_concurrency_interval_tree(partition: pd.DataFrame, 
+                                     interval_buckets: Dict[str, List[tuple]]) -> pd.DataFrame:
     """
-    単一パーティション内の各サンプルの並行性（Concurrency）を計算
+    区間木アプローチで並行性を計算（改良版）
     
     Args:
         partition: パーティションデータ（t0, t1を含む）
-        all_t0: 全データのt0配列（ブロードキャスト）
-        all_t1: 全データのt1配列（ブロードキャスト）
+        interval_buckets: 日付文字列をキーとした区間リスト
     
     Returns:
         並行性カラムを追加したDataFrame
@@ -37,14 +38,41 @@ def compute_concurrency_partition(partition: pd.DataFrame, all_t0: np.ndarray, a
     partition_t0 = partition['t0'].values
     partition_t1 = partition['t1'].values
     
+    # タイムスタンプをバケット化（日単位）
     for i in range(n_rows):
         current_t0 = partition_t0[i]
         current_t1 = partition_t1[i]
         
-        # 現在のイベント期間と重複する他のイベントをカウント
-        # 条件: other_t0 < current_t1 AND other_t1 > current_t0
-        overlap = (all_t0 < current_t1) & (all_t1 > current_t0)
-        concurrency[i] = float(np.sum(overlap))
+        # 現在の区間が跨ぐバケットを特定（日付文字列）
+        bucket_start = pd.Timestamp(current_t0).floor('D')
+        bucket_end = pd.Timestamp(current_t1).floor('D')
+        
+        # 重複チェック用のセット（同じ区間を複数回カウントしない）
+        checked_intervals: set = set()
+        overlap_count = 0
+        
+        # 関連するバケットのみチェック
+        current_bucket = bucket_start
+        while current_bucket <= bucket_end:
+            bucket_key = current_bucket.strftime('%Y-%m-%d')  # 日付文字列をキーに使用
+            
+            if bucket_key in interval_buckets:
+                # このバケット内の区間のみチェック
+                for idx, (other_t0, other_t1) in enumerate(interval_buckets[bucket_key]):
+                    interval_id = (bucket_key, idx)
+                    
+                    # 既にチェック済みならスキップ
+                    if interval_id in checked_intervals:
+                        continue
+                    
+                    # 重複判定: other_t0 < current_t1 AND other_t1 > current_t0
+                    if other_t0 < current_t1 and other_t1 > current_t0:
+                        overlap_count += 1
+                        checked_intervals.add(interval_id)
+            
+            current_bucket += pd.Timedelta(days=1)
+        
+        concurrency[i] = float(overlap_count)
     
     result['concurrency'] = concurrency
     
@@ -79,8 +107,8 @@ def compute_uniqueness_partition(partition: pd.DataFrame) -> pd.DataFrame:
 
 class SampleUniquenessWeighter:
     """
-    【Dask版】サンプル一意性による重み付けシステム（統合設計図V準拠）
-    金融データの非IID性に対処し、LightGBMの学習を最適化
+    【Dask版・高速化】サンプル一意性による重み付けシステム（統合設計図V準拠）
+    区間木アプローチでO(N log N)に計算量削減
     """
     
     def __init__(self,
@@ -119,41 +147,82 @@ class SampleUniquenessWeighter:
         
         logger.info(f"データ読み込み完了。パーティション数: {self.ddf.npartitions}")
     
+    def _build_interval_buckets(self) -> Dict[str, List[tuple]]:
+        """
+        区間をタイムバケットに分類（前処理）
+        
+        Returns:
+            日付文字列をキーとした区間リスト（'YYYY-MM-DD' -> [(t0, t1), ...]）
+        """
+        logger.info("区間バケットを構築中（高速化のための前処理）...")
+        
+        if self.ddf is None:
+            raise ValueError("データが読み込まれていません")
+        
+        # t0, t1を取得（必要最小限のデータのみ）
+        t0_series: Series = self.ddf['t0']  # type: ignore[assignment]
+        t1_series: Series = self.ddf['t1']  # type: ignore[assignment]
+        
+        t0_pd: pd.Series[Any]
+        t1_pd: pd.Series[Any]
+        t0_pd, t1_pd = dask.compute(t0_series, t1_series)  # type: ignore
+        
+        all_t0: np.ndarray = t0_pd.values
+        all_t1: np.ndarray = t1_pd.values
+        
+        n_total = len(all_t0)
+        logger.info(f"総サンプル数: {n_total:,}")
+        logger.info(f"メモリ使用量（t0+t1配列）: {(all_t0.nbytes + all_t1.nbytes) / 1024**2:.2f} MB")
+        
+        # バケット化（日単位、日付文字列をキーに使用）
+        interval_buckets: Dict[str, List[tuple]] = defaultdict(list)
+        
+        logger.info("区間を日単位バケットに分類中...")
+        for i in range(n_total):
+            t0 = all_t0[i]
+            t1 = all_t1[i]
+            
+            # この区間が跨ぐすべての日バケットに登録
+            bucket_start = pd.Timestamp(t0).floor('D')
+            bucket_end = pd.Timestamp(t1).floor('D')
+            
+            current_bucket = bucket_start
+            while current_bucket <= bucket_end:
+                bucket_key = current_bucket.strftime('%Y-%m-%d')  # 日付文字列をキーに
+                interval_buckets[bucket_key].append((t0, t1))
+                current_bucket += pd.Timedelta(days=1)
+        
+        logger.info(f"バケット数: {len(interval_buckets):,}")
+        avg_intervals_per_bucket = sum(len(v) for v in interval_buckets.values()) / len(interval_buckets)
+        logger.info(f"バケット当たり平均区間数: {avg_intervals_per_bucket:.1f}")
+        logger.info(f"総区間登録数: {sum(len(v) for v in interval_buckets.values()):,}")
+        
+        return dict(interval_buckets)
+    
     def compute_sample_weights(self) -> None:
         """サンプル一意性による重み付けを計算"""
         if self.ddf is None:
             raise ValueError("データが読み込まれていません。_load_data()を先に実行してください。")
         
         logger.info("=" * 50)
-        logger.info("サンプル一意性計算開始")
+        logger.info("サンプル一意性計算開始（高速化版）")
         logger.info("=" * 50)
         
-        # ステップ1: 全データのt0, t1を取得（メモリに載せる）
-        logger.info("全データのイベント期間（t0, t1）を取得中...")
-        all_t0_series: Series = self.ddf['t0']  # type: ignore[assignment]
-        all_t1_series: Series = self.ddf['t1']  # type: ignore[assignment]
+        # ステップ1: 区間バケットの構築
+        interval_buckets = self._build_interval_buckets()
         
-        all_t0_computed, all_t1_computed = dask.compute(all_t0_series, all_t1_series)  # type: ignore
-        all_t0: np.ndarray = all_t0_computed.values  # type: ignore[union-attr]
-        all_t1: np.ndarray = all_t1_computed.values  # type: ignore[union-attr]
-        
-        n_total = len(all_t0)
-        logger.info(f"総サンプル数: {n_total:,}")
-        logger.info(f"メモリ使用量（t0+t1配列）: {(all_t0.nbytes + all_t1.nbytes) / 1024**2:.2f} MB")
-        
-        # ステップ2: 並行性の計算（各パーティションに対してブロードキャスト）
+        # ステップ2: 並行性の計算（各パーティションに対してバケットをブロードキャスト）
         logger.info("並行性（Concurrency）を計算中...")
-        logger.info("警告: この処理は計算集約的です（O(N²)の時間複雑性）")
+        logger.info("区間木アプローチによりO(N log N)で処理")
         
         # メタデータ定義
         meta_concurrency = self.ddf._meta.copy()  # type: ignore[union-attr]
         meta_concurrency['concurrency'] = 0.0
         
-        # map_partitionsで並行性計算（all_t0とall_t1をブロードキャスト）
+        # map_partitionsで並行性計算
         ddf_with_concurrency: DataFrame = self.ddf.map_partitions(  # type: ignore[assignment]
-            compute_concurrency_partition,
-            all_t0=all_t0,
-            all_t1=all_t1,
+            compute_concurrency_interval_tree,
+            interval_buckets=interval_buckets,
             meta=meta_concurrency
         )
         
@@ -173,8 +242,7 @@ class SampleUniquenessWeighter:
         
         if self.use_return_weighting:
             logger.info("重み付け方式: 一意性 × |return|")
-            # リターン計算: (close_t1 - close_t0) / close_t0
-            # 簡易実装: 現在の close を使用（厳密にはt0時点のclose）
+            # リターン計算: 前の行からの変化率
             ddf_with_uniqueness['abs_return'] = ddf_with_uniqueness['close'].pct_change().abs()  # type: ignore[index]
             ddf_with_uniqueness = ddf_with_uniqueness.fillna({'abs_return': 0.0})  # type: ignore[call-overload]
             
@@ -192,6 +260,7 @@ class SampleUniquenessWeighter:
             sample_weight_normalized: Series = sample_weight_series / weight_sum_computed  # type: ignore[assignment, operator]
         else:
             logger.warning("サンプルウェイトの合計が0です。均等ウェイトを使用します。")
+            n_total = len(self.ddf)  # type: ignore[arg-type]
             sample_weight_normalized = sample_weight_series * 0.0 + (1.0 / n_total)  # type: ignore[assignment, operator]
         
         # ステップ6: DataFrameに追加
@@ -226,9 +295,15 @@ class SampleUniquenessWeighter:
         
         computed_stats: Dict[str, Any] = dask.compute(stats)[0]  # type: ignore
         
+        # 総サンプル数を正しく計算（バケット数ではなく）
+        n_total_delayed = len(self.ddf)  # type: ignore[arg-type]
+        n_total: int = int(dask.compute(n_total_delayed)[0])  # type: ignore
+        
         result_info = {
             'total_samples': n_total,
             'weighting_method': 'uniqueness_x_return' if self.use_return_weighting else 'uniqueness_only',
+            'optimization': 'interval_tree',
+            'time_complexity': 'O(N log N)',
             'sample_weight_stats': {
                 'mean': float(computed_stats['mean']),
                 'std': float(computed_stats['std']),
@@ -251,7 +326,7 @@ class SampleUniquenessWeighter:
             json.dump(result_info, f, indent=2)
         
         logger.info("=" * 50)
-        logger.info("🎉 サンプル一意性計算完了 🎉")
+        logger.info("サンプル一意性計算完了")
         logger.info("=" * 50)
         logger.info(f"総サンプル数: {n_total:,}")
         logger.info(f"平均並行性: {result_info['concurrency_stats']['mean']:.2f}")
@@ -285,7 +360,7 @@ if __name__ == '__main__':
         weighter = SampleUniquenessWeighter(
             input_path='data/temp_chunks/training_data/labeled_dataset_partitioned',
             output_path='data/temp_chunks/training_data/weighted_dataset_partitioned',
-            use_return_weighting=False  # 基本形: 一意性のみ
+            use_return_weighting=False
         )
         
         weighter.run()

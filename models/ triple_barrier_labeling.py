@@ -99,19 +99,22 @@ def label_partition(partition: pd.DataFrame, profit_multiplier: float,
             labels[i] = 1
             barriers[i] = 'profit'
             times[i] = int(first_profit)
-            t1_array[i] = timestamp_values[i + int(first_profit)]
+            hit_idx = i + int(first_profit)
+            t1_array[i] = timestamp_values[hit_idx] if hit_idx < n_rows else timestamp_values[n_rows - 1]
         elif first_loss < first_profit:
             # 損切りバリアに先に到達
             labels[i] = -1
             barriers[i] = 'loss'
             times[i] = int(first_loss)
-            t1_array[i] = timestamp_values[i + int(first_loss)]
+            hit_idx = i + int(first_loss)
+            t1_array[i] = timestamp_values[hit_idx] if hit_idx < n_rows else timestamp_values[n_rows - 1]
         else:
             # どちらにも到達せず（時間切れ）
             labels[i] = 0
             barriers[i] = 'time'
             times[i] = max_look_ahead
-            t1_array[i] = timestamp_values[i + max_look_ahead] if max_look_ahead > 0 else current_timestamp
+            end_idx = i + max_look_ahead
+            t1_array[i] = timestamp_values[end_idx] if end_idx < n_rows else timestamp_values[n_rows - 1]
     
     # 結果をDataFrameに追加
     result_df['label'] = labels

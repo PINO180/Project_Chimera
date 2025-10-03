@@ -6,10 +6,11 @@ import numpy as np
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, TypedDict
 import logging
 import joblib
 from sklearn.calibration import CalibratedClassifierCV
+from collections import deque
 
 # 独自モジュール
 from state_manager import StateManager, SystemState, Position, EventType
@@ -17,6 +18,25 @@ from market_regime_detector import MarketRegimeDetector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# 型定義
+class MarketInfo(TypedDict):
+    """市場情報の型定義"""
+    current_price: float
+    atr: float
+    predicted_time: Optional[float]
+    volatility_ratio: Optional[float]  # GARCH予測 / 平均ATR
+
+
+class AIFeatures(TypedDict):
+    """AI特徴量の型定義"""
+    base_features: np.ndarray
+    m1_rolling_precision: List[float]
+    m1_rolling_f1: List[float]
+    atr: float
+    volatility: float
+    trend_strength: float
 
 
 class ExtremeRiskEngineV2:
@@ -48,8 +68,12 @@ class ExtremeRiskEngineV2:
         self.regime_detector = regime_detector
         
         # 較正済みモデル
-        self.m1_calibrated: Optional[Any] = None
-        self.m2_calibrated: Optional[Any] = None
+        self.m1_calibrated: Optional[CalibratedClassifierCV] = None
+        self.m2_calibrated: Optional[CalibratedClassifierCV] = None
+        
+        # M1性能履歴（ローリング統計用）
+        self.m1_precision_history: deque = deque(maxlen=20)
+        self.m1_f1_history: deque = deque(maxlen=20)
         
         if m1_model_path:
             self.load_calibrated_model(m1_model_path, model_type='M1')
@@ -119,12 +143,15 @@ class ExtremeRiskEngineV2:
         except Exception as e:
             logger.error(f"✗ モデル読み込み失敗 ({model_type}): {e}")
     
-    def predict_with_confidence(self, features: np.ndarray) -> Tuple[float, float]:
+    def predict_with_confidence(self, 
+                               features: np.ndarray,
+                               market_info: MarketInfo) -> Tuple[float, float]:
         """
         較正済みモデルで予測と確信度を取得
         
         Args:
-            features: 特徴量ベクトル
+            features: 基本特徴量ベクトル
+            market_info: 市場情報（ATR、ボラティリティ等）
         
         Returns:
             (M1予測確率, M2成功確率)
@@ -135,14 +162,92 @@ class ExtremeRiskEngineV2:
         # M1予測（利食い確率）
         p_m1 = self.m1_calibrated.predict_proba(features)[0, 1]
         
+        # M2用拡張特徴量の構築
+        # 1. 基本特徴量
+        # 2. M1出力
+        # 3. M1性能特徴量（ローリング統計）
+        # 4. 市場レジーム特徴量
+        
+        extended_features_list = [features[0]]  # 基本特徴量
+        
+        # M1出力
+        extended_features_list.append(p_m1)
+        
+        # M1性能特徴量（ウォークフォワード、リーケージ防止）
+        if len(self.m1_precision_history) > 0:
+            m1_rolling_precision = float(np.mean(self.m1_precision_history))
+            m1_rolling_f1 = float(np.mean(self.m1_f1_history))
+        else:
+            m1_rolling_precision = 0.5  # デフォルト
+            m1_rolling_f1 = 0.5
+        
+        extended_features_list.extend([m1_rolling_precision, m1_rolling_f1])
+        
+        # 市場レジーム特徴量
+        extended_features_list.extend([
+            market_info['atr'],
+            market_info.get('volatility_ratio', 1.0),
+        ])
+        
+        # 配列に変換
+        extended_features = np.array([extended_features_list])
+        
         # M2予測（M1シグナルの成功確率）
-        # 注: 実装では、M1の出力を含む拡張特徴量をM2に渡す
-        extended_features = np.hstack([features, [[p_m1]]])
         p_m2 = self.m2_calibrated.predict_proba(extended_features)[0, 1]
         
         return float(p_m1), float(p_m2)
     
-    # ========== ケリー基準による最適資本配分 ==========
+    def update_m1_performance(self, precision: float, f1_score: float) -> None:
+        """
+        M1モデルの性能統計を更新
+        
+        Args:
+            precision: 最新のプレシジョン
+            f1_score: 最新のF1スコア
+        """
+        self.m1_precision_history.append(precision)
+        self.m1_f1_history.append(f1_score)
+        logger.debug(f"M1性能更新: Precision={precision:.4f}, F1={f1_score:.4f}")
+    
+    def calculate_volatility_adjustment(self,
+                                       current_volatility: float,
+                                       historical_avg: float) -> float:
+        """
+        ボラティリティ比率による調整係数を計算（GARCH適応）
+        
+        Args:
+            current_volatility: 現在のボラティリティ（GARCH予測値）
+            historical_avg: 過去平均ATR
+        
+        Returns:
+            調整係数（0.7〜1.2）
+        """
+        if historical_avg <= 0:
+            logger.warning("過去平均ATRが無効です。調整係数1.0を返します。")
+            return 1.0
+        
+        volatility_ratio = current_volatility / historical_avg
+        
+        # 設定から閾値を取得（既存実装との互換性）
+        vol_config = {
+            'high_threshold': 1.5,
+            'high_multiplier': 0.7,
+            'low_threshold': 0.5,
+            'low_multiplier': 1.2
+        }
+        
+        if volatility_ratio > vol_config['high_threshold']:
+            adjustment = vol_config['high_multiplier']
+            logger.info(f"高ボラティリティ検出（比率: {volatility_ratio:.2f}）。"
+                       f"ロット調整: {adjustment}")
+        elif volatility_ratio < vol_config['low_threshold']:
+            adjustment = vol_config['low_multiplier']
+            logger.info(f"低ボラティリティ検出（比率: {volatility_ratio:.2f}）。"
+                       f"ロット調整: {adjustment}")
+        else:
+            adjustment = 1.0
+        
+        return adjustment
     
     def calculate_kelly_fraction(self,
                                  p_win: float,
