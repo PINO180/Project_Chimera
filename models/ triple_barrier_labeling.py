@@ -25,15 +25,15 @@ def label_partition(partition: pd.DataFrame, profit_multiplier: float,
         time_barrier: 時間バリア（バー数）
     
     Returns:
-        ラベル付きDataFrame
+        ラベル付きDataFrame (t0, t1カラムを含む)
     """
     if partition.empty:
         # 空のパーティションの場合、スキーマを維持
-        result_cols = list(partition.columns) + ['label', 'barrier_reached', 'time_to_barrier']
+        result_cols = list(partition.columns) + ['label', 'barrier_reached', 'time_to_barrier', 't0', 't1']
         return pd.DataFrame(columns=result_cols)
     
     # 必要なカラムの存在確認
-    required_cols = ['close', 'ATR']
+    required_cols = ['close', 'ATR', 'timestamp']
     for col in required_cols:
         if col not in partition.columns:
             logger.error(f"必須カラム '{col}' がパーティションに存在しません。")
@@ -46,19 +46,24 @@ def label_partition(partition: pd.DataFrame, profit_multiplier: float,
     labels = np.zeros(n_rows, dtype=np.int32)
     barriers = np.empty(n_rows, dtype=object)
     times = np.zeros(n_rows, dtype=np.int32)
+    t0_array = partition['timestamp'].values.copy()
+    t1_array = np.empty(n_rows, dtype='datetime64[ns]')
     
     close_values = partition['close'].values
     atr_values = partition['ATR'].values
+    timestamp_values = partition['timestamp'].values
     
     for i in range(n_rows):
         current_price = close_values[i]
         current_atr = atr_values[i]
+        current_timestamp = timestamp_values[i]
         
         # ATRが無効な場合はスキップ
         if pd.isna(current_atr) or current_atr <= 0:
             labels[i] = 0
             barriers[i] = 'none'
             times[i] = 0
+            t1_array[i] = current_timestamp
             continue
         
         # バリアを計算
@@ -73,6 +78,7 @@ def label_partition(partition: pd.DataFrame, profit_multiplier: float,
             labels[i] = 0
             barriers[i] = 'time'
             times[i] = 0
+            t1_array[i] = current_timestamp
             continue
         
         future_prices = close_values[i+1:i+1+max_look_ahead]
@@ -93,28 +99,33 @@ def label_partition(partition: pd.DataFrame, profit_multiplier: float,
             labels[i] = 1
             barriers[i] = 'profit'
             times[i] = int(first_profit)
+            t1_array[i] = timestamp_values[i + int(first_profit)]
         elif first_loss < first_profit:
             # 損切りバリアに先に到達
             labels[i] = -1
             barriers[i] = 'loss'
             times[i] = int(first_loss)
+            t1_array[i] = timestamp_values[i + int(first_loss)]
         else:
             # どちらにも到達せず（時間切れ）
             labels[i] = 0
             barriers[i] = 'time'
             times[i] = max_look_ahead
+            t1_array[i] = timestamp_values[i + max_look_ahead] if max_look_ahead > 0 else current_timestamp
     
     # 結果をDataFrameに追加
     result_df['label'] = labels
     result_df['barrier_reached'] = barriers
     result_df['time_to_barrier'] = times
+    result_df['t0'] = t0_array  # イベント開始時刻
+    result_df['t1'] = t1_array  # イベント終了時刻
     
     return result_df
 
 
 class TripleBarrierLabeler:
     """
-    【Dask版】トリプルバリアラベリングシステム
+    【Dask版】トリプルバリアラベリングシステム（統合設計図V準拠）
     純化された特徴量データセットに対して現実的なターゲット変数を生成
     """
     
@@ -149,7 +160,7 @@ class TripleBarrierLabeler:
         )
         
         # 必須カラムの確認
-        required_cols = ['close', 'ATR']
+        required_cols = ['close', 'ATR', 'timestamp']
         missing_cols = [col for col in required_cols if col not in self.ddf.columns]
         
         if missing_cols:
@@ -162,7 +173,9 @@ class TripleBarrierLabeler:
         if self.ddf is None:
             raise ValueError("データが読み込まれていません。_load_data()を先に実行してください。")
         
-        logger.info("--- トリプルバリアラベリング開始 ---")
+        logger.info("=" * 50)
+        logger.info("トリプルバリアラベリング開始")
+        logger.info("=" * 50)
         logger.info(f"設定: 利食い={self.profit_multiplier}xATR, 損切り={self.loss_multiplier}xATR, 時間={self.time_barrier}バー")
         
         # 出力スキーマを定義
@@ -170,10 +183,10 @@ class TripleBarrierLabeler:
         meta_dict['label'] = 'int32'
         meta_dict['barrier_reached'] = 'object'
         meta_dict['time_to_barrier'] = 'int32'
+        meta_dict['t0'] = 'datetime64[ns]'
+        meta_dict['t1'] = 'datetime64[ns]'
         
         # 【重要】map_overlapを使用してパーティション境界問題を解決
-        # before=0: 前のパーティションからのオーバーラップは不要
-        # after=time_barrier: 将来のtime_barrier分のデータを各パーティションに含める
         logger.info(f"map_overlapを使用（オーバーラップ: {self.time_barrier}バー先）")
         labeled_ddf = self.ddf.map_overlap(  # type: ignore[assignment]
             label_partition,
@@ -201,20 +214,18 @@ class TripleBarrierLabeler:
         
         logger.info("保存完了。メタデータを計算中...")
         
-        # メタデータの計算（Daskの遅延評価オブジェクト）
+        # メタデータの計算
         label_counts_series = labeled_ddf['label'].value_counts()  # type: ignore[index]
         n_rows_delayed: Any = len(labeled_ddf)  # type: ignore[arg-type]
-        
-        # 列数を安全に取得（columnsをリストに変換）
         columns_list = list(labeled_ddf.columns)  # type: ignore[attr-defined]
         n_cols: int = len(columns_list)
         
         # 一度に計算を実行
         computed_results = dask.compute(label_counts_series, n_rows_delayed)  # type: ignore
         label_counts_series_computed: pd.Series = computed_results[0]  # type: ignore
-        n_rows: int = int(computed_results[1])  # 明示的にintに変換
+        n_rows: int = int(computed_results[1])
         
-        # 辞書に変換（型ヒントを明示）
+        # 辞書に変換
         label_counts: Dict[int, int] = label_counts_series_computed.to_dict()  # type: ignore
         
         # 統計情報
@@ -227,9 +238,9 @@ class TripleBarrierLabeler:
                 'time': int(label_counts.get(0, 0))
             },
             'label_distribution_percent': {
-                'profit': float(label_counts.get(1, 0) / n_rows * 100),
-                'loss': float(label_counts.get(-1, 0) / n_rows * 100),
-                'time': float(label_counts.get(0, 0) / n_rows * 100)
+                'profit': float(label_counts.get(1, 0) / n_rows * 100) if n_rows > 0 else 0.0,
+                'loss': float(label_counts.get(-1, 0) / n_rows * 100) if n_rows > 0 else 0.0,
+                'time': float(label_counts.get(0, 0) / n_rows * 100) if n_rows > 0 else 0.0
             },
             'settings': {
                 'profit_multiplier': self.profit_multiplier,
@@ -244,15 +255,17 @@ class TripleBarrierLabeler:
         with open(json_path, 'w') as f:
             json.dump(result_info, f, indent=2)
         
-        logger.info("-" * 50)
+        logger.info("=" * 50)
         logger.info("🎉 トリプルバリアラベリング完了 🎉")
+        logger.info("=" * 50)
         logger.info(f"総行数: {n_rows:,}")
         logger.info(f"ラベル分布: 利食い={result_info['label_distribution']['profit']:,} ({result_info['label_distribution_percent']['profit']:.2f}%), "
                    f"損切り={result_info['label_distribution']['loss']:,} ({result_info['label_distribution_percent']['loss']:.2f}%), "
                    f"時間切れ={result_info['label_distribution']['time']:,} ({result_info['label_distribution_percent']['time']:.2f}%)")
+        logger.info(f"出力:")
         logger.info(f"- Parquet: {self.output_path}")
         logger.info(f"- JSON: {json_path}")
-        logger.info("-" * 50)
+        logger.info("=" * 50)
     
     def run(self) -> None:
         """パイプライン全体を実行"""

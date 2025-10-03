@@ -27,3 +27,52 @@ Bash
 
 conda env export > environment.yml
 まずは、手軽で直接的なpip freezeコマンドを覚えておけば問題ありません。
+
+
+## 今後のメンテナンス方法
+pip-toolsを使ったメンテナンス方法は非常にシンプルです。ルールは一つだけです。
+「編集するのは常に.inファイルだけ。.txtファイルは絶対に手で編集しない」
+
+### ケース1：新しいライブラリの追加・削除
+例えば、pandas-taという新しいライブラリをCPU環境に追加したくなった場合の手順です。
+
+.inファイルを編集する
+requirements-cpu.inファイルを開き、pandas-taという行を追加します。
+
+コード スニペット
+
+# requirements-cpu.in
+...
+# 開発用
+jupyterlab>=4.0,<5.0
+pandas-ta  # ← 新しく追加
+pip-compileを再実行する
+ターミナルで、以前と同じコマンドを実行します。
+
+Bash
+
+pip-compile requirements-cpu.in --output-file requirements-cpu.txt
+pip-compileがpandas-taとその依存関係を考慮した、新しいrequirements-cpu.txtを自動で再生成してくれます。
+
+環境に反映させる
+VS Codeでコンテナを再ビルドします。
+
+コマンドパレット(Ctrl+Shift+P)を開き、「Remote-Containers: Rebuild Container」を選択します。
+
+これにより、新しいrequirements-cpu.txtの内容でコンテナが再構築され、pandas-taが使えるようになります。
+
+### ケース2：既存のライブラリをまとめて最新版に更新
+プロジェクトを進める中で、全てのライブラリを互換性を保ちながら最新版にしたい場合があります。
+
+--upgradeオプションを付けてコマンドを実行する
+ターミナルで以下のコマンドを実行します。
+
+Bash
+
+pip-compile --upgrade requirements-cpu.in --output-file requirements-cpu.txt
+--upgradeを付けることで、pip-compileは各ライブラリの最新バージョンを探しに行き、互換性のある範囲でバージョンを更新したrequirements-cpu.txtを生成します。
+
+環境に反映させる
+ケース1と同様に、「Remote-Containers: Rebuild Container」でコンテナを再ビルドします。
+
+このルールさえ守れば、あなたの開発環境は常にクリーンで、安定し、再現可能な状態に保たれます。

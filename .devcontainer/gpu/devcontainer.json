@@ -1,20 +1,28 @@
 {
-    "name": "RAPIDS Dev Container",
-    // 1. 成功したイメージを正確に指定
-    "image": "rapidsai/base:25.08-cuda12.0-py3.11",
+    "name": "GPU Dev Container (Project Forge)",
+    // Dockerfileからビルド
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "../.."
+    },
+    // ワークスペースのマウント設定
+    "workspaceFolder": "/workspace",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+    ],
     // time zoneの変更
     "containerEnv": {
         "TZ": "Asia/Tokyo"
     },
-    // 2. GPUを割り当てるための引数を追加
+    // GPUを割り当てるための引数を追加
     "remoteUser": "root",
     "runArgs": [
         "--gpus=all",
         "--memory=64g",
         "--memory-swap=64g",
-        "--shm-size=2g" // 共有メモリを2GBに増量,    
+        "--shm-size=2g"
     ],
-    // VS Codeの便利な設定（Python拡張機能の自動インストールなど）
+    // VS Codeの便利な設定
     "customizations": {
         "vscode": {
             "settings": {
@@ -27,8 +35,8 @@
             },
             "extensions": [
                 "ms-python.python",
-                "ms-python.vscode-pylance", // 高機能なコード補完
-                "ms-toolsai.jupyter" // Jupyter Notebook連携
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter"
             ]
         }
     },
@@ -44,11 +52,5 @@
         "8787": {
             "label": "Dask Dashboard"
         }
-    },
-    // コンテナ初回起動時のみ実行されるコマンド
-    // 例: pipで追加パッケージをインストールする
-    "postCreateCommand": "pip install -r requirements.txt"
-    //"features": {
-    //    "ghcr.io/devcontainers/features/github-cli:1": {}
-    //}
+    }
 }

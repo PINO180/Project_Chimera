@@ -1,62 +1,90 @@
+"""
+極限リスク管理エンジン 2.0
+ケリー基準、確率キャリブレーション、状態管理、市場レジーム適応を統合
+"""
 import numpy as np
 import json
 from pathlib import Path
-from datetime import datetime, time
-from typing import Dict, Any, Optional, List
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
 import logging
+import joblib
+from sklearn.calibration import CalibratedClassifierCV
 
-# ロギング設定
+# 独自モジュール
+from state_manager import StateManager, SystemState, Position, EventType
+from market_regime_detector import MarketRegimeDetector
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class ExtremeRiskEngine:
+class ExtremeRiskEngineV2:
     """
-    極限リスク管理エンジン
-    AIの予測結果から最適なポジションサイズとリスクパラメータを計算し、取引コマンドを生成
+    極限リスク管理エンジン 2.0
+    数学的原則に基づいた最適資本配分と動的市場適応
     """
     
-    def __init__(self, config_path: str = 'config/risk_config.json'):
+    def __init__(self,
+                 config_path: str = 'config/risk_config.json',
+                 state_manager: Optional[StateManager] = None,
+                 regime_detector: Optional[MarketRegimeDetector] = None,
+                 m1_model_path: Optional[str] = None,
+                 m2_model_path: Optional[str] = None):
         """
         Args:
-            config_path: リスク管理設定ファイルのパス
+            config_path: リスク管理設定ファイル
+            state_manager: 状態管理マネージャー
+            regime_detector: 市場レジーム検知器
+            m1_model_path: M1較正済みモデルのパス
+            m2_model_path: M2較正済みモデルのパス
         """
         self.config = self._load_config(config_path)
-        logger.info(f"ExtremeRiskEngineを初期化しました。設定: {config_path}")
+        
+        # 状態管理
+        self.state_manager = state_manager or StateManager()
+        
+        # 市場レジーム検知
+        self.regime_detector = regime_detector
+        
+        # 較正済みモデル
+        self.m1_calibrated: Optional[Any] = None
+        self.m2_calibrated: Optional[Any] = None
+        
+        if m1_model_path:
+            self.load_calibrated_model(m1_model_path, model_type='M1')
+        if m2_model_path:
+            self.load_calibrated_model(m2_model_path, model_type='M2')
+        
+        logger.info("ExtremeRiskEngineV2を初期化しました。")
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
-        """リスク管理設定をJSONファイルから読み込む"""
+        """リスク管理設定を読み込む"""
         config_file = Path(config_path)
         
         if not config_file.exists():
-            # デフォルト設定を作成
             logger.warning(f"設定ファイル '{config_path}' が見つかりません。デフォルト設定を使用します。")
             default_config = {
-                'risk_percent': 0.02,  # 口座残高の2%をリスクに晒す
-                'max_drawdown': 0.20,  # 最大ドローダウン20%
-                'drawdown_reduction_threshold': 0.15,  # 15%でロット縮小
-                'confidence_threshold': 0.60,  # エントリー最低確信度
-                'min_risk_reward_ratio': 2.0,  # 最小リスクリワード比
-                'atr_sl_multiplier': 1.0,  # 損切りATR倍率
-                'atr_tp_multiplier': 2.0,  # 利食いATR倍率
-                'volatility_adjustment': {
-                    'high_threshold': 1.5,  # 高ボラティリティ閾値
-                    'high_multiplier': 0.7,  # 高ボラ時のロット倍率
-                    'low_threshold': 0.5,   # 低ボラティリティ閾値
-                    'low_multiplier': 1.2    # 低ボラ時のロット倍率
-                },
+                'base_risk_percent': 0.02,
+                'max_drawdown': 0.20,
+                'drawdown_reduction_threshold': 0.15,
+                'base_confidence_threshold': 0.60,
+                'min_risk_reward_ratio': 2.0,
+                'base_atr_sl_multiplier': 1.0,
+                'base_atr_tp_multiplier': 2.0,
+                'kelly_fraction': 0.5,  # ハーフケリー
+                'max_risk_per_trade': 0.05,  # 1取引あたり最大5%
+                'max_positions': 3,
+                'contract_size': 100000,
+                'pip_value_per_lot': 10,
                 'time_filters': {
-                    'blocked_hours_before_news': 0.5,  # ニュース前30分
-                    'blocked_hours_after_news': 0.5,   # ニュース後30分
-                    'blocked_hours_weekend_close': 4,   # 週末クローズ前4時間
-                    'blocked_hours_weekend_open': 2     # 週明けオープン後2時間
-                },
-                'max_positions': 3,  # 同時保有ポジション数
-                'contract_size': 100000,  # 1ロットの契約サイズ（標準）
-                'pip_value_per_lot': 10  # 1pipあたりの価値（USD/JPY想定）
+                    'blocked_hours_before_news': 0.5,
+                    'blocked_hours_after_news': 0.5,
+                    'blocked_hours_weekend_close': 4,
+                    'blocked_hours_weekend_open': 2
+                }
             }
             
-            # デフォルト設定を保存
             config_file.parent.mkdir(parents=True, exist_ok=True)
             with open(config_file, 'w') as f:
                 json.dump(default_config, f, indent=2)
@@ -66,80 +94,190 @@ class ExtremeRiskEngine:
         with open(config_file, 'r') as f:
             return json.load(f)
     
-    def calculate_position_size(self,
-                               account_balance: float,
-                               entry_price: float,
-                               stop_loss_price: float,
-                               confidence: float,
-                               current_drawdown: float = 0.0,
-                               volatility_ratio: float = 1.0) -> float:
+    # ========== モデル管理 ==========
+    
+    def load_calibrated_model(self, model_path: str, model_type: str) -> None:
         """
-        ポジションサイズを計算
+        較正済みモデルを読み込む
+        
+        Args:
+            model_path: モデルファイルパス
+            model_type: 'M1' or 'M2'
+        """
+        try:
+            model = joblib.load(model_path)
+            
+            if model_type == 'M1':
+                self.m1_calibrated = model
+                logger.info(f"✓ M1較正済みモデル読み込み: {model_path}")
+            elif model_type == 'M2':
+                self.m2_calibrated = model
+                logger.info(f"✓ M2較正済みモデル読み込み: {model_path}")
+            else:
+                raise ValueError(f"無効なモデルタイプ: {model_type}")
+        
+        except Exception as e:
+            logger.error(f"✗ モデル読み込み失敗 ({model_type}): {e}")
+    
+    def predict_with_confidence(self, features: np.ndarray) -> Tuple[float, float]:
+        """
+        較正済みモデルで予測と確信度を取得
+        
+        Args:
+            features: 特徴量ベクトル
+        
+        Returns:
+            (M1予測確率, M2成功確率)
+        """
+        if self.m1_calibrated is None or self.m2_calibrated is None:
+            raise ValueError("較正済みモデルが読み込まれていません。")
+        
+        # M1予測（利食い確率）
+        p_m1 = self.m1_calibrated.predict_proba(features)[0, 1]
+        
+        # M2予測（M1シグナルの成功確率）
+        # 注: 実装では、M1の出力を含む拡張特徴量をM2に渡す
+        extended_features = np.hstack([features, [[p_m1]]])
+        p_m2 = self.m2_calibrated.predict_proba(extended_features)[0, 1]
+        
+        return float(p_m1), float(p_m2)
+    
+    # ========== ケリー基準による最適資本配分 ==========
+    
+    def calculate_kelly_fraction(self,
+                                 p_win: float,
+                                 win_loss_ratio: float,
+                                 kelly_fraction: float = 0.5) -> float:
+        """
+        ケリー基準で最適な資本配分比率を計算
+        
+        Args:
+            p_win: 勝利確率（較正済み）
+            win_loss_ratio: 勝敗比率（利食い幅 / 損切り幅）
+            kelly_fraction: ケリー分数（0.5でハーフケリー、0.25でクォーターケリー）
+        
+        Returns:
+            最適資本配分比率（0-1）
+        """
+        # ケリー基準の公式: f* = (b*p - q) / b
+        # b = win_loss_ratio, p = p_win, q = 1 - p_win
+        
+        if win_loss_ratio <= 0 or p_win <= 0 or p_win >= 1:
+            logger.warning("ケリー基準の計算に無効なパラメータ")
+            return 0.0
+        
+        q_lose = 1.0 - p_win
+        
+        # ケリー基準
+        kelly_f = (win_loss_ratio * p_win - q_lose) / win_loss_ratio
+        
+        # 負の値（期待値マイナス）の場合は0
+        if kelly_f <= 0:
+            logger.info(f"期待値マイナスのシグナル（Kelly={kelly_f:.4f}）。エントリー不可。")
+            return 0.0
+        
+        # 分数ケリー（リスク軽減）
+        fractional_kelly = kelly_f * kelly_fraction
+        
+        logger.debug(f"Kelly計算: p_win={p_win:.4f}, b={win_loss_ratio:.2f}, "
+                    f"f*={kelly_f:.4f}, fractional={fractional_kelly:.4f}")
+        
+        return fractional_kelly
+    
+    def calculate_position_size_kelly(self,
+                                     account_balance: float,
+                                     p_m2: float,
+                                     entry_price: float,
+                                     stop_loss_price: float,
+                                     take_profit_price: float,
+                                     current_drawdown: float = 0.0,
+                                     regime_params: Optional[Dict[str, Any]] = None) -> Tuple[float, Dict[str, Any]]:
+        """
+        ケリー基準でポジションサイズを計算
         
         Args:
             account_balance: 口座残高
+            p_m2: M2の成功確率（較正済み）
             entry_price: エントリー価格
             stop_loss_price: 損切り価格
-            confidence: AIの確信度（0-1）
+            take_profit_price: 利食い価格
             current_drawdown: 現在のドローダウン（0-1）
-            volatility_ratio: ボラティリティ比率（GARCH予測値 / 平均ATR）
+            regime_params: 市場レジーム別パラメータ
         
         Returns:
-            計算されたロット数
+            (ロット数, 計算詳細)
         """
-        # 基本リスク額の計算
-        base_risk_amount = account_balance * self.config['risk_percent']
+        # レジームパラメータの取得
+        if regime_params:
+            kelly_fraction = regime_params['kelly_fraction']
+        else:
+            kelly_fraction = self.config['kelly_fraction']
         
-        # ドローダウンによる調整
+        # ドローダウンチェック
         if current_drawdown >= self.config['max_drawdown']:
             logger.warning(f"最大ドローダウン超過（{current_drawdown:.2%}）。エントリー不可。")
-            return 0.0
+            return 0.0, {'reason': 'max_drawdown_exceeded'}
         
         if current_drawdown >= self.config['drawdown_reduction_threshold']:
-            base_risk_amount *= 0.5
-            logger.info(f"ドローダウン警戒レベル（{current_drawdown:.2%}）。リスクを50%削減。")
+            kelly_fraction *= 0.5
+            logger.info(f"ドローダウン警戒レベル（{current_drawdown:.2%}）。Kelly分数を50%削減。")
         
-        # 損切り幅の計算（pips）
-        sl_distance_pips = abs(entry_price - stop_loss_price) * 100  # USD/JPY想定
+        # 勝敗比率の計算
+        sl_distance = abs(entry_price - stop_loss_price)
+        tp_distance = abs(entry_price - take_profit_price)
         
-        if sl_distance_pips <= 0:
+        if sl_distance <= 0:
             logger.error("損切り幅が無効です。")
-            return 0.0
+            return 0.0, {'reason': 'invalid_sl_distance'}
         
-        # 基本ロットサイズの計算
-        base_lots = base_risk_amount / (sl_distance_pips * self.config['pip_value_per_lot'])
+        win_loss_ratio = tp_distance / sl_distance
         
-        # 確信度による調整
-        confidence_adjustment = (confidence - self.config['confidence_threshold']) / \
-                               (1.0 - self.config['confidence_threshold'])
-        adjusted_lots = base_lots * (1.0 + confidence_adjustment * 0.5)  # 最大1.5倍
+        # ケリー基準で最適比率を計算
+        kelly_f = self.calculate_kelly_fraction(p_m2, win_loss_ratio, kelly_fraction)
         
-        # ボラティリティによる調整
-        vol_config = self.config['volatility_adjustment']
-        if volatility_ratio > vol_config['high_threshold']:
-            # 高ボラティリティ環境
-            adjusted_lots *= vol_config['high_multiplier']
-            logger.info(f"高ボラティリティ検出（比率: {volatility_ratio:.2f}）。ロットを{vol_config['high_multiplier']}倍に調整。")
-        elif volatility_ratio < vol_config['low_threshold']:
-            # 低ボラティリティ環境
-            adjusted_lots *= vol_config['low_multiplier']
-            logger.info(f"低ボラティリティ検出（比率: {volatility_ratio:.2f}）。ロットを{vol_config['low_multiplier']}倍に調整。")
+        if kelly_f <= 0:
+            return 0.0, {'reason': 'negative_expected_value'}
         
-        # ロット数を0.01単位に丸める
-        final_lots = round(adjusted_lots, 2)
+        # 最大リスク制約
+        risk_fraction = min(kelly_f, self.config['max_risk_per_trade'])
+        
+        # リスク額
+        risk_amount = account_balance * risk_fraction
+        
+        # ロット計算（pips単位）
+        sl_distance_pips = sl_distance * 100  # USD/JPY想定
+        lots = risk_amount / (sl_distance_pips * self.config['pip_value_per_lot'])
+        
+        # 0.01単位に丸める
+        lots = round(lots, 2)
         
         # 最小ロット確認
-        if final_lots < 0.01:
+        if lots < 0.01:
             logger.warning("計算されたロットが最小値未満です。")
-            return 0.0
+            return 0.0, {'reason': 'lots_below_minimum'}
         
-        return final_lots
+        details = {
+            'kelly_f_raw': kelly_f / kelly_fraction,  # 生ケリー
+            'kelly_f_fractional': kelly_f,
+            'risk_fraction': risk_fraction,
+            'risk_amount': risk_amount,
+            'win_loss_ratio': win_loss_ratio,
+            'sl_distance_pips': sl_distance_pips,
+            'reason': 'success'
+        }
+        
+        logger.info(f"Kelly最適ロット: {lots:.2f} (リスク: {risk_fraction:.2%})")
+        
+        return lots, details
+    
+    # ========== 損切り・利食いの計算 ==========
     
     def calculate_sl_tp(self,
                        entry_price: float,
                        atr: float,
                        direction: str,
-                       predicted_time: Optional[float] = None) -> Dict[str, float]:
+                       predicted_time: Optional[float] = None,
+                       regime_params: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
         """
         損切り・利食いラインを計算
         
@@ -148,23 +286,27 @@ class ExtremeRiskEngine:
             atr: 現在のATR値
             direction: 取引方向（'BUY' or 'SELL'）
             predicted_time: AI予測の到達時間（バー数）
+            regime_params: 市場レジーム別パラメータ
         
         Returns:
             {'stop_loss': float, 'take_profit': float}
         """
-        # 基本的なSL/TP倍率
-        sl_multiplier = self.config['atr_sl_multiplier']
-        tp_multiplier = self.config['atr_tp_multiplier']
+        # レジームパラメータの取得
+        if regime_params:
+            sl_multiplier = regime_params['atr_multiplier_sl']
+            tp_multiplier = regime_params['atr_multiplier_tp']
+        else:
+            sl_multiplier = self.config['base_atr_sl_multiplier']
+            tp_multiplier = self.config['base_atr_tp_multiplier']
         
         # 予測時間に基づく動的調整
         if predicted_time is not None:
             if predicted_time < 30:
-                # 短時間予測: 利食いを拡大
                 tp_multiplier *= 1.25
             elif predicted_time > 90:
-                # 長時間予測: 利食いを縮小
                 tp_multiplier *= 0.75
         
+        # 計算
         if direction == 'BUY':
             stop_loss = entry_price - sl_multiplier * atr
             take_profit = entry_price + tp_multiplier * atr
@@ -174,48 +316,43 @@ class ExtremeRiskEngine:
         else:
             raise ValueError(f"無効な取引方向: {direction}")
         
-        # 価格を2桁に丸める（USD/JPY想定）
         return {
             'stop_loss': round(stop_loss, 2),
             'take_profit': round(take_profit, 2)
         }
     
+    # ========== エントリー条件チェック ==========
+    
     def check_entry_conditions(self,
-                              confidence: float,
-                              prob_profit: float,
-                              prob_loss: float,
+                              p_m2: float,
                               current_positions: int,
                               current_time: Optional[datetime] = None,
-                              news_times: Optional[List[datetime]] = None) -> Dict[str, Any]:
+                              news_times: Optional[List[datetime]] = None,
+                              regime_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         エントリー条件をチェック
         
         Args:
-            confidence: 確信度
-            prob_profit: 利食い確率
-            prob_loss: 損切り確率
+            p_m2: M2成功確率
             current_positions: 現在の保有ポジション数
             current_time: 現在時刻
             news_times: 経済指標発表時刻リスト
+            regime_params: 市場レジーム別パラメータ
         
         Returns:
             {'allowed': bool, 'reason': str}
         """
-        # 確信度チェック
-        if confidence < self.config['confidence_threshold']:
+        # 確信度チェック（レジーム適応）
+        if regime_params:
+            threshold = regime_params['confidence_threshold']
+        else:
+            threshold = self.config['base_confidence_threshold']
+        
+        if p_m2 < threshold:
             return {
                 'allowed': False,
-                'reason': f"確信度不足（{confidence:.2%} < {self.config['confidence_threshold']:.2%}）"
+                'reason': f"確信度不足（{p_m2:.2%} < {threshold:.2%}）"
             }
-        
-        # リスクリワード比チェック
-        if prob_loss > 0:
-            risk_reward = prob_profit / prob_loss
-            if risk_reward < self.config['min_risk_reward_ratio']:
-                return {
-                    'allowed': False,
-                    'reason': f"リスクリワード比不足（{risk_reward:.2f} < {self.config['min_risk_reward_ratio']:.2f}）"
-                }
         
         # ポジション数チェック
         if current_positions >= self.config['max_positions']:
@@ -226,7 +363,7 @@ class ExtremeRiskEngine:
         
         # 時間帯フィルター
         if current_time is not None:
-            # ニュース前後のチェック
+            # ニュース前後
             if news_times is not None:
                 for news_time in news_times:
                     time_diff = abs((current_time - news_time).total_seconds() / 3600)
@@ -237,7 +374,7 @@ class ExtremeRiskEngine:
                             'reason': f"経済指標発表前後の取引禁止時間帯（{time_diff:.1f}時間前）"
                         }
             
-            # 週末クローズ前後のチェック（金曜日21:00以降、月曜日9:00まで想定）
+            # 週末前後
             if current_time.weekday() == 4 and current_time.hour >= 21:
                 return {
                     'allowed': False,
@@ -252,151 +389,195 @@ class ExtremeRiskEngine:
         
         return {'allowed': True, 'reason': 'すべての条件をクリア'}
     
+    # ========== 統合取引コマンド生成 ==========
+    
     def generate_trade_command(self,
-                              ai_prediction: Dict[str, Any],
-                              account_info: Dict[str, float],
+                              features: np.ndarray,
                               market_info: Dict[str, float],
+                              market_data_for_regime: Optional[Any] = None,
                               current_time: Optional[datetime] = None,
                               news_times: Optional[List[datetime]] = None) -> Dict[str, Any]:
         """
-        取引コマンドを生成（メイン関数）
+        取引コマンドを生成（統合メイン関数）
         
         Args:
-            ai_prediction: AIモデルの予測結果
-                {
-                    'prob_profit': float,  # 利食い確率
-                    'prob_loss': float,    # 損切り確率
-                    'prob_time': float,    # 時間切れ確率
-                    'predicted_time': float  # 予測到達時間
-                }
-            account_info: 口座情報
-                {
-                    'balance': float,           # 口座残高
-                    'drawdown': float,          # 現在のドローダウン（0-1）
-                    'current_positions': int    # 現在の保有ポジション数
-                }
+            features: AI予測用の特徴量
             market_info: 市場情報
                 {
-                    'current_price': float,   # 現在価格
-                    'atr': float,             # ATR値
-                    'volatility_ratio': float # ボラティリティ比率（GARCH/平均ATR）
+                    'current_price': float,
+                    'atr': float,
+                    'predicted_time': Optional[float]
                 }
+            market_data_for_regime: 市場レジーム検知用のデータ（pd.DataFrame）
             current_time: 現在時刻
             news_times: 経済指標発表時刻リスト
         
         Returns:
             取引コマンド辞書
         """
-        # 確信度の計算（利食い確率をそのまま使用）
-        confidence = ai_prediction['prob_profit']
+        # 状態の取得
+        if self.state_manager.current_state is None:
+            logger.error("システム状態が初期化されていません。")
+            return self._generate_hold_command("state_not_initialized")
+        
+        state = self.state_manager.current_state
+        
+        # 市場レジームの検知
+        regime_params = None
+        if self.regime_detector and market_data_for_regime is not None:
+            try:
+                regime_info = self.regime_detector.detect_current_regime(market_data_for_regime)
+                regime_params = regime_info['risk_params']
+                logger.info(f"現在の市場レジーム: {regime_info['regime_name']}")
+            except Exception as e:
+                logger.warning(f"レジーム検知失敗: {e}。デフォルトパラメータを使用。")
+        
+        # AI予測（較正済み確率）
+        try:
+            p_m1, p_m2 = self.predict_with_confidence(features)
+            logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}")
+        except Exception as e:
+            logger.error(f"AI予測失敗: {e}")
+            return self._generate_hold_command("prediction_failed")
         
         # エントリー条件チェック
         entry_check = self.check_entry_conditions(
-            confidence=confidence,
-            prob_profit=ai_prediction['prob_profit'],
-            prob_loss=ai_prediction['prob_loss'],
-            current_positions=account_info['current_positions'],
+            p_m2=p_m2,
+            current_positions=len(state.open_positions),
             current_time=current_time,
-            news_times=news_times
+            news_times=news_times,
+            regime_params=regime_params
         )
         
         if not entry_check['allowed']:
             logger.info(f"エントリー不可: {entry_check['reason']}")
-            return {
-                'action': 'HOLD',
-                'lots': 0.0,
-                'stop_loss': 0.0,
-                'take_profit': 0.0,
-                'confidence': confidence,
-                'reason': entry_check['reason'],
-                'timestamp': current_time.isoformat() if current_time else None
-            }
+            return self._generate_hold_command(entry_check['reason'])
         
-        # 取引方向の決定（利食い確率が高ければBUY）
-        direction = 'BUY' if ai_prediction['prob_profit'] > 0.5 else 'SELL'
+        # 取引方向の決定
+        direction = 'BUY' if p_m1 > 0.5 else 'SELL'
         
         # SL/TPの計算
         sl_tp = self.calculate_sl_tp(
             entry_price=market_info['current_price'],
             atr=market_info['atr'],
             direction=direction,
-            predicted_time=ai_prediction.get('predicted_time')
+            predicted_time=market_info.get('predicted_time'),
+            regime_params=regime_params
         )
         
-        # ポジションサイズの計算
-        lots = self.calculate_position_size(
-            account_balance=account_info['balance'],
+        # ポジションサイズの計算（ケリー基準）
+        lots, calc_details = self.calculate_position_size_kelly(
+            account_balance=state.current_balance,
+            p_m2=p_m2,
             entry_price=market_info['current_price'],
             stop_loss_price=sl_tp['stop_loss'],
-            confidence=confidence,
-            current_drawdown=account_info['drawdown'],
-            volatility_ratio=market_info.get('volatility_ratio', 1.0)
+            take_profit_price=sl_tp['take_profit'],
+            current_drawdown=state.current_drawdown,
+            regime_params=regime_params
         )
         
         if lots <= 0:
-            return {
-                'action': 'HOLD',
-                'lots': 0.0,
-                'stop_loss': 0.0,
-                'take_profit': 0.0,
-                'confidence': confidence,
-                'reason': 'ポジションサイズ計算でエントリー不可',
-                'timestamp': current_time.isoformat() if current_time else None
-            }
+            logger.info(f"ポジションサイズ計算でエントリー不可: {calc_details.get('reason')}")
+            return self._generate_hold_command(calc_details.get('reason', 'zero_position_size'))
         
-        # 最終的な取引コマンド
+        # 取引コマンドの生成
         trade_command = {
             'action': direction,
             'lots': lots,
             'entry_price': market_info['current_price'],
             'stop_loss': sl_tp['stop_loss'],
             'take_profit': sl_tp['take_profit'],
-            'confidence': confidence,
-            'predicted_time': ai_prediction.get('predicted_time', 0),
-            'reason': f"確信度{confidence:.2%}、リスク{self.config['risk_percent']:.1%}、{direction}シグナル",
-            'risk_amount': account_info['balance'] * self.config['risk_percent'],
-            'timestamp': current_time.isoformat() if current_time else None
+            'confidence_m2': p_m2,
+            'confidence_m1': p_m1,
+            'predicted_time': market_info.get('predicted_time', 0),
+            'reason': (f"M2確信度{p_m2:.2%}, Kelly={calc_details['kelly_f_fractional']:.2%}, "
+                      f"リスク{calc_details['risk_fraction']:.2%}, {direction}シグナル"),
+            'risk_amount': calc_details['risk_amount'],
+            'win_loss_ratio': calc_details['win_loss_ratio'],
+            'kelly_fraction': calc_details['kelly_f_fractional'],
+            'timestamp': (current_time.isoformat() if current_time else datetime.now().isoformat())
         }
         
-        logger.info(f"取引コマンド生成: {direction} {lots}ロット @ {market_info['current_price']:.2f}")
+        logger.info(f"✓ 取引コマンド生成: {direction} {lots}ロット @ {market_info['current_price']:.2f}")
         logger.info(f"  SL: {sl_tp['stop_loss']:.2f}, TP: {sl_tp['take_profit']:.2f}")
-        logger.info(f"  確信度: {confidence:.2%}")
+        logger.info(f"  M2確信度: {p_m2:.2%}, Kelly: {calc_details['kelly_f_fractional']:.2%}")
+        
+        # イベント記録
+        if self.state_manager.use_event_sourcing:
+            self.state_manager.append_event(
+                EventType.TRADE_SIGNAL_SENT,
+                {'command': trade_command}
+            )
         
         return trade_command
+    
+    def _generate_hold_command(self, reason: str) -> Dict[str, Any]:
+        """HOLDコマンドを生成"""
+        return {
+            'action': 'HOLD',
+            'lots': 0.0,
+            'entry_price': 0.0,
+            'stop_loss': 0.0,
+            'take_profit': 0.0,
+            'confidence_m2': 0.0,
+            'confidence_m1': 0.0,
+            'predicted_time': 0,
+            'reason': reason,
+            'risk_amount': 0.0,
+            'timestamp': datetime.now().isoformat()
+        }
 
 
 # 使用例
 if __name__ == '__main__':
+    import pandas as pd
+    
+    # 状態管理の初期化
+    state_manager = StateManager(use_event_sourcing=True)
+    
+    # 初期状態の設定
+    initial_state = SystemState(
+        timestamp=datetime.now().isoformat(),
+        current_equity=1000000.0,
+        current_balance=1000000.0,
+        current_drawdown=0.0,
+        open_positions={},
+        m1_rolling_precision=[],
+        m2_rolling_auc=[],
+        recent_trades_count=0
+    )
+    state_manager.current_state = initial_state
+    state_manager.save_checkpoint(initial_state)
+    
     # リスクエンジンの初期化
-    engine = ExtremeRiskEngine(config_path='config/risk_config.json')
+    engine = ExtremeRiskEngineV2(
+        state_manager=state_manager
+    )
     
     # サンプルデータ
-    ai_prediction = {
-        'prob_profit': 0.72,    # 72%の確率で利食い
-        'prob_loss': 0.18,      # 18%の確率で損切り
-        'prob_time': 0.10,      # 10%の確率で時間切れ
-        'predicted_time': 45.0  # 45バーで決着予測
-    }
-    
-    account_info = {
-        'balance': 1000000.0,      # 100万円
-        'drawdown': 0.05,          # 5%のドローダウン
-        'current_positions': 1     # 1ポジション保有中
-    }
+    sample_features = np.random.randn(1, 50)  # ダミー特徴量
     
     market_info = {
-        'current_price': 150.25,   # USD/JPY
-        'atr': 0.85,               # ATR値
-        'volatility_ratio': 1.2    # やや高めのボラティリティ
+        'current_price': 150.25,
+        'atr': 0.85,
+        'predicted_time': 45.0
     }
     
-    # 取引コマンド生成
+    # 注: 実際の使用では較正済みモデルとレジーム検知器が必要
+    print("=" * 60)
+    print("取引コマンド生成テスト")
+    print("=" * 60)
+    print("\n注: このテストは較正済みモデルなしで実行されます。")
+    print("実運用では M1/M2 較正済みモデルが必須です。\n")
+    
+    # モデルなしではHOLDになる
     command = engine.generate_trade_command(
-        ai_prediction=ai_prediction,
-        account_info=account_info,
+        features=sample_features,
         market_info=market_info,
         current_time=datetime.now()
     )
     
-    print("\n生成された取引コマンド:")
+    print(f"\n生成されたコマンド:")
     print(json.dumps(command, indent=2, ensure_ascii=False))
+    
+    print("\n✓ テスト完了")

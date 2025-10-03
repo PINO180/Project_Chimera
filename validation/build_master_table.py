@@ -3,21 +3,12 @@ build_master_table.py - 安定版マスターテーブル構築スクリプト
 
 Project Forge - 第一防衛線通過後の特徴量統合システム
 
-このスクリプトは、feature_validator.pyによって選別された「安定した特徴量」のみを
-tickの時間軸に統合し、AIモデル学習用の最終データセットを生成する。
-
-主要機能:
-- 安定特徴量リストの読み込み
-- tickデータをマスター時間軸として使用
-- 各時間足特徴量のjoin_asof結合
-- 日次パーティション化による効率的な保存
-
-技術スタック:
-- Polars: 高速データ処理
-- joblib: 設定ファイル読み込み
+統合設計図V準拠：
+- Polars高速データ処理
+- join_asof結合による時間軸統合
+- 日次パーティション化保存
+- Pylance厳格型定義準拠
 """
-
-# ==================== ブロック1開始 ====================
 
 import sys
 from pathlib import Path
@@ -30,8 +21,6 @@ import psutil
 import polars as pl
 import joblib
 
-
-# ロギング設定
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -65,30 +54,26 @@ class MasterTableConfig:
     memory_warning_gb: float = 50.0
     memory_critical_gb: float = 55.0
     
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """デフォルト値の設定とパス検証"""
         if self.timeframes is None:
-            # tickを除く全時間足（M0.5からMNまで）
             self.timeframes = [
                 "M0.5", "M1", "M3", "M5", "M8", "M15", "M30",
                 "H1", "H4", "H6", "H12", "D1", "W1", "MN"
             ]
         
-        # パスをPathオブジェクトに変換
         self.feature_dir = Path(self.feature_dir)
         self.stable_list_path = Path(self.stable_list_path)
         self.output_dir = Path(self.output_dir)
         
-        # 入力パスの存在確認
         if not self.feature_dir.exists():
             raise FileNotFoundError(f"特徴量ディレクトリが見つかりません: {self.feature_dir}")
         if not self.stable_list_path.exists():
             raise FileNotFoundError(f"安定特徴量リストが見つかりません: {self.stable_list_path}")
         
-        # 出力ディレクトリの作成
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"設定初期化完了:")
+        logger.info("設定初期化完了:")
         logger.info(f"  特徴量ディレクトリ: {self.feature_dir}")
         logger.info(f"  安定リスト: {self.stable_list_path}")
         logger.info(f"  出力先: {self.output_dir / self.output_name}")
@@ -155,12 +140,11 @@ def load_stable_feature_list(path: Path) -> List[str]:
     logger.info(f"安定特徴量リストを読み込み中: {path}")
     
     try:
-        stable_features = joblib.load(path)
+        stable_features: List[str] = joblib.load(path)
     except Exception as e:
         logger.error(f"安定特徴量リストの読み込みに失敗: {e}")
         raise
     
-    # リスト形式の検証
     if not isinstance(stable_features, list):
         raise ValueError(
             f"安定特徴量リストの形式が不正です。リストが期待されていますが、"
@@ -194,7 +178,7 @@ def identify_tick_features(stable_features: List[str]) -> List[str]:
 def find_feature_file(
     feature_dir: Path,
     timeframe: str,
-    engine_prefixes: List[str] = None
+    engine_prefixes: Optional[List[str]] = None
 ) -> Optional[Path]:
     """
     指定された時間足の特徴量ファイルを検索
@@ -202,23 +186,19 @@ def find_feature_file(
     Args:
         feature_dir: 特徴量ファイルが格納されているディレクトリ
         timeframe: 時間足（例: "tick", "M1", "H1"）
-        engine_prefixes: 検索対象のエンジンプレフィックスリスト（例: ["e1a", "e1b"]）
+        engine_prefixes: 検索対象のエンジンプレフィックスリスト
     
     Returns:
         見つかったファイルのパス、または見つからない場合はNone
     """
     if engine_prefixes is None:
-        # デフォルトでは全てのエンジンを検索
         engine_prefixes = [f"e{i}{chr(ord('a')+j)}" for i in range(1, 10) for j in range(6)]
     
-    # パターン: features_e1a_tick.parquet または features_e1a_tick/ (ディレクトリ)
     for prefix in engine_prefixes:
-        # ファイルとして検索
         file_path = feature_dir / f"features_{prefix}_{timeframe}.parquet"
         if file_path.exists():
             return file_path
         
-        # ディレクトリ（パーティション）として検索
         dir_path = feature_dir / f"features_{prefix}_{timeframe}"
         if dir_path.exists() and dir_path.is_dir():
             return dir_path
@@ -252,7 +232,6 @@ def load_master_timeaxis(
     
     memory_monitor.check("マスター時間軸作成開始前")
     
-    # tickデータファイルの検索
     tick_file = find_feature_file(feature_dir, "tick")
     if tick_file is None:
         raise FileNotFoundError(
@@ -261,25 +240,19 @@ def load_master_timeaxis(
     
     logger.info(f"tickデータファイル: {tick_file}")
     
-    # tick特徴量が存在する場合は選択する列を指定
-    # 基本列 + tick専用特徴量
     base_columns = ["timestamp", "open", "high", "low", "close", "volume"]
     select_columns = base_columns + tick_features if tick_features else None
     
     try:
-        # tickデータの読み込み
         if tick_file.is_dir():
-            # パーティション化されたデータの場合
             logger.info("パーティション化されたtickデータを読み込み中...")
             master_df = pl.read_parquet(tick_file, columns=select_columns)
         else:
-            # 単一ファイルの場合
             logger.info("単一tickファイルを読み込み中...")
             master_df = pl.read_parquet(tick_file, columns=select_columns)
         
         memory_monitor.check("tickデータ読み込み後")
         
-        # timestampでソート
         logger.info("timestampでソート中...")
         master_df = master_df.sort("timestamp")
         
@@ -294,16 +267,6 @@ def load_master_timeaxis(
         logger.error(f"マスター時間軸の作成中にエラーが発生: {e}")
         raise
 
-
-# ==================== ブロック1完了 ====================
-
-"""
-build_master_table.py - ブロック2/2
-
-各時間足特徴量の結合ループと最終保存処理
-"""
-
-# ==================== ブロック2開始 ====================
 
 def join_timeframe_features(
     master_df: pl.DataFrame,
@@ -335,7 +298,6 @@ def join_timeframe_features(
     
     memory_monitor.check(f"{timeframe}結合開始前")
     
-    # 特徴量ファイルの検索
     feature_file = find_feature_file(feature_dir, timeframe)
     if feature_file is None:
         logger.warning(f"時間足 {timeframe} の特徴量ファイルが見つかりません。スキップします。")
@@ -343,11 +305,9 @@ def join_timeframe_features(
     
     logger.info(f"特徴量ファイル: {feature_file}")
     
-    # この時間足に属する安定特徴量をフィルタリング
-    # 命名規則: 特徴量名の末尾が "_timeframe" となっている
-    timeframe_suffix = f"_{timeframe.replace('.', '')}"  # M0.5 -> _M05
+    timeframe_suffix = f"_{timeframe.replace('.', '')}"
     timeframe_features = [
-        f for f in stable_features 
+        f for f in stable_features
         if f.endswith(timeframe_suffix)
     ]
     
@@ -357,23 +317,18 @@ def join_timeframe_features(
     
     logger.info(f"結合対象の安定特徴量: {len(timeframe_features)}個")
     
-    # 必要な列: timestamp + 安定特徴量
     select_columns = ["timestamp"] + timeframe_features
     
     try:
-        # 特徴量データの読み込み
         if feature_file.is_dir():
-            # パーティション化されたデータの場合
             logger.info("パーティション化データを読み込み中...")
             feature_df = pl.read_parquet(feature_file, columns=select_columns)
         else:
-            # 単一ファイルの場合
             logger.info("単一ファイルを読み込み中...")
             feature_df = pl.read_parquet(feature_file, columns=select_columns)
         
         memory_monitor.check(f"{timeframe}データ読み込み後")
         
-        # timestampでソート
         logger.info("timestampでソート中...")
         feature_df = feature_df.sort("timestamp")
         
@@ -381,12 +336,11 @@ def join_timeframe_features(
         
         logger.info(f"特徴量データ: {len(feature_df):,}行 × {len(feature_df.columns)}列")
         
-        # join_asofで結合
         logger.info("join_asofで結合中...")
         master_df = master_df.join_asof(
             feature_df,
             on="timestamp",
-            strategy="backward"  # tickの各時点で、最も近い過去の特徴量値を使用
+            strategy="backward"
         )
         
         memory_monitor.check(f"{timeframe}結合後")
@@ -424,7 +378,6 @@ def save_master_table(
     
     memory_monitor.check("保存開始前")
     
-    # 年月日カラムの追加（パーティション用）
     logger.info("年月日カラムを追加中...")
     master_df = master_df.with_columns([
         pl.col("timestamp").dt.year().alias("year"),
@@ -432,7 +385,6 @@ def save_master_table(
         pl.col("timestamp").dt.day().alias("day")
     ])
     
-    # 出力パス
     output_path = output_dir / output_name
     
     logger.info(f"出力先: {output_path}")
@@ -440,7 +392,6 @@ def save_master_table(
     logger.info("パーティション化して保存中...")
     
     try:
-        # 日次パーティションで保存
         master_df.write_parquet(
             output_path,
             compression="snappy",
@@ -475,22 +426,18 @@ def build_master_table(config: MasterTableConfig) -> None:
     logger.info("=" * 80)
     logger.info(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # メモリ監視の初期化
     memory_monitor = MemoryMonitor(
         warning_gb=config.memory_warning_gb,
         critical_gb=config.memory_critical_gb
     )
     
     try:
-        # ステップ1: 安定特徴量リストの読み込み
         logger.info("\n【ステップ1】安定特徴量リストの読み込み")
         stable_features = load_stable_feature_list(config.stable_list_path)
         
-        # ステップ2: tick専用特徴量の特定
         logger.info("\n【ステップ2】tick専用特徴量の特定")
         tick_features = identify_tick_features(stable_features)
         
-        # ステップ3: マスター時間軸の作成
         logger.info("\n【ステップ3】マスター時間軸の作成")
         master_df = load_master_timeaxis(
             config.feature_dir,
@@ -498,8 +445,10 @@ def build_master_table(config: MasterTableConfig) -> None:
             memory_monitor
         )
         
-        # ステップ4: 各時間足の特徴量を結合
         logger.info("\n【ステップ4】各時間足の特徴量を結合")
+        if config.timeframes is None:
+            raise ValueError("Timeframes not configured.")
+        
         logger.info(f"処理対象時間足: {', '.join(config.timeframes)}")
         
         for i, timeframe in enumerate(config.timeframes, 1):
@@ -513,7 +462,6 @@ def build_master_table(config: MasterTableConfig) -> None:
                 memory_monitor
             )
         
-        # ステップ5: 最終的な保存
         logger.info("\n【ステップ5】マスターテーブルの保存")
         save_master_table(
             master_df,
@@ -522,7 +470,6 @@ def build_master_table(config: MasterTableConfig) -> None:
             memory_monitor
         )
         
-        # 処理完了
         end_time = datetime.now()
         elapsed_time = end_time - start_time
         
@@ -542,24 +489,18 @@ def build_master_table(config: MasterTableConfig) -> None:
         raise
 
 
-def main():
-    """
-    メインエントリーポイント
-    
-    インタラクティブモードで設定を取得し、マスターテーブルを構築
-    """
+def main() -> None:
+    """メインエントリーポイント"""
     print("=" * 80)
     print("安定版マスターテーブル構築スクリプト")
     print("Project Forge - 第一防衛線通過特徴量の統合")
     print("=" * 80)
     print()
     
-    # デフォルト設定
     default_feature_dir = Path("/workspaces/project_forge/data/2_feature_value")
     default_stable_list = Path("/workspaces/project_forge/data/3_validation_results/stable_feature_list.joblib")
     default_output_dir = Path("/workspaces/project_forge/data/4_master_table")
     
-    # インタラクティブ設定
     print("【設定】")
     feature_dir_input = input(f"特徴量ディレクトリのパス [{default_feature_dir}]: ").strip()
     feature_dir = Path(feature_dir_input) if feature_dir_input else default_feature_dir
@@ -572,7 +513,6 @@ def main():
     
     output_name = input("出力名（パーティションディレクトリ名） [stable_master_table]: ").strip() or "stable_master_table"
     
-    # メモリ設定
     memory_warning = input("メモリ警告閾値（GB） [50.0]: ").strip()
     memory_warning_gb = float(memory_warning) if memory_warning else 50.0
     
@@ -599,7 +539,6 @@ def main():
     
     print()
     
-    # 設定オブジェクトの作成
     try:
         config = MasterTableConfig(
             feature_dir=feature_dir,
@@ -613,7 +552,6 @@ def main():
         logger.error(f"設定の初期化に失敗: {e}")
         return
     
-    # マスターテーブル構築の実行
     try:
         build_master_table(config)
     except Exception as e:
@@ -623,6 +561,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ==================== ブロック2完了 ====================

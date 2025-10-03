@@ -1,0 +1,55 @@
+{
+    "name": "CPU Dev Container (Project Forge)",
+    // Dockerfileからビルド
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "../.."
+    },
+    // ワークスペースのマウント設定
+    "workspaceFolder": "/workspace",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+    ],
+    // time zoneの変更
+    "containerEnv": {
+        "TZ": "Asia/Tokyo"
+    },
+    // CPU環境用の設定（GPUオプションは削除）
+    "remoteUser": "root",
+    "runArgs": [
+        "--memory=64g",
+        "--memory-swap=64g",
+        "--shm-size=2g"
+    ],
+    // VS Codeの便利な設定
+    "customizations": {
+        "vscode": {
+            "settings": {
+                // Pythonインタプリタのパス
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                // ターミナル起動時の設定
+                "python.terminal.activateEnvironment": true,
+                "python.formatting.provider": "black",
+                "python.linting.enabled": true
+            },
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter"
+            ]
+        }
+    },
+    // コンテナ内のポートを手元のPCに転送
+    "forwardPorts": [
+        8888,
+        8787
+    ],
+    "portsAttributes": {
+        "8888": {
+            "label": "JupyterLab"
+        },
+        "8787": {
+            "label": "Dask Dashboard"
+        }
+    }
+}
