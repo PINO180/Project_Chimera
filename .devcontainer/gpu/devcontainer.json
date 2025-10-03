@@ -1,5 +1,5 @@
 {
-    "name": "GPU Dev Container (Project Forge)",
+    "name": "GPU Hermes Talaria",
     // Dockerfileからビルド
     "build": {
         "dockerfile": "Dockerfile",

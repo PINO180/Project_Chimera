@@ -1,5 +1,5 @@
 {
-    "name": "CPU Dev Container (Project Forge)",
+    "name": "CPU Hephaestus Zero",
     // Dockerfileからビルド
     "build": {
         "dockerfile": "Dockerfile",
