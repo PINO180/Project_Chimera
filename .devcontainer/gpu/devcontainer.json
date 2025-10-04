@@ -15,8 +15,9 @@
         "TZ": "Asia/Tokyo"
     },
     // GPUを割り当てるための引数を追加
-    "remoteUser": "root",
+    "remoteUser": "hermes_talaria",
     "runArgs": [
+        "--name=hermes_talaria",
         "--gpus=all",
         "--memory=64g",
         "--memory-swap=64g",

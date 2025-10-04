@@ -5,8 +5,8 @@ FROM python:3.11-slim
 ENV TZ=Asia/Tokyo
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# 新しいユーザー'hephaestuszero'を作成し、sudoグループに追加
-ARG USERNAME=hephaestuszero
+# 新しいユーザー'hephaestus-zero'を作成し、sudoグループに追加
+ARG USERNAME=hephaestus-zero
 RUN useradd -m -s /bin/bash -G sudo ${USERNAME} && \
     # sudoers.dディレクトリを作成
     mkdir -p /etc/sudoers.d && \

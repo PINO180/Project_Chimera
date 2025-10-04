@@ -24,6 +24,9 @@ lightgbm
 xgboost
 scikit-learn
 shap
+dask[complete]
+dask-ml
+tslearn
 
 # PyTorch
 torch
