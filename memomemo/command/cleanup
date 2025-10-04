@@ -1,0 +1,76 @@
+手順1: Dockerのクリーンアップ 実行場所Linux
+
+オプション1: 一括削除（推奨）
+docker system prune -a --volumes
+
+オプション2: 確認しながら削除（慎重派向け）
+# 1. イメージ一覧を確認
+docker images
+# 2. コンテナ一覧を確認（停止中も含む）
+docker ps -a
+# 3. ボリューム一覧を確認
+docker volume ls
+# 4. 個別削除する場合
+docker rm <コンテナID>           # 停止中のコンテナを削除
+docker rmi <イメージID>          # イメージを削除
+docker volume rm <ボリューム名>   # ボリュームを削除
+
+オプション3: Docker Desktopアプリから削除（GUI派向け）
+1.	Docker Desktopを開く（タスクバーのクジラアイコン）
+2.	Troubleshoot → Clean / Purge data
+3.	削除したい項目を選択（Images, Containers, Volumes）
+4.	Delete をクリック
+
+手順2: 両方のvhdxファイルを圧縮 実行場所 Windows PowerShell（管理者権限）
+# ステップ1: すべて完全終了
+# タスクバーのクジラアイコン → 右クリック → Quit Docker Desktop
+# VS Codeも閉じる
+
+# ステップ2: WSLをシャットダウン
+wsl --shutdown
+
+# ステップ3: diskpartを起動
+diskpart
+
+# ステップ4: Docker Desktopのvhdxを圧縮（1行で入力）
+select vdisk file="C:\Users\HiroyukiSakurai\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
+
+# 圧縮実行
+compact vdisk
+
+# ステップ5: WSL2 (Ubuntu)のvhdxを圧縮（1行で入力）
+select vdisk file="C:\Users\HiroyukiSakurai\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu22.04LTS_79rhkp1fndgsc\LocalState\ext4.vhdx"
+
+# 圧縮実行
+compact vdisk
+
+# ステップ6: diskpartを終了
+exit
+
+🔄 定期メンテナンス（重要！）
+
+週1回: 軽い掃除
+# VS Codeのターミナルで実行
+docker system prune
+
+月1回: 徹底的な掃除
+ステップ1: Dockerクリーンアップ
+# VS Codeのターミナル
+docker system prune -a --volumes
+# → y で確定
+ステップ2: vhdx圧縮
+# PowerShell（管理者）
+# 1. Docker Desktop終了（タスクバーから Quit）
+# 2. VS Code終了
+
+wsl --shutdown
+
+diskpart
+select vdisk file="C:\Users\HiroyukiSakurai\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
+compact vdisk
+select vdisk file="C:\Users\HiroyukiSakurai\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu22.04LTS_79rhkp1fndgsc\LocalState\ext4.vhdx"
+compact vdisk
+exit
+
+# 古いプロジェクトを開かなくなったら
+docker system prune -a

@@ -29,16 +29,6 @@ class MarketInfo(TypedDict):
     volatility_ratio: Optional[float]  # GARCH予測 / 平均ATR
 
 
-class AIFeatures(TypedDict):
-    """AI特徴量の型定義"""
-    base_features: np.ndarray
-    m1_rolling_precision: List[float]
-    m1_rolling_f1: List[float]
-    atr: float
-    volatility: float
-    trend_strength: float
-
-
 class ExtremeRiskEngineV2:
     """
     極限リスク管理エンジン 2.0
@@ -101,6 +91,7 @@ class ExtremeRiskEngineV2:
                 'max_positions': 3,
                 'contract_size': 100000,
                 'pip_value_per_lot': 10,
+                'pip_multiplier': 100.0,  # 価格差→pips変換係数（USD/JPY: 100, XAU/USD: 100, EUR/USD: 10000）
                 'time_filters': {
                     'blocked_hours_before_news': 0.5,
                     'blocked_hours_after_news': 0.5,
@@ -296,6 +287,7 @@ class ExtremeRiskEngineV2:
                                      stop_loss_price: float,
                                      take_profit_price: float,
                                      current_drawdown: float = 0.0,
+                                     volatility_adjustment: float = 1.0,
                                      regime_params: Optional[Dict[str, Any]] = None) -> Tuple[float, Dict[str, Any]]:
         """
         ケリー基準でポジションサイズを計算
@@ -307,6 +299,7 @@ class ExtremeRiskEngineV2:
             stop_loss_price: 損切り価格
             take_profit_price: 利食い価格
             current_drawdown: 現在のドローダウン（0-1）
+            volatility_adjustment: ボラティリティ調整係数
             regime_params: 市場レジーム別パラメータ
         
         Returns:
@@ -353,6 +346,9 @@ class ExtremeRiskEngineV2:
         sl_distance_pips = sl_distance * 100  # USD/JPY想定
         lots = risk_amount / (sl_distance_pips * self.config['pip_value_per_lot'])
         
+        # ボラティリティ調整を適用
+        lots *= volatility_adjustment
+        
         # 0.01単位に丸める
         lots = round(lots, 2)
         
@@ -368,10 +364,12 @@ class ExtremeRiskEngineV2:
             'risk_amount': risk_amount,
             'win_loss_ratio': win_loss_ratio,
             'sl_distance_pips': sl_distance_pips,
+            'volatility_adjustment': volatility_adjustment,
             'reason': 'success'
         }
         
-        logger.info(f"Kelly最適ロット: {lots:.2f} (リスク: {risk_fraction:.2%})")
+        logger.info(f"Kelly最適ロット: {lots:.2f} (リスク: {risk_fraction:.2%}, "
+                   f"ボラ調整: {volatility_adjustment:.2f})")
         
         return lots, details
     
@@ -498,7 +496,7 @@ class ExtremeRiskEngineV2:
     
     def generate_trade_command(self,
                               features: np.ndarray,
-                              market_info: Dict[str, float],
+                              market_info: MarketInfo,
                               market_data_for_regime: Optional[Any] = None,
                               current_time: Optional[datetime] = None,
                               news_times: Optional[List[datetime]] = None) -> Dict[str, Any]:
@@ -506,13 +504,8 @@ class ExtremeRiskEngineV2:
         取引コマンドを生成（統合メイン関数）
         
         Args:
-            features: AI予測用の特徴量
+            features: AI予測用の基本特徴量
             market_info: 市場情報
-                {
-                    'current_price': float,
-                    'atr': float,
-                    'predicted_time': Optional[float]
-                }
             market_data_for_regime: 市場レジーム検知用のデータ（pd.DataFrame）
             current_time: 現在時刻
             news_times: 経済指標発表時刻リスト
@@ -539,7 +532,7 @@ class ExtremeRiskEngineV2:
         
         # AI予測（較正済み確率）
         try:
-            p_m1, p_m2 = self.predict_with_confidence(features)
+            p_m1, p_m2 = self.predict_with_confidence(features, market_info)
             logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}")
         except Exception as e:
             logger.error(f"AI予測失敗: {e}")
@@ -570,6 +563,15 @@ class ExtremeRiskEngineV2:
             regime_params=regime_params
         )
         
+        # ボラティリティ調整係数の計算
+        volatility_adjustment = 1.0
+        if market_info.get('volatility_ratio') is not None:
+            # GARCHベースのボラティリティ適応
+            volatility_adjustment = self.calculate_volatility_adjustment(
+                current_volatility=market_info['atr'],
+                historical_avg=market_info['atr'] / market_info['volatility_ratio']
+            )
+        
         # ポジションサイズの計算（ケリー基準）
         lots, calc_details = self.calculate_position_size_kelly(
             account_balance=state.current_balance,
@@ -578,6 +580,7 @@ class ExtremeRiskEngineV2:
             stop_loss_price=sl_tp['stop_loss'],
             take_profit_price=sl_tp['take_profit'],
             current_drawdown=state.current_drawdown,
+            volatility_adjustment=volatility_adjustment,
             regime_params=regime_params
         )
         
@@ -600,6 +603,7 @@ class ExtremeRiskEngineV2:
             'risk_amount': calc_details['risk_amount'],
             'win_loss_ratio': calc_details['win_loss_ratio'],
             'kelly_fraction': calc_details['kelly_f_fractional'],
+            'volatility_adjustment': calc_details['volatility_adjustment'],
             'timestamp': (current_time.isoformat() if current_time else datetime.now().isoformat())
         }
         
@@ -662,10 +666,11 @@ if __name__ == '__main__':
     # サンプルデータ
     sample_features = np.random.randn(1, 50)  # ダミー特徴量
     
-    market_info = {
+    market_info_typed: MarketInfo = {
         'current_price': 150.25,
         'atr': 0.85,
-        'predicted_time': 45.0
+        'predicted_time': 45.0,
+        'volatility_ratio': 1.2
     }
     
     # 注: 実際の使用では較正済みモデルとレジーム検知器が必要
@@ -678,7 +683,7 @@ if __name__ == '__main__':
     # モデルなしではHOLDになる
     command = engine.generate_trade_command(
         features=sample_features,
-        market_info=market_info,
+        market_info=market_info_typed,
         current_time=datetime.now()
     )
     

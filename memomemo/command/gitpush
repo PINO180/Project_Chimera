@@ -1,5 +1,25 @@
-# gitpushに関して
+新しい環境でのGit初回設定コマンド
 
+ステップ1：あなたの情報をGitに登録する
+まず、コミットの作者としてあなたの名前とメールアドレスを登録します。
+git config --global user.name "PINO180"
+git config --global user.email "hs.xxxx84xx@gmail.com"
+
+
+ステップ2：改行コードの問題を解決する
+次に、WindowsとLinuxの改行コードの違いをGitが自動で吸収してくれるように、おまじないコマンドを実行します。
+git config --global core.autocrlf input
+
+ステップ3：Gitの状態をリセットする
+改行コードの設定を反映させ、Gitが「全ファイルが変更された」と誤認識している状態をリセットします。
+【注意】このコマンドは、まだコミットしていない全ての変更を破棄します。もし何か編集中のファイルがあれば、必ず先に保存・退避してください。
+git reset --hard HEAD
+
+ステップ4：通常のGit操作を実行する
+これで全ての準備が整いました。あとは通常通り、変更をコミットしてプッシュするだけです。
+1.変更をステージングする
 git add .
-git commit -m "update20251003"
+2.変更をコミットする
+git commit -m "update20251004"
+3.リモートリポジトリにプッシュする
 git push origin main
