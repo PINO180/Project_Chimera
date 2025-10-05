@@ -16,7 +16,7 @@ Project Forge - 軍資金増大プロジェクト
 - CalculationEngine（60%）: 学際的特徴量計算核心（物理的垂直分割実装）
 - OutputEngine（10%）: ストリーミング出力
 """
-
+import config
 import os, sys, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -69,45 +69,39 @@ def get_default_window_sizes() -> Dict[str, List[int]]:
 @dataclass
 class ProcessingConfig:
     """処理設定 - Project Forge統合版"""
-    
-    # データパス（Project Forge構造準拠）
-    input_path: str = "/workspaces/project_forge/data/1_XAUUSD_base_data/XAUUSD_tick_master_GOLDEN"
-    partitioned_tick_path: str = "/workspaces/project_forge/data/0_tick_partitioned/"
-    output_path: str = "/workspaces/project_forge/data/2_feature_value"
-    
+
+    # データパス（Project Forge構造準拠） - config.pyから読み込む
+    input_path: str = str(config.S1_BASE_MULTITIMEFRAME)
+    partitioned_tick_path: str = str(config.S1_RAW_TICK_PARTITIONED)
+    output_path: str = str(config.S2_FEATURES)
+
     # エンジン識別
-    engine_id: str = "e1f"  # 例: "e1a", "e1b", "e2a"
+    engine_id: str = "e1f"
     engine_name: str = "Engine_1F_InterdisciplinaryFeatures"
-    
+
     # 並列処理（戦略的並列処理スロットリング）
     max_threads: int = 4
-    
+
     # メモリ制限（64GB RAM制約）
     memory_limit_gb: float = 55.0
     memory_warning_gb: float = 50.0
-    
+
     timeframes: List[str] = field(default_factory=get_default_timeframes)
     window_sizes: Dict[str, List[int]] = field(default_factory=get_default_window_sizes)
-    
+
     # 処理モード
     test_mode: bool = False
     test_rows: int = 10000
-    
+
     # システムハイパーパラメータとしてW_maxを定義
-    # この値は、全特徴量計算の最大ウィンドウサイズを反映しなければならない
-    # 例：移動平均線でsma_200などを使う場合は200以上に設定
     w_max: int = 200
-    
+
     def validate(self) -> bool:
         """設定検証"""
-        if not Path(self.input_path).exists():
-            logger.error(f"入力パスが存在しません: {self.input_path}")
-            return False
-        
-        if not Path(self.output_path).exists():
-            Path(self.output_path).mkdir(parents=True, exist_ok=True)
-            logger.info(f"出力ディレクトリを作成: {self.output_path}")
-        
+        output_path_obj = Path(self.output_path)
+        if not output_path_obj.exists():
+            output_path_obj.mkdir(parents=True, exist_ok=True)
+            logger.info(f"出力ディレクトリを作成: {output_path_obj}")
         return True
 
 class MemoryMonitor:

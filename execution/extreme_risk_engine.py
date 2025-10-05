@@ -2,6 +2,7 @@
 極限リスク管理エンジン 2.0
 ケリー基準、確率キャリブレーション、状態管理、市場レジーム適応を統合
 """
+import config
 import numpy as np
 import json
 from pathlib import Path
@@ -36,11 +37,11 @@ class ExtremeRiskEngineV2:
     """
     
     def __init__(self,
-                 config_path: str = 'config/risk_config.json',
-                 state_manager: Optional[StateManager] = None,
-                 regime_detector: Optional[MarketRegimeDetector] = None,
-                 m1_model_path: Optional[str] = None,
-                 m2_model_path: Optional[str] = None):
+                config_path: str = str(config.CONFIG_RISK),
+                state_manager: Optional[StateManager] = None,
+                regime_detector: Optional[MarketRegimeDetector] = None,
+                m1_model_path: Optional[str] = None,
+                m2_model_path: Optional[str] = None):
         """
         Args:
             config_path: リスク管理設定ファイル
@@ -50,26 +51,26 @@ class ExtremeRiskEngineV2:
             m2_model_path: M2較正済みモデルのパス
         """
         self.config = self._load_config(config_path)
-        
+
         # 状態管理
         self.state_manager = state_manager or StateManager()
-        
+
         # 市場レジーム検知
         self.regime_detector = regime_detector
-        
+
         # 較正済みモデル
         self.m1_calibrated: Optional[CalibratedClassifierCV] = None
         self.m2_calibrated: Optional[CalibratedClassifierCV] = None
-        
+
         # M1性能履歴（ローリング統計用）
         self.m1_precision_history: deque = deque(maxlen=20)
         self.m1_f1_history: deque = deque(maxlen=20)
-        
+
         if m1_model_path:
             self.load_calibrated_model(m1_model_path, model_type='M1')
         if m2_model_path:
             self.load_calibrated_model(m2_model_path, model_type='M2')
-        
+
         logger.info("ExtremeRiskEngineV2を初期化しました。")
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:

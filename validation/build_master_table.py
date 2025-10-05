@@ -9,7 +9,8 @@ Project Forge - 第一防衛線通過後の特徴量統合システム
 - 日次パーティション化保存
 - Pylance厳格型定義準拠
 """
-
+import config
+import re
 import sys
 from pathlib import Path
 from dataclasses import dataclass
@@ -178,31 +179,40 @@ def identify_tick_features(stable_features: List[str]) -> List[str]:
 def find_feature_file(
     feature_dir: Path,
     timeframe: str,
-    engine_prefixes: Optional[List[str]] = None
 ) -> Optional[Path]:
     """
-    指定された時間足の特徴量ファイルを検索
-    
-    Args:
-        feature_dir: 特徴量ファイルが格納されているディレクトリ
-        timeframe: 時間足（例: "tick", "M1", "H1"）
-        engine_prefixes: 検索対象のエンジンプレフィックスリスト
-    
-    Returns:
-        見つかったファイルのパス、または見つからない場合はNone
+    指定された時間足の特徴量ファイルを、複数のエンジン出力ディレクトリを横断して検索する
     """
-    if engine_prefixes is None:
-        engine_prefixes = [f"e{i}{chr(ord('a')+j)}" for i in range(1, 10) for j in range(6)]
-    
-    for prefix in engine_prefixes:
-        file_path = feature_dir / f"features_{prefix}_{timeframe}.parquet"
+    # stratum_2内の全てのサブディレクトリを検索対象とする
+    for engine_output_dir in feature_dir.iterdir():
+        if not engine_output_dir.is_dir():
+            continue
+
+        # ディレクトリ名からエンジンIDを推測 (例: feature_value_a_vast_universeA -> e1a)
+        dir_name = engine_output_dir.name
+        engine_id = None
+
+        vast_match = re.search(r"feature_value_a_vast_universe([A-F])", dir_name, re.IGNORECASE)
+        complexity_match = re.search(r"feature_value_complexity_theory([A-Z])", dir_name, re.IGNORECASE)
+
+        if vast_match:
+            engine_id = f"e1{vast_match.group(1).lower()}"
+        elif complexity_match:
+            engine_id = f"e2{complexity_match.group(1).lower()}"
+
+        if not engine_id:
+            continue
+
+        # 目的のファイルパスを構築
+        if timeframe == "tick":
+            file_path = engine_output_dir / f"features_{engine_id}_tick"
+        else:
+            file_path = engine_output_dir / f"features_{engine_id}_{timeframe}.parquet"
+
         if file_path.exists():
+            # 最初に見つかったファイルを返す
             return file_path
-        
-        dir_path = feature_dir / f"features_{prefix}_{timeframe}"
-        if dir_path.exists() and dir_path.is_dir():
-            return dir_path
-    
+
     return None
 
 
@@ -495,65 +505,31 @@ def main() -> None:
     print("安定版マスターテーブル構築スクリプト")
     print("Project Forge - 第一防衛線通過特徴量の統合")
     print("=" * 80)
-    print()
-    
-    default_feature_dir = Path("/workspaces/project_forge/data/2_feature_value")
-    default_stable_list = Path("/workspaces/project_forge/data/3_validation_results/stable_feature_list.joblib")
-    default_output_dir = Path("/workspaces/project_forge/data/4_master_table")
-    
-    print("【設定】")
-    feature_dir_input = input(f"特徴量ディレクトリのパス [{default_feature_dir}]: ").strip()
-    feature_dir = Path(feature_dir_input) if feature_dir_input else default_feature_dir
-    
-    stable_list_input = input(f"安定特徴量リストのパス [{default_stable_list}]: ").strip()
-    stable_list_path = Path(stable_list_input) if stable_list_input else default_stable_list
-    
-    output_dir_input = input(f"出力ディレクトリのパス [{default_output_dir}]: ").strip()
-    output_dir = Path(output_dir_input) if output_dir_input else default_output_dir
-    
-    output_name = input("出力名（パーティションディレクトリ名） [stable_master_table]: ").strip() or "stable_master_table"
-    
-    memory_warning = input("メモリ警告閾値（GB） [50.0]: ").strip()
-    memory_warning_gb = float(memory_warning) if memory_warning else 50.0
-    
-    memory_critical = input("メモリ緊急停止閾値（GB） [55.0]: ").strip()
-    memory_critical_gb = float(memory_critical) if memory_critical else 55.0
-    
-    print()
-    print("=" * 80)
-    print("設定確認")
-    print("=" * 80)
-    print(f"特徴量ディレクトリ: {feature_dir}")
-    print(f"安定特徴量リスト: {stable_list_path}")
-    print(f"出力ディレクトリ: {output_dir}")
-    print(f"出力名: {output_name}")
-    print(f"メモリ警告閾値: {memory_warning_gb}GB")
-    print(f"メモリ緊急停止閾値: {memory_critical_gb}GB")
-    print("=" * 80)
-    print()
-    
-    confirm = input("この設定で実行しますか？ (yes/no): ").strip().lower()
-    if confirm not in ["yes", "y"]:
-        print("処理を中止しました。")
-        return
-    
-    print()
-    
+
     try:
-        config = MasterTableConfig(
-            feature_dir=feature_dir,
-            stable_list_path=stable_list_path,
-            output_dir=output_dir,
-            output_name=output_name,
-            memory_warning_gb=memory_warning_gb,
-            memory_critical_gb=memory_critical_gb
+        # config.pyからパスを直接読み込む
+        config_obj = MasterTableConfig(
+            feature_dir=config.S2_FEATURES,
+            stable_list_path=config.S3_STABLE_FEATURE_LIST,
+            output_dir=config.S4_MASTER,
+            output_name="master_table_partitioned",
         )
+        logger.info("config.pyから設定を読み込みました。")
+        logger.info(f"入力特徴量ディレクトリ: {config_obj.feature_dir}")
+        logger.info(f"入力安定リスト: {config_obj.stable_list_path}")
+        logger.info(f"出力ディレクトリ: {config_obj.output_dir / config_obj.output_name}")
+
     except Exception as e:
         logger.error(f"設定の初期化に失敗: {e}")
         return
-    
+
+    confirm = input("この設定で実行しますか？ (yes/no): ").strip().lower()
+    if confirm not in ["yes", "y"]:
+        logger.info("処理を中止しました。")
+        return
+
     try:
-        build_master_table(config)
+        build_master_table(config_obj)
     except Exception as e:
         logger.error(f"マスターテーブルの構築に失敗: {e}")
         sys.exit(1)

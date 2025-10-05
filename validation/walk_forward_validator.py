@@ -9,7 +9,7 @@ walk_forward_validator_v2.py - SHAPベース版
 - 敵対的検証スコアによる特徴量ペナルティ
 - Dask-LightGBM + map_partitions並列SHAP計算
 """
-
+import config
 import logging
 from typing import List, Dict, Tuple, cast
 from pathlib import Path
@@ -339,41 +339,45 @@ class WalkForwardValidatorV2:
 
 if __name__ == '__main__':
     dask.config.set({'dataframe.query-planning': True})
-    
+
     from dask.distributed import Client, LocalCluster
-    
+
     with LocalCluster(n_workers=4, threads_per_worker=2, memory_limit='8GB') as cluster, \
          Client(cluster) as client:
-        
+
         logger.info(f"Daskクライアントを起動しました: {client.dashboard_link}")
-        
+
         validator = WalkForwardValidatorV2(
-            feature_universe_path='data/master_table_partitioned',
-            stable_features_path='data/temp_chunks/defense_results/joblib/stable_feature_list.joblib',
-            adversarial_scores_path='data/temp_chunks/defense_results/joblib/adversarial_scores.joblib'
+            feature_universe_path=str(config.S4_MASTER_TABLE_PARTITIONED),
+            stable_features_path=str(config.S3_STABLE_FEATURE_LIST),
+            adversarial_scores_path=str(config.S3_ADVERSARIAL_SCORES)
         )
         final_feature_team = validator.run_validation()
-    
-    output_dir = Path('data/temp_chunks/defense_results')
-    (output_dir / 'joblib').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'csv').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'json').mkdir(parents=True, exist_ok=True)
-    
-    joblib.dump(final_feature_team, output_dir / 'joblib' / 'final_feature_team.joblib')
-    
+
+    output_dir = config.S3_ARTIFACTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    final_team_path = config.S3_FINAL_FEATURE_TEAM
+    shap_scores_path = config.S3_SHAP_SCORES # config.pyにSHAPスコアパスも定義推奨
+
+    joblib.dump(final_feature_team, final_team_path)
+
+    # SHAPスコアも保存する場合 (validatorクラスから返り値として受け取る必要あり)
+    # joblib.dump(shap_scores, shap_scores_path)
+
     final_df = pd.DataFrame({'feature_name': final_feature_team})
-    final_df.to_csv(output_dir / 'csv' / 'final_feature_team.csv', index=False)
-    
+    final_df.to_csv(output_dir / 'final_feature_team.csv', index=False)
+
     result_info = {
         'total_features': len(final_feature_team),
         'features': final_feature_team,
         'validation_type': 'second_defense_line_shap_based',
         'timestamp': pd.Timestamp.now().isoformat()
     }
-    with open(output_dir / 'json' / 'final_feature_team.json', 'w') as f:
+    with open(output_dir / 'final_feature_team.json', 'w') as f:
         json.dump(result_info, f, indent=2)
-    
+
     logger.info("最終選抜メンバーリストを複数形式で保存しました。")
-    logger.info(f"- JOBLIB: {output_dir / 'joblib' / 'final_feature_team.joblib'}")
-    logger.info(f"- CSV: {output_dir / 'csv' / 'final_feature_team.csv'}")
-    logger.info(f"- JSON: {output_dir / 'json' / 'final_feature_team.json'}")
+    logger.info(f"- JOBLIB: {final_team_path}")
+    logger.info(f"- CSV: {output_dir / 'final_feature_team.csv'}")
+    logger.info(f"- JSON: {output_dir / 'final_feature_team.json'}")

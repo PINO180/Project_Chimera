@@ -1,3 +1,4 @@
+import config
 import dask
 import dask.dataframe as dd
 from dask.dataframe.core import DataFrame, Series
@@ -748,21 +749,21 @@ class MetaLabelingTrainer:
 if __name__ == '__main__':
     # Daskの設定
     dask.config.set({'dataframe.query-planning': True})
-    
+
     # Daskクライアントの起動
     from dask.distributed import Client, LocalCluster  # type: ignore
-    
+
     with LocalCluster(n_workers=4, threads_per_worker=2, memory_limit='8GB') as cluster, \
          Client(cluster) as client:
-        
+
         logger.info(f"Daskクライアントを起動: {client.dashboard_link}")
-        
+
         trainer = MetaLabelingTrainer(
-            input_path='data/temp_chunks/training_data/weighted_dataset_partitioned',
-            output_dir='data/models',
+            input_path=str(config.S6_WEIGHTED_DATASET),
+            output_dir=str(config.S7_MODELS),
             n_splits=5,
             n_trials=50,  # 本番は100推奨
             embargo_pct=0.01
         )
-        
+
         trainer.run()

@@ -2,6 +2,7 @@
 市場レジーム検知エンジン
 HMMと時系列クラスタリングによる市場環境の分類と動的リスクパラメータ調整
 """
+import config
 import numpy as np
 import pandas as pd
 import json
@@ -26,10 +27,10 @@ class MarketRegimeDetector:
     """
     
     def __init__(self,
-                 method: str = 'hmm',
-                 n_regimes: int = 4,
-                 model_path: Optional[str] = None,
-                 config_path: str = 'config/regime_config.json'):
+                method: str = 'hmm',
+                n_regimes: int = 4,
+                model_path: Optional[str] = None,
+                config_path: str = str(config.CONFIG_REGIME)):
         """
         Args:
             method: 検知手法 ('hmm' or 'clustering')
@@ -41,18 +42,18 @@ class MarketRegimeDetector:
         self.n_regimes = n_regimes
         self.model_path = model_path
         self.config_path = Path(config_path)
-        
+
         # モデル
         self.model: Optional[Any] = None
         self.scaler: Optional[StandardScaler] = None
-        
+
         # レジーム別リスクパラメータ
         self.regime_params = self._load_regime_config()
-        
+
         # モデル読み込み
         if model_path and Path(model_path).exists():
             self.load_model(model_path)
-        
+
         logger.info(f"MarketRegimeDetector初期化: method={method}, n_regimes={n_regimes}")
     
     def _load_regime_config(self) -> Dict[int, Dict[str, Any]]:
@@ -397,13 +398,13 @@ if __name__ == '__main__':
     # サンプルデータの生成
     np.random.seed(42)
     n_samples = 1000
-    
+
     dates = pd.date_range(start='2020-01-01', periods=n_samples, freq='D')
-    
+
     # シンプルな価格シミュレーション
     returns = np.random.randn(n_samples) * 0.01
     prices = 100 * np.exp(np.cumsum(returns))
-    
+
     sample_data = pd.DataFrame({
         'date': dates,
         'open': prices * (1 + np.random.randn(n_samples) * 0.001),
@@ -412,18 +413,18 @@ if __name__ == '__main__':
         'close': prices,
         'volume': np.random.randint(1000000, 5000000, n_samples)
     })
-    
+
     # HMMによるレジーム検知
     print("=" * 60)
     print("HMMによるレジーム検知")
     print("=" * 60)
-    
+
     detector_hmm = MarketRegimeDetector(method='hmm', n_regimes=4)
-    
+
     # 訓練
     features = detector_hmm.extract_features(sample_data)
     detector_hmm.train_hmm(features)
-    
+
     # 現在のレジーム検知
     current_regime = detector_hmm.detect_current_regime(sample_data.tail(100))
     print(f"\n現在のレジーム:")
@@ -432,10 +433,10 @@ if __name__ == '__main__':
     print(f"  リスクパラメータ:")
     for key, value in current_regime['risk_params'].items():
         print(f"    {key}: {value}")
-    
+
     # モデル保存
-    model_path = 'models/regime_detector_hmm.pkl'
-    Path('models').mkdir(exist_ok=True)
-    detector_hmm.save_model(model_path)
-    
+    model_path = config.S7_REGIME_MODEL
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    detector_hmm.save_model(str(model_path))
+
     print(f"\n✓ すべてのテスト完了")

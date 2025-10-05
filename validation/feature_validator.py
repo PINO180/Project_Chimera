@@ -9,6 +9,7 @@ feature_validator.py - v3.0
 - Pylance厳格型定義準拠
 """
 
+import config
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +31,7 @@ import numpy as np
 import joblib
 from tqdm import tqdm
 import pandas as pd
+from dask.dataframe.core import DataFrame as DaskDataFrame
 
 
 class FeatureValidator:
@@ -56,21 +58,38 @@ class FeatureValidator:
         self.feature_columns: List[str] = []
         
     def _load_data(self) -> None:
-        """Dask DataFrameとしてパーティション化されたParquetを読み込む"""
-        logger.info(f"第一防衛線: 特徴量ユニバース '{self.feature_universe_path}' をDask DataFrameとして読み込んでいます...")
-        
-        self.ddf = dd.read_parquet(
-            self.feature_universe_path,
-            engine='pyarrow'
-        )
-        
+        """
+        Dask DataFrameとして特徴量ユニバースを読み込む
+        stratum_2の複数エンジン出力を自動で検出し統合する
+        """
+        feature_universe_path = Path(self.feature_universe_path)
+        logger.info(f"第一防衛線: 特徴量ユニバース '{feature_universe_path}' をDask DataFrameとして読み込み中...")
+
+        if not feature_universe_path.exists() or not feature_universe_path.is_dir():
+            raise FileNotFoundError(f"特徴量ユニバースの親ディレクトリが見つかりません: {feature_universe_path}")
+
+        # stratum_2内の全Parquetファイルを探索（tickのパーティションを除く）
+        all_parquet_files = []
+        for engine_output_dir in feature_universe_path.iterdir():
+            if engine_output_dir.is_dir():
+                # 非tickファイルを追加
+                all_parquet_files.extend(engine_output_dir.glob("*.parquet"))
+
+        if not all_parquet_files:
+            raise FileNotFoundError(f"'{feature_universe_path}'内でParquetファイルが見つかりませんでした。")
+
+        logger.info(f"{len(all_parquet_files)}個のParquetファイルを検出。Daskで統合します。")
+
+        # 複数のParquetファイルをDaskで単一のDataFrameとして読み込む
+        self.ddf = dd.read_parquet(all_parquet_files, engine='pyarrow')
+
         logger.info("スキーマ情報を取得中...")
         all_columns = self.ddf.columns.tolist()
         self.feature_columns = [
             col for col in all_columns 
-            if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp']
+            if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp', 'timeframe']
         ]
-        
+
         n_partitions = self.ddf.npartitions
         logger.info(f"読み込み完了。{n_partitions}パーティション、{len(self.feature_columns)}特徴量を検出。")
         
@@ -300,25 +319,26 @@ class FeatureValidator:
 
 if __name__ == '__main__':
     dask.config.set({'dataframe.query-planning': True})
-    
+
     validator = FeatureValidator(
-        feature_universe_path='data/master_table_partitioned',
+        feature_universe_path=str(config.S2_FEATURES),
         n_jobs=4
     )
-    
+
     stable_features, adversarial_scores = validator.run_validation()
-    
-    output_dir = Path('data/temp_chunks/defense_results')
-    (output_dir / 'joblib').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'csv').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'json').mkdir(parents=True, exist_ok=True)
-    
-    joblib.dump(stable_features, output_dir / 'joblib' / 'stable_feature_list.joblib')
-    joblib.dump(adversarial_scores, output_dir / 'joblib' / 'adversarial_scores.joblib')
-    
+
+    output_dir = config.S3_ARTIFACTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stable_list_path = config.S3_STABLE_FEATURE_LIST
+    adversarial_scores_path = config.S3_ADVERSARIAL_SCORES
+
+    joblib.dump(stable_features, stable_list_path)
+    joblib.dump(adversarial_scores, adversarial_scores_path)
+
     stable_df = pd.DataFrame({'feature_name': stable_features})
-    stable_df.to_csv(output_dir / 'csv' / 'stable_feature_list.csv', index=False)
-    
+    stable_df.to_csv(output_dir / 'stable_feature_list.csv', index=False)
+
     result_info = {
         'total_features': len(stable_features),
         'features': stable_features,
@@ -326,11 +346,12 @@ if __name__ == '__main__':
         'adversarial_auc_threshold': validator.adversarial_auc_threshold,
         'timestamp': pd.Timestamp.now().isoformat()
     }
-    
-    with open(output_dir / 'json' / 'stable_feature_list.json', 'w') as f:
+
+    with open(output_dir / 'stable_feature_list.json', 'w') as f:
         json.dump(result_info, f, indent=2)
-    
+
     logger.info("一次選抜通過特徴量リストを複数形式で保存しました。")
-    logger.info(f"- JOBLIB: {output_dir / 'joblib' / 'stable_feature_list.joblib'}")
-    logger.info(f"- CSV: {output_dir / 'csv' / 'stable_feature_list.csv'}")
-    logger.info(f"- JSON: {output_dir / 'json' / 'stable_feature_list.json'}")
+    logger.info(f"- JOBLIB (Stable List): {stable_list_path}")
+    logger.info(f"- JOBLIB (Adversarial Scores): {adversarial_scores_path}")
+    logger.info(f"- CSV: {output_dir / 'stable_feature_list.csv'}")
+    logger.info(f"- JSON: {output_dir / 'stable_feature_list.json'}")

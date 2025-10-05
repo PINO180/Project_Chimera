@@ -2,6 +2,7 @@
 状態管理とフォールトトレランス
 チェックポインティングとイベントソーシングによる状態永続化
 """
+import config
 import json
 import pickle
 import sqlite3
@@ -102,9 +103,9 @@ class StateManager:
     """
     
     def __init__(self, 
-                 checkpoint_dir: str = "data/state",
-                 event_log_path: str = "data/state/event_log.jsonl",
-                 use_event_sourcing: bool = False):
+                checkpoint_dir: str = str(config.STATE_CHECKPOINT_DIR),
+                event_log_path: str = str(config.STATE_EVENT_LOG),
+                use_event_sourcing: bool = False):
         """
         Args:
             checkpoint_dir: チェックポイント保存ディレクトリ
@@ -113,15 +114,15 @@ class StateManager:
         """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.event_log_path = Path(event_log_path)
         self.event_log_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         self.use_event_sourcing = use_event_sourcing
         self.current_state: Optional[SystemState] = None
-        
+
         logger.info(f"StateManager初期化: checkpoint_dir={checkpoint_dir}, "
-                   f"event_sourcing={use_event_sourcing}")
+                f"event_sourcing={use_event_sourcing}")
     
     # ========== チェックポインティング ==========
     

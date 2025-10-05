@@ -8,7 +8,7 @@ feature_neutralizer.py - v2.1
 - 純粋なアルファ成分の抽出
 - Pylance厳格型定義準拠
 """
-
+import config
 import logging
 from typing import List, Dict, Any
 from pathlib import Path
@@ -208,13 +208,10 @@ class FeatureNeutralizer:
 
 if __name__ == '__main__':
     dask.config.set({'dataframe.query-planning': True})
-    
-    output_base = Path('data/temp_chunks/defense_results')
-    output_base.mkdir(parents=True, exist_ok=True)
-    
+
     neutralizer = FeatureNeutralizer(
-        feature_universe_path='data/master_table_partitioned',
-        final_team_path='data/temp_chunks/defense_results/joblib/final_feature_team.joblib',
-        output_path='data/temp_chunks/defense_results/neutralized_feature_set_partitioned'
+        feature_universe_path=str(config.S4_MASTER_TABLE_PARTITIONED),
+        final_team_path=str(config.S3_FINAL_FEATURE_TEAM),
+        output_path=str(config.S5_NEUTRALIZED_ALPHA_SET)
     )
     neutralizer.run()

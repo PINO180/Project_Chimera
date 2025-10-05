@@ -27,6 +27,7 @@ import warnings
 import json
 import logging
 import math
+import config
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field
@@ -80,47 +81,38 @@ def get_default_window_sizes() -> Dict[str, List[int]]:
 @dataclass
 class ProcessingConfig:
     """処理設定"""
-    # データパス
-    input_base_path: str = "/workspaces/project_forge/data/1_XAUUSD_base_data/XAUUSD_tick_master_GOLDEN"
-    partitioned_tick_path: str = "/workspaces/project_forge/data/0_tick_partitioned/"
-    output_base_path: str = "/workspaces/project_forge/data/2_feature_value"
-    
+    # データパス - config.pyから読み込む
+    input_base_path: str = str(config.S1_BASE_MULTITIMEFRAME)
+    partitioned_tick_path: str = str(config.S1_RAW_TICK_PARTITIONED)
+    output_base_path: str = str(config.S2_FEATURES)
+
     # エンジン識別
     engine_id: str = "e1c"
     engine_name: str = "Engine_1C_Technical_Indicators"
-    
+
     # 並列処理
     max_threads: int = 4
-    
+
     # メモリ制限
     memory_limit_gb: float = 55.0
     memory_warning_gb: float = 50.0
-    
-    # 【修正点】default_factoryを使用して、Noneを許容しないように変更
+
     timeframes: List[str] = field(default_factory=get_default_timeframes)
     window_sizes: Dict[str, List[int]] = field(default_factory=get_default_window_sizes)
-    
+
     # 処理モード
     test_mode: bool = False
     test_rows: int = 10000
-    
-    # 【最重要】システムハイパーパラメータとしてW_maxを定義
-    # この値は、全特徴量計算の最大ウィンドウサイズを反映しなければならない
-    # 例：移動平均線でsma_200などを使う場合は200以上に設定
+
+    # システムハイパーパラメータとしてW_maxを定義
     w_max: int = 200
 
-    # 【削除点】__post_init__ は不要になったため、メソッドごと削除
-    
     def validate(self) -> bool:
         """設定検証"""
-        if not Path(self.input_base_path).exists():
-            logger.error(f"入力パスが存在しません: {self.input_base_path}")
-            return False
-        
-        if not Path(self.output_base_path).exists():
-            Path(self.output_base_path).mkdir(parents=True, exist_ok=True)
-            logger.info(f"出力ディレクトリを作成: {self.output_base_path}")
-        
+        output_path_obj = Path(self.output_base_path)
+        if not output_path_obj.exists():
+            output_path_obj.mkdir(parents=True, exist_ok=True)
+            logger.info(f"出力ディレクトリを作成: {output_path_obj}")
         return True
 
 # ========================================

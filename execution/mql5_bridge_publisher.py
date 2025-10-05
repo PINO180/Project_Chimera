@@ -2,6 +2,7 @@
 MQL5ブリッジ 2.0 - 高信頼性通信
 レイジー・パイレートパターンと双方向ハートビートによるミッションクリティカル通信
 """
+import config
 import zmq
 import json
 import time
@@ -37,7 +38,7 @@ class BridgeConfig:
     request_retries: int = 3
     heartbeat_interval: int = 10  # 秒
     heartbeat_timeout: int = 30  # 秒
-    log_dir: str = "logs/zmq_bridge_v2"
+    log_dir: str = str(config.LOGS_ZMQ_BRIDGE)
 
 
 class MQL5BridgePublisherV2:
@@ -463,7 +464,7 @@ class FileBasedBridge:
     JSONファイルを介した通信
     """
     
-    def __init__(self, file_path: str = "data/bridge/trade_command.json"):
+    def __init__(self, file_path: str = str(config.BRIDGE_FALLBACK_FILE)):
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         logger.info(f"ファイルベースBridgeを初期化: {self.file_path}")

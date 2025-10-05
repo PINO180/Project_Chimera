@@ -1,3 +1,4 @@
+import config
 import dask
 import dask.dataframe as dd
 from dask.dataframe.core import DataFrame, Series
@@ -167,8 +168,8 @@ class SampleUniquenessWeighter:
         t1_pd: pd.Series[Any]
         t0_pd, t1_pd = dask.compute(t0_series, t1_series)  # type: ignore
         
-        all_t0: np.ndarray = t0_pd.values
-        all_t1: np.ndarray = t1_pd.values
+        all_t0: np.ndarray = t0_pd.to_numpy()
+        all_t1: np.ndarray = t1_pd.to_numpy()
         
         n_total = len(all_t0)
         logger.info(f"総サンプル数: {n_total:,}")
@@ -348,19 +349,19 @@ class SampleUniquenessWeighter:
 if __name__ == '__main__':
     # Daskの設定
     dask.config.set({'dataframe.query-planning': True})
-    
+
     # Daskクライアントの起動
     from dask.distributed import Client, LocalCluster  # type: ignore
-    
+
     with LocalCluster(n_workers=4, threads_per_worker=2, memory_limit='8GB') as cluster, \
          Client(cluster) as client:
-        
+
         logger.info(f"Daskクライアントを起動: {client.dashboard_link}")
-        
+
         weighter = SampleUniquenessWeighter(
-            input_path='data/temp_chunks/training_data/labeled_dataset_partitioned',
-            output_path='data/temp_chunks/training_data/weighted_dataset_partitioned',
+            input_path=str(config.S6_LABELED_DATASET),
+            output_path=str(config.S6_WEIGHTED_DATASET),
             use_return_weighting=False
         )
-        
+
         weighter.run()

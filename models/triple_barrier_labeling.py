@@ -1,3 +1,4 @@
+import config
 import dask
 import dask.dataframe as dd
 from dask.dataframe.core import DataFrame
@@ -279,21 +280,21 @@ class TripleBarrierLabeler:
 if __name__ == '__main__':
     # Daskの設定
     dask.config.set({'dataframe.query-planning': True})
-    
+
     # Daskクライアントの起動
     from dask.distributed import Client, LocalCluster  # type: ignore
-    
+
     with LocalCluster(n_workers=4, threads_per_worker=2, memory_limit='8GB') as cluster, \
          Client(cluster) as client:
-        
+
         logger.info(f"Daskクライアントを起動: {client.dashboard_link}")
-        
+
         labeler = TripleBarrierLabeler(
-            input_path='data/temp_chunks/defense_results/neutralized_feature_set_partitioned',
-            output_path='data/temp_chunks/training_data/labeled_dataset_partitioned',
+            input_path=str(config.S5_NEUTRALIZED_ALPHA_SET),
+            output_path=str(config.S6_LABELED_DATASET),
             profit_multiplier=2.0,
             loss_multiplier=1.0,
             time_barrier=60
         )
-        
+
         labeler.run()

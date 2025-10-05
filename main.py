@@ -2,6 +2,7 @@
 Project Forge 統合実行スクリプト
 全コンポーネントを統合し、リアルタイム取引システムを起動
 """
+import config
 import numpy as np
 import pandas as pd
 import time
@@ -36,31 +37,31 @@ class ForgeSystem:
     全コンポーネントを統合し、リアルタイム取引を実行
     """
     
-    def __init__(self, config_path: str = 'config/system_config.json'):
+    def __init__(self, config_path: str = str(config.CONFIG_SYSTEM)):
         """
         Args:
             config_path: システム設定ファイル
         """
         self.config_path = Path(config_path)
         self.is_running = False
-        
+
         # コンポーネント
         self.state_manager: Optional[StateManager] = None
         self.regime_detector: Optional[MarketRegimeDetector] = None
         self.risk_engine: Optional[ExtremeRiskEngineV2] = None
         self.bridge: Optional[MQL5BridgePublisherV2] = None
         self.fallback_bridge: Optional[FileBasedBridge] = None
-        
+
         # 較正済みモデル
         self.m1_calibrated: Optional[Any] = None
         self.m2_calibrated: Optional[Any] = None
-        
+
         logger.info("ForgeSystemを初期化しました。")
     
     def initialize(self) -> bool:
         """
         システムの初期化と起動準備
-        
+
         Returns:
             初期化成功の場合True
         """
@@ -68,18 +69,18 @@ class ForgeSystem:
             logger.info("=" * 60)
             logger.info("Project Forge システム初期化開始")
             logger.info("=" * 60)
-            
+
             # 1. 状態管理マネージャーの初期化
             logger.info("\n[1/5] 状態管理マネージャーを初期化中...")
             self.state_manager = StateManager(
-                checkpoint_dir="data/state",
-                event_log_path="data/state/event_log.jsonl",
+                checkpoint_dir=str(config.STATE_CHECKPOINT_DIR),
+                event_log_path=str(config.STATE_EVENT_LOG),
                 use_event_sourcing=True
             )
-            
+
             # チェックポイントから状態を復元
             loaded_state = self.state_manager.load_checkpoint()
-            
+
             if loaded_state is None:
                 logger.info("チェックポイントが見つかりません。新規状態を作成します。")
                 initial_state = SystemState(
@@ -94,31 +95,31 @@ class ForgeSystem:
                 )
                 self.state_manager.current_state = initial_state
                 self.state_manager.save_checkpoint(initial_state)
-            
+
             logger.info("✓ 状態管理マネージャー初期化完了")
-            
+
             # 2. 市場レジーム検知器の初期化
             logger.info("\n[2/5] 市場レジーム検知器を初期化中...")
-            regime_model_path = 'models/regime_detector_hmm.pkl'
-            
-            if Path(regime_model_path).exists():
+            regime_model_path = config.S7_REGIME_MODEL
+
+            if regime_model_path.exists():
                 self.regime_detector = MarketRegimeDetector(
                     method='hmm',
                     n_regimes=4,
-                    model_path=regime_model_path
+                    model_path=str(regime_model_path)
                 )
                 logger.info("✓ 市場レジーム検知器初期化完了（学習済みモデル使用）")
             else:
                 logger.warning("市場レジーム検知器モデルが見つかりません。")
                 logger.warning("レジーム適応機能は無効化されます。")
                 self.regime_detector = None
-            
+
             # 3. 較正済みモデルの読み込み
             logger.info("\n[3/5] 較正済みAIモデルを読み込み中...")
-            m1_path = 'models/metalabeling/m1_primary_calibrated.pkl'
-            m2_path = 'models/metalabeling/m2_meta_calibrated.pkl'
-            
-            if Path(m1_path).exists() and Path(m2_path).exists():
+            m1_path = config.S7_M1_CALIBRATED
+            m2_path = config.S7_M2_CALIBRATED
+
+            if m1_path.exists() and m2_path.exists():
                 self.m1_calibrated = joblib.load(m1_path)
                 self.m2_calibrated = joblib.load(m2_path)
                 logger.info("✓ 較正済みモデル読み込み完了")
@@ -126,54 +127,51 @@ class ForgeSystem:
                 logger.error("較正済みモデルが見つかりません。")
                 logger.error("システムを起動できません。")
                 return False
-            
+
             # 4. リスク管理エンジンの初期化
             logger.info("\n[4/5] リスク管理エンジンを初期化中...")
             self.risk_engine = ExtremeRiskEngineV2(
-                config_path='config/risk_config.json',
+                config_path=str(config.CONFIG_RISK),
                 state_manager=self.state_manager,
                 regime_detector=self.regime_detector,
-                m1_model_path=m1_path,
-                m2_model_path=m2_path
+                m1_model_path=str(m1_path),
+                m2_model_path=str(m2_path)
             )
             logger.info("✓ リスク管理エンジン初期化完了")
-            
+
             # 5. MQL5ブリッジの初期化
             logger.info("\n[5/5] MQL5ブリッジを初期化中...")
-            bridge_config = BridgeConfig(
-                trade_endpoint="tcp://127.0.0.1:5555",
-                heartbeat_endpoint="tcp://127.0.0.1:5556",
-                request_timeout=2500,
-                request_retries=3,
-                heartbeat_interval=10,
-                heartbeat_timeout=30
+            bridge_config_obj = BridgeConfig(
+                trade_endpoint=config.ZMQ["trade_endpoint"],
+                heartbeat_endpoint=config.ZMQ["heartbeat_endpoint"],
+                log_dir=str(config.LOGS_ZMQ_BRIDGE)
             )
-            
-            self.bridge = MQL5BridgePublisherV2(config=bridge_config)
-            
+
+            self.bridge = MQL5BridgePublisherV2(config=bridge_config_obj)
+
             # コールバック設定
             self.bridge.on_connection_lost = self._on_connection_lost
             self.bridge.on_connection_restored = self._on_connection_restored
-            
+
             if self.bridge.connect():
                 logger.info("✓ MQL5ブリッジ初期化完了")
             else:
                 logger.warning("MQL5ブリッジの接続に失敗しました。")
                 logger.warning("フォールバックモードで継続します。")
-            
+
             # フォールバックブリッジ
             self.fallback_bridge = FileBasedBridge()
-            
+
             # ブローカー整合性検証
             logger.info("\n[整合性検証] ブローカー状態を確認中...")
             self._perform_broker_reconciliation()
-            
+
             logger.info("\n" + "=" * 60)
             logger.info("✓ Project Forge システム初期化完了")
             logger.info("=" * 60)
-            
+
             return True
-        
+
         except Exception as e:
             logger.error(f"✗ システム初期化失敗: {e}", exc_info=True)
             return False
