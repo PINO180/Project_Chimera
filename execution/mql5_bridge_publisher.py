@@ -2,6 +2,10 @@
 MQL5ブリッジ 2.0 - 高信頼性通信
 レイジー・パイレートパターンと双方向ハートビートによるミッションクリティカル通信
 """
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import zmq
 import json

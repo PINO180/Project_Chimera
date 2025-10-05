@@ -9,6 +9,10 @@ feature_validator.py - v3.0
 - Pylance厳格型定義準拠
 """
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import sys
 import os

@@ -2,6 +2,10 @@
 極限リスク管理エンジン 2.0
 ケリー基準、確率キャリブレーション、状態管理、市場レジーム適応を統合
 """
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import numpy as np
 import json

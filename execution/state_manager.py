@@ -2,6 +2,10 @@
 状態管理とフォールトトレランス
 チェックポインティングとイベントソーシングによる状態永続化
 """
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import json
 import pickle

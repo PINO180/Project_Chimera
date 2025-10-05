@@ -2,6 +2,10 @@
 Project Forge 統合実行スクリプト
 全コンポーネントを統合し、リアルタイム取引システムを起動
 """
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import numpy as np
 import pandas as pd

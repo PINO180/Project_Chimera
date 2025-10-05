@@ -2,6 +2,10 @@
 市場レジーム検知エンジン
 HMMと時系列クラスタリングによる市場環境の分類と動的リスクパラメータ調整
 """
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import numpy as np
 import pandas as pd

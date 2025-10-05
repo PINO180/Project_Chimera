@@ -9,6 +9,10 @@ walk_forward_validator_v2.py - SHAPベース版
 - 敵対的検証スコアによる特徴量ペナルティ
 - Dask-LightGBM + map_partitions並列SHAP計算
 """
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import logging
 from typing import List, Dict, Tuple, cast

@@ -25,6 +25,10 @@ Project Forge - 軍資金増大プロジェクト
 - F21: Lempel-Ziv複雑性
 """
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import blueprint as config
 import os, sys, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
