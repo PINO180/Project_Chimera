@@ -16,7 +16,7 @@ Project Forge - 軍資金増大プロジェクト
 - CalculationEngine（60%）: 特徴量計算核心（物理的垂直分割実装）
 - OutputEngine（10%）: ストリーミング出力
 """
-import config
+import blueprint as config
 import os, sys, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any

@@ -1,4 +1,4 @@
-import config
+import blueprint as config
 import dask
 import dask.dataframe as dd
 from dask.dataframe.core import DataFrame, Series

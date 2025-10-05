@@ -9,7 +9,7 @@ feature_validator.py - v3.0
 - Pylance厳格型定義準拠
 """
 
-import config
+import blueprint as config
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

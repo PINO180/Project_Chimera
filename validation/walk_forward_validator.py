@@ -9,7 +9,7 @@ walk_forward_validator_v2.py - SHAPベース版
 - 敵対的検証スコアによる特徴量ペナルティ
 - Dask-LightGBM + map_partitions並列SHAP計算
 """
-import config
+import blueprint as config
 import logging
 from typing import List, Dict, Tuple, cast
 from pathlib import Path

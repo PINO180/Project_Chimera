@@ -2,7 +2,7 @@
 状態管理とフォールトトレランス
 チェックポインティングとイベントソーシングによる状態永続化
 """
-import config
+import blueprint as config
 import json
 import pickle
 import sqlite3

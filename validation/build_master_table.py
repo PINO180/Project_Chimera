@@ -9,7 +9,7 @@ Project Forge - 第一防衛線通過後の特徴量統合システム
 - 日次パーティション化保存
 - Pylance厳格型定義準拠
 """
-import config
+import blueprint as config
 import re
 import sys
 from pathlib import Path

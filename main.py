@@ -2,7 +2,7 @@
 Project Forge 統合実行スクリプト
 全コンポーネントを統合し、リアルタイム取引システムを起動
 """
-import config
+import blueprint as config
 import numpy as np
 import pandas as pd
 import time

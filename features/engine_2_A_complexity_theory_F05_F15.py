@@ -21,7 +21,7 @@ Project Forge - 軍資金増大プロジェクト
 - UDF内部でのローリング処理とprange並列化
 - 遅延束縛バグの完全排除(デフォルト引数による即時束縛)
 """
-import config
+import blueprint as config
 import os, sys, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any

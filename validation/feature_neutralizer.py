@@ -8,7 +8,7 @@ feature_neutralizer.py - v2.1
 - 純粋なアルファ成分の抽出
 - Pylance厳格型定義準拠
 """
-import config
+import blueprint as config
 import logging
 from typing import List, Dict, Any
 from pathlib import Path

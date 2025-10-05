@@ -27,7 +27,7 @@ import warnings
 import json
 import logging
 import math
-import config
+import blueprint as config
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field

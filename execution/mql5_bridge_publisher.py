@@ -2,7 +2,7 @@
 MQL5ブリッジ 2.0 - 高信頼性通信
 レイジー・パイレートパターンと双方向ハートビートによるミッションクリティカル通信
 """
-import config
+import blueprint as config
 import zmq
 import json
 import time
