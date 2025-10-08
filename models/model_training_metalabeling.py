@@ -6,7 +6,7 @@ import blueprint as config
 import dask
 import dask.dataframe as dd
 from dask.dataframe.core import DataFrame, Series
-import dask_lightgbm.core as dlgb
+from lightgbm.dask import DaskLGBMRegressor, DaskLGBMClassifier
 import numpy as np
 import pandas as pd
 import joblib

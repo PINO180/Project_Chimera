@@ -28,15 +28,17 @@ logger = logging.getLogger(__name__)
 
 import dask
 import dask.dataframe as dd
-from dask.dataframe.core import DataFrame as DaskDataFrame
-import dask_lightgbm.core as dlgb
+from dask.dataframe import DataFrame as DaskDataFrame # .coreを削除
+from dask import config as dask_config # dask専用の別名を付ける
+# lightgbm.daskからDask用のクラスをインポート
+from lightgbm.dask import DaskLGBMRegressor, DaskLGBMClassifier
+from dask.base import compute # dask -> dask.base に変更
 from scipy.stats import chi2_contingency
 import numpy as np
 import joblib
 from tqdm import tqdm
 import pandas as pd
-from dask.dataframe.core import DataFrame as DaskDataFrame
-
+from scipy.stats import ks_2samp  # 追加
 
 class FeatureValidator:
     """
@@ -63,8 +65,7 @@ class FeatureValidator:
         
     def _load_data(self) -> None:
         """
-        Dask DataFrameとして特徴量ユニバースを読み込む
-        stratum_2の複数エンジン出力を自動で検出し統合する
+        Dask DataFrameとして特徴量ユニバースを読み込む (v4.1 - タイムフレームサフィックス版)
         """
         feature_universe_path = Path(self.feature_universe_path)
         logger.info(f"第一防衛線: 特徴量ユニバース '{feature_universe_path}' をDask DataFrameとして読み込み中...")
@@ -72,26 +73,107 @@ class FeatureValidator:
         if not feature_universe_path.exists() or not feature_universe_path.is_dir():
             raise FileNotFoundError(f"特徴量ユニバースの親ディレクトリが見つかりません: {feature_universe_path}")
 
-        # stratum_2内の全Parquetファイルを探索（tickのパーティションを除く）
-        all_parquet_files = []
-        for engine_output_dir in feature_universe_path.iterdir():
-            if engine_output_dir.is_dir():
-                # 非tickファイルを追加
-                all_parquet_files.extend(engine_output_dir.glob("*.parquet"))
+        # 全ての.parquetファイルとパーティション化ディレクトリを再帰的に検出
+        all_parquet_paths = []
+        
+        for engine_dir in feature_universe_path.iterdir():
+            if not engine_dir.is_dir():
+                continue
+            
+            for item in engine_dir.iterdir():
+                if item.is_file() and item.suffix == '.parquet':
+                    all_parquet_paths.append(item)
+                elif item.is_dir():
+                    all_parquet_paths.append(item)
+        
+        if not all_parquet_paths:
+            raise FileNotFoundError("Parquetファイルまたはパーティションが見つかりません")
 
-        if not all_parquet_files:
-            raise FileNotFoundError(f"'{feature_universe_path}'内でParquetファイルが見つかりませんでした。")
+        logger.info(f"{len(all_parquet_paths)}個のParquetデータソースを検出。")
 
-        logger.info(f"{len(all_parquet_files)}個のParquetファイルを検出。Daskで統合します。")
-
-        # 複数のParquetファイルをDaskで単一のDataFrameとして読み込む
-        self.ddf = dd.read_parquet(all_parquet_files, engine='pyarrow')
-
+        non_feature_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'timeframe', 'year', 'month', 'day']
+        
+        base_ddf = None
+        remaining_ddfs = []
+        
+        for path in tqdm(all_parquet_paths, desc="データ読み込み中"):
+            try:
+                temp_ddf = dd.read_parquet(
+                    str(path),
+                    engine='pyarrow',
+                    dtype_backend='numpy_nullable'
+                )
+                
+                # 型を統一
+                for col in ['year', 'month', 'day']:
+                    if col in temp_ddf.columns:
+                        temp_ddf[col] = temp_ddf[col].astype('int32')
+                
+                # タイムフレーム情報を抽出（ファイル名から）
+                # 例: features_e1a_D1.parquet → _D1
+                #     features_e1a_M0.5.parquet → _M0.5
+                #     features_e1a_tick → _tick
+                if path.is_dir():
+                    # ディレクトリの場合（tickデータ）
+                    timeframe_suffix = '_tick'
+                else:
+                    # ファイルの場合
+                    filename = path.name  # "features_e1a_M0.5.parquet"
+                    # .parquetを除去
+                    base_name = filename.replace('.parquet', '')  # "features_e1a_M0.5"
+                    # 最後のアンダースコア以降を取得
+                    parts = base_name.split('_')
+                    if len(parts) > 1:
+                        timeframe_suffix = f"_{parts[-1]}"  # "_M0.5"
+                    else:
+                        timeframe_suffix = ""
+                
+                # 特徴量カラムにタイムフレームサフィックスを追加
+                rename_dict = {}
+                for col in temp_ddf.columns:
+                    if col not in non_feature_columns and col not in ['year', 'month', 'day']:
+                        rename_dict[col] = f"{col}{timeframe_suffix}"
+                
+                if rename_dict:
+                    temp_ddf = temp_ddf.rename(columns=rename_dict)
+                
+                if base_ddf is None:
+                    base_ddf = temp_ddf
+                    logger.info(f"ベースデータセット: {path.name} ({len(temp_ddf.columns)}カラム)")
+                else:
+                    remaining_ddfs.append((path.name, temp_ddf))
+                    
+            except Exception as e:
+                logger.warning(f"{path.name} の読み込みに失敗: {e}")
+                continue
+        
+        if base_ddf is None:
+            raise ValueError("有効なデータソースが1つも読み込めませんでした")
+        
+        logger.info("特徴量カラムを結合中...")
+        
+        for name, ddf in tqdm(remaining_ddfs, desc="結合中"):
+            if 'timestamp' not in ddf.columns:
+                logger.warning(f"{name}: timestampカラムがありません。スキップします。")
+                continue
+            
+            feature_cols = [col for col in ddf.columns if col not in non_feature_columns]
+            
+            if not feature_cols:
+                logger.warning(f"{name}: 特徴量カラムが見つかりません。スキップします。")
+                continue
+            
+            ddf_features = ddf[['timestamp'] + feature_cols]
+            base_ddf = base_ddf.merge(ddf_features, on='timestamp', how='outer')
+            logger.info(f"{name}: {len(feature_cols)}個の特徴量を追加")
+        
+        self.ddf = base_ddf
+        
         logger.info("スキーマ情報を取得中...")
         all_columns = self.ddf.columns.tolist()
         self.feature_columns = [
-            col for col in all_columns 
-            if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp', 'timeframe']
+            col for col in all_columns
+            if col not in non_feature_columns
         ]
 
         n_partitions = self.ddf.npartitions
@@ -99,48 +181,47 @@ class FeatureValidator:
         
     def _test_distribution_stability(self) -> Set[str]:
         """
-        【v3.0】分布安定性テスト
-        全データのヒストグラムを並列計算し、カイ二乗検定で比較
+        【v3.1 - KS検定版】分布安定性テスト
+        Kolmogorov-Smirnov検定で時間的分布変化を検出
         """
-        logger.info("--- 分布安定性テスト（カイ二乗検定）を開始 ---")
+        logger.info("--- 分布安定性テスト（Kolmogorov-Smirnov検定）を開始 ---")
         
         if self.ddf is None:
             raise ValueError("Dask DataFrame not loaded.")
         
+        # データを前半・後半に分割
         split_point = self.ddf.npartitions // 2
         p1_ddf = self.ddf.partitions[:split_point]
         p2_ddf = self.ddf.partitions[split_point:]
         
         unstable_features: Set[str] = set()
+        
+        # バッチ処理（メモリ効率化）
         feature_batches = [
             self.feature_columns[i:i + 20] 
             for i in range(0, len(self.feature_columns), 20)
         ]
         
-        for batch in tqdm(feature_batches, desc="Chi-Squared Test"):
-            tasks = []
+        for batch in tqdm(feature_batches, desc="KS Test"):
+            # バッチごとにデータをcompute
+            p1_batch = p1_ddf[batch].compute()
+            p2_batch = p2_ddf[batch].compute()
+            
             for feature in batch:
-                tasks.append(p1_ddf[feature].histogram(bins=50))
-                tasks.append(p2_ddf[feature].histogram(bins=50))
-            
-            histograms = dask.compute(*tasks)
-            
-            for i, feature in enumerate(batch):
-                hist1_counts, _ = histograms[i*2]
-                hist2_counts, _ = histograms[i*2 + 1]
+                # NaN/Inf除外
+                data1 = p1_batch[feature].dropna()
+                data2 = p2_batch[feature].dropna()
                 
-                observed = np.array([hist1_counts, hist2_counts])
-                observed = observed[:, observed.sum(axis=0) > 0]
-                
-                if observed.shape[1] < 2:
+                # データ量チェック
+                if len(data1) < 10 or len(data2) < 10:
+                    logger.warning(f"特徴量 {feature} はデータ不足のためスキップ")
                     continue
                 
-                try:
-                    _, p_value, _, _ = chi2_contingency(observed)
-                    if p_value < self.ks_p_value_threshold:
-                        unstable_features.add(feature)
-                except ValueError:
-                    continue
+                # scipy KS検定実行
+                statistic, p_value = ks_2samp(data1, data2)
+                
+                if p_value < self.ks_p_value_threshold:
+                    unstable_features.add(feature)
         
         logger.info(f"分布安定性テスト完了。{len(unstable_features)}個の不安定な特徴量を検出。")
         return unstable_features
@@ -176,7 +257,7 @@ class FeatureValidator:
         X1_val = p1_val_ddf[self.feature_columns]
         y1_val = p1_val_ddf['target']
         
-        model1 = dlgb.LGBMRegressor(n_estimators=50, random_state=42, verbosity=-1, n_jobs=self.n_jobs)
+        model1 = DaskLGBMRegressor(n_estimators=50, random_state=42, verbosity=-1, n_jobs=self.n_jobs)
         model1.fit(X1_train, y1_train)
         
         logger.info("前半期間: ベースラインスコアを計算...")
@@ -199,7 +280,7 @@ class FeatureValidator:
         X2_val = p2_val_ddf[self.feature_columns]
         y2_val = p2_val_ddf['target']
         
-        model2 = dlgb.LGBMRegressor(n_estimators=50, random_state=42, verbosity=-1, n_jobs=self.n_jobs)
+        model2 = DaskLGBMRegressor(n_estimators=50, random_state=42, verbosity=-1, n_jobs=self.n_jobs)
         model2.fit(X2_train, y2_train)
         
         logger.info("後半期間: ベースラインスコアを計算...")
@@ -252,7 +333,7 @@ class FeatureValidator:
         X = combined_ddf[self.feature_columns]
         y = combined_ddf['adversarial_label']
         
-        model = dlgb.LGBMClassifier(
+        model = DaskLGBMClassifier(
             n_estimators=50,
             random_state=42,
             verbosity=-1,
@@ -263,7 +344,7 @@ class FeatureValidator:
         # AUC計算（メモリ効率のため予測とターゲットを同時にcompute）
         logger.info("敵対的検証の性能を評価中...")
         y_pred_proba = model.predict_proba(X)
-        y_computed, y_pred_computed = dask.compute(y, y_pred_proba)
+        y_computed, y_pred_computed = compute(y, y_pred_proba)
         
         from sklearn.metrics import roc_auc_score
         auc = roc_auc_score(y_computed, y_pred_computed[:, 1])
@@ -322,10 +403,11 @@ class FeatureValidator:
 
 
 if __name__ == '__main__':
-    dask.config.set({'dataframe.query-planning': True})
+    # Daskの最新エンジンを明示的に有効化
+    dask_config.set({'dataframe.query-planning': True})
 
     validator = FeatureValidator(
-        feature_universe_path=str(config.S2_FEATURES),
+        feature_universe_path=str(config.S2_FEATURES2),
         n_jobs=4
     )
 

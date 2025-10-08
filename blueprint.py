@@ -25,6 +25,7 @@ S1_BASE_MULTITIMEFRAME = S1_BASE / "master_from_tick"
 
 # --- Stratum 2: 特徴量 ---
 S2_FEATURES = DATA_DIR / SYMBOL / "stratum_2_features"
+S2_FEATURES_FIXED = DATA_DIR / SYMBOL / "stratum_2_features_fixed" # ← 変数名を修正
 
 # --- Stratum 3: 検証成果物 ---
 S3_ARTIFACTS = DATA_DIR / SYMBOL / "stratum_3_artifacts" / FEATURE_SET_ID

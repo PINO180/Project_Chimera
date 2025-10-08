@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 import dask
 import dask.dataframe as dd
 from dask.dataframe.core import DataFrame as DaskDataFrame, Series as DaskSeries
-import dask_lightgbm.core as dlgb
+from lightgbm.dask import DaskLGBMRegressor, DaskLGBMClassifier
 import numpy as np
 import joblib
 from sklearn.metrics import roc_auc_score

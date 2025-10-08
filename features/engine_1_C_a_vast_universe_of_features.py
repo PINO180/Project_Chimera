@@ -5,8 +5,6 @@ Engine 1C: テクニカル指標・トレンド分析特徴量エンジン
 Technical Indicators and Trend Analysis Features Engine
 
 対象: XAU/USD (Gold vs US Dollar)
-データソース: /workspaces/project_forge/data/1_XAUUSD_base_data/XAUUSD_tick_master_GOLDEN
-出力先: /workspaces/project_forge/data/2_feature_value/
 
 特徴量カテゴリ:
 - 基本テクニカル指標 (RSI, MACD, BB, ATR, Stochastic)
