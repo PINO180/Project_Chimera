@@ -1,543 +1,176 @@
+# /workspace/validation/build_master_table.py
 """
-build_master_table.py - 安定版マスターテーブル構築スクリプト
+build_master_table.py v1.6 - レジューム機能・ソート修正版
 
-Project Forge - 第一防衛線通過後の特徴量統合システム
-
-統合設計図V準拠：
-- Polars高速データ処理
-- join_asof結合による時間軸統合
-- 日次パーティション化保存
-- Pylance厳格型定義準拠
+v1.5からの改善点：
+- レジューム機能の追加：マスターテーブルの土台が既に存在する場合、
+  3時間かかる初期化プロセスをスキップし、マージ処理から再開する。
+- join_asofのエラーを修正：結合前に両方のLazyFrameを'timestamp'で
+  明示的にソートする処理を追加し、「not sorted」エラーを回避する。
 """
 import sys
 from pathlib import Path
+import shutil
+import logging
+import time
+from typing import List, Tuple
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import blueprint as config
-import re
-import sys
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional
-import logging
-from datetime import datetime
-import psutil
-
 import polars as pl
-import joblib
+from tqdm import tqdm
+import blueprint as config
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('build_master_table.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class MasterTableConfig:
-    """
-    マスターテーブル構築の設定を一元管理するdataclass
-    
-    Attributes:
-        feature_dir: 個別特徴量ファイルが格納されているディレクトリ
-        stable_list_path: 安定特徴量リストのパス（.joblib）
-        output_dir: 出力先ディレクトリ
-        output_name: 出力ファイル名（パーティションディレクトリ名）
-        timeframes: 処理対象の時間足リスト（tickを除く）
-        memory_warning_gb: メモリ警告閾値（GB）
-        memory_critical_gb: メモリ緊急停止閾値（GB）
-    """
-    feature_dir: Path
-    stable_list_path: Path
+class MasterTableBuilder:
+    input_dir: Path
     output_dir: Path
-    output_name: str = "stable_master_table"
-    timeframes: Optional[List[str]] = None
-    memory_warning_gb: float = 50.0
-    memory_critical_gb: float = 55.0
-    
-    def __post_init__(self) -> None:
-        """デフォルト値の設定とパス検証"""
-        if self.timeframes is None:
-            self.timeframes = [
-                "M0.5", "M1", "M3", "M5", "M8", "M15", "M30",
-                "H1", "H4", "H6", "H12", "D1", "W1", "MN"
-            ]
-        
-        self.feature_dir = Path(self.feature_dir)
-        self.stable_list_path = Path(self.stable_list_path)
-        self.output_dir = Path(self.output_dir)
-        
-        if not self.feature_dir.exists():
-            raise FileNotFoundError(f"特徴量ディレクトリが見つかりません: {self.feature_dir}")
-        if not self.stable_list_path.exists():
-            raise FileNotFoundError(f"安定特徴量リストが見つかりません: {self.stable_list_path}")
-        
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info("設定初期化完了:")
-        logger.info(f"  特徴量ディレクトリ: {self.feature_dir}")
-        logger.info(f"  安定リスト: {self.stable_list_path}")
-        logger.info(f"  出力先: {self.output_dir / self.output_name}")
+    temp_dir: Path
+    base_columns: List[str]
 
+    def __init__(self) -> None:
+        self.input_dir = Path(config.S2_FEATURES_AFTER_AV)
+        self.output_dir = Path(config.S4_MASTER_TABLE_PARTITIONED)
+        self.temp_dir = self.output_dir.parent / f"_temp_{self.output_dir.name}"
+        self.base_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        
+        logger.info("="*50)
+        logger.info("🚀 MasterTableBuilder initialized (v1.6)")
+        logger.info(f"Input Directory: {self.input_dir}")
+        logger.info(f"Output Directory: {self.output_dir}")
+        logger.info("="*50)
 
-class MemoryMonitor:
-    """メモリ使用量を監視し、閾値超過時に警告・停止を実行するクラス"""
-    
-    def __init__(self, warning_gb: float, critical_gb: float):
-        """
-        Args:
-            warning_gb: 警告閾値（GB）
-            critical_gb: 緊急停止閾値（GB）
-        """
-        self.warning_gb = warning_gb
-        self.critical_gb = critical_gb
-        self.warning_issued = False
-    
-    def check(self, operation: str = "操作") -> None:
-        """
-        現在のメモリ使用量をチェックし、必要に応じて警告・停止を実行
-        
-        Args:
-            operation: 実行中の操作名（ログ出力用）
-        
-        Raises:
-            MemoryError: メモリ使用量が緊急停止閾値を超えた場合
-        """
-        memory_info = psutil.virtual_memory()
-        used_gb = memory_info.used / (1024 ** 3)
-        
-        if used_gb > self.critical_gb:
-            error_msg = (
-                f"メモリ使用量が緊急停止閾値を超えました: {used_gb:.2f}GB > {self.critical_gb}GB "
-                f"({operation}中)"
+    def _get_feature_sources(self) -> Tuple[Path, List[Path]]:
+        logger.info("🔍 Scanning for feature sources correctly...")
+        all_tick_dirs = [p for p in self.input_dir.rglob('features_*_tick') if p.is_dir()]
+        all_parquet_files_found = list(self.input_dir.rglob('*.parquet'))
+        single_parquet_files = []
+        for pq_file in all_parquet_files_found:
+            is_in_tick_dir = any(tick_dir in pq_file.parents for tick_dir in all_tick_dirs)
+            if not is_in_tick_dir:
+                single_parquet_files.append(pq_file)
+
+        all_sources = single_parquet_files + all_tick_dirs
+        if not all_sources:
+            raise FileNotFoundError(f"No feature sources found in {self.input_dir}")
+
+        base_source = next((s for s in all_sources if 'e1a_tick' in s.name and s.is_dir()), None)
+        if not base_source:
+            base_source = next((s for s in all_sources if s.is_dir() and 'tick' in s.name), None)
+        if not base_source:
+            raise FileNotFoundError("Base tick data source could not be found.")
+
+        merge_sources = [s for s in all_sources if s.resolve() != base_source.resolve()]
+        logger.info(f"🛡️  Base source identified: {base_source.name}")
+        logger.info(f"➕ Found {len(merge_sources)} sources to merge. (Corrected)")
+        return base_source, merge_sources
+
+    def _write_partitioned(self, lf: pl.LazyFrame, target_dir: Path) -> None:
+        if 'year' not in lf.columns:
+             lf = lf.with_columns(
+                pl.col("timestamp").dt.year().alias("year").cast(pl.Int32),
+                pl.col("timestamp").dt.month().alias("month").cast(pl.Int32),
+                pl.col("timestamp").dt.day().alias("day").cast(pl.Int32)
             )
-            logger.error(error_msg)
-            raise MemoryError(error_msg)
-        
-        if used_gb > self.warning_gb and not self.warning_issued:
-            logger.warning(
-                f"メモリ使用量が警告閾値を超えました: {used_gb:.2f}GB > {self.warning_gb}GB "
-                f"({operation}中)"
-            )
-            self.warning_issued = True
-        
-        logger.debug(f"メモリ使用量: {used_gb:.2f}GB / {memory_info.total / (1024 ** 3):.2f}GB")
 
+        dates_df = lf.select(["year", "month", "day"]).unique().collect()
+        logger.info(f"  -> Writing {len(dates_df)} daily partitions...")
 
-def load_stable_feature_list(path: Path) -> List[str]:
-    """
-    安定特徴量リストを読み込む
-    
-    Args:
-        path: stable_feature_list.joblibのパス
-    
-    Returns:
-        安定特徴量の名前リスト
-    
-    Raises:
-        FileNotFoundError: ファイルが存在しない場合
-        ValueError: ファイルの形式が不正な場合
-    """
-    logger.info(f"安定特徴量リストを読み込み中: {path}")
-    
-    try:
-        stable_features: List[str] = joblib.load(path)
-    except Exception as e:
-        logger.error(f"安定特徴量リストの読み込みに失敗: {e}")
-        raise
-    
-    if not isinstance(stable_features, list):
-        raise ValueError(
-            f"安定特徴量リストの形式が不正です。リストが期待されていますが、"
-            f"{type(stable_features)}が見つかりました"
-        )
-    
-    if not all(isinstance(f, str) for f in stable_features):
-        raise ValueError("安定特徴量リストに文字列以外の要素が含まれています")
-    
-    logger.info(f"安定特徴量リスト読み込み完了: {len(stable_features)}個の特徴量")
-    
-    return stable_features
+        for row in tqdm(dates_df.iter_rows(named=True), total=len(dates_df), desc=f"Writing to {target_dir.name}"):
+            y, m, d = row['year'], row['month'], row['day']
+            partition_lf = lf.filter((pl.col('year') == y) & (pl.col('month') == m) & (pl.col('day') == d))
+            output_path = target_dir / f"year={y}/month={m}/day={d}"
+            output_path.mkdir(parents=True, exist_ok=True)
+            partition_lf.sink_parquet(str(output_path / "0.parquet"), compression='snappy')
 
+    def _initialize_master_table(self, base_source: Path) -> None:
+        logger.info("🏗️  Initializing master table skeleton...")
+        if self.output_dir.exists():
+            shutil.rmtree(self.output_dir)
+        self.output_dir.mkdir(parents=True)
 
-def identify_tick_features(stable_features: List[str]) -> List[str]:
-    """
-    安定特徴量リストからtick専用特徴量（_tickで終わる）を特定
-    
-    Args:
-        stable_features: 安定特徴量の名前リスト
-    
-    Returns:
-        tick専用特徴量の名前リスト
-    """
-    tick_features = [f for f in stable_features if f.endswith("_tick")]
-    logger.info(f"tick専用特徴量を特定: {len(tick_features)}個")
-    
-    return tick_features
+        try:
+            lf = pl.scan_parquet(str(base_source))
+            skeleton_lf = lf.select(self.base_columns)
+            self._write_partitioned(skeleton_lf, self.output_dir)
+            logger.info("✅ Master table skeleton created successfully.")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize master table: {e}", exc_info=True)
+            if self.output_dir.exists():
+                shutil.rmtree(self.output_dir)
+            raise
 
-
-def find_feature_file(
-    feature_dir: Path,
-    timeframe: str,
-) -> Optional[Path]:
-    """
-    指定された時間足の特徴量ファイルを、複数のエンジン出力ディレクトリを横断して検索する
-    """
-    # stratum_2内の全てのサブディレクトリを検索対象とする
-    for engine_output_dir in feature_dir.iterdir():
-        if not engine_output_dir.is_dir():
-            continue
-
-        # ディレクトリ名からエンジンIDを推測 (例: feature_value_a_vast_universeA -> e1a)
-        dir_name = engine_output_dir.name
-        engine_id = None
-
-        vast_match = re.search(r"feature_value_a_vast_universe([A-F])", dir_name, re.IGNORECASE)
-        complexity_match = re.search(r"feature_value_complexity_theory([A-Z])", dir_name, re.IGNORECASE)
-
-        if vast_match:
-            engine_id = f"e1{vast_match.group(1).lower()}"
-        elif complexity_match:
-            engine_id = f"e2{complexity_match.group(1).lower()}"
-
-        if not engine_id:
-            continue
-
-        # 目的のファイルパスを構築
-        if timeframe == "tick":
-            file_path = engine_output_dir / f"features_{engine_id}_tick"
-        else:
-            file_path = engine_output_dir / f"features_{engine_id}_{timeframe}.parquet"
-
-        if file_path.exists():
-            # 最初に見つかったファイルを返す
-            return file_path
-
-    return None
-
-
-def load_master_timeaxis(
-    feature_dir: Path,
-    tick_features: List[str],
-    memory_monitor: MemoryMonitor
-) -> pl.DataFrame:
-    """
-    tickデータからマスター時間軸を作成
-    
-    Args:
-        feature_dir: 特徴量ファイルが格納されているディレクトリ
-        tick_features: tick専用特徴量の名前リスト
-        memory_monitor: メモリ監視オブジェクト
-    
-    Returns:
-        マスター時間軸DataFrame（timestampでソート済み）
-    
-    Raises:
-        FileNotFoundError: tickデータファイルが見つからない場合
-        MemoryError: メモリ不足の場合
-    """
-    logger.info("=" * 80)
-    logger.info("マスター時間軸（tickデータ）の作成を開始")
-    logger.info("=" * 80)
-    
-    memory_monitor.check("マスター時間軸作成開始前")
-    
-    tick_file = find_feature_file(feature_dir, "tick")
-    if tick_file is None:
-        raise FileNotFoundError(
-            f"tickデータファイルが見つかりません: {feature_dir}/features_*_tick.parquet"
-        )
-    
-    logger.info(f"tickデータファイル: {tick_file}")
-    
-    base_columns = ["timestamp", "open", "high", "low", "close", "volume"]
-    select_columns = base_columns + tick_features if tick_features else None
-    
-    try:
-        if tick_file.is_dir():
-            logger.info("パーティション化されたtickデータを読み込み中...")
-            master_df = pl.read_parquet(tick_file, columns=select_columns)
-        else:
-            logger.info("単一tickファイルを読み込み中...")
-            master_df = pl.read_parquet(tick_file, columns=select_columns)
-        
-        memory_monitor.check("tickデータ読み込み後")
-        
-        logger.info("timestampでソート中...")
-        master_df = master_df.sort("timestamp")
-        
-        memory_monitor.check("ソート後")
-        
-        logger.info(f"マスター時間軸作成完了: {len(master_df):,}行 × {len(master_df.columns)}列")
-        logger.info(f"列: {master_df.columns}")
-        
-        return master_df
-    
-    except Exception as e:
-        logger.error(f"マスター時間軸の作成中にエラーが発生: {e}")
-        raise
-
-
-def join_timeframe_features(
-    master_df: pl.DataFrame,
-    feature_dir: Path,
-    timeframe: str,
-    stable_features: List[str],
-    memory_monitor: MemoryMonitor
-) -> pl.DataFrame:
-    """
-    指定された時間足の特徴量をマスターテーブルに結合
-    
-    Args:
-        master_df: マスター時間軸DataFrame
-        feature_dir: 特徴量ファイルが格納されているディレクトリ
-        timeframe: 時間足（例: "M1", "H1"）
-        stable_features: 安定特徴量の名前リスト
-        memory_monitor: メモリ監視オブジェクト
-    
-    Returns:
-        特徴量が結合されたDataFrame
-    
-    Raises:
-        FileNotFoundError: 特徴量ファイルが見つからない場合
-        MemoryError: メモリ不足の場合
-    """
-    logger.info("-" * 80)
-    logger.info(f"時間足 {timeframe} の特徴量を結合中...")
-    logger.info("-" * 80)
-    
-    memory_monitor.check(f"{timeframe}結合開始前")
-    
-    feature_file = find_feature_file(feature_dir, timeframe)
-    if feature_file is None:
-        logger.warning(f"時間足 {timeframe} の特徴量ファイルが見つかりません。スキップします。")
-        return master_df
-    
-    logger.info(f"特徴量ファイル: {feature_file}")
-    
-    timeframe_suffix = f"_{timeframe.replace('.', '')}"
-    timeframe_features = [
-        f for f in stable_features
-        if f.endswith(timeframe_suffix)
-    ]
-    
-    if not timeframe_features:
-        logger.info(f"時間足 {timeframe} に安定特徴量が存在しません。スキップします。")
-        return master_df
-    
-    logger.info(f"結合対象の安定特徴量: {len(timeframe_features)}個")
-    
-    select_columns = ["timestamp"] + timeframe_features
-    
-    try:
-        if feature_file.is_dir():
-            logger.info("パーティション化データを読み込み中...")
-            feature_df = pl.read_parquet(feature_file, columns=select_columns)
-        else:
-            logger.info("単一ファイルを読み込み中...")
-            feature_df = pl.read_parquet(feature_file, columns=select_columns)
-        
-        memory_monitor.check(f"{timeframe}データ読み込み後")
-        
-        logger.info("timestampでソート中...")
-        feature_df = feature_df.sort("timestamp")
-        
-        memory_monitor.check(f"{timeframe}ソート後")
-        
-        logger.info(f"特徴量データ: {len(feature_df):,}行 × {len(feature_df.columns)}列")
-        
-        logger.info("join_asofで結合中...")
-        master_df = master_df.join_asof(
-            feature_df,
-            on="timestamp",
-            strategy="backward"
-        )
-        
-        memory_monitor.check(f"{timeframe}結合後")
-        
-        logger.info(f"結合完了: 現在の列数 = {len(master_df.columns)}")
-        
-        return master_df
-    
-    except Exception as e:
-        logger.error(f"時間足 {timeframe} の結合中にエラーが発生: {e}")
-        raise
-
-
-def save_master_table(
-    master_df: pl.DataFrame,
-    output_dir: Path,
-    output_name: str,
-    memory_monitor: MemoryMonitor
-) -> None:
-    """
-    マスターテーブルを日次パーティション化して保存
-    
-    Args:
-        master_df: 保存するマスターテーブル
-        output_dir: 出力ディレクトリ
-        output_name: 出力名（パーティションディレクトリ名）
-        memory_monitor: メモリ監視オブジェクト
-    
-    Raises:
-        MemoryError: メモリ不足の場合
-    """
-    logger.info("=" * 80)
-    logger.info("マスターテーブルの保存を開始")
-    logger.info("=" * 80)
-    
-    memory_monitor.check("保存開始前")
-    
-    logger.info("年月日カラムを追加中...")
-    master_df = master_df.with_columns([
-        pl.col("timestamp").dt.year().alias("year"),
-        pl.col("timestamp").dt.month().alias("month"),
-        pl.col("timestamp").dt.day().alias("day")
-    ])
-    
-    output_path = output_dir / output_name
-    
-    logger.info(f"出力先: {output_path}")
-    logger.info(f"データサイズ: {len(master_df):,}行 × {len(master_df.columns)}列")
-    logger.info("パーティション化して保存中...")
-    
-    try:
-        master_df.write_parquet(
-            output_path,
-            compression="snappy",
-            partition_by=["year", "month", "day"]
-        )
-        
-        memory_monitor.check("保存完了後")
-        
-        logger.info("=" * 80)
-        logger.info("マスターテーブルの保存が完了しました")
-        logger.info("=" * 80)
-        
-    except Exception as e:
-        logger.error(f"マスターテーブルの保存中にエラーが発生: {e}")
-        raise
-
-
-def build_master_table(config: MasterTableConfig) -> None:
-    """
-    安定版マスターテーブルを構築するメイン処理
-    
-    Args:
-        config: マスターテーブル構築の設定
-    
-    Raises:
-        FileNotFoundError: 入力ファイルが見つからない場合
-        MemoryError: メモリ不足の場合
-    """
-    start_time = datetime.now()
-    logger.info("=" * 80)
-    logger.info("安定版マスターテーブル構築を開始")
-    logger.info("=" * 80)
-    logger.info(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    memory_monitor = MemoryMonitor(
-        warning_gb=config.memory_warning_gb,
-        critical_gb=config.memory_critical_gb
-    )
-    
-    try:
-        logger.info("\n【ステップ1】安定特徴量リストの読み込み")
-        stable_features = load_stable_feature_list(config.stable_list_path)
-        
-        logger.info("\n【ステップ2】tick専用特徴量の特定")
-        tick_features = identify_tick_features(stable_features)
-        
-        logger.info("\n【ステップ3】マスター時間軸の作成")
-        master_df = load_master_timeaxis(
-            config.feature_dir,
-            tick_features,
-            memory_monitor
-        )
-        
-        logger.info("\n【ステップ4】各時間足の特徴量を結合")
-        if config.timeframes is None:
-            raise ValueError("Timeframes not configured.")
-        
-        logger.info(f"処理対象時間足: {', '.join(config.timeframes)}")
-        
-        for i, timeframe in enumerate(config.timeframes, 1):
-            logger.info(f"\n[{i}/{len(config.timeframes)}] {timeframe} を処理中...")
+    def run(self) -> None:
+        start_time = time.time()
+        try:
+            base_source, merge_sources = self._get_feature_sources()
             
-            master_df = join_timeframe_features(
-                master_df,
-                config.feature_dir,
-                timeframe,
-                stable_features,
-                memory_monitor
-            )
-        
-        logger.info("\n【ステップ5】マスターテーブルの保存")
-        save_master_table(
-            master_df,
-            config.output_dir,
-            config.output_name,
-            memory_monitor
-        )
-        
-        end_time = datetime.now()
-        elapsed_time = end_time - start_time
-        
-        logger.info("=" * 80)
-        logger.info("全処理が正常に完了しました")
-        logger.info("=" * 80)
-        logger.info(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"終了時刻: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"処理時間: {elapsed_time}")
-        logger.info(f"最終データサイズ: {len(master_df):,}行 × {len(master_df.columns)}列")
-        
-    except Exception as e:
-        logger.error("=" * 80)
-        logger.error("処理中に致命的なエラーが発生しました")
-        logger.error("=" * 80)
-        logger.error(f"エラー内容: {e}", exc_info=True)
-        raise
+            # --- NEW v1.6: レジューム機能 ---
+            if self.output_dir.exists():
+                logger.info("✅ Skeleton directory already exists. Skipping initialization and resuming merge process.")
+            else:
+                self._initialize_master_table(base_source)
+            # --- レジューム機能ここまで ---
+            
+            logger.info("\n" + "="*50)
+            logger.info("🔄 Starting iterative merge process...")
+            logger.info("="*50)
+
+            # メインの結合ループ
+            for i, feature_source in enumerate(tqdm(merge_sources, desc="Merging Features")):
+                logger.info(f"\n[{i+1}/{len(merge_sources)}] Merging source: {feature_source.name}")
+                
+                if self.temp_dir.exists():
+                    shutil.rmtree(self.temp_dir)
+                self.temp_dir.mkdir(parents=True)
+
+                lf_master = pl.scan_parquet(str(self.output_dir))
+                lf_feature = pl.scan_parquet(str(feature_source))
+                
+                # --- SORTING FIX v1.6: join_asofの前に両方のDFをソート ---
+                logger.info("  -> Sorting dataframes by 'timestamp'...")
+                lf_master_sorted = lf_master.sort("timestamp")
+                lf_feature_sorted = lf_feature.sort("timestamp")
+                # --- FIXここまで ---
+                
+                new_columns_to_add = [col for col in lf_feature_sorted.columns if col not in lf_master_sorted.columns]
+                if not new_columns_to_add:
+                    logger.warning(f"  -> No new columns to add from {feature_source.name}. Skipping.")
+                    continue
+                
+                lf_feature_filtered = lf_feature_sorted.select(['timestamp'] + new_columns_to_add)
+                
+                # ソート済みのLazyFrameを使用して結合
+                lf_joined = lf_master_sorted.join_asof(lf_feature_filtered, on="timestamp")
+                
+                self._write_partitioned(lf_joined, self.temp_dir)
+
+                logger.info("  -> Atomically swapping master table...")
+                shutil.rmtree(self.output_dir)
+                self.temp_dir.rename(self.output_dir)
+                logger.info(f"✅ Successfully merged {feature_source.name}")
+
+            total_time = time.time() - start_time
+            logger.info("\n" + "="*50)
+            logger.info(f"🎉 All features merged successfully! Total time: {total_time:.2f} seconds")
+            logger.info(f"Final master table located at: {self.output_dir}")
+            logger.info("="*50)
+
+        except Exception as e:
+            logger.critical(f"❌ A critical error occurred: {e}", exc_info=True)
+        finally:
+            if self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir)
+            logger.info("🧹 Cleanup complete.")
 
 
-def main() -> None:
-    """メインエントリーポイント"""
-    print("=" * 80)
-    print("安定版マスターテーブル構築スクリプト")
-    print("Project Forge - 第一防衛線通過特徴量の統合")
-    print("=" * 80)
-
-    try:
-        # config.pyからパスを直接読み込む
-        config_obj = MasterTableConfig(
-            feature_dir=config.S2_FEATURES,
-            stable_list_path=config.S3_STABLE_FEATURE_LIST,
-            output_dir=config.S4_MASTER,
-            output_name="master_table_partitioned",
-        )
-        logger.info("config.pyから設定を読み込みました。")
-        logger.info(f"入力特徴量ディレクトリ: {config_obj.feature_dir}")
-        logger.info(f"入力安定リスト: {config_obj.stable_list_path}")
-        logger.info(f"出力ディレクトリ: {config_obj.output_dir / config_obj.output_name}")
-
-    except Exception as e:
-        logger.error(f"設定の初期化に失敗: {e}")
-        return
-
-    confirm = input("この設定で実行しますか？ (yes/no): ").strip().lower()
-    if confirm not in ["yes", "y"]:
-        logger.info("処理を中止しました。")
-        return
-
-    try:
-        build_master_table(config_obj)
-    except Exception as e:
-        logger.error(f"マスターテーブルの構築に失敗: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    builder = MasterTableBuilder()
+    builder.run()

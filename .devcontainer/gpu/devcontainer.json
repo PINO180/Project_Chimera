@@ -26,18 +26,19 @@
     // VS Codeの便利な設定
     "customizations": {
         "vscode": {
+            // コンテナの「デフォルト値」となる設定
             "settings": {
-                // コンテナ内で使用するPythonインタプリタを固定
+                // Pythonインタプリタのパス指定 (これは正しいです)
                 "python.defaultInterpreterPath": "/opt/conda/bin/python",
-                // ターミナル起動時に自動でconda activateを実行
-                "python.terminal.activateEnvironment": true,
-                "python.formatting.provider": "black",
-                "python.linting.enabled": true
+                // ターミナル起動時にconda環境を有効化
+                "python.terminal.activateEnvironment": true
             },
+            // コンテナ起動時に自動インストールする拡張機能リスト
             "extensions": [
                 "ms-python.python",
                 "ms-python.vscode-pylance",
-                "ms-toolsai.jupyter"
+                "ms-toolsai.jupyter",
+                "astral.ruff" // <-- 公式Ruff拡張機能をこちらにも追加
             ]
         }
     },

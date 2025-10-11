@@ -1290,32 +1290,40 @@ class OutputEngine:
         logger.info(f"特徴量保存開始: {output_path}")
         
         try:
-            # 出力ディレクトリ作成
             output_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # メモリ安全性チェック
             is_safe, message = self.memory_monitor.check_memory_safety()
             if not is_safe:
                 raise MemoryError(f"保存処理でメモリ不足: {message}")
             
-            # NaN埋め処理適用
             processed_frame = self.apply_nan_filling(lazy_frame)
             
             start_time = time.time()
             
-            # 【修正】sink_parquetの代わりにcollect + write_parquetを使用
             try:
-                # まずストリーミングcollectを試行(新しいAPI使用)
                 df = processed_frame.collect(engine="streaming")
             except Exception as streaming_error:
                 logger.warning(f"ストリーミングcollectが失敗、通常collectを使用: {streaming_error}")
                 df = processed_frame.collect()
+
+            # --- ▼▼▼ ここから修正 ▼▼▼ ---
             
-            # DataFrameとして保存
+            # 1. 辞書エンコーディング(Categorical)をUtf8(通常の文字列)に変換
+            categorical_cols = [name for name, dtype in df.schema.items() if dtype == pl.Categorical]
+            if categorical_cols:
+                df = df.with_columns(
+                    [pl.col(c).cast(pl.Utf8) for c in categorical_cols]
+                )
+                logging.info(f"辞書エンコーディングを無効化: {categorical_cols}")
+
+            # 2. PyArrow互換モードで保存
             df.write_parquet(
                 str(output_path),
-                compression=self.output_config["compression"]
+                compression=self.output_config["compression"],
+                use_pyarrow=True
             )
+            
+            # --- ▲▲▲ 修正ここまで ▲▲▲ ---
             
             save_time = time.time() - start_time
             
@@ -1431,14 +1439,12 @@ def run_on_partitions_mode(config: ProcessingConfig, resume_date: Optional[datet
     FEATURES_ROOT = Path(config.output_path) / f"features_{config.engine_id}_{timeframe}"
     
     # 【安全なディレクトリ作成】
-    # 出力ディレクトリの存在を確認し、なければ作成する。
-    # 既存のファイルやディレクトリを削除する危険な処理は行わない。
     try:
         FEATURES_ROOT.mkdir(parents=True, exist_ok=True)
         logging.info(f"出力ディレクトリを確保しました: {FEATURES_ROOT}")
     except FileExistsError:
         logging.error(f"エラー: 出力パスがファイルとして存在しています。処理を中断します: {FEATURES_ROOT}")
-        return # ここで処理を中断
+        return
     except Exception as e:
         logging.error(f"エラー: 出力ディレクトリの作成に失敗しました: {e}")
         return
@@ -1467,7 +1473,6 @@ def run_on_partitions_mode(config: ProcessingConfig, resume_date: Optional[datet
         logging.error("処理対象の日次パーティションが見つかりません。")
         return
     
-    # 日次パーティション逐次処理
     total_days = len(all_days)
     logging.info(f"処理対象日数: {total_days}日")
     
@@ -1476,41 +1481,33 @@ def run_on_partitions_mode(config: ProcessingConfig, resume_date: Optional[datet
         logging.info(f"=== 日次処理 ({i+1}/{total_days}): {day_name} ===")
         
         try:
-            # 前日のパーティション(オーバーラップ用)
             current_index_in_all = all_partitions.index(current_day_path)
             prev_day_path = all_partitions[current_index_in_all - 1] if current_index_in_all > 0 else None
             
-            # オーバーラップを含む拡張データフレーム作成
             logging.info(f"データ読み込み開始: {day_name}")
             augmented_df, current_day_rows = create_augmented_frame(current_day_path, prev_day_path, W_MAX)
             logging.info(f"データ読み込み完了: 実データ{current_day_rows}行、総データ{augmented_df.height}行")
             
             logging.info(f"特徴量計算開始: {day_name}")
             
-            # 一時ディレクトリ作成(日次処理用)
             temp_dir = Path(tempfile.mkdtemp(prefix=f"day_{i:04d}_{config.engine_id}_"))
             logging.info(f"日次一時ディレクトリ作成: {temp_dir}")
             
             temp_files = []
             
-            # 特徴量グループを取得
             feature_groups = calculation_engine.get_feature_groups()
             logging.info(f"物理的垂直分割: {len(feature_groups)}グループで処理")
             
-            # 各グループを順次処理(親方が工程管理)
             for group_idx, (group_name, group_expressions) in enumerate(feature_groups.items()):
                 logging.info(f"グループ処理開始: {group_name} ({len(group_expressions)}個の特徴量)")
                 
-                # 1. 下請けに「このグループだけ計算しろ」と指示
                 group_result_lf = calculation_engine.calculate_one_group(
                     augmented_df.lazy(), group_name, group_expressions
                 )
                 
-                # 2. 親方が自らメモリに実現化(単一グループなので安全)
                 group_result_df = group_result_lf.collect(streaming=True)
                 logging.info(f"グループデータ実現化: {group_result_df.height}行 x {group_result_df.width}列")
                 
-                # 3. 親方が自らディスクに保存する
                 temp_file = temp_dir / f"group_{group_idx:02d}_{group_name}.parquet"
                 group_result_df.write_parquet(str(temp_file), compression="snappy")
                 
@@ -1520,14 +1517,11 @@ def run_on_partitions_mode(config: ProcessingConfig, resume_date: Optional[datet
                 else:
                     raise FileNotFoundError(f"グループファイル作成失敗: {temp_file}")
                 
-                # メモリ使用量チェック
                 memory_usage = calculation_engine.memory_monitor.get_memory_usage_gb()
                 logging.info(f"メモリ使用量: {memory_usage:.2f}GB")
             
-            # 4. 全グループ完了後、親方が最終組み立て(クリーン・オン・クリーン結合)
             logging.info("グループファイル結合開始(クリーン・オン・クリーン結合)...")
             
-            # 1. 「クリーンな土台」を準備 (オーバーラップ除去済み)
             base_df = pl.read_parquet(str(temp_files[0]))
             
             if prev_day_path is not None:
@@ -1537,19 +1531,16 @@ def run_on_partitions_mode(config: ProcessingConfig, resume_date: Optional[datet
             
             logging.info(f"クリーンな土台を準備: {clean_base_df.height}行 x {clean_base_df.width}列")
 
-            # 2. 残りの一時ファイルを「クリーンなパーツ」として一つずつ結合
             base_columns = ["timestamp", "open", "high", "low", "close", "volume", "timeframe"]
             
             for idx, temp_file in enumerate(temp_files[1:], 1):
                 next_df = pl.read_parquet(str(temp_file))
                 
-                # 「クリーンなパーツ」を作成 (オーバーラップ除去済み)
                 if prev_day_path is not None:
                     clean_next_df = next_df.tail(current_day_rows)
                 else:
                     clean_next_df = next_df
                 
-                # 行数が一致することを確認
                 if clean_base_df.height != clean_next_df.height:
                     raise ValueError(f"行数不一致: ベース{clean_base_df.height}行 vs 追加{clean_next_df.height}行")
                 
@@ -1560,23 +1551,36 @@ def run_on_partitions_mode(config: ProcessingConfig, resume_date: Optional[datet
             result_df = clean_base_df
             logging.info(f"全グループ結合完了: {result_df.height}行 x {result_df.width}列")
             
-            # パーティション保存用の日付列を追加
+            # --- ▼▼▼ ここから修正 ▼▼▼ ---
+            
+            # 1. パーティションカラムをInt32で生成
             final_df = result_df.with_columns([
-                pl.col("timestamp").dt.year().alias("year"),
-                pl.col("timestamp").dt.month().alias("month"),
-                pl.col("timestamp").dt.day().alias("day")
+                pl.col("timestamp").dt.year().alias("year").cast(pl.Int32),
+                pl.col("timestamp").dt.month().alias("month").cast(pl.Int32),
+                pl.col("timestamp").dt.day().alias("day").cast(pl.Int32)
             ])
             
-            # 当日の結果を保存
+            # 2. 辞書エンコーディング(Categorical)をUtf8(通常の文字列)に変換
+            categorical_cols = [name for name, dtype in final_df.schema.items() if dtype == pl.Categorical]
+            if categorical_cols:
+                final_df = final_df.with_columns(
+                    [pl.col(c).cast(pl.Utf8) for c in categorical_cols]
+                )
+                logging.info(f"辞書エンコーディングを無効化: {categorical_cols}")
+
             logging.info(f"最終保存開始: {day_name}")
+            
+            # 3. PyArrow互換モードで保存
             final_df.write_parquet(
                 FEATURES_ROOT,
-                partition_by=['year', 'month', 'day']
+                partition_by=['year', 'month', 'day'],
+                use_pyarrow=True
             )
             
+            # --- ▲▲▲ 修正ここまで ▲▲▲ ---
+
             logging.info(f"保存完了: {day_name} - {final_df.height}行の特徴量データ")
             
-            # 一時ディレクトリクリーンアップ
             for temp_file in temp_files:
                 if temp_file.exists():
                     temp_file.unlink()

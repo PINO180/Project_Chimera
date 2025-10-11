@@ -27,6 +27,12 @@ S1_BASE_MULTITIMEFRAME = S1_BASE / "master_from_tick"
 S2_FEATURES = DATA_DIR / SYMBOL / "stratum_2_features"
 S2_FEATURES_FIXED = DATA_DIR / SYMBOL / "stratum_2_features_fixed" # ← 変数名を修正
 
+# KS検定後の安定特徴量セット
+S2_FEATURES_AFTER_KS = DATA_DIR / SYMBOL / "stratum_2_features_after_ks"
+
+# AV後の安定特徴量セット 
+S2_FEATURES_AFTER_AV = DATA_DIR / SYMBOL / "stratum_2_features_after_av"
+
 # --- Stratum 3: 検証成果物 ---
 S3_ARTIFACTS = DATA_DIR / SYMBOL / "stratum_3_artifacts" / FEATURE_SET_ID
 S3_STABLE_FEATURE_LIST = S3_ARTIFACTS / "stable_feature_list.joblib"

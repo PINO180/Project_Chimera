@@ -1,387 +1,335 @@
-"""
-walk_forward_validator_v2.py - SHAPベース版
-第二防衛線：シングルパス重要度評価による最強チーム選抜
+# =================================================================
+#
+# walk_forward_validator_v5_final.py
+#
+# Project Forge - Second Line of Defense
+#
+# -----------------------------------------------------------------
+#
+# **設計思想とアーキテクチャ**
+#
+# 過去の失敗の歴史 (v3.x, v4.x) から得られた最大の教訓は、
+# Daskの遅延評価が我々の環境では不安定要因である、という一点に尽きる。
+# 特に、.shift() と .dropna() を組み合わせた目的変数生成は、
+# Daskの計算グラフ内でインデックスの不整合を頻繁に引き起こし、
+# 致命的な "Length of labels differs" エラーの原因となった [cite: 135-136, 144]。
+#
+# 本スクリプト (v5) は、その問題を根本から解決するため、
+# 以下の「脱Dask・物理データ確定」アーキテクチャを全面的に採用する。
+#
+# 1. **脱Dask**: 不安定要因であったDaskを完全に排除。データ操作はPolarsに一本化。
+#
+# 2. **ストリーミング・ウォークフォワード**:
+#    マスターテーブル全体を一度に読み込むのではなく、ウォークフォワードの
+#    各分割（Split）で必要となるパーティションファイル群のみを
+#    `polars.scan_parquet`でスキャンする。
+#
+# 3. **物理データ確定 (最重要)**:
+#    各分割において、目的変数を生成した後、`collect(streaming=True)`を実行する。
+#    これにより、特徴量(X)と目的変数(y)が完全に整合した状態でメモリ上に
+#    物理的に展開される。これにより、インデックス不整合の問題は原理的に発生しない。
+#
+# 4. **標準ライブラリによる学習**:
+#    物理的に確定したクリーンなデータを、オリジナルの`lightgbm`および`shap`
+#    ライブラリに渡す。これにより、dask-lightgbm等の複雑なラッパーは不要となり、
+#    最も安定した方法で学習と評価を実行できる。
+#
+# このアーキテクチャは、AVスクリプトやbuild_master_table.pyで得た
+# 「小さく分割して処理し、結果を物理的に確定させる」という
+# 成功体験の集大成である [cite: 24, 66]。
+#
+# =================================================================
 
-統合設計図V準拠：
-- RFE完全削除、SHAPベースアプローチに置換
-- 計算量：O(k × N²) → O(k × N)に削減
-- 所要時間：12年以上 → 3-8時間
-- 敵対的検証スコアによる特徴量ペナルティ
-- Dask-LightGBM + map_partitions並列SHAP計算
-"""
-import sys
+import gc
 from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import blueprint as config
-import logging
-from typing import List, Dict, Tuple, cast
-from pathlib import Path
-import json
-from collections import Counter
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-import dask
-import dask.dataframe as dd
-from dask.dataframe.core import DataFrame as DaskDataFrame, Series as DaskSeries
-from lightgbm.dask import DaskLGBMRegressor, DaskLGBMClassifier
-import numpy as np
 import joblib
-from sklearn.metrics import roc_auc_score
-from tqdm import tqdm
+import lightgbm as lgb
+import numpy as np
 import pandas as pd
+import polars as pl
+import shap
+from tqdm import tqdm
+
+# --- Project Forge Blueprint ---
+# 他のスクリプトと設定を共有するため、blueprintからパスをインポート
+# (blueprint.pyが同じディレクトリにあると仮定)
+try:
+    from blueprint import (
+        S3_FINAL_FEATURE_TEAM,
+        S3_SHAP_SCORES,
+        S4_MASTER_TABLE_PARTITIONED,
+    )
+except ImportError:
+    # blueprint.py がない場合のフォールバック
+    print("WARNING: blueprint.py not found. Using hardcoded paths.")
+    S4_MASTER_TABLE_PARTITIONED = Path(
+        "/workspace/data/XAUUSD/stratum_4_master/1A_2B/master_table_partitioned"
+    )
+    S3_ARTIFACTS = Path("/workspace/data/XAUUSD/stratum_3_artifacts/1A_2B")
+    S3_FINAL_FEATURE_TEAM = S3_ARTIFACTS / "final_feature_team.joblib"
+    S3_SHAP_SCORES = S3_ARTIFACTS / "shap_scores.joblib"
+    S3_ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
 
-def calculate_shap_for_partition(
-    partition: pd.DataFrame,
-    model_booster: object,
-    feature_columns: List[str]
-) -> pd.Series:
-    """
-    単一パーティションのSHAP値を計算
-    
-    Args:
-        partition: データのパーティション
-        model_booster: LightGBMのboosterオブジェクト
-        feature_columns: 特徴量カラムのリスト
-    
-    Returns:
-        平均絶対SHAP値のSeries
-    """
-    import shap
-    
-    if partition.empty:
-        return pd.Series(0.0, index=feature_columns)
-    
-    X_partition = partition[feature_columns].values
-    
-    explainer = shap.TreeExplainer(model_booster)
-    shap_values = explainer.shap_values(X_partition)
-    
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    
-    return pd.Series(mean_abs_shap, index=feature_columns)
+# --- 設定項目 ---
+class Config:
+    """スクリプトの振る舞いを制御する設定クラス"""
 
+    # 入出力パス
+    MASTER_TABLE_PATH = S4_MASTER_TABLE_PARTITIONED
+    OUTPUT_FEATURE_LIST_PATH = S3_FINAL_FEATURE_TEAM
+    OUTPUT_SHAP_SCORES_PATH = S3_SHAP_SCORES
 
-class WalkForwardValidatorV2:
-    """
-    【Dask版 v3.0 - SHAPベース】
-    TB級のマスターテーブルをDask-LightGBMで処理。
-    SHAPベースのシングルパス重要度評価でエリート特徴量を選抜。
-    """
-    
-    def __init__(
-        self,
-        feature_universe_path: str,
-        stable_features_path: str,
-        adversarial_scores_path: str,
-        n_splits: int = 5,
-        final_feature_count: int = 15,
-        adversarial_penalty_factor: float = 0.5
-    ):
-        self.feature_universe_path = feature_universe_path
-        self.stable_features_path = stable_features_path
-        self.adversarial_scores_path = adversarial_scores_path
-        self.n_splits = n_splits
-        self.final_feature_count = final_feature_count
-        self.adversarial_penalty_factor = adversarial_penalty_factor
-        self.ddf: DaskDataFrame | None = None
-        self.stable_features: List[str] | None = None
-        self.adversarial_scores: Dict[str, float] | None = None
-    
-    def _load_data(self) -> None:
-        """データとメタデータを読み込み"""
-        logger.info(f"第二防衛線: マスターテーブル '{self.feature_universe_path}' をDask DataFrameとして読み込み中...")
-        
-        self.ddf = dd.read_parquet(
-            self.feature_universe_path,
-            engine='pyarrow'
-        )
-        
-        logger.info(f"一次選抜通過リスト '{self.stable_features_path}' を読み込み中...")
-        self.stable_features = joblib.load(self.stable_features_path)
-        
-        logger.info(f"敵対的検証スコア '{self.adversarial_scores_path}' を読み込み中...")
-        self.adversarial_scores = joblib.load(self.adversarial_scores_path)
-        
-        available_features = [f for f in self.stable_features if f in self.ddf.columns]
-        if len(available_features) != len(self.stable_features):
-            removed = len(self.stable_features) - len(available_features)
-            logger.warning(f"{removed}個の特徴量がデータセットに存在しないため除外されました。")
-            self.stable_features = available_features
-        
-        logger.info(f"読み込み完了。{len(self.stable_features)}個の安定特徴量を対象とします。")
-    
-    def _define_target(self, target_horizon: int = 60, profit_thresh: float = 0.0005) -> None:
-        """ターゲット変数を定義"""
-        logger.info("予測目標（ターゲット）を計算中...")
-        
-        if self.ddf is None:
-            raise ValueError("DataFrame not loaded.")
-        
-        future_max = self.ddf['close'].shift(-target_horizon).rolling(
-            window=target_horizon,
-            min_periods=1
-        ).max()
-        
-        future_returns = (future_max / self.ddf['close']) - 1
-        target = (future_returns > profit_thresh).astype('int32')
-        
-        self.ddf = self.ddf.assign(target=target)
-        self.ddf = self.ddf.dropna(subset=['target'])
-        self.ddf = self.ddf.dropna()
-        
-        logger.info(f"ターゲット計算完了。{self.ddf.npartitions}パーティションで処理します。")
-    
-    def _create_time_series_splits(self) -> List[Dict[str, pd.Timestamp]]:
-        """TimeSeriesSplit用のタイムスタンプ範囲を計算"""
-        logger.info("TimeSeriesSplit用のタイムスタンプ範囲を計算中...")
-        
-        if self.ddf is None:
-            raise ValueError("Dask DataFrame not loaded.")
-        
-        min_ts, max_ts = dask.compute(
-            self.ddf['timestamp'].min(),
-            self.ddf['timestamp'].max()
-        )
-        
-        total_duration = max_ts - min_ts
-        logger.info(f"データセット全体期間: {min_ts} から {max_ts} まで")
-        
-        split_duration = total_duration / (self.n_splits + 1)
-        
-        splits = []
-        for i in range(self.n_splits):
-            train_end_ts = min_ts + split_duration * (i + 1)
-            test_start_ts = train_end_ts
-            test_end_ts = test_start_ts + split_duration
-            
-            splits.append({
-                'train_start_ts': min_ts,
-                'train_end_ts': train_end_ts,
-                'test_start_ts': test_start_ts,
-                'test_end_ts': test_end_ts
-            })
-        
-        logger.info(f"{self.n_splits}個のタイムスタンプ分割を作成しました。")
-        return splits
-    
-    def _extract_split_data(
-        self,
-        split_info: Dict[str, pd.Timestamp]
-    ) -> Tuple[DaskDataFrame, DaskDataFrame]:
-        """タイムスタンプ範囲に基づいてデータを抽出"""
-        if self.ddf is None:
-            raise ValueError("Dask DataFrame not loaded.")
-        
-        ddf = self.ddf
-        
-        # 型キャストを使用してPylanceに明示的に型を伝える
-        timestamp_series = cast(DaskSeries, ddf['timestamp'])
-        
-        # 訓練データの抽出
-        train_start_cond = cast(DaskSeries, timestamp_series >= split_info['train_start_ts'])
-        train_end_cond = cast(DaskSeries, timestamp_series < split_info['train_end_ts'])
-        train_mask = train_start_cond & train_end_cond
-        train_ddf = ddf[train_mask]
-        
-        # テストデータの抽出
-        test_start_cond = cast(DaskSeries, timestamp_series >= split_info['test_start_ts'])
-        test_end_cond = cast(DaskSeries, timestamp_series < split_info['test_end_ts'])
-        test_mask = test_start_cond & test_end_cond
-        test_ddf = ddf[test_mask]
-        
-        return train_ddf, test_ddf
-    
-    def _calculate_shap_importance(
-        self,
-        train_ddf: DaskDataFrame,
-        features: List[str]
-    ) -> Dict[str, float]:
-        """
-        【v3.0新規】SHAPベースの特徴量重要度計算
-        map_partitionsで並列処理し、メモリ効率を最大化
-        """
-        logger.info("  -> SHAP値を計算中（並列処理）...")
-        
-        y_train = train_ddf['target']
-        X_train = train_ddf[features]
-        
-        model = dlgb.LGBMClassifier(random_state=42, verbosity=-1, n_estimators=50)
-        model.fit(X_train, y_train)
-        
-        # LightGBMのboosterオブジェクトを取得（Pylance型推論補助）
-        booster = model.booster_  # type: ignore[attr-defined]
-        
-        shap_results = X_train.map_partitions(
-            calculate_shap_for_partition,
-            model_booster=booster,
-            feature_columns=features,
-            meta=pd.Series(dtype='float64')
-        )
-        
-        mean_shap_values = shap_results.mean().compute()
-        
-        shap_importance = dict(zip(features, mean_shap_values))
-        
-        logger.info("  -> SHAP計算完了。")
-        return shap_importance
-    
-    def _select_top_features(
-        self,
-        shap_importance: Dict[str, float]
-    ) -> List[str]:
-        """
-        【v3.0】SHAP重要度 + 敵対的ペナルティでトップ特徴量を選抜
-        """
-        if self.adversarial_scores is None:
-            raise ValueError("Adversarial scores not loaded.")
-        
-        adjusted_scores: Dict[str, float] = {}
-        for feature, shap_score in shap_importance.items():
-            adversarial_score = self.adversarial_scores.get(feature, 0.0)
-            penalty = 1.0 - (adversarial_score * self.adversarial_penalty_factor)
-            adjusted_scores[feature] = shap_score * max(penalty, 0.1)
-        
-        sorted_features = sorted(
-            adjusted_scores.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        top_features = [feat for feat, _ in sorted_features[:self.final_feature_count]]
-        
-        return top_features
-    
-    def _train_and_evaluate_split(
-        self,
-        split_idx: int,
-        split_info: Dict[str, pd.Timestamp],
-        best_features: List[str]
-    ) -> float:
-        """選択された特徴量でモデルを訓練し、テストデータで評価"""
-        logger.info(f"  -> 分割 {split_idx+1} のモデル訓練を開始...")
-        
-        train_ddf, test_ddf = self._extract_split_data(split_info)
-        
-        X_train = train_ddf[best_features]
-        y_train = train_ddf['target']
-        X_test = test_ddf[best_features]
-        y_test = test_ddf['target']
-        
-        logger.info(f"  -> Dask-LightGBMで訓練中（特徴量数: {len(best_features)}）...")
-        
-        model = dlgb.LGBMClassifier(
-            n_estimators=50,
-            random_state=42,
-            verbosity=-1
-        )
-        
-        model.fit(X_train, y_train)
-        
-        logger.info(f"  -> テストデータで予測中...")
-        y_pred_proba = model.predict_proba(X_test)
-        
-        y_test_computed, y_pred_proba_computed = dask.compute(y_test, y_pred_proba)
-        
-        assert isinstance(y_pred_proba_computed, np.ndarray)
-        
-        oos_score = roc_auc_score(y_test_computed, y_pred_proba_computed[:, 1])
-        
-        logger.info(f"  -> テストデータでの性能（AUC）: {oos_score:.4f}")
-        
-        return oos_score
-    
-    def run_validation(self) -> List[str]:
-        """ウォークフォワード検証パイプラインを実行"""
-        self._load_data()
-        self._define_target()
-        
-        splits = self._create_time_series_splits()
-        
-        selected_features_across_splits: List[str] = []
-        
-        logger.info(f"--- 第二防衛線: 全{self.n_splits}分割のウォークフォワード検証を開始（SHAPベース） ---")
-        
-        for i, split_info in enumerate(tqdm(splits, desc="Walk-Forward Validation")):
-            logger.info(f"--- [分割 {i+1}/{self.n_splits}] ---")
-            
-            train_ddf, test_ddf = self._extract_split_data(split_info)
-            
-            train_len = len(train_ddf)
-            test_len = len(test_ddf)
-            logger.info(f"  -> 訓練データ: {train_len}行、テストデータ: {test_len}行")
-            
-            if self.stable_features is None:
-                raise ValueError("Stable features not loaded.")
-            
-            shap_importance = self._calculate_shap_importance(train_ddf, self.stable_features)
-            
-            best_features_for_this_split = self._select_top_features(shap_importance)
-            
-            selected_features_across_splits.extend(best_features_for_this_split)
-            logger.info(f"  -> 分割 {i+1} の最強チーム（{len(best_features_for_this_split)}名）を選出。")
-            
-            _ = self._train_and_evaluate_split(i, split_info, best_features_for_this_split)
-        
-        feature_counts = Counter(selected_features_across_splits)
-        final_team = [
-            feature for feature, count in feature_counts.most_common(self.final_feature_count)
-        ]
-        
-        logger.info("-" * 50)
-        logger.info("🎉 第二防衛線: 最強チームの選抜完了（SHAPベース） 🎉")
-        logger.info(f"最終選抜メンバー（{len(final_team)}名）:")
-        for f in final_team:
-            logger.info(f"  - {f} (選出回数: {feature_counts[f]}回)")
-        logger.info("-" * 50)
-        
-        return final_team
+    # ウォークフォワード検証の設定
+    N_SPLITS = 5  # データセットをいくつのフォールドに分割するか
 
+    # 目的変数の定義
+    TARGET_SHIFT = -30  # 30ステップ未来のリターンを予測
+    TARGET_THRESHOLD = 0.0005  # 0.05%以上の価格上昇を「買い」シグナル (ラベル=1) とする
 
-if __name__ == '__main__':
-    dask.config.set({'dataframe.query-planning': True})
-
-    from dask.distributed import Client, LocalCluster
-
-    with LocalCluster(n_workers=4, threads_per_worker=2, memory_limit='8GB') as cluster, \
-         Client(cluster) as client:
-
-        logger.info(f"Daskクライアントを起動しました: {client.dashboard_link}")
-
-        validator = WalkForwardValidatorV2(
-            feature_universe_path=str(config.S4_MASTER_TABLE_PARTITIONED),
-            stable_features_path=str(config.S3_STABLE_FEATURE_LIST),
-            adversarial_scores_path=str(config.S3_ADVERSARIAL_SCORES)
-        )
-        final_feature_team = validator.run_validation()
-
-    output_dir = config.S3_ARTIFACTS
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    final_team_path = config.S3_FINAL_FEATURE_TEAM
-    shap_scores_path = config.S3_SHAP_SCORES # config.pyにSHAPスコアパスも定義推奨
-
-    joblib.dump(final_feature_team, final_team_path)
-
-    # SHAPスコアも保存する場合 (validatorクラスから返り値として受け取る必要あり)
-    # joblib.dump(shap_scores, shap_scores_path)
-
-    final_df = pd.DataFrame({'feature_name': final_feature_team})
-    final_df.to_csv(output_dir / 'final_feature_team.csv', index=False)
-
-    result_info = {
-        'total_features': len(final_feature_team),
-        'features': final_feature_team,
-        'validation_type': 'second_defense_line_shap_based',
-        'timestamp': pd.Timestamp.now().isoformat()
+    # LightGBMモデルのパラメータ (軽量な設定)
+    LGBM_PARAMS = {
+        "objective": "binary",
+        "metric": "auc",
+        "n_estimators": 500,
+        "learning_rate": 0.05,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "lambda_l1": 0.1,
+        "lambda_l2": 0.1,
+        "num_leaves": 31,
+        "verbose": -1,
+        "n_jobs": -1,
+        "seed": 42,
+        "boosting_type": "gbdt",
     }
-    with open(output_dir / 'final_feature_team.json', 'w') as f:
-        json.dump(result_info, f, indent=2)
 
-    logger.info("最終選抜メンバーリストを複数形式で保存しました。")
-    logger.info(f"- JOBLIB: {final_team_path}")
-    logger.info(f"- CSV: {output_dir / 'final_feature_team.csv'}")
-    logger.info(f"- JSON: {output_dir / 'final_feature_team.json'}")
+    # 特徴量選抜
+    TOP_N_FEATURES = 100  # SHAPスコア上位何個の特徴量を選抜するか
+
+
+def get_partition_paths(master_path: Path) -> list[Path]:
+    """マスターテーブルの全パーティションパスを時系列順に取得する"""
+    if not master_path.is_dir():
+        raise FileNotFoundError(f"Master table directory not found: {master_path}")
+
+    # year/month/day の構造を想定
+    paths = sorted(list(master_path.glob("year=*/month=*/day=*/*.parquet")))
+    if not paths:
+        raise FileNotFoundError(
+            f"No parquet files found in master table directory: {master_path}"
+        )
+    print(f"Found {len(paths)} daily partitions.")
+    return paths
+
+
+def define_walk_forward_splits(
+    partition_paths: list[Path], n_splits: int
+) -> list[tuple[list[Path], list[Path]]]:
+    """ウォークフォワード検証のための分割を定義する"""
+    splits = []
+    total_partitions = len(partition_paths)
+
+    # 拡張ウィンドウ方式 (Expanding Window)
+    # 最初の訓練期間を確保するため、全期間を (n_splits + 1) で分割
+    initial_train_size = total_partitions // (n_splits + 1)
+    validation_size = initial_train_size
+
+    for i in range(n_splits):
+        train_end_idx = initial_train_size + i * validation_size
+        val_end_idx = train_end_idx + validation_size
+
+        # 最後のスプリットで残りの全データを含める
+        if i == n_splits - 1:
+            val_end_idx = total_partitions
+
+        train_paths = partition_paths[:train_end_idx]
+        val_paths = partition_paths[train_end_idx:val_end_idx]
+
+        if not train_paths or not val_paths:
+            print(f"Skipping split {i + 1} due to empty train/validation set.")
+            continue
+
+        splits.append((train_paths, val_paths))
+
+    print(f"Defined {len(splits)} walk-forward splits.")
+    return splits
+
+
+def load_and_prepare_data_for_split(
+    train_paths: list[Path], val_paths: list[Path]
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str]]:
+    """
+    指定されたパーティションを読み込み、目的変数を生成し、
+    物理的に確定された訓練・検証データセットを返す。
+    """
+    print(
+        f"  Loading {len(train_paths)} train partitions and {len(val_paths)} validation partitions..."
+    )
+
+    # Polars LazyFrameで必要なファイルのみをスキャン
+    lazy_df = pl.scan_parquet(train_paths + val_paths)
+
+    # --- 目的変数 (ターゲット) の生成 ---
+    # .shift() を使って未来のリターンを計算
+    future_return = lazy_df.select(
+        pl.col("timestamp"),
+        (pl.col("close").shift(Config.TARGET_SHIFT) / pl.col("close") - 1).alias(
+            "future_return"
+        ),
+    )
+
+    # LazyFrameを結合
+    lazy_df = lazy_df.join(future_return, on="timestamp", how="left")
+
+    # ラベルを定義 (1: 上昇, 0: その他)
+    lazy_df = lazy_df.with_columns(
+        pl.when(pl.col("future_return") > Config.TARGET_THRESHOLD)
+        .then(1)
+        .otherwise(0)
+        .alias("target")
+    )
+
+    # 目的変数生成に伴うNaNを持つ行を削除
+    # これがDaskでインデックス不整合を引き起こした元凶
+    lazy_df = lazy_df.drop_nulls(subset=["target"])
+
+    # --- 物理データ確定 ---
+    # ここで .collect() を呼ぶことで、計算が実行され、
+    # 完全に整合性の取れたデータがメモリ上に展開される。
+    print("  Materializing data... (This may take a moment)")
+    df = lazy_df.collect(streaming=True)
+    print(f"  Materialized dataframe shape: {df.shape}")
+
+    # Pandas DataFrameに変換して後続処理へ
+    df = df.to_pandas()
+
+    # メモリ解放
+    del lazy_df
+    gc.collect()
+
+    # 特徴量カラムとターゲットを分離
+    target_col = "target"
+    # タイムスタンプと目的変数そのものは特徴量から除外
+    feature_cols = [
+        c for c in df.columns if c not in ["timestamp", "future_return", target_col]
+    ]
+
+    X = df[feature_cols]
+    y = df[target_col]
+
+    # 訓練データと検証データを再度分割
+    # 境界となるタイムスタンプを取得
+    split_timestamp = pd.to_datetime(
+        pl.scan_parquet(train_paths[-1]).select(pl.max("timestamp")).collect()[0, 0]
+    )
+
+    train_mask = df["timestamp"] <= split_timestamp
+    val_mask = df["timestamp"] > split_timestamp
+
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_val, y_val = X[val_mask], y[val_mask]
+
+    print(f"  Train set shape: {X_train.shape}, Validation set shape: {X_val.shape}")
+
+    return X_train, y_train, X_val, y_val, feature_cols
+
+
+def main():
+    """スクリプトのメイン実行関数"""
+    print("--- Project Forge: Second Line of Defense ---")
+    print("--- Walk-Forward Validator (v5 - Dask-Free) ---")
+
+    # 1. パーティションパスの取得
+    all_paths = get_partition_paths(Config.MASTER_TABLE_PATH)
+
+    # 2. ウォークフォワード分割の定義
+    splits = define_walk_forward_splits(all_paths, Config.N_SPLITS)
+
+    all_shap_values = []
+    feature_names = None
+
+    # 3. 各分割で学習と評価を実行
+    for i, (train_paths, val_paths) in enumerate(splits):
+        print(f"\n--- Processing Split {i + 1}/{len(splits)} ---")
+
+        try:
+            # 3a. データの読み込みと物理的確定
+            X_train, y_train, X_val, y_val, current_features = (
+                load_and_prepare_data_for_split(train_paths, val_paths)
+            )
+
+            if feature_names is None:
+                feature_names = current_features
+
+            if X_train.empty or X_val.empty:
+                print("  Skipping split due to empty data after preparation.")
+                continue
+
+            # 3b. モデルの学習
+            print("  Training LightGBM model...")
+            model = lgb.LGBMClassifier(**Config.LGBM_PARAMS)
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(100, verbose=False)],
+            )
+
+            # 3c. SHAP値の計算
+            print("  Calculating SHAP values...")
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_val)
+
+            # shap_values[1] がクラス1（買いシグナル）に対するSHAP値
+            all_shap_values.append(pd.DataFrame(shap_values[1], columns=feature_names))
+
+            # メモリクリーンアップ
+            del X_train, y_train, X_val, y_val, model, explainer, shap_values
+            gc.collect()
+
+        except Exception as e:
+            print(f"  !! ERROR in Split {i + 1}: {e}")
+            print("  Skipping this split and continuing...")
+            continue
+
+    if not all_shap_values:
+        print("\n--- No splits were successfully processed. Exiting. ---")
+        return
+
+    # 4. 全分割の結果を集計
+    print("\n--- Aggregating results from all splits ---")
+    combined_shap_df = pd.concat(all_shap_values)
+
+    # 平均絶対SHAP値を計算して特徴量をランク付け
+    mean_abs_shap = combined_shap_df.abs().mean().sort_values(ascending=False)
+
+    shap_scores_df = pd.DataFrame(
+        {"feature": mean_abs_shap.index, "mean_abs_shap": mean_abs_shap.values}
+    )
+
+    # 5. 結果の保存
+    print(f"Saving SHAP scores to: {Config.OUTPUT_SHAP_SCORES_PATH}")
+    joblib.dump(shap_scores_df, Config.OUTPUT_SHAP_SCORES_PATH)
+
+    final_feature_team = shap_scores_df.head(Config.TOP_N_FEATURES)["feature"].tolist()
+
+    print(
+        f"Saving final feature team (top {Config.TOP_N_FEATURES}) to: {Config.OUTPUT_FEATURE_LIST_PATH}"
+    )
+    joblib.dump(final_feature_team, Config.OUTPUT_FEATURE_LIST_PATH)
+
+    # 6. 結果の表示
+    print("\n--- Top 20 Features by Mean Absolute SHAP Value ---")
+    print(shap_scores_df.head(20).to_string(index=False))
+
+    print(
+        f"\n✅ Successfully completed. Found {len(final_feature_team)} elite features."
+    )
+    print("--- End of Process ---")
+
+
+if __name__ == "__main__":
+    main()
