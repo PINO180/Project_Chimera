@@ -38,10 +38,14 @@
                 "ms-python.python",
                 "ms-python.vscode-pylance",
                 "ms-toolsai.jupyter",
-                "astral.ruff" // <-- 公式Ruff拡張機能をこちらにも追加
+                "charliermarsh.ruff" 
             ]
         }
     },
+
+    // コンテナ作成後に実行されるコマンドを、所有権問題の解決策に書き換える
+    "postCreateCommand": "git config --global --add safe.directory /workspace",
+    
     // コンテナ内のポートを手元のPCに転送
     "forwardPorts": [
         8888,
