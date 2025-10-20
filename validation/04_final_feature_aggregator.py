@@ -7,7 +7,7 @@ sys.path.append("/workspace")
 from blueprint import (
     S3_FINAL_FEATURE_TEAM,
     S3_SURVIVED_HF_FEATURES,
-    S3_FINAL_FEATURE_SET,
+    S3_FEATURES_FOR_ALPHA_DECAY,
 )
 
 
@@ -48,8 +48,8 @@ def main():
     print(f"  - Total features before deduplication: {len(combined_features)}")
     print(f"  - Total unique features after deduplication: {len(unique_features)}")
 
-    print(f"\nSaving final feature set to: {S3_FINAL_FEATURE_SET}")
-    with open(S3_FINAL_FEATURE_SET, "w") as f:
+    print(f"\nSaving final feature set to: {S3_FEATURES_FOR_ALPHA_DECAY}")
+    with open(S3_FEATURES_FOR_ALPHA_DECAY, "w") as f:
         for feature in unique_features:
             f.write(f"{feature}\n")
 

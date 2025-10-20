@@ -1,304 +1,353 @@
+# /workspace/models/triple_barrier_labeling.py
 import sys
 from pathlib import Path
+import warnings
+import argparse
+import shutil
+from dataclasses import dataclass
+import logging
+from typing import List
+
+# プロジェクトのルートディレクトリをPythonの検索パスに追加
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import blueprint as config
-import dask
-import dask.dataframe as dd
-from dask.dataframe.core import DataFrame
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import json
-import logging
-from typing import Optional, Dict, Any
+import polars as pl
 
-# ロギング設定
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# blueprintから一元管理された設定を読み込む
+from blueprint import S5_NEUTRALIZED_ALPHA_SET, S2_FEATURES_AFTER_AV, S6_LABELED_DATASET
+
+# --- ロギング設定 ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
-def label_partition(partition: pd.DataFrame, profit_multiplier: float, 
-                    loss_multiplier: float, time_barrier: int) -> pd.DataFrame:
-    """
-    単一パーティション内でトリプルバリアラベリングを実行する関数
-    
-    Args:
-        partition: パーティションデータ（Pandas DataFrame）
-        profit_multiplier: 利食いバリアの倍率（ATRに対する）
-        loss_multiplier: 損切りバリアの倍率（ATRに対する）
-        time_barrier: 時間バリア（バー数）
-    
-    Returns:
-        ラベル付きDataFrame (t0, t1カラムを含む)
-    """
-    if partition.empty:
-        # 空のパーティションの場合、スキーマを維持
-        result_cols = list(partition.columns) + ['label', 'barrier_reached', 'time_to_barrier', 't0', 't1']
-        return pd.DataFrame(columns=result_cols)
-    
-    # 必要なカラムの存在確認
-    required_cols = ['close', 'ATR', 'timestamp']
-    for col in required_cols:
-        if col not in partition.columns:
-            logger.error(f"必須カラム '{col}' がパーティションに存在しません。")
-            return pd.DataFrame()
-    
-    result_df = partition.copy()
-    n_rows = len(partition)
-    
-    # 結果カラムを初期化
-    labels = np.zeros(n_rows, dtype=np.int32)
-    barriers = np.empty(n_rows, dtype=object)
-    times = np.zeros(n_rows, dtype=np.int32)
-    t0_array = partition['timestamp'].values.copy()
-    t1_array = np.empty(n_rows, dtype='datetime64[ns]')
-    
-    close_values = partition['close'].values
-    atr_values = partition['ATR'].values
-    timestamp_values = partition['timestamp'].values
-    
-    for i in range(n_rows):
-        current_price = close_values[i]
-        current_atr = atr_values[i]
-        current_timestamp = timestamp_values[i]
-        
-        # ATRが無効な場合はスキップ
-        if pd.isna(current_atr) or current_atr <= 0:
-            labels[i] = 0
-            barriers[i] = 'none'
-            times[i] = 0
-            t1_array[i] = current_timestamp
-            continue
-        
-        # バリアを計算
-        profit_barrier = current_price + profit_multiplier * current_atr
-        loss_barrier = current_price - loss_multiplier * current_atr
-        
-        # 将来の価格を確認
-        max_look_ahead = min(time_barrier, n_rows - i - 1)
-        
-        if max_look_ahead <= 0:
-            # 将来のデータがない場合
-            labels[i] = 0
-            barriers[i] = 'time'
-            times[i] = 0
-            t1_array[i] = current_timestamp
-            continue
-        
-        future_prices = close_values[i+1:i+1+max_look_ahead]
-        
-        # 各バリアに到達するかチェック
-        profit_hit = future_prices >= profit_barrier
-        loss_hit = future_prices <= loss_barrier
-        
-        profit_hit_idx = np.where(profit_hit)[0]
-        loss_hit_idx = np.where(loss_hit)[0]
-        
-        # 最初に到達したバリアを判定
-        first_profit = profit_hit_idx[0] + 1 if len(profit_hit_idx) > 0 else float('inf')
-        first_loss = loss_hit_idx[0] + 1 if len(loss_hit_idx) > 0 else float('inf')
-        
-        if first_profit < first_loss:
-            # 利食いバリアに先に到達
-            labels[i] = 1
-            barriers[i] = 'profit'
-            times[i] = int(first_profit)
-            hit_idx = i + int(first_profit)
-            t1_array[i] = timestamp_values[hit_idx] if hit_idx < n_rows else timestamp_values[n_rows - 1]
-        elif first_loss < first_profit:
-            # 損切りバリアに先に到達
-            labels[i] = -1
-            barriers[i] = 'loss'
-            times[i] = int(first_loss)
-            hit_idx = i + int(first_loss)
-            t1_array[i] = timestamp_values[hit_idx] if hit_idx < n_rows else timestamp_values[n_rows - 1]
-        else:
-            # どちらにも到達せず（時間切れ）
-            labels[i] = 0
-            barriers[i] = 'time'
-            times[i] = max_look_ahead
-            end_idx = i + max_look_ahead
-            t1_array[i] = timestamp_values[end_idx] if end_idx < n_rows else timestamp_values[n_rows - 1]
-    
-    # 結果をDataFrameに追加
-    result_df['label'] = labels
-    result_df['barrier_reached'] = barriers
-    result_df['time_to_barrier'] = times
-    result_df['t0'] = t0_array  # イベント開始時刻
-    result_df['t1'] = t1_array  # イベント終了時刻
-    
-    return result_df
+# --- 設定クラス ---
+@dataclass
+class TripleBarrierConfig:
+    input_dir: Path = S5_NEUTRALIZED_ALPHA_SET
+    price_data_source: Path = (
+        S2_FEATURES_AFTER_AV
+        / "feature_value_a_vast_universeC"
+        / "features_e1c_M5.parquet"
+    )
+    output_dir: Path = S6_LABELED_DATASET
+    lookahead_periods: int = 60
+    profit_take_multiplier: float = 2.0
+    stop_loss_multiplier: float = 1.0
+    atr_col_name: str = "e1c_atr_21"
+    test_limit: int = 0
+    resume: bool = True
 
 
-class TripleBarrierLabeler:
-    """
-    【Dask版】トリプルバリアラベリングシステム（統合設計図V準拠）
-    純化された特徴量データセットに対して現実的なターゲット変数を生成
-    """
-    
-    def __init__(self,
-                 input_path: str,
-                 output_path: str,
-                 profit_multiplier: float = 2.0,
-                 loss_multiplier: float = 1.0,
-                 time_barrier: int = 60):
-        """
-        Args:
-            input_path: 入力データセットのパス（Parquet）
-            output_path: 出力データセットのパス
-            profit_multiplier: 利食いバリアの倍率（ATRに対する）
-            loss_multiplier: 損切りバリアの倍率（ATRに対する）
-            time_barrier: 時間バリア（バー数）
-        """
-        self.input_path = input_path
-        self.output_path = output_path
-        self.profit_multiplier = profit_multiplier
-        self.loss_multiplier = loss_multiplier
-        self.time_barrier = time_barrier
-        self.ddf: Optional[DataFrame] = None
-    
-    def _load_data(self) -> None:
-        """純化された特徴量データセットをDask DataFrameとして読み込む"""
-        logger.info(f"入力データセット '{self.input_path}' を読み込み中...")
-        
-        self.ddf = dd.read_parquet(  # type: ignore
-            self.input_path,
-            engine='pyarrow'
-        )
-        
-        # 必須カラムの確認
-        required_cols = ['close', 'ATR', 'timestamp']
-        missing_cols = [col for col in required_cols if col not in self.ddf.columns]
-        
-        if missing_cols:
-            raise ValueError(f"必須カラムが見つかりません: {missing_cols}")
-        
-        logger.info(f"データ読み込み完了。パーティション数: {self.ddf.npartitions}")
-    
-    def apply_triple_barrier_labeling(self) -> None:
-        """トリプルバリアラベリングを実行"""
-        if self.ddf is None:
-            raise ValueError("データが読み込まれていません。_load_data()を先に実行してください。")
-        
-        logger.info("=" * 50)
-        logger.info("トリプルバリアラベリング開始")
-        logger.info("=" * 50)
-        logger.info(f"設定: 利食い={self.profit_multiplier}xATR, 損切り={self.loss_multiplier}xATR, 時間={self.time_barrier}バー")
-        
-        # 出力スキーマを定義
-        meta_dict = {col: self.ddf[col].dtype for col in self.ddf.columns}
-        meta_dict['label'] = 'int32'
-        meta_dict['barrier_reached'] = 'object'
-        meta_dict['time_to_barrier'] = 'int32'
-        meta_dict['t0'] = 'datetime64[ns]'
-        meta_dict['t1'] = 'datetime64[ns]'
-        
-        # 【重要】map_overlapを使用してパーティション境界問題を解決
-        logger.info(f"map_overlapを使用（オーバーラップ: {self.time_barrier}バー先）")
-        labeled_ddf = self.ddf.map_overlap(  # type: ignore[assignment]
-            label_partition,
-            before=0,
-            after=self.time_barrier,
-            profit_multiplier=self.profit_multiplier,
-            loss_multiplier=self.loss_multiplier,
-            time_barrier=self.time_barrier,
-            meta=meta_dict
-        )
-        
-        logger.info("ラベリング完了。結果をParquet形式で保存中...")
-        
-        # 出力ディレクトリの作成
-        output_dir = Path(self.output_path).parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Parquet形式で保存
-        labeled_ddf.to_parquet(
-            str(self.output_path),
-            engine='pyarrow',
-            compression='snappy',
-            write_index=False
-        )
-        
-        logger.info("保存完了。メタデータを計算中...")
-        
-        # メタデータの計算
-        label_counts_series = labeled_ddf['label'].value_counts()  # type: ignore[index]
-        n_rows_delayed: Any = len(labeled_ddf)  # type: ignore[arg-type]
-        columns_list = list(labeled_ddf.columns)  # type: ignore[attr-defined]
-        n_cols: int = len(columns_list)
-        
-        # 一度に計算を実行
-        computed_results = dask.compute(label_counts_series, n_rows_delayed)  # type: ignore
-        label_counts_series_computed: pd.Series = computed_results[0]  # type: ignore
-        n_rows: int = int(computed_results[1])
-        
-        # 辞書に変換
-        label_counts: Dict[int, int] = label_counts_series_computed.to_dict()  # type: ignore
-        
-        # 統計情報
-        result_info = {
-            'total_rows': n_rows,
-            'total_columns': n_cols,
-            'label_distribution': {
-                'profit': int(label_counts.get(1, 0)),
-                'loss': int(label_counts.get(-1, 0)),
-                'time': int(label_counts.get(0, 0))
-            },
-            'label_distribution_percent': {
-                'profit': float(label_counts.get(1, 0) / n_rows * 100) if n_rows > 0 else 0.0,
-                'loss': float(label_counts.get(-1, 0) / n_rows * 100) if n_rows > 0 else 0.0,
-                'time': float(label_counts.get(0, 0) / n_rows * 100) if n_rows > 0 else 0.0
-            },
-            'settings': {
-                'profit_multiplier': self.profit_multiplier,
-                'loss_multiplier': self.loss_multiplier,
-                'time_barrier': self.time_barrier
-            },
-            'timestamp': pd.Timestamp.now().isoformat()
-        }
-        
-        # JSONで保存
-        json_path = output_dir / 'triple_barrier_metadata.json'
-        with open(json_path, 'w') as f:
-            json.dump(result_info, f, indent=2)
-        
-        logger.info("=" * 50)
-        logger.info("🎉 トリプルバリアラベリング完了 🎉")
-        logger.info("=" * 50)
-        logger.info(f"総行数: {n_rows:,}")
-        logger.info(f"ラベル分布: 利食い={result_info['label_distribution']['profit']:,} ({result_info['label_distribution_percent']['profit']:.2f}%), "
-                   f"損切り={result_info['label_distribution']['loss']:,} ({result_info['label_distribution_percent']['loss']:.2f}%), "
-                   f"時間切れ={result_info['label_distribution']['time']:,} ({result_info['label_distribution_percent']['time']:.2f}%)")
-        logger.info(f"出力:")
-        logger.info(f"- Parquet: {self.output_path}")
-        logger.info(f"- JSON: {json_path}")
-        logger.info("=" * 50)
-    
-    def run(self) -> None:
-        """パイプライン全体を実行"""
-        self._load_data()
-        self.apply_triple_barrier_labeling()
+# --- 実行エンジン ---
+class PolarsLabelingEngine:
+    def __init__(self, config: TripleBarrierConfig):
+        self.config = config
+        warnings.filterwarnings("ignore", category=UserWarning, module="polars")
+        self._validate_paths()
 
+    def _validate_paths(self):
+        if not self.config.input_dir.exists():
+            raise FileNotFoundError(
+                f"Input directory not found: {self.config.input_dir}"
+            )
+        if not self.config.price_data_source.exists():
+            raise FileNotFoundError(
+                f"Price data source not found: {self.config.price_data_source}"
+            )
 
-if __name__ == '__main__':
-    # Daskの設定
-    dask.config.set({'dataframe.query-planning': True})
-
-    # Daskクライアントの起動
-    from dask.distributed import Client, LocalCluster  # type: ignore
-
-    with LocalCluster(n_workers=4, threads_per_worker=2, memory_limit='8GB') as cluster, \
-         Client(cluster) as client:
-
-        logger.info(f"Daskクライアントを起動: {client.dashboard_link}")
-
-        labeler = TripleBarrierLabeler(
-            input_path=str(config.S5_NEUTRALIZED_ALPHA_SET),
-            output_path=str(config.S6_LABELED_DATASET),
-            profit_multiplier=2.0,
-            loss_multiplier=1.0,
-            time_barrier=60
+    def run(self):
+        logging.info(
+            "### Chapter 3, Script 1: Triple Barrier Labeling (Polars Edition v3.2.6 - Final Path Fix) ###"
         )
 
-        labeler.run()
+        if not self.config.resume and self.config.output_dir.exists():
+            logging.warning(
+                f"Output directory {self.config.output_dir} exists and not resuming. Removing it."
+            )
+            shutil.rmtree(self.config.output_dir)
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            logging.info(
+                f"Step 1: Lazily scanning all feature files from {self.config.input_dir}..."
+            )
+            all_feature_files = [
+                str(p) for p in self.config.input_dir.rglob("*.parquet")
+            ]
+            if not all_feature_files:
+                raise ValueError("No feature files found.")
+
+            # --- ここからが核心的な修正箇所 ---
+            logging.info(
+                "Step 1.5: Renaming columns with timeframe suffixes before concatenation..."
+            )
+            modified_lazy_frames = []
+            for f_path in all_feature_files:
+                path_obj = Path(f_path)
+                timeframe_suffix = ""
+
+                # パスを構成する全部分（ディレクトリ名、ファイル名）を探索
+                for part in path_obj.parts:
+                    if part.startswith("features_e1") and "_neutralized" in part:
+                        # 例: 'features_e1a_tick_neutralized' or 'features_e1a_D1_neutralized.parquet'
+
+                        # .parquet拡張子がある場合は除去
+                        clean_part = part.replace(".parquet", "")
+
+                        split_parts = clean_part.split("_")
+                        if len(split_parts) >= 4:
+                            # 'features', 'e1a', 'tick', 'neutralized' -> 'tick'
+                            timeframe = split_parts[2]
+                            timeframe_suffix = f"_{timeframe}"
+                            break  # timeframeが見つかったのでループを抜ける
+
+                if not timeframe_suffix:
+                    logging.warning(
+                        f"Could not extract timeframe from path {f_path}. Skipping suffix."
+                    )
+
+                lf = pl.scan_parquet(f_path)
+
+                # 'timestamp' 以外の全ての列を取得
+                # [FIX] スキーマ解決を避けるため、collect().columns を使用
+                try:
+                    feature_cols = [
+                        col for col in lf.collect_schema().names() if col != "timestamp"
+                    ]
+                except Exception:
+                    # スキーマ解決が困難な場合でも処理を継続
+                    logging.warning(
+                        f"Could not reliably determine schema for {f_path}. Proceeding with caution."
+                    )
+                    # 暫定的に空リストとして扱うことでエラーを回避
+                    feature_cols = []
+
+                # 新しい列名を作成するための式(Expression)を生成
+                rename_exprs = [
+                    pl.col(col).alias(f"{col}{timeframe_suffix}")
+                    for col in feature_cols
+                ]
+
+                # 列名をリネームしてリストに追加
+                if rename_exprs:
+                    # selectで明示的に列を選択し直すことで堅牢性を高める
+                    renamed_lf = lf.select(
+                        "timestamp",
+                        *[
+                            pl.col(c).alias(f"{c}{timeframe_suffix}")
+                            for c in feature_cols
+                        ],
+                    )
+                    modified_lazy_frames.append(renamed_lf)
+                else:
+                    modified_lazy_frames.append(lf)
+
+            # タイムフレームサフィックスが付与されたLazyFrameを結合
+            original_lf = pl.concat(modified_lazy_frames, how="diagonal").sort(
+                "timestamp"
+            )
+            # --- 修正箇所ここまで ---
+
+            logging.info(
+                f"   -> Successfully created a lazy plan for {len(all_feature_files)} files with unique column names."
+            )
+
+            logging.info(
+                f"Step 2: Loading price data from {self.config.price_data_source}..."
+            )
+            price_df = (
+                pl.read_parquet(self.config.price_data_source)
+                .select(["timestamp", "high", "low", "close", self.config.atr_col_name])
+                .sort("timestamp")
+            )
+
+            logging.info(
+                "Step 3: Discovering daily partitions via lightweight reconnaissance..."
+            )
+            recon_plan_lf = pl.concat(
+                [pl.scan_parquet(f).select("timestamp") for f in all_feature_files],
+                how="diagonal",
+            )
+
+            partitions_df = (
+                recon_plan_lf.select(pl.col("timestamp").dt.date().alias("date"))
+                .unique()
+                .collect()
+                .sort("date")
+            )
+
+            if self.config.test_limit > 0:
+                logging.warning(
+                    f"--- TEST MODE ENABLED: Processing only the first {self.config.test_limit} partitions. ---"
+                )
+                partitions_df = partitions_df.head(self.config.test_limit)
+
+            logging.info(
+                f"   -> Reconnaissance complete. Found {len(partitions_df)} daily partitions to process."
+            )
+
+            logging.info(
+                "Step 4: Starting daily processing and direct-to-disk writing loop..."
+            )
+            for i, row in enumerate(partitions_df.iter_rows(named=True)):
+                current_date = row["date"]
+                year, month, day = (
+                    current_date.year,
+                    current_date.month,
+                    current_date.day,
+                )
+
+                output_partition_dir = (
+                    self.config.output_dir / f"year={year}/month={month}/day={day}"
+                )
+                if self.config.resume and output_partition_dir.exists():
+                    logging.info(
+                        f"  [{i + 1}/{len(partitions_df)}] SKIPPING date: {current_date} (already processed)."
+                    )
+                    continue
+
+                logging.info(
+                    f"  [{i + 1}/{len(partitions_df)}] Processing date: {current_date}..."
+                )
+
+                daily_bets_lf = original_lf.filter(
+                    pl.col("timestamp").dt.date() == current_date
+                )
+                daily_labeled_df = self._calculate_labels_for_batch(
+                    daily_bets_lf, price_df
+                )
+
+                if not daily_labeled_df.is_empty():
+                    output_partition_dir.mkdir(parents=True, exist_ok=True)
+                    daily_labeled_df.write_parquet(
+                        output_partition_dir / "data.parquet"
+                    )
+
+            logging.info("\n" + "=" * 60)
+            logging.info("### Triple Barrier Labeling COMPLETED! ###")
+            logging.info("The 'Answer Key' for our AI is now ready in Stratum 6.")
+            logging.info("=" * 60)
+
+        except Exception as e:
+            logging.error(
+                f"An error occurred during the labeling process: {e}", exc_info=True
+            )
+            raise
+
+    def _calculate_labels_for_batch(
+        self, bets_lf: pl.LazyFrame, price_df: pl.DataFrame
+    ) -> pl.DataFrame:
+        cfg = self.config
+
+        bets_with_price_lf = bets_lf.join_asof(price_df.lazy(), on="timestamp").filter(
+            pl.col(cfg.atr_col_name).is_not_null()
+        )
+
+        bets_df = bets_with_price_lf.select(
+            pl.col("timestamp").alias("t0"),
+            (
+                pl.col("close") + pl.col(cfg.atr_col_name) * cfg.profit_take_multiplier
+            ).alias("pt_barrier"),
+            (
+                pl.col("close") - pl.col(cfg.atr_col_name) * cfg.stop_loss_multiplier
+            ).alias("sl_barrier"),
+            (
+                pl.col("timestamp") + pl.duration(minutes=cfg.lookahead_periods * 5)
+            ).alias("t1_max"),
+            pl.all().exclude(["timestamp", "close", cfg.atr_col_name, "high", "low"]),
+        ).collect()
+
+        if bets_df.is_empty():
+            return pl.DataFrame()
+
+        min_ts = bets_df["t0"].min()
+        max_ts = bets_df["t1_max"].max()
+        if min_ts is None or max_ts is None:
+            return pl.DataFrame()
+        price_window_df = price_df.filter(
+            (pl.col("timestamp") >= min_ts) & (pl.col("timestamp") <= max_ts)
+        )
+
+        hits_df = (
+            price_window_df.join_asof(
+                bets_df.select(["t0", "pt_barrier", "sl_barrier", "t1_max"]),
+                left_on="timestamp",
+                right_on="t0",
+            )
+            .filter(pl.col("timestamp") <= pl.col("t1_max"))
+            .with_columns(
+                pl.when(pl.col("high") >= pl.col("pt_barrier"))
+                .then(pl.col("timestamp"))
+                .alias("pt_hit_time"),
+                pl.when(pl.col("low") <= pl.col("sl_barrier"))
+                .then(pl.col("timestamp"))
+                .alias("sl_hit_time"),
+            )
+            .group_by("t0")
+            .agg(
+                pl.col("pt_hit_time").min().alias("first_pt_time"),
+                pl.col("sl_hit_time").min().alias("first_sl_time"),
+            )
+        )
+
+        final_df = (
+            bets_df.join(hits_df, on="t0", how="left")
+            .with_columns(
+                pl.when(
+                    (pl.col("first_pt_time").is_not_null())
+                    & (
+                        pl.col("first_sl_time").is_null()
+                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
+                    )
+                )
+                .then(pl.col("first_pt_time"))
+                .when(pl.col("first_sl_time").is_not_null())
+                .then(pl.col("first_sl_time"))
+                .otherwise(pl.col("t1_max"))
+                .alias("t1"),
+                pl.when(
+                    (pl.col("first_pt_time").is_not_null())
+                    & (
+                        pl.col("first_sl_time").is_null()
+                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
+                    )
+                )
+                .then(pl.lit(1, dtype=pl.Int8))
+                .when(pl.col("first_sl_time").is_not_null())
+                .then(pl.lit(-1, dtype=pl.Int8))
+                .otherwise(pl.lit(0, dtype=pl.Int8))
+                .alias("label"),
+            )
+            .with_columns(
+                pl.col("t0").dt.year().alias("year"),
+                pl.col("t0").dt.month().alias("month"),
+                pl.col("t0").dt.day().alias("day"),
+            )
+            .rename({"t0": "timestamp"})
+        )
+
+        return final_df.drop(
+            ["pt_barrier", "sl_barrier", "t1_max", "first_pt_time", "first_sl_time"]
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Triple Barrier Labeling with Polars")
+    parser.add_argument(
+        "--test-limit",
+        type=int,
+        default=0,
+        help="Limit processing to the first N partitions for testing.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume feature and start from scratch.",
+    )
+    args = parser.parse_args()
+
+    config = TripleBarrierConfig(test_limit=args.test_limit, resume=not args.no_resume)
+    engine = PolarsLabelingEngine(config)
+    engine.run()

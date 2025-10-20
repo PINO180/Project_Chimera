@@ -17,6 +17,7 @@ pyarrow
 scipy
 sympy
 tqdm
+duckdb
 
 # =================================================================
 # 機械学習・統計 (Machine Learning & Statistics)
@@ -27,6 +28,7 @@ lightgbm
 dask-ml
 hmmlearn
 scikit-learn
+scikit-optimize
 shap
 statsmodels
 tensorflow
@@ -47,6 +49,8 @@ entropy
 MFDFA
 nolds
 pmdarima
+seaborn
+optuna
 
 # =================================================================
 # インフラ・開発 (Infrastructure & Development)

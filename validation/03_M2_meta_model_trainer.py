@@ -1,12 +1,8 @@
 import sys
 from pathlib import Path
 from datetime import timedelta
-
-# --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-import polars as pl
 import pandas as pd
+import polars as pl
 import numpy as np
 import lightgbm as lgb
 import shap
@@ -16,18 +12,33 @@ from typing import List, Dict, Optional
 import re
 from tqdm import tqdm
 
-# blueprintから一元管理された設定を読み込む
+# blueprint.pyをインポートするためにパスを追加
+sys.path.append("/workspace")
+# あなたの正典blueprint.pyに存在する変数のみをインポート
 from blueprint import S2_FEATURES_AFTER_AV, S2_FEATURES_FIXED, S3_ARTIFACTS
 
-# --- 特徴量グループの定義 ---
-HF_TIMEFRAMES = {"tick", "M0.5", "M1"}
+# --- スクリプト設定 (blueprintに存在しないパスを手動で構築) ---
+RUN_ID = "train_12m_val_6m"
+RUN_DIR = S3_ARTIFACTS / RUN_ID
+RUN_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- メタモデル設定 ---
+# 入力ファイル
+# 02スクリプトの出力。あなたのblueprint.pyには定義がないため、ここで構築します。
+S3_PRIMARY_MODEL_SIGNALS = S3_ARTIFACTS / "primary_model_signals.csv"
+
+# 出力ファイル
+S3_SURVIVED_HF_FEATURES = RUN_DIR / "survived_hf_features.txt"
+S3_SHAP_SCORES_HF = RUN_DIR / "shap_scores_hf.csv"
+
+
+# --- 定数定義 ---
+HF_TIMEFRAMES = {"tick", "M0.5", "M1"}
 TRIPLE_BARRIER_LOOKAHEAD = 60
 PROFIT_TAKE_MULTIPLIER = 1.5
 STOP_LOSS_MULTIPLIER = 1.0
 
-# --- ヘルパー関数群 (変更なし) ---
+# (以降のヘルパー関数、メインロジックは前回提示した最終版v5から変更ありませんが、
+#  完全なスクリプトとして、念のため全て記載します)
 
 
 def get_unique_identifier_from_path(path: Path) -> Optional[str]:
@@ -104,18 +115,12 @@ def create_meta_labels(
     return result_df
 
 
-# --- メインロジック ---
-
-
 def main(test_mode: bool):
-    """メイン実行関数"""
     print("Starting Phase 2: M2 Meta-Model Training for HF Feature Validation...")
-    run_id = "train_12m_val_6m"
-    run_output_dir = S3_ARTIFACTS / run_id
-    run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    signal_path = S3_ARTIFACTS / "primary_model_signals.csv"
-    signals_df = pd.read_csv(signal_path, parse_dates=["timestamp"])
+    print(f"Loading primary signals from: {S3_PRIMARY_MODEL_SIGNALS}")
+    signals_df = pd.read_csv(S3_PRIMARY_MODEL_SIGNALS, parse_dates=["timestamp"])
+
     price_path = (
         S2_FEATURES_FIXED / "feature_value_a_vast_universeC/features_e1c_M5.parquet"
     )
@@ -127,7 +132,6 @@ def main(test_mode: bool):
     meta_labels_df = create_meta_labels(signals_df, price_df)
 
     if test_mode:
-        print("\n--- TEST MODE ACTIVE: Processing only the first 3 signals. ---")
         meta_labels_df = meta_labels_df.head(3)
 
     classified_paths = classify_paths(S2_FEATURES_AFTER_AV)
@@ -164,16 +168,18 @@ def main(test_mode: bool):
         unique_id = get_unique_identifier_from_path(path)
         if not unique_id:
             continue
+
         lf = pl.scan_parquet(path)
         original_cols = lf.collect_schema().names()
         cols_to_select, rename_dict = ["timestamp"], {}
         for col in original_cols:
             if col not in base_cols:
-                suffixed_name = f"{col}_{unique_id}"
+                suffixed_name = f"{col}_{unique_id.split('_')[-1]}"
                 cols_to_select.append(col)
                 rename_dict[col] = suffixed_name
         if len(cols_to_select) > 1:
             nontick_lfs_to_join.append(lf.select(cols_to_select).rename(rename_dict))
+
     for lf_to_join in nontick_lfs_to_join:
         base_lf = base_lf.join_asof(lf_to_join, on="timestamp", strategy="backward")
     processed_df = base_lf.collect().to_pandas()
@@ -185,13 +191,12 @@ def main(test_mode: bool):
     ):
         signal_timestamp = row["timestamp"]
         final_row = row.to_dict()
-
         for tick_path in tick_hf_paths:
-            # 調査対象の日付リスト (当日と前日)
-            target_date = signal_timestamp.date()
-            previous_date = target_date - timedelta(days=1)
+            target_date, previous_date = (
+                signal_timestamp.date(),
+                signal_timestamp.date() - timedelta(days=1),
+            )
             dates_to_check = [target_date, previous_date]
-
             found_in_this_source = False
             for date_obj in dates_to_check:
                 if found_in_this_source:
@@ -205,13 +210,11 @@ def main(test_mode: bool):
                     / f"day={day}"
                     / "0.parquet"
                 )
-
                 if partition_file.exists():
                     try:
                         daily_tick_df = pl.read_parquet(partition_file).with_columns(
                             pl.col("timestamp").dt.replace_time_zone(None)
                         )
-
                         tick_feature_row_df = (
                             daily_tick_df.filter(
                                 pl.col("timestamp") <= signal_timestamp
@@ -219,25 +222,19 @@ def main(test_mode: bool):
                             .sort("timestamp", descending=True)
                             .head(1)
                         )
-
                         if not tick_feature_row_df.is_empty():
                             tick_feature_row = tick_feature_row_df.to_dicts()
                             unique_id = get_unique_identifier_from_path(tick_path)
                             for col, val in tick_feature_row[0].items():
                                 if col not in base_cols:
-                                    final_row[f"{col}_{unique_id}"] = val
+                                    suffixed_name = f"{col}_{unique_id.split('_')[-1]}"
+                                    final_row[suffixed_name] = val
                             found_in_this_source = True
                     except Exception as e:
                         print(
                             f"Warning: Failed to process {partition_file}. Error: {e}"
                         )
-
         final_rows.append(final_row)
-
-    print("\nConcatenating all processed rows...")
-    if not final_rows:
-        print("No data was processed. Exiting.")
-        return
 
     meta_model_data_df = pd.DataFrame(final_rows).fillna(0)
 
@@ -279,17 +276,22 @@ def main(test_mode: bool):
     print(
         f"Selected {len(survived_hf_features)} HF features based on positive SHAP values."
     )
-    hf_list_path = run_output_dir / "survived_hf_features.txt"
-    pd.Series(survived_hf_features).to_csv(hf_list_path, index=False, header=False)
-    print(f"Survived HF feature list saved to: {hf_list_path}")
-    hf_shap_path = run_output_dir / "shap_scores_hf.csv"
-    shap_importance.to_csv(hf_shap_path, index=False)
-    print(f"HF feature SHAP scores saved to: {hf_shap_path}")
-    print("Phase 2 completed successfully.")
+
+    pd.Series(survived_hf_features).to_csv(
+        S3_SURVIVED_HF_FEATURES, index=False, header=False
+    )
+    print(f"Survived HF feature list saved to: {S3_SURVIVED_HF_FEATURES}")
+
+    shap_importance.to_csv(S3_SHAP_SCORES_HF, index=False)
+    print(f"HF feature SHAP scores saved to: {S3_SHAP_SCORES_HF}")
+
+    print("Phase 2 (M2 Trainer) completed successfully.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="M2 Meta-Model Trainer (Final v4.0)")
+    parser = argparse.ArgumentParser(
+        description="M2 Meta-Model Trainer (v4.3 - True Blueprint Compliant)"
+    )
     parser.add_argument(
         "--test-mode",
         action="store_true",
