@@ -4,7 +4,7 @@ from pathlib import Path
 # --- 設定 ---
 # 調査対象のParquetファイル
 file_to_check = Path(
-    "/workspace/data/XAUUSD/stratum_7_models/1A_2B/meta_labeled_oof_partitioned/year=2021/month=7/day=2"
+    "/workspace/data/XAUUSD/stratum_6_training/1A_2B/weighted_dataset_partitioned/year=2021/month=8/day=1/data.parquet"
 )
 
 # 比較元の特徴量リストファイル

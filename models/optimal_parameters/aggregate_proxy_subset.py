@@ -24,7 +24,7 @@ OPTIMIZATION_DIR = (
 )
 
 # Input: The daily partitioned subset we just created
-INPUT_PATH = OPTIMIZATION_DIR / "temp_labeled_subset_partitioned"
+INPUT_PATH = OPTIMIZATION_DIR / "temp_labeled_subset_partitioned_5_08_02"
 
 # Output: The monthly aggregated version of the subset
 OUTPUT_PATH = OPTIMIZATION_DIR / "temp_labeled_subset_monthly"

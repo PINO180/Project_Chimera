@@ -1,5 +1,5 @@
 # /workspace/models/model_training_metalabeling_A.py
-# [修正版: n_estimators を合計として解釈し、パーティションごとに分配する]
+# [修正版: コスト考慮型学習 (scale_pos_weight) 導入]
 
 import sys
 from pathlib import Path
@@ -8,15 +8,15 @@ import argparse
 from dataclasses import dataclass, field
 import datetime
 import warnings
-import gc  # --- ★ gc をインポート (維持) ---
+import gc  # --- ★ gc をインポート ---
 
 import polars as pl
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection._split import BaseCrossValidator
 from typing import List, Tuple, Dict, Any, Generator
-from tqdm import tqdm  # --- ★ tqdm をインポート (維持) ---
-from collections import Counter  # --- ★ Counter をインポート (維持) ---
+from tqdm import tqdm  # --- ★ tqdm をインポート ---
+from collections import Counter  # --- ★ Counter をインポート ---
 
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
@@ -52,10 +52,10 @@ class TrainingConfig:
     embargo_days: int = 2
     lgbm_params: Dict[str, Any] = field(
         default_factory=lambda: {
-            "objective": "binary",
-            "metric": "auc",
+            "objective": "binary",  # 確率を出力するので binary のまま
+            "metric": "auc",  # 評価指標も AUC のままで良い
             "boosting_type": "gbdt",
-            "n_estimators": 1000,  # ★★★ これは「合計」の本数として解釈する ★★★
+            "n_estimators": 1000,
             "learning_rate": 0.01,
             "num_leaves": 31,
             "max_depth": -1,
@@ -111,11 +111,11 @@ class M1CrossValidator:
             )
             self.partitions = self.partitions[: self.config.test_limit]
 
-        # --- ★★★ (維持) scale_pos_weight を計算してLGBMパラメータに追加 ★★★ ---
+        # --- ★★★ 追加: scale_pos_weight を計算してLGBMパラメータに追加 ★★★ ---
         self.scale_pos_weight = self._calculate_scale_pos_weight()
         self.config.lgbm_params["scale_pos_weight"] = self.scale_pos_weight
         logging.info(f"Using scale_pos_weight: {self.scale_pos_weight:.4f}")
-        # --- ★★★ (維持) ここまで ★★★ ---
+        # --- ★★★ 追加ここまで ★★★ ---
 
     def _load_features(self) -> List[str]:
         logging.info(f"Loading feature list from {self.config.feature_list_path}...")
@@ -142,7 +142,7 @@ class M1CrossValidator:
         logging.info(f"  -> Discovered and sorted {len(dates)} daily partitions.")
         return dates
 
-    # --- ★★★ (維持) scale_pos_weight を計算する関数 ★★★ ---
+    # --- ★★★ 新規追加: scale_pos_weight を計算する関数 ★★★ ---
     def _calculate_scale_pos_weight(self) -> float:
         """
         全パーティションをスキャンして M1 の scale_pos_weight (勝ち=1 vs それ以外=0) を計算する。
@@ -153,7 +153,9 @@ class M1CrossValidator:
         counts = Counter({0: 0, 1: 0})  # 0: Negative/Timeout, 1: Positive
         total_samples = 0
 
+        # test_limit が設定されている場合は、計算対象のパーティションも制限する
         partitions_to_scan = self.partitions
+        # (test_fold_limit はCV中の制限なのでここでは使わない)
 
         for partition_date in tqdm(
             partitions_to_scan, desc="Scanning labels for scale_pos_weight"
@@ -163,10 +165,12 @@ class M1CrossValidator:
                 / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
             )
             try:
+                # label 列だけを読み込む
                 df_labels = pl.read_parquet(p_path_glob, columns=["label"])
                 if df_labels.is_empty():
                     continue
 
+                # 勝ち(1)を1、それ以外(-1, 0)を0に変換してカウント
                 binary_labels = df_labels.select(
                     pl.when(pl.col("label") == 1)
                     .then(1)
@@ -205,6 +209,7 @@ class M1CrossValidator:
             )
             return 1.0
 
+        # scale_pos_weight = count_negative / count_positive
         scale_pos_weight = count_neg / count_pos
         logging.info(f"  -> Total samples scanned: {total_samples}")
         logging.info(f"  -> Positive (label=1) count: {count_pos}")
@@ -212,7 +217,7 @@ class M1CrossValidator:
         logging.info(f"  -> Calculated scale_pos_weight: {scale_pos_weight:.4f}")
         return scale_pos_weight
 
-    # --- ★★★ (維持) ここまで ★★★ ---
+    # --- ★★★ 新規追加ここまで ★★★ ---
 
     def run(self) -> None:
         logging.info("### Script 1/3: M1 Cross-Validation ###")
@@ -238,9 +243,6 @@ class M1CrossValidator:
         logging.info("### Script 1/3 FINISHED! You can now run Script B. ###")
         logging.info("=" * 60)
 
-    # ---
-    # --- ★★★ ここが根本的な修正箇所 ★★★
-    # ---
     def _train_model_partition_based(self) -> Dict[str, np.ndarray]:
         logging.info(
             "--- Starting True Sequential Partition-Based Training for M1 (Primary) ---"
@@ -259,9 +261,11 @@ class M1CrossValidator:
             kfold.split(self.partitions)
         ):
             logging.info(f"  [M1 (Primary)] Fold {i + 1}/{self.config.n_splits}...")
-            # --- (維持) Booster API を使用 ---
-            model: lgb.Booster = None  # Boosterオブジェクトを初期化
-            # --- (維持) ここまで ---
+            # --- ★★★ 修正: Booster API から Scikit-learn API (LGBMClassifier) へ変更 ★★★ ---
+            # model: lgb.Booster = None # OLD
+            model = lgb.LGBMClassifier(**self.config.lgbm_params)  # NEW: インスタンス化
+            is_first_chunk = True  # NEW: Scikit-learn API 用のフラグ
+            # --- ★★★ 修正ここまで ★★★ ---
 
             if self.config.test_fold_limit > 0:
                 logging.warning(
@@ -270,76 +274,58 @@ class M1CrossValidator:
                 train_partitions = train_partitions[: self.config.test_fold_limit]
                 val_partitions = val_partitions[: self.config.test_fold_limit]
 
-            # --- ★★★ 新規: 1パーティションあたりの木の数を計算 ★★★ ---
-            # lgbm_params から n_estimators を取り出し、ループ内では使わないようにする
-            train_params = self.config.lgbm_params.copy()
-            n_estimators_total = train_params.pop("n_estimators", 1000)
-            n_partitions_train = len(train_partitions)
-            num_boost_round_per_partition = 0  # 初期化
+            logging.info(
+                f"    -> Training on {len(train_partitions)} partitions sequentially..."
+            )
+            # --- ▼▼▼ tqdm を訓練ループに追加 ▼▼▼ ---
+            for partition_date in tqdm(
+                train_partitions, desc=f"  Training Fold {i + 1}"
+            ):
+                # --- ▲▲▲ 追加ここまで ▲▲▲ ---
+                p_path_glob = str(  # --- ★ globパターンを使うように修正 ---
+                    self.config.input_dir
+                    / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
+                )
+                try:
+                    df_chunk = pl.read_parquet(
+                        p_path_glob
+                    )  # --- ★ globパターンで読み込み ---
+                except Exception:
+                    continue
+                if df_chunk.is_empty():
+                    continue
 
-            if n_partitions_train == 0:
-                logging.warning("    -> No train partitions found. Skipping fold.")
-                # model is None のままなので、この後の予測もスキップされる
-            else:
-                # 合計の木の本数を、訓練パーティション数で分配する (最低1本)
-                # 例: 1000本 / 1017パーティション -> ceil(0.98) -> 1本ずつ
-                num_boost_round_per_partition = max(
-                    1, int(np.ceil(n_estimators_total / n_partitions_train))
-                )
+                X_chunk = df_chunk.select(self.features).to_numpy()
+                y_chunk = np.where(
+                    df_chunk["label"] == 1, 1, 0
+                )  # ターゲットは 勝ち(1) vs それ以外(0)
+                w_chunk = df_chunk["uniqueness"].to_numpy()  # サンプル独自性の重み
 
-                logging.info(
-                    f"    -> Total {n_estimators_total} estimators distributed over {n_partitions_train} partitions."
-                )
-                logging.info(
-                    f"    -> Setting num_boost_round = {num_boost_round_per_partition} per partition."
-                )
-            # --- ★★★ 新規ここまで ★★★ ---
-
-            # --- ★★★ 修正: n_partitions_train > 0 の場合のみ訓練 ★★★ ---
-            if n_partitions_train > 0:
-                logging.info(
-                    f"    -> Training on {len(train_partitions)} partitions sequentially..."
-                )
-                # --- (維持) tqdm を訓練ループに追加 ---
-                for partition_date in tqdm(
-                    train_partitions, desc=f"  Training Fold {i + 1}"
-                ):
-                    p_path_glob = str(
-                        self.config.input_dir
-                        / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
+                # --- ★★★ 修正: LGBMClassifier の fit を使用 ★★★ ---
+                # model = lgb.train(...) # OLD
+                try:
+                    model.fit(
+                        X_chunk,
+                        y_chunk,
+                        sample_weight=w_chunk,  # ここでサンプル独自性 + scale_pos_weight が考慮される
+                        init_model=None
+                        if is_first_chunk
+                        else model.booster_,  # 逐次学習
+                        # callbacks=[lgb.log_evaluation(period=0)] # ログ出力を抑制する場合
                     )
-                    try:
-                        df_chunk = pl.read_parquet(p_path_glob)
-                    except Exception:
-                        continue
-                    if df_chunk.is_empty():
-                        continue
+                    is_first_chunk = False
+                except Exception as fit_error:
+                    logging.error(
+                        f"Error during model fitting for partition {partition_date}: {fit_error}",
+                        exc_info=False,  # 詳細なトレースバックは冗長なのでFalseに
+                    )
+                    continue  # このチャンクをスキップして続行
+                # --- ★★★ 修正ここまで ★★★ ---
 
-                    X_chunk = df_chunk.select(self.features).to_numpy()
-                    y_chunk = np.where(
-                        df_chunk["label"] == 1, 1, 0
-                    )  # ターゲットは 勝ち(1) vs それ以外(0)
-                    w_chunk = df_chunk["uniqueness"].to_numpy()  # サンプル独自性の重み
-
-                    # --- ★★★ 修正: lgb.train のパラメータを修正 ★★★ ---
-                    try:
-                        model = lgb.train(
-                            train_params,  # n_estimators を除外したパラメータ
-                            lgb.Dataset(X_chunk, label=y_chunk, weight=w_chunk),
-                            num_boost_round=num_boost_round_per_partition,  # ★ 1パーティションあたりの追加本数を指定
-                            init_model=model,  # Noneでなければ追加学習 (Boosting Continuation)
-                            keep_training_booster=True,  # 必須
-                        )
-                    except Exception as fit_error:
-                        logging.error(
-                            f"Error during model training for partition {partition_date}: {fit_error}",
-                            exc_info=False,
-                        )
-                        continue
-                    # --- ★★★ 修正ここまで ★★★ ---
-
-            # --- ★★★ (維持) model is None で訓練成功を判定 ★★★ ---
-            if model is None:
+            # --- ★★★ 修正: is_first_chunk で訓練成功を判定 ★★★ ---
+            # if model is None: # OLD
+            if is_first_chunk:  # NEW
+                # --- ★★★ 修正ここまで ★★★ ---
                 logging.warning(
                     f"    -> Model for Fold {i + 1} was not trained (no data or fit errors). Skipping."
                 )
@@ -348,47 +334,58 @@ class M1CrossValidator:
             logging.info(
                 f"    -> Predicting on {len(val_partitions)} partitions sequentially..."
             )
-            # --- (維持) tqdm を予測ループに追加 ---
+            # --- ▼▼▼ tqdm を予測ループに追加 ▼▼▼ ---
             for partition_date in tqdm(
                 val_partitions, desc=f"  Predicting Fold {i + 1}"
             ):
-                p_path_glob = str(
+                # --- ▲▲▲ 追加ここまで ▲▲▲ ---
+                p_path_glob = str(  # --- ★ globパターンを使うように修正 ---
                     self.config.input_dir
                     / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
                 )
                 try:
-                    df_chunk = pl.read_parquet(p_path_glob)
+                    df_chunk = pl.read_parquet(
+                        p_path_glob
+                    )  # --- ★ globパターンで読み込み ---
                 except Exception:
                     continue
                 if df_chunk.is_empty():
                     continue
 
                 X_val = df_chunk.select(self.features).to_numpy()
-                # --- (維持) Booster API の predict を使用 ---
+                # --- ★★★ 修正: predict_proba を使用して確率を取得 ★★★ ---
+                # predictions = model.predict(X_val) # OLD: Booster API の predict はスコアを返す
+                # predict_proba は [クラス0の確率, クラス1の確率] の配列を返すので、クラス1(勝ち)の確率を取得
                 try:
-                    predictions = model.predict(X_val)
+                    predictions = model.predict_proba(X_val)[:, 1]  # NEW
                 except Exception as pred_error:
                     logging.error(
                         f"Error during prediction for partition {partition_date}: {pred_error}",
                         exc_info=False,
                     )
+                    # エラーが発生した場合、予測値をNaNやデフォルト値（例: 0.5）で埋めるか、スキップするかを決定
+                    # ここではNaNで埋める例
                     predictions = np.full(len(df_chunk), np.nan)
-                # --- (維持) ここまで ---
+                    # continue # または、このパーティションの予測をスキップ
+                # --- ★★★ 修正ここまで ★★★ ---
 
                 oof_results["timestamp"].append(df_chunk["timestamp"].to_numpy())
-                oof_results["prediction"].append(predictions)
-                oof_results["true_label"].append(df_chunk["label"].to_numpy())
+                oof_results["prediction"].append(predictions)  # 予測確率を格納
+                oof_results["true_label"].append(
+                    df_chunk["label"].to_numpy()
+                )  # 元のラベル (-1, 0, 1) を格納
                 oof_results["uniqueness"].append(df_chunk["uniqueness"].to_numpy())
 
             logging.info(f"    -> Fold {i + 1} prediction complete.")
-            # --- (維持) メモリ解放 ---
+            # --- ★ メモリ解放 ---
             del model
             gc.collect()
-            # --- (維持) メモリ解放ここまで ---
+            # --- ★ メモリ解放ここまで ---
 
-        logging.info("Concatenating OOF results...")
-        # --- (維持) 空の配列がある場合の concatenate エラーを回避 ---
+        logging.info("Concatenating OOF results...")  # --- ★ ログ追加 ---
+        # --- ★★★ 修正: 空の配列がある場合の concatenate エラーを回避 ★★★ ---
         for key in oof_results:
+            # リストが空でない場合のみ concatenate を実行
             if oof_results[key]:
                 try:
                     oof_results[key] = np.concatenate(oof_results[key])
@@ -396,11 +393,13 @@ class M1CrossValidator:
                     logging.error(
                         f"Error concatenating results for key '{key}': {concat_error}"
                     )
-                    oof_results[key] = np.array([])
+                    # エラーが発生した場合、そのキーのリストを空にするか、エラー処理を行う
+                    oof_results[key] = np.array([])  # 空のNumPy配列にする例
             else:
+                # リストが最初から空の場合も空のNumPy配列に初期化
                 oof_results[key] = np.array([])
-        # --- (維持) 修正ここまで ---
-        logging.info("OOF results concatenated.")
+        # --- ★★★ 修正ここまで ★★★ ---
+        logging.info("OOF results concatenated.")  # --- ★ ログ追加 ---
 
         return oof_results
 

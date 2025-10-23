@@ -1,0 +1,52 @@
+python /workspace/models/optimal_parameters/create_proxy_labels.py --duration "30m"--pt-mult 1.0 --sl-mult 0.5
+
+タイムアウトが減るということは、言い換えれば「制限時間内に、より多くのベットが利益確定（PT）または損切り（SL）のラインに到達する」ということです。そのために変更できるパラメータは主に2つあります。
+
+1. バリアの距離を調整する (ATR Multipliers)
+これが最も直接的で効果的な方法です。現在の設定では、バリアは以下のように計算されています。
+
+利益確定(PT)バリア: エントリー価格 + ATR * 2.0
+
+損切り(SL)バリア: エントリー価格 - ATR * 1.0
+
+この 2.0 と 1.0 という値を小さくすれば、バリアがエントリー価格に近づき、価格が到達しやすくなるため、タイムアウトは劇的に減少します。
+
+調整箇所
+create_proxy_labels.py の中の ProxyLabelConfig クラスです。
+
+Python
+
+# /workspace/models/optimal_parameters/create_proxy_labels.py
+
+@dataclass
+class ProxyLabelConfig:
+    """Config for creating a context-adaptive, labeled subset for proxy model training."""
+    # ... (省略) ...
+    profit_take_multiplier: float = 2.0  # ← この値を小さくする (例: 1.5, 1.0)
+    stop_loss_multiplier: float = 1.0    # ← この値を小さくする (例: 0.75, 0.5)
+    # ... (省略) ...
+実験のアイデア
+対称的なバリア: profit_take_multiplier と stop_loss_multiplier を同じ値（例: 1.0 と 1.0）に設定してみる。これにより、ペイオフレシオは1.0になります。
+
+よりタイトな設定: 両方の値を半分にしてみる（例: 1.0 と 0.5）。これにより、タイムアウトは大幅に減少し、利益確定と損切りのラベルが顕著に増えるはずです。
+
+2. 制限時間を調整する (Lookahead Duration)
+これはあなたが既に 5m と 300m で実験し、その効果を実証された方法です。
+
+制限時間 (target_duration) を長くすれば、価格がバリアに到達するための猶予が長くなるため、タイムアウトは減少します。
+
+調整箇所
+スクリプト実行時の --duration 引数、または ProxyLabelConfig 内の target_duration です。
+
+Python
+
+# /workspace/models/optimal_parameters/create_proxy_labels.py
+
+@dataclass
+class ProxyLabelConfig:
+    """Config for creating a context-adaptive, labeled subset for proxy model training."""
+    # ... (省略) ...
+    target_duration: str = "300m"  # ← この値を大きくする (例: "480m", "720m")
+    # ... (省略) ...
+実験のアイデア
+より長期の観測: 現在の 300m (5時間) から、480m (8時間) や 1440m (24時間) など、さらに長い期間で実行してみる。これにより、タイムアウトがどの程度まで減少し、利益確定と損切りの比率がどう変化するかを観測できます。

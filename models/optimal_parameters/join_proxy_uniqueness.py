@@ -26,7 +26,7 @@ OPTIMIZATION_DIR = (
 )
 
 # Input 1: The daily partitioned subset
-INPUT_LABELED_PATH = OPTIMIZATION_DIR / "temp_labeled_subset_partitioned"
+INPUT_LABELED_PATH = OPTIMIZATION_DIR / "temp_labeled_subset_partitioned_5_08_02"
 
 # Input 2: The concurrency results we just created
 INPUT_CONCURRENCY_PATH = OPTIMIZATION_DIR / "temp_concurrency_results.parquet"

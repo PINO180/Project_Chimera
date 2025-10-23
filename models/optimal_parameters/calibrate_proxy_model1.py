@@ -1,5 +1,4 @@
 # /workspace/models/optimal_parameters/calibrate_proxy_model.py
-# FINAL VERSION - Multi-class calibration
 
 import sys
 from pathlib import Path
@@ -11,7 +10,7 @@ import polars as pl
 import numpy as np
 import joblib
 from sklearn.isotonic import IsotonicRegression
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 from tqdm import tqdm
 import gc
 
@@ -59,19 +58,15 @@ def load_all_data_for_calibration(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Loads all necessary data from the partitioned directory into memory.
-    Ensures consistency with the multi-class training data preparation.
+    This mimics the exact data loading process used for model training to ensure consistency.
     """
     logging.info("Loading all training data into memory for calibration...")
     X_list, y_list = [], []
 
-    # This label map must be identical to the one in the training script
-    label_map = {-1: 0, 0: 1, 1: 2}  # SL -> 0, TO -> 1, PT -> 2
-
     for path in tqdm(partitions, desc="Loading Data Partitions"):
         try:
             df_chunk = pl.read_parquet(path)
-        except Exception as e:
-            logging.warning(f"Could not read {path}: {e}. Skipping.")
+        except Exception:
             continue
 
         if df_chunk.is_empty():
@@ -85,24 +80,14 @@ def load_all_data_for_calibration(
                 [pl.lit(None, dtype=pl.Float64).alias(col) for col in missing_cols]
             )
 
-        X_chunk = (
-            df_chunk.select(features)
-            .cast(pl.Float64, strict=False)
-            .fill_null(0)
-            .to_numpy()
-        )
-        X_list.append(X_chunk)
-
-        # --- ★★★ CORE CHANGE: Load labels for multi-class ★★★ ---
-        y_chunk = df_chunk["label"].replace_strict(label_map, default=1).to_numpy()
-        y_list.append(y_chunk)
-        # --------------------------------------------------------
+        X_list.append(df_chunk.select(features).to_numpy())
+        y_list.append(np.where(df_chunk["label"] == 1, 1, 0))
 
     logging.info("Concatenating all data chunks...")
     X_all = np.vstack(X_list)
     y_all = np.concatenate(y_list)
 
-    del X_list, y_list, X_chunk, y_chunk
+    del X_list, y_list
     gc.collect()
 
     logging.info(f"  -> Data loaded. Total samples: {len(X_all)}")
@@ -111,27 +96,30 @@ def load_all_data_for_calibration(
 
 def calibrate_proxy_model(config: ProxyCalibrationConfig):
     """
-    Trains an Isotonic Regression model for each class (SL, TO, PT) to calibrate
-    the multi-class proxy model's outputs.
+    Trains an Isotonic Regression model to calibrate the proxy model's outputs.
     """
-    logging.info("### Phase 1, Script 6: Calibrate Multi-Class Proxy Model ###")
+    logging.info("### Phase 1, New Script: Calibrate Proxy Model (Build Megaphone) ###")
 
     # --- 1. Validation and Setup ---
-    if not all(
-        [
-            config.input_data_dir.exists(),
-            config.input_model_path.exists(),
-            config.feature_list_path.exists(),
-        ]
-    ):
-        logging.error("CRITICAL: One or more input paths not found. Aborting.")
+    if not config.input_data_dir.exists():
+        logging.error(
+            f"CRITICAL: Input data directory not found at {config.input_data_dir}"
+        )
         return
+    if not config.input_model_path.exists():
+        logging.error(f"CRITICAL: Proxy model not found at {config.input_model_path}")
+        return
+    if not config.feature_list_path.exists():
+        logging.error(f"CRITICAL: Feature list not found at {config.feature_list_path}")
+        return
+
     config.output_calibrator_path.parent.mkdir(parents=True, exist_ok=True)
 
     # --- 2. Load Features and Data Partitions ---
     logging.info(f"Loading feature list from {config.feature_list_path}...")
     with open(config.feature_list_path, "r") as f:
         features = [line.strip() for line in f if line.strip()]
+    logging.info(f"  -> Loaded {len(features)} features.")
 
     partitions = sorted(config.input_data_dir.glob("year=*/month=*/day=*/*.parquet"))
     if not partitions:
@@ -140,53 +128,40 @@ def calibrate_proxy_model(config: ProxyCalibrationConfig):
     # --- 3. Load All Data into Memory ---
     X_all, y_all = load_all_data_for_calibration(partitions, features)
 
-    # --- 4. Get Raw Predictions from Proxy Model ---
+    # --- 4. Get Raw Predictions from Proxy Model (the 'Whispers') ---
     logging.info(f"Loading proxy model from {config.input_model_path}...")
     proxy_model = joblib.load(config.input_model_path)
 
-    logging.info("Generating raw probability predictions for all 3 classes...")
-    # This will be an (n_samples, 3) array
-    raw_probabilities = proxy_model.predict_proba(X_all)
+    logging.info("Generating raw probability predictions (the 'whispers')...")
+    raw_probabilities = proxy_model.predict_proba(X_all)[:, 1]
+
+    # Free up memory from the full feature matrix
     del X_all
     gc.collect()
 
-    # --- ★★★ CORE CHANGE: Train one calibrator per class ★★★ ---
-    logging.info("Training one Isotonic Regression calibrator per class...")
+    # --- 5. Train the Calibrator (the 'Megaphone') ---
+    logging.info("Training the Isotonic Regression calibrator (the 'megaphone')...")
 
-    # We will store the 3 calibrators in a dictionary
-    calibrators: Dict[int, IsotonicRegression] = {}
-    class_map = {0: "SL", 1: "TO", 2: "PT"}
+    # IsotonicRegression is perfect for converting a model's biased outputs
+    # into a properly calibrated probability scale.
+    calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
 
-    for i in range(raw_probabilities.shape[1]):  # Should be 3 classes
-        class_name = class_map.get(i, f"Class {i}")
-        logging.info(f"  -> Calibrating for class {i} ({class_name})...")
+    # We fit the calibrator on the raw probabilities and the true outcomes.
+    # It learns the mapping: "When the scout whispers '0.002%', the actual win rate was 2%".
+    calibrator.fit(raw_probabilities, y_all)
 
-        # Get the raw probabilities for the current class
-        raw_proba_class = raw_probabilities[:, i]
+    logging.info("  -> Calibrator training complete.")
 
-        # Create a binary target for the current class (1 if this class, 0 otherwise)
-        y_true_class = (y_all == i).astype(int)
-
-        # Train a separate calibrator for this class
-        calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
-        calibrator.fit(raw_proba_class, y_true_class)
-
-        calibrators[i] = calibrator
-        logging.info(f"     -> Done.")
-
-    logging.info("  -> All calibrators trained.")
-    # -------------------------------------------------------------
-
-    # --- 6. Save the Collection of Calibrators ---
-    # Save the dictionary containing all 3 calibrator models
-    joblib.dump(calibrators, config.output_calibrator_path)
+    # --- 6. Save the Calibrator ---
+    joblib.dump(calibrator, config.output_calibrator_path)
 
     logging.info("\n" + "=" * 60)
-    logging.info("### Multi-Class Proxy Model Calibration COMPLETED! ###")
-    logging.info(f"The multi-class calibrator (dictionary of 3 models) is ready at:")
-    logging.info(f"  -> {config.output_calibrator_path}")
+    logging.info("### Proxy Model Calibration COMPLETED! ###")
     logging.info(
-        "The high-speed optimization can now use these calibrated probabilities."
+        f"The 'Megaphone' (Calibrator) is ready at: {config.output_calibrator_path}"
+    )
+    logging.info(
+        "The high-speed optimization in Phase 2 can now begin with calibrated probabilities."
     )
     logging.info("=" * 60)
 

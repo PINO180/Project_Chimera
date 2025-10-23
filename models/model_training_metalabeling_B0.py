@@ -1,5 +1,4 @@
 # /workspace/models/model_training_metalabeling_B.py
-# [修正版: タイムゾーン不一致エラーを修正]
 
 import sys
 from pathlib import Path
@@ -7,14 +6,13 @@ import logging
 import argparse
 import datetime
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 import shutil
 from tqdm import tqdm
 
 import polars as pl
 
-# --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
@@ -43,7 +41,6 @@ class MetaLabelingConfig:
     m1_oof_path: Path = S7_M1_OOF_PREDICTIONS
     weighted_dataset_path: Path = S6_WEIGHTED_DATASET
     output_dir: Path = S7_META_LABELED_OOF_PARTITIONED
-    top_n_per_day: int = 20  # 各日のM1予測確率上位N件をサンプリングする
     test: bool = False
 
 
@@ -77,10 +74,7 @@ class MetaLabelGenerator:
 
     def run(self) -> None:
         logging.info(
-            "### Script 2/3: Meta-Label Generation (Dynamic Sampling Version) ###"
-        )
-        logging.info(
-            f"Using dynamic sampling: Top {self.config.top_n_per_day} M1 predictions per day."
+            "### Script 2/3: Meta-Label Generation (Final Cleanup Version) ###"
         )
 
         if not self.config.m1_oof_path.exists():
@@ -96,29 +90,7 @@ class MetaLabelGenerator:
         self.config.output_dir.mkdir(parents=True)
 
         logging.info(f"Loading M1 OOF predictions from {self.config.m1_oof_path}...")
-        try:
-            m1_oof_df = pl.read_parquet(self.config.m1_oof_path)
-
-            # --- ★★★ ここがエラー修正箇所 ★★★ ---
-            # S6 (左側) は UTC (datetime[us, UTC]) を持つ
-            # S7 (右側) はタイムゾーンを失っている (datetime[us])
-            # S7 (m1_oof_df) に UTC タイムゾーンを明示的に付与して型を一致させる
-            m1_oof_df = m1_oof_df.with_columns(
-                pl.col("timestamp").dt.replace_time_zone("UTC")
-            )
-            # --- ★★★ 修正ここまで ★★★ ---
-
-            # 予測確率列をリネームしておく
-            m1_oof_df = m1_oof_df.rename({"prediction": "m1_pred_proba"})
-            # 日付列を追加しておく (サンプリング処理のため)
-            m1_oof_df = m1_oof_df.with_columns(
-                pl.col("timestamp").dt.date().alias("date")
-            )
-        except Exception as e:
-            logging.error(
-                f"Failed to load or process M1 OOF predictions: {e}", exc_info=True
-            )
-            return
+        m1_oof_lf = pl.scan_parquet(self.config.m1_oof_path)
 
         total_records_processed = 0
         logging.info(
@@ -126,63 +98,47 @@ class MetaLabelGenerator:
         )
 
         for partition_date in tqdm(self.partitions, desc="Generating Meta-Labels"):
-            partition_path_glob = str(
+            partition_path = str(
                 self.config.weighted_dataset_path
                 / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
             )
 
             try:
-                df_chunk = pl.read_parquet(partition_path_glob)
+                df_chunk = pl.read_parquet(partition_path)
             except Exception:
                 continue
 
             if df_chunk.is_empty():
                 continue
 
-            # --- (動的サンプリングとメタラベル生成ロジック) ---
-            try:
-                # 1. その日のM1 OOF予測データを取得 (m1_oof_df は既にUTCタイムゾーン持ち)
-                daily_m1_oof = m1_oof_df.filter(pl.col("date") == partition_date)
-                if daily_m1_oof.is_empty():
-                    continue
+            # M1のOOF予測結果を結合 (ここで `uniqueness_right` が生成される)
+            merged_chunk_lf = df_chunk.lazy().join(
+                m1_oof_lf, on="timestamp", how="inner"
+            )
 
-                # 2. その日の予測確率上位N件のタイムスタンプを取得
-                top_n_timestamps = (
-                    daily_m1_oof.sort("m1_pred_proba", descending=True)
-                    .head(self.config.top_n_per_day)
-                    .select("timestamp")
-                )
-                if top_n_timestamps.is_empty():
-                    continue
+            # メタラベルを計算
+            final_chunk_lf = merged_chunk_lf.with_columns(
+                pl.when((pl.col("prediction") > 0.5) & (pl.col("label") == 1))
+                .then(1)
+                .when(pl.col("prediction") > 0.5)
+                .then(0)
+                .otherwise(None)
+                .alias("meta_label")
+            ).rename({"prediction": "m1_pred_proba"})
 
-                # 3. 元のデータチャンク (df_chunk, UTCタイムゾーン持ち) を上位N件 (UTCタイムゾーン持ち) でフィルタリング
-                sampled_chunk_lf = df_chunk.lazy().join(
-                    top_n_timestamps.lazy(), on="timestamp", how="inner"
-                )
+            # --- ★★★ ここが最終修正箇所 ★★★ ---
+            # 不要な副産物カラムを、存在しない場合でもエラーにならないように安全に削除
+            columns_to_drop = ["uniqueness_right", "event_id"]
+            # ★★★ Polarsが推奨する、警告の出ない書き方に修正 ★★★
+            schema_columns = final_chunk_lf.collect_schema().names()
+            existing_columns_to_drop = [
+                col for col in columns_to_drop if col in schema_columns
+            ]
 
-                # 4. フィルタリングされたデータに、対応するM1予測確率を結合
-                merged_chunk_lf = sampled_chunk_lf.join(
-                    daily_m1_oof.lazy().select(["timestamp", "m1_pred_proba"]),
-                    on="timestamp",
-                    how="inner",
-                )
-
-                # 5. メタラベルを生成
-                final_chunk_lf = merged_chunk_lf.with_columns(
-                    pl.when(pl.col("label") == 1)
-                    .then(1)  # Yes -> meta_label = 1 (True Positive)
-                    .otherwise(0)  # No -> meta_label = 0 (False Positive)
-                    .alias("meta_label")
-                )
-
-                result_chunk = final_chunk_lf.collect(streaming=True)
-
-            except Exception as e:
-                logging.error(
-                    f"Error processing partition {partition_date}: {e}", exc_info=False
-                )
-                continue
-            # --- (ロジックここまで) ---
+            if existing_columns_to_drop:
+                result_chunk = final_chunk_lf.drop(existing_columns_to_drop).collect()
+            else:
+                result_chunk = final_chunk_lf.collect()
 
             if not result_chunk.is_empty():
                 output_partition_dir = (
@@ -199,14 +155,14 @@ class MetaLabelGenerator:
         if total_records_processed > 0:
             logging.info("### Script 2/3 FINISHED! You can now run Script C. ###")
             logging.info(
-                f"  - Total M2 training samples generated: {total_records_processed}"
+                f"  - Total records processed and saved: {total_records_processed}"
             )
             logging.info(
-                f"  - Meta-labeled partitioned output is ready at: {self.config.output_dir}"
+                f"  - Cleaned partitioned output is ready at: {self.config.output_dir}"
             )
         else:
             logging.error(
-                "No meta-labeled data was generated. Please check M1 predictions and logs."
+                "No data was processed. Please check the input files and logs."
             )
         logging.info("=" * 60)
 
@@ -218,15 +174,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Run in quick test mode, processing only the first 5 partitions.",
     )
-    parser.add_argument(
-        "--top-n",
-        type=int,
-        default=20,
-        help="Number of top M1 predictions per day to sample for M2 training.",
-    )
-
     args = parser.parse_args()
-    config = MetaLabelingConfig(test=args.test, top_n_per_day=args.top_n)
-
+    config = MetaLabelingConfig(test=args.test)
     generator = MetaLabelGenerator(config)
     generator.run()
