@@ -1,5 +1,4 @@
 # /workspace/models/backtest_simulator.py
-# [修正版: 破産閾値 (min_capital_threshold) の導入]
 # [修正版: Chunking (Streaming) 導入によるメモリ効率化 + Schemaログ抑制]
 # [修正版: Booster API の .predict() を使うように修正]
 # [修正版: AttributeError (clip_min) 修正 + レバレッジ調整]
@@ -72,19 +71,17 @@ class BacktestConfig:
     m2_model_path: Path = S7_M2_MODEL_PKL
     m1_calibrator_path: Path = S7_M1_CALIBRATED
     m2_calibrator_path: Path = S7_M2_CALIBRATED
-    kelly_fraction: float = 0.1
-    max_leverage: float = 2000  # レバレッジ (前回修正済み)
+    kelly_fraction: float = 1.0
+    max_leverage: float = 100  # レバレッジ (前回修正済み)
     # --- ★ 追加: 1取引あたりの最大リスク割合 ---
-    max_risk_per_trade: float = 0.01  # 例: 資金の10%0.1を上限とする
+    max_risk_per_trade: float = 0.50  # 例: 資金の10%0.1を上限とする
 
     f_star_threshold: float = 0.0  # 例: f_star 閾値 (0.0 なら実質無効)
-    m2_proba_threshold: float = 0.50  # 例: M2 確率閾値
+    m2_proba_threshold: float = 0.5  # 例: M2 確率閾値
 
     test_limit_partitions: int = 0
     # ★★★ ここに oof_mode を追加 ★★★
     oof_mode: bool = False
-    # ★★★ ここに 破産閾値 を追加 ★★★
-    min_capital_threshold: float = 40  # 証拠金がこれを下回ると破産（取引停止）
 
 
 class BacktestSimulator:
@@ -135,11 +132,6 @@ class BacktestSimulator:
             f"Strategy: Probabilistic Betting with Kelly Fraction = {self.config.kelly_fraction}, "
             f"Max Leverage = {self.config.max_leverage}, Max Risk/Trade = {self.config.max_risk_per_trade * 100:.1f}%"  # リスク上限もログ出力
         )
-        # ★★★ 修正: 破産閾値もログ出力 ★★★
-        logging.info(
-            f"Bankruptcy Threshold (Min Capital): {self.config.min_capital_threshold:,.2f}"
-        )
-        # ★★★ 修正ここまで ★★★
 
         lf, partitions_df = self._prepare_data()
 
@@ -161,10 +153,6 @@ class BacktestSimulator:
         self._current_capital = Decimal(
             str(self.config.initial_capital)
         )  # ← 正しく Decimal で初期化
-
-        # ★★★ 修正: 破産閾値を Decimal で定義 ★★★
-        DECIMAL_MIN_CAPITAL = Decimal(str(self.config.min_capital_threshold))
-        # ★★★ 修正ここまで ★★★
 
         for row in tqdm(
             partitions_to_process.iter_rows(named=True),
@@ -190,15 +178,12 @@ class BacktestSimulator:
                 continue
 
             try:
-                # ★★★ 修正: 破産チェックを 0 から 閾値 に変更 ★★★
-                if self._current_capital < DECIMAL_MIN_CAPITAL:
+                if self._current_capital <= 0:
                     logging.warning(
-                        f"Capital ({self._current_capital:,.2f}) fell below threshold ({DECIMAL_MIN_CAPITAL:,.2f}) "
-                        f"before processing {current_date}. Stopping simulation."
+                        f"Capital depleted before processing {current_date}. Skipping remaining partitions."
                     )
                     # 破産した場合、以降のパーティション処理をスキップ
                     break  # ループを抜ける
-                # ★★★ 修正ここまで ★★★
 
                 # --- ★★★ ここから修正 ★★★ ---
                 # OOFモードかどうかに関わらず、常に _run_ai_predictions を呼ぶ
@@ -406,6 +391,7 @@ class BacktestSimulator:
                 logging.error(f"Error during M2 calibration (OOF): {e}", exc_info=True)
                 raise
 
+    # /workspace/models/backtest_simulator.py (修正版: _run_simulation_loop)
     def _run_simulation_loop(
         self, df_chunk: pl.DataFrame
     ) -> Tuple[pl.DataFrame, pl.DataFrame]:
@@ -419,9 +405,6 @@ class BacktestSimulator:
         DECIMAL_MAX_RISK = Decimal(str(self.config.max_risk_per_trade))
         DECIMAL_KELLY_FRACTION = Decimal(str(self.config.kelly_fraction))
         DECIMAL_F_STAR_THRESHOLD = Decimal(str(self.config.f_star_threshold))
-        # ★★★ 修正: 破産閾値を Decimal で定義 ★★★
-        DECIMAL_MIN_CAPITAL = Decimal(str(self.config.min_capital_threshold))
-        # ★★★ 修正ここまで ★★★
 
         timestamps_chunk = df_chunk["timestamp"].to_list()
         p_m2_calibrated = df_chunk["m2_calibrated_proba"].to_numpy()
@@ -440,9 +423,8 @@ class BacktestSimulator:
         # --- ★ 修正ここまで ---
 
         for i in range(len(df_chunk)):
-            # ★★★ 修正: 破産チェックを 0 から 閾値 に変更 ★★★
-            if current_capital < DECIMAL_MIN_CAPITAL:
-                # 破産した場合、資本は 0 として記録（ドローダウン計算のため）
+            # --- ★ 修正: 資本 <= 0 のチェック (Decimal) ---
+            if current_capital <= DECIMAL_ZERO:
                 equity_values_chunk.append(DECIMAL_ZERO)
                 # ログ用変数は初期化 (Decimal)
                 pnl, base_bet_fraction, capped_bet_fraction, effective_bet_fraction = (
@@ -454,7 +436,6 @@ class BacktestSimulator:
                 actual_label = labels_chunk[i]
                 should_trade = False
                 continue
-            # ★★★ 修正ここまで ★★★
             else:
                 p_float = p_m2_calibrated[i]  # float
                 b = payoff_ratios_chunk[i]  # Decimal
@@ -515,18 +496,6 @@ class BacktestSimulator:
                         # --- ★ 修正なし: 次の資本 (Decimal + Decimal) ---
                         next_capital = current_capital + pnl
 
-                        # ★★★ 修正: Inf/NaN チェック (Inf + (-Inf) = NaN 対策) ★★★
-                        if not next_capital.is_finite():
-                            logging.error(
-                                f"Capital became non-finite (Inf/NaN) at {timestamps_chunk[i]}. "
-                                f"Prev Capital: {current_capital:,.2E}, PnL: {pnl:,.2E}, Label: {actual_label}"
-                            )
-                            # NaN になったら、それ以上悪化しないよう 0 にリセット (または break)
-                            current_capital = DECIMAL_ZERO
-                            equity_values_chunk.append(current_capital)  # 0 を記録
-                            continue  # このループの残りをスキップ
-                        # ★★★ 修正ここまで ★★★
-
                         # --- ★ 修正: ログには float ではなく Decimal のまま記録 ---
                         trade_log_chunk.append(
                             {
@@ -559,173 +528,123 @@ class BacktestSimulator:
 
         self._current_capital = current_capital  # Decimal のまま保持
 
-        # ★★★ ここから修正 (BindingsError 対策) ★★★
-        # pl.Object 型を polars に正しく認識させるため、
-        # pl.DataFrame(リスト[dict]) ではなく、pl.Series を使って列ごとに DataFrame を構築する
+        # ★★★ ここから修正 ★★★
+        # Polars に渡す前に、Decimal を float に変換する。
+        # Inf/NaN になる可能性があるが、それは後続の _analyze_and_report で処理する。
+
+        # 1. equity を float リストに変換
+        equity_values_float = [
+            float(e) if e is not None and e.is_finite() else np.nan
+            for e in equity_values_chunk
+        ]
 
         results_chunk_df = pl.DataFrame(
             {
                 "timestamp": timestamps_chunk,
-                "equity": pl.Series("equity", equity_values_chunk, dtype=pl.Object),
+                "equity": pl.Series("equity", equity_values_float, dtype=pl.Float64),
             }
         )
 
-        # trade_log_chunk_df も同様に、pl.Series を使って構築する
-        trade_log_schema = {
-            "timestamp": pl.Datetime,
-            "pnl": pl.Object,
-            "capital_after_trade": pl.Object,
-            "m2_calibrated_proba": pl.Float64,
-            "payoff_ratio": pl.Object,
-            "kelly_f_star": pl.Object,
-            "f_star": pl.Object,
-            "base_bet_fraction": pl.Object,
-            "capped_bet_fraction": pl.Object,
-            "effective_bet_fraction": pl.Object,
-            "label": pl.Int64,
-        }
-
-        if trade_log_chunk:
-            # 1. リスト[dict] を dict[リスト] に変換 (unzip)
-            try:
-                trade_log_data = {
-                    key: [d[key] for d in trade_log_chunk] for key in trade_log_chunk[0]
-                }
-            except KeyError as e:
-                logging.error(f"Inconsistent keys in trade_log_chunk: {e}")
-                # 空のDFを返す
-                trade_log_chunk_df = pl.DataFrame(schema=trade_log_schema)
-                return results_chunk_df, trade_log_chunk_df
-
-            # 2. pl.Series を使って DataFrame を構築
-            trade_log_chunk_df = pl.DataFrame(
+        # 2. trade_log_chunk の Decimal も float に変換
+        trade_log_chunk_float = []
+        for row in trade_log_chunk:
+            trade_log_chunk_float.append(
                 {
-                    "timestamp": trade_log_data["timestamp"],
-                    "pnl": pl.Series("pnl", trade_log_data["pnl"], dtype=pl.Object),
-                    "capital_after_trade": pl.Series(
-                        "capital_after_trade",
-                        trade_log_data["capital_after_trade"],
-                        dtype=pl.Object,
-                    ),
-                    "m2_calibrated_proba": trade_log_data["m2_calibrated_proba"],
-                    "payoff_ratio": pl.Series(
-                        "payoff_ratio",
-                        trade_log_data["payoff_ratio"],
-                        dtype=pl.Object,
-                    ),
-                    "kelly_f_star": pl.Series(
-                        "kelly_f_star",
-                        trade_log_data["kelly_f_star"],
-                        dtype=pl.Object,
-                    ),
-                    "f_star": pl.Series(
-                        "f_star", trade_log_data["f_star"], dtype=pl.Object
-                    ),
-                    "base_bet_fraction": pl.Series(
-                        "base_bet_fraction",
-                        trade_log_data["base_bet_fraction"],
-                        dtype=pl.Object,
-                    ),
-                    "capped_bet_fraction": pl.Series(
-                        "capped_bet_fraction",
-                        trade_log_data["capped_bet_fraction"],
-                        dtype=pl.Object,
-                    ),
-                    "effective_bet_fraction": pl.Series(
-                        "effective_bet_fraction",
-                        trade_log_data["effective_bet_fraction"],
-                        dtype=pl.Object,
-                    ),
-                    "label": trade_log_data["label"],
+                    "timestamp": row["timestamp"],
+                    "pnl": float(row["pnl"]) if row["pnl"].is_finite() else np.nan,
+                    "capital_after_trade": float(row["capital_after_trade"])
+                    if row["capital_after_trade"].is_finite()
+                    else np.nan,
+                    "m2_calibrated_proba": row["m2_calibrated_proba"],  # float
+                    "payoff_ratio": float(row["payoff_ratio"])
+                    if row["payoff_ratio"].is_finite()
+                    else np.nan,
+                    "kelly_f_star": float(row["kelly_f_star"])
+                    if row["kelly_f_star"].is_finite()
+                    else np.nan,
+                    "f_star": float(row["f_star"])
+                    if row["f_star"].is_finite()
+                    else np.nan,
+                    "base_bet_fraction": float(row["base_bet_fraction"])
+                    if row["base_bet_fraction"].is_finite()
+                    else np.nan,
+                    "capped_bet_fraction": float(row["capped_bet_fraction"])
+                    if row["capped_bet_fraction"].is_finite()
+                    else np.nan,
+                    "effective_bet_fraction": float(row["effective_bet_fraction"])
+                    if row["effective_bet_fraction"].is_finite()
+                    else np.nan,
+                    "label": row["label"],  # int
                 }
             )
-        else:
-            # 3. トレードがない場合は空のスキーマで作成
-            trade_log_chunk_df = pl.DataFrame(schema=trade_log_schema)
+
+        # 3. DataFrame 作成 (dtype=pl.Object は不要になった)
+        trade_log_schema = {
+            "timestamp": pl.Datetime,
+            "pnl": pl.Float64,
+            "capital_after_trade": pl.Float64,
+            "m2_calibrated_proba": pl.Float64,
+            "payoff_ratio": pl.Float64,
+            "kelly_f_star": pl.Float64,
+            "f_star": pl.Float64,
+            "base_bet_fraction": pl.Float64,
+            "capped_bet_fraction": pl.Float64,
+            "effective_bet_fraction": pl.Float64,
+            "label": pl.Int64,
+        }
+        trade_log_chunk_df = pl.DataFrame(
+            trade_log_chunk_float, schema=trade_log_schema
+        )
         # ★★★ 修正ここまで ★★★
 
         return results_chunk_df, trade_log_chunk_df
 
-    # /workspace/models/backtest_simulator.py (修正版: _analyze_and_report の print 文)
-    # (小数点以下3桁表示に変更)
-
+    # /workspace/models/backtest_simulator.py (修正版: _analyze_and_report)
     def _analyze_and_report(self, results_df: pl.DataFrame, trade_log: pl.DataFrame):
         logging.info("Analyzing results and generating report...")
 
-        # --- ★ 修正: Decimal定数を定義 ---
+        # --- ★ 修正: Decimal定数を定義 (レポート表示用) ---
         DECIMAL_ONE = Decimal("1.0")
         DECIMAL_ZERO = Decimal("0.0")
+        # ★ 修正: initial_capital は config から float で取得
+        initial_capital_float = self.config.initial_capital
 
         if results_df.is_empty():
             logging.error("No simulation results to analyze.")
-            # --- ★ 修正: Decimal で初期化 ---
-            final_capital = Decimal(str(self.config.initial_capital))
-            initial_capital = Decimal(str(self.config.initial_capital))
-            total_return = DECIMAL_ZERO
+            final_capital_float = initial_capital_float
+            total_return_float = 0.0
             sharpe_ratio = 0.0
             sortino_ratio = 0.0
             max_drawdown = 0.0
             daily_returns = pl.Series(dtype=pl.Float64)
             drawdown = pl.Series(dtype=pl.Float64)
         else:
-            # --- ★ 修正: initial_capital も Decimal で定義 ---
-            initial_capital = Decimal(str(self.config.initial_capital))
-            # --- ★ 修正: final_capital は results_df から Decimal として取得 ---
-            final_capital = (
+            # --- ★ 修正: final_capital は results_df (Float64) から取得 ---
+            final_capital_float = (
                 results_df["equity"][-1]
-                if not results_df.is_empty()
-                else initial_capital
+                if not results_df.is_empty() and results_df["equity"][-1] is not None
+                else initial_capital_float
             )
-            # ★ 修正: Inf/NaN/None チェック
-            if final_capital is None or not final_capital.is_finite():
-                final_capital = (
-                    DECIMAL_ZERO  # レポート用に 0 扱い (または 'NaN' 文字列)
-                )
-
-            total_return = (
-                (final_capital / initial_capital - DECIMAL_ONE)
-                if initial_capital > DECIMAL_ZERO
-                else DECIMAL_ZERO
+            total_return_float = (
+                (final_capital_float / initial_capital_float - 1.0)
+                if initial_capital_float > 0
+                else 0.0
             )
 
-            # --- ★ 修正: daily_returns を Decimal で手動計算 ---
+            # --- ★ 修正: daily_returns を Float64 で計算 ---
             daily_equity_series = (
                 results_df.group_by(pl.col("timestamp").dt.date().alias("date"))
-                .agg(pl.first("equity"))  # 'equity' は Decimal (pl.Object)
+                .agg(pl.first("equity"))  # 'equity' は Float64
                 .sort("date")["equity"]
             )
-            daily_equity_list = daily_equity_series.to_list()
-            daily_returns_float = []  # 統計計算用に float に変換
-            if len(daily_equity_list) > 1:
-                for i in range(1, len(daily_equity_list)):
-                    prev = daily_equity_list[i - 1]
-                    curr = daily_equity_list[i]
-                    # ★ 修正: prev/curr が Inf/NaN/None でないかチェック
-                    if (
-                        prev is not None
-                        and curr is not None
-                        and prev.is_finite()
-                        and curr.is_finite()
-                        and prev > DECIMAL_ZERO
-                    ):
-                        daily_ret_decimal = (curr / prev) - DECIMAL_ONE
-                        daily_returns_float.append(
-                            float(daily_ret_decimal)
-                            if daily_ret_decimal.is_finite()
-                            else np.nan
-                        )
-                    elif prev is not None and not prev.is_finite():
-                        daily_returns_float.append(
-                            np.nan
-                        )  # 以前がInfならリターンは計算不能
-                    else:
-                        daily_returns_float.append(0.0)  # 0からのスタートなど
-            daily_returns = pl.Series(daily_returns_float, dtype=pl.Float64)
+
+            # pct_change() は自動的に NaN を処理する
+            daily_returns = daily_equity_series.pct_change().fill_null(0.0)
             # --- ★ 修正ここまで ---
 
             num_trading_days = len(daily_returns)
             if num_trading_days > 1:
-                # --- ★ 修正: drop_nans() を追加 (Inf/NaN対策) ---
+                # --- ★ 修正: drop_nans() で Inf/NaN を無視 ---
                 std_daily_return = (
                     daily_returns.drop_nans().std()
                     if not daily_returns.is_empty()
@@ -740,7 +659,7 @@ class BacktestSimulator:
                         else 0.0
                     )
                     negative_returns = daily_returns.filter(daily_returns < 0)
-                    # --- ★ 修正: drop_nans() を追加 (Inf/NaN対策) ---
+                    # --- ★ 修正: drop_nans() で Inf/NaN を無視 ---
                     downside_std = (
                         negative_returns.drop_nans().std()
                         if not negative_returns.is_empty()
@@ -761,71 +680,29 @@ class BacktestSimulator:
                 sharpe_ratio = 0.0
                 sortino_ratio = 0.0
 
-            # --- ★ 修正: drawdown を Decimal で手動計算 ---
-            equity_list = results_df["equity"].to_list()  # List of Decimal
-            rolling_max_list = []
-            current_max = Decimal("-Inf")  # Decimal で初期化
-            for e in equity_list:
-                # ★ Inf/NaN/None 対策
-                if e is None:
-                    e = Decimal("-Inf")
-                elif not e.is_finite():
-                    if e.is_nan():
-                        e = Decimal("-Inf")
+            # --- ★ 修正: drawdown を Float64 で計算 ---
+            equity_series = results_df["equity"]  # Float64
+            rolling_max = equity_series.cum_max(reverse=False)
 
-                if e > current_max:
-                    current_max = e
-                rolling_max_list.append(current_max)
+            # (equity - rolling_max) / rolling_max
+            drawdown = (equity_series / rolling_max - 1.0).fill_null(0.0)
 
-            drawdown_list_float = []  # 統計/プロット用に float に変換
-            for i in range(len(equity_list)):
-                r_max = rolling_max_list[i]
-                e_curr = equity_list[i]
-
-                if e_curr is None or not e_curr.is_finite():
-                    e_curr = Decimal("-Inf")  # 計算上、現在の資本がNaNなら-Inf扱い
-
-                if r_max > DECIMAL_ZERO and r_max.is_finite():
-                    dd_decimal = (e_curr - r_max) / r_max
-                    drawdown_list_float.append(
-                        float(dd_decimal) if dd_decimal.is_finite() else np.nan
-                    )
-                elif r_max is not None and not r_max.is_finite():
-                    # ピークが Inf の場合
-                    drawdown_list_float.append(
-                        float(e_curr - r_max)
-                    )  # Inf - Inf = NaN, -Inf - Inf = -Inf
-                else:
-                    drawdown_list_float.append(0.0)
-
-            drawdown = pl.Series(drawdown_list_float, dtype=pl.Float64)
-            # --- ★ 修正: drop_nans() を追加 (Inf/NaN対策) ---
             max_drawdown = (
                 drawdown.drop_nans().min() if not drawdown.is_empty() else 0.0
             )
-            if max_drawdown is None or np.isnan(max_drawdown) or np.isinf(max_drawdown):
-                max_drawdown = -1.0  # -Inf になった場合は -100% とする
             # --- ★ 修正ここまで ---
 
         total_trades = len(trade_log)
         if total_trades > 0:
-            # --- ★ 修正: trade_log の pnl も Decimal (pl.Object) のまま ---
-            # ★★★ 修正: .map_elements() の代わりに .to_list() を使用 ★★★
-            pnl_list_decimal = trade_log["pnl"].to_list()
-            pnl_list_float = [
-                float(d) if d is not None and d.is_finite() else np.nan
-                for d in pnl_list_decimal
-            ]
-            pnl_series_float = pl.Series("pnl_float", pnl_list_float, dtype=pl.Float64)
-            # ★★★ 修正ここまで ★★★
-
+            # --- ★ 修正: trade_log の pnl (Float64) を使用 ---
+            pnl_series_float = trade_log["pnl"]
             winning_pnl_float = pnl_series_float.filter(trade_log["label"] == 1)
             losing_pnl_float = pnl_series_float.filter(trade_log["label"] == -1)
 
             win_rate = (
                 len(winning_pnl_float) / total_trades if total_trades > 0 else 0.0
             )
-            # --- ★ 修正: drop_nans() を追加 (Inf/NaN対策) ---
+            # --- ★ 修正: drop_nans() で Inf/NaN を無視 ---
             avg_profit = (
                 winning_pnl_float.drop_nans().mean()
                 if not winning_pnl_float.is_empty()
@@ -847,18 +724,9 @@ class BacktestSimulator:
                 else 0.0
             )
 
-            # --- ★ 修正: bet_fraction も Decimal (pl.Object) のまま ---
-            # ★★★ 修正: .map_elements() の代わりに .to_list() を使用 ★★★
-            bet_list_decimal = trade_log["effective_bet_fraction"].to_list()
-            bet_list_float = [
-                float(d) if d is not None and d.is_finite() else np.nan
-                for d in bet_list_decimal
-            ]
-            bet_frac_float = pl.Series(
-                "bet_frac_float", bet_list_float, dtype=pl.Float64
-            )
-            # ★★★ 修正ここまで ★★★
-            # --- ★ 修正: drop_nans() を追加 (Inf/NaN対策) ---
+            # --- ★ 修正: bet_fraction (Float64) を使用 ---
+            bet_frac_float = trade_log["effective_bet_fraction"]
+            # --- ★ 修正: drop_nans() で Inf/NaN を無視 ---
             avg_bet_fraction = (
                 bet_frac_float.drop_nans().mean()
                 if not bet_frac_float.is_empty()
@@ -881,10 +749,14 @@ class BacktestSimulator:
             f"f* Thresh: {self.config.f_star_threshold}, "
             f"M2 Thresh: {self.config.m2_proba_threshold}"
             f")",
-            # ★ 修正: Decimal のまま格納
-            "initial_capital": initial_capital,
-            "final_capital": final_capital,  # (★これは巨大な Decimal か 0 になる)
-            "total_return_pct": total_return * Decimal("100.0"),  # (★これも巨大か 0)
+            # ★ 修正: レポート用に Decimal に変換
+            "initial_capital": Decimal(str(initial_capital_float)),
+            "final_capital": Decimal(str(final_capital_float))
+            if np.isfinite(final_capital_float)
+            else "Inf/NaN",
+            "total_return_pct": Decimal(str(total_return_float)) * Decimal("100.0")
+            if np.isfinite(total_return_float)
+            else "Inf/NaN",
             "sharpe_ratio_annual": sharpe_ratio,  # (float)
             "sortino_ratio_annual": sortino_ratio,  # (float)
             "max_drawdown_pct": max_drawdown * 100,  # (float)
@@ -908,40 +780,32 @@ class BacktestSimulator:
         print("    Backtest Performance Report")
         print("=" * 50)
         print(f" Strategy:             {report_data['strategy']}")
-        # --- ★★★ 修正: 科学的表記 (E) を 固定小数点 (f) に変更 ★★★
-        print(f" Initial Capital:      {report_data['initial_capital']:,.2f}")
-        # ★ 修正: Inf/NaN でないかチェック
-        if (
-            isinstance(report_data["final_capital"], Decimal)
-            and report_data["final_capital"].is_finite()
-        ):
-            # ★★★ 修正: :.2E -> :.2f ★★★
-            print(f" Final Capital:        {report_data['final_capital']:,.2f}")
+        # --- ★ 修正: 科学的表記 (E) を使用 (Decimal または str) ---
+        if isinstance(report_data["initial_capital"], Decimal):
+            print(f" Initial Capital:      {report_data['initial_capital']:,.2f}")
         else:
-            print(
-                f" Final Capital:        {report_data['final_capital']}"
-            )  # 巨大なDecimalは '1.23E+800' のように表示される
+            print(f" Initial Capital:      {report_data['initial_capital']}")
 
-        if (
-            isinstance(report_data["total_return_pct"], Decimal)
-            and report_data["total_return_pct"].is_finite()
-        ):
-            # ★★★ 修正: :.2E -> :.2f ★★★
-            print(f" Total Return:         {report_data['total_return_pct']:,.2f}%")
+        if isinstance(report_data["final_capital"], Decimal):
+            print(f" Final Capital:        {report_data['final_capital']:,.2E}")
+        else:
+            print(f" Final Capital:        {report_data['final_capital']}")
+
+        if isinstance(report_data["total_return_pct"], Decimal):
+            print(f" Total Return:         {report_data['total_return_pct']:,.2E}%")
         else:
             print(f" Total Return:         {report_data['total_return_pct']}%")
-        # --- ★★★ 修正ここまで ★★★
+        # --- ★ 修正ここまで ---
         print(f" Sharpe Ratio (Ann.):  {report_data['sharpe_ratio_annual']:.2f}")
         print(f" Sortino Ratio (Ann.): {report_data['sortino_ratio_annual']:.2f}")
         print(f" Max Drawdown:         {report_data['max_drawdown_pct']:.2f}%")
         print("-" * 50)
         print(f" Total Trades:         {report_data['total_trades']}")
         print(f" Win Rate:             {report_data['win_rate_pct']:.2f}%")
-        # --- ★★★ 修正: 小数点以下を3桁に変更 ★★★
-        # (float の Inf/NaN も考慮 - これらは 'inf'/'nan' と表示される)
-        print(f" Average Profit:       {report_data['average_profit']:,.3f}")
-        print(f" Average Loss:         {report_data['average_loss']:,.3f}")
-        # --- ★★★ 修正ここまで ★★★
+        # --- ★ 修正: 科学的表記 (E) を使用 ---
+        print(f" Average Profit:       {report_data['average_profit']:,.2E}")
+        print(f" Average Loss:         {report_data['average_loss']:,.2E}")
+        # --- ★ 修正ここまで ---
         print(f" Profit Factor:        {report_data['profit_factor']:.2f}")
         print(
             f" Avg. Bet Fraction:    {report_data['average_effective_bet_fraction_pct']:.2f}%"
@@ -957,7 +821,7 @@ class BacktestSimulator:
         with open(FINAL_REPORT_PATH, "w") as f:
             json.dump(
                 report_data, f, indent=4, default=str
-            )  # default=str で Decimal を文字列に
+            )  # default=str で Decimal/Inf/NaN を文字列に
         logging.info(f"Performance report saved to {FINAL_REPORT_PATH}")
 
         logging.info("Generating equity curve and drawdown chart...")
@@ -974,14 +838,11 @@ class BacktestSimulator:
                 gridspec_kw={"height_ratios": [3, 1]},
             )
             timestamps_list = results_df["timestamp"].to_list()
-            # --- ★ 修正: equity を float リストに (★ここで Inf が発生する★) ---
-            equity_list_float = [
-                float(e) if e is not None and e.is_finite() else np.nan
-                for e in results_df["equity"].to_list()
-            ]
+            # --- ★ 修正: equity (Float64) を使用 ---
+            equity_list_float = results_df["equity"].to_list()
             # --- ★ 修正ここまで ---
             drawdown_list = (
-                drawdown.to_list()  # これは既に float のリスト (nan を含む可能性がある)
+                drawdown.to_list()  # これは既に float のリスト
                 if not drawdown.is_empty()
                 else [0] * len(timestamps_list)
             )
@@ -998,25 +859,7 @@ class BacktestSimulator:
             )
             ax1.set_ylabel("Equity")
             ax1.grid(True)
-
-            # ★ 修正: 資本が巨大すぎる場合、matplotlib が 'plain' で表示しきれないため yscale を 'log' に変更
-            try:
-                finite_equity = [
-                    e for e in equity_list_float if np.isfinite(e) and e > 0
-                ]
-                if not finite_equity:
-                    ax1.ticklabel_format(style="plain", axis="y")  # すべて 0 か NaN
-                elif any(np.isinf(equity_list_float)) or (
-                    max(finite_equity, default=1)
-                    / max(min(finite_equity, default=1), 1)
-                    > 1000
-                ):
-                    ax1.set_yscale("log")
-                    # ax1.ticklabel_format(style="sci", axis="y", scilimits=(0,0)) # logscale では不要な場合が多い
-                else:
-                    ax1.ticklabel_format(style="plain", axis="y")
-            except Exception:
-                ax1.ticklabel_format(style="plain", axis="y")  # エラー時はデフォルト
+            ax1.ticklabel_format(style="plain", axis="y")
 
             ax2.fill_between(timestamps_list, drawdown_list, 0, color="red", alpha=0.3)
             ax2.set_title("Drawdown", fontsize=16)
@@ -1029,104 +872,6 @@ class BacktestSimulator:
             plt.close(fig)
         except Exception as e:
             logging.error(f"Failed to generate equity curve chart: {e}", exc_info=True)
-
-        # ★★★ 詳細な取引ログをCSVファイルとして出力 (再々々修正版 - フォーマット指定修正) ★★★
-        if not trade_log.is_empty():
-            trade_log_output_path = FINAL_REPORT_PATH.parent / "detailed_trade_log.csv"
-            try:
-                # 1. 元のDataFrameをコピー
-                trade_log_for_csv = trade_log.clone()
-
-                # 2. Object型の列を特定
-                object_cols = [
-                    col
-                    for col in trade_log_for_csv.columns
-                    if trade_log_for_csv[col].dtype == pl.Object
-                ]
-                # 3. Float型の列を特定 (Object型除く)
-                float_cols = [
-                    col
-                    for col in trade_log_for_csv.columns
-                    if trade_log_for_csv[col].dtype == pl.Float64
-                ]
-
-                # 4. Object型 -> Float64 変換 (Python経由)
-                converted_series_list = []
-                for col_name in object_cols:
-                    decimal_list = trade_log_for_csv[col_name].to_list()
-                    float_list = [
-                        float(d) if d is not None and d.is_finite() else None
-                        for d in decimal_list
-                    ]
-                    converted_series_list.append(
-                        pl.Series(col_name, float_list, dtype=pl.Float64)
-                    )
-
-                # 5. 変換した Series で DataFrame を更新 (もし Object 列があれば)
-                if converted_series_list:
-                    trade_log_for_csv = trade_log_for_csv.with_columns(
-                        converted_series_list
-                    )
-
-                # 6. フォーマット指定用の式リストを作成 (変換後の DataFrame に対して)
-                format_expressions = []
-
-                # --- Timestamp フォーマット ---
-                format_expressions.append(
-                    pl.col("timestamp")
-                    .dt.strftime("%Y-%m-%d %H:%M:%S")
-                    .alias("timestamp")
-                )
-
-                # --- pnl, capital_after_trade (元Object) -> 整数 ---
-                if "pnl" in trade_log_for_csv.columns:
-                    format_expressions.append(pl.col("pnl").round(0).alias("pnl"))
-                if "capital_after_trade" in trade_log_for_csv.columns:
-                    format_expressions.append(
-                        pl.col("capital_after_trade")
-                        .round(0)
-                        .alias("capital_after_trade")
-                    )
-
-                # --- その他の元Object列 -> 小数点以下2桁 ---
-                other_object_cols = [
-                    c for c in object_cols if c not in ["pnl", "capital_after_trade"]
-                ]
-                for col_name in other_object_cols:
-                    if col_name in trade_log_for_csv.columns:
-                        format_expressions.append(
-                            pl.col(col_name).round(2).alias(col_name)
-                        )
-
-                # --- 元々Float型だった列 -> 小数点以下2桁 ---
-                for col_name in float_cols:
-                    format_expressions.append(pl.col(col_name).round(2).alias(col_name))
-
-                # 7. フォーマットを適用
-                if format_expressions:
-                    trade_log_formatted = trade_log_for_csv.with_columns(
-                        format_expressions
-                    )
-                else:
-                    trade_log_formatted = (
-                        trade_log_for_csv  # フォーマット対象がなければそのまま
-                    )
-
-                # 8. Polars の write_csv で出力 (float_precisionは不要)
-                trade_log_formatted.write_csv(
-                    trade_log_output_path,
-                    # float_precision=3 # 個別に丸めたので不要
-                    null_value="NaN",  # None を NaN 文字列として出力
-                )
-                logging.info(f"Detailed trade log saved to {trade_log_output_path}")
-
-            except Exception as e:
-                logging.error(f"Failed to save detailed trade log: {e}", exc_info=True)
-        else:
-            logging.info("No trades were executed, skipping detailed trade log output.")
-        # ★★★ 修正ここまで ★★★
-
-        # logging.info("### Backtest Simulator: FINISHED ###") # FINISHEDログは run メソッドの最後にあるべき
 
 
 if __name__ == "__main__":
@@ -1183,14 +928,6 @@ if __name__ == "__main__":
         action="store_true",  # この引数があれば True になる
         help="Run in Out-of-Fold (OOF) mode using pre-calculated predictions (S7_M2_OOF_PREDICTIONS).",
     )
-    # ★★★ ここに 破産閾値 の引数を追加 ★★★
-    parser.add_argument(
-        "--min-capital",
-        type=float,
-        default=default_config.min_capital_threshold,
-        dest="min_capital",
-        help=f"Minimum capital threshold to stop simulation (bankruptcy). Default: {default_config.min_capital_threshold}",
-    )
     # --- ★★★ 追加ここまで ★★★ ---
 
     parser.add_argument(
@@ -1214,7 +951,6 @@ if __name__ == "__main__":
         m2_proba_threshold=args.m2_th,
         test_limit_partitions=args.test_limit_partitions,
         oof_mode=args.oof,
-        min_capital_threshold=args.min_capital,  # ★ 追加
     )
 
     # --- (以降の検証ロジック、シミュレータ実行は同じ) ---

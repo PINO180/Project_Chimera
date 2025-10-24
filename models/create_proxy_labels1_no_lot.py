@@ -675,9 +675,6 @@ class ProxyLabelingEngine:
             ).filter(pl.col(atr_col_name).is_not_null())
             if bets_with_price_df.is_empty():
                 continue
-
-            # ★ 修正（変更）: select リストに atr_col_name を 'atr_value' として追加
-            # これにより、S5の特徴量に加えて、ラベル付けに使用したATRの生データが保持されます。
             bets_df = bets_with_price_df.select(
                 pl.col("timestamp").alias("t0"),
                 (
@@ -687,10 +684,8 @@ class ProxyLabelingEngine:
                     pl.col("close") - pl.col(atr_col_name) * cfg.stop_loss_multiplier
                 ).alias("sl_barrier"),
                 t1_max_expr.alias("t1_max"),
-                pl.col(atr_col_name).alias("atr_value"),  # ★ 挿入: ATRの生データを保持
                 pl.col(original_cols).exclude("timestamp"),
             )
-
             hits_df = (
                 price_window_df.join_asof(
                     bets_df.select(["t0", "pt_barrier", "sl_barrier", "t1_max"]),
@@ -713,8 +708,6 @@ class ProxyLabelingEngine:
                 )
             )
             final_group_df = bets_df.join(hits_df, on="t0", how="left")
-
-            # ★ 修正（変更）: with_columns に sl_multiplier と direction を追加
             labeled_group = final_group_df.with_columns(
                 t1=pl.when(
                     (pl.col("first_pt_time").is_not_null())
@@ -742,16 +735,7 @@ class ProxyLabelingEngine:
                     cfg.profit_take_multiplier / cfg.stop_loss_multiplier,
                     dtype=pl.Float32,
                 ),
-                # ★ 挿入: SL乗数と方向性を保存
-                sl_multiplier=pl.lit(cfg.stop_loss_multiplier, dtype=pl.Float32),
-                direction=pl.lit(
-                    1, dtype=pl.Int8
-                ),  # <--- ★★★ ここを修正 ( : -> , # ) ★★★ 1 = Buy (このスクリプトの暗黙の前提)
             ).rename({"t0": "timestamp"})
-
-            # ★ 修正（変更なし）:
-            # 以下の drop リストに 'atr_value', 'sl_multiplier', 'direction' が
-            # 含まれていないため、これらの新しい列はS6に正しく保存されます。
             labeled_chunks.append(
                 labeled_group.drop(
                     [
