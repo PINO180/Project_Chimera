@@ -100,6 +100,7 @@ class FinalTrainingConfig:
             "verbose": -1,
             "colsample_bytree": 0.8,
             "subsample": 0.8,
+            # 'scale_pos_weight' は M2 用に計算して追加する
         }
     )
     test: bool = False
@@ -154,7 +155,6 @@ class FinalAssembler:
         logging.info(f"Using scale_pos_weight for M1: {self.scale_pos_weight_m1:.4f}")
 
         # --- M2 用の scale_pos_weight を計算 (S7_META_LABELED_OOF_PARTITIONED から) ---
-        # ★★★ 修正適用済み: 空フレーム防御ロジック搭載 ★★★
         self.scale_pos_weight_m2 = self._calculate_scale_pos_weight_m2()
         self.config.lgbm_params_m2["scale_pos_weight"] = self.scale_pos_weight_m2
         logging.info(f"Using scale_pos_weight for M2: {self.scale_pos_weight_m2:.4f}")
@@ -197,14 +197,14 @@ class FinalAssembler:
             )
         return dates
 
-    # --- M1 用の scale_pos_weight 計算関数 ---
+    # --- ★★★ M1 用の scale_pos_weight 計算関数 (Script A から移植) ★★★ ---
     def _calculate_scale_pos_weight_m1(self) -> float:
         logging.info(
             "Calculating scale_pos_weight for M1 (label == 1 vs label != 1) from S6_WEIGHTED_DATASET..."
         )
         counts = Counter({0: 0, 1: 0})
         total_samples = 0
-        partitions_to_scan = self.partitions_m1_final
+        partitions_to_scan = self.partitions_m1_final  # M1最終訓練用パーティション
         if not partitions_to_scan:
             logging.warning("No M1 partitions (S6) found. Returning 1.0.")
             return 1.0
@@ -213,11 +213,10 @@ class FinalAssembler:
             partitions_to_scan, desc="Scanning labels for scale_pos_weight (M1)"
         ):
             p_path_glob = str(
-                self.config.weighted_dataset_path
+                self.config.weighted_dataset_path  # M1データパス
                 / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
             )
             try:
-                # 注: weighted_dataset_path は uniqueness 列を持つため、空フレームになる可能性は低い
                 df_labels = pl.read_parquet(p_path_glob, columns=["label"])
                 if df_labels.is_empty():
                     continue
@@ -228,17 +227,18 @@ class FinalAssembler:
                     .alias("binary_label")
                 )
                 counts_in_partition = binary_labels["binary_label"].value_counts()
-
-                pos_count_df = counts_in_partition.filter(
-                    pl.col("binary_label") == 1
-                ).select(pl.col("count"))
-                pos_count = pos_count_df.item() if not pos_count_df.is_empty() else 0
-
-                neg_count_df = counts_in_partition.filter(
-                    pl.col("binary_label") == 0
-                ).select(pl.col("count"))
-                neg_count = neg_count_df.item() if not neg_count_df.is_empty() else 0
-
+                pos_count = (
+                    counts_in_partition.filter(pl.col("binary_label") == 1)
+                    .select(pl.col("count"))
+                    .item()
+                    or 0
+                )
+                neg_count = (
+                    counts_in_partition.filter(pl.col("binary_label") == 0)
+                    .select(pl.col("count"))
+                    .item()
+                    or 0
+                )
                 counts[1] += pos_count
                 counts[0] += neg_count
                 total_samples += pos_count + neg_count
@@ -260,7 +260,7 @@ class FinalAssembler:
         )
         return scale_pos_weight
 
-    # --- M2 用の scale_pos_weight 計算関数 (空フレーム防御適用) ---
+    # --- ★★★ M2 用の scale_pos_weight 計算関数 (維持) ★★★ ---
     def _calculate_scale_pos_weight_m2(self) -> float:
         logging.info(
             "Calculating scale_pos_weight for M2 (meta_label == 1 vs meta_label == 0)..."
@@ -286,23 +286,19 @@ class FinalAssembler:
                 df_labels = df_labels.filter(pl.col("meta_label").is_not_null())
                 if df_labels.is_empty():
                     continue
-
                 counts_in_partition = df_labels["meta_label"].value_counts()
-
-                # ★★★ 修正適用済み: Polars の防御的プログラミング (item() 呼び出しの防御) ★★★
-                # Positive Count
-                pos_count_df = counts_in_partition.filter(
-                    pl.col("meta_label") == 1
-                ).select(pl.col("count"))
-                pos_count = pos_count_df.item() if not pos_count_df.is_empty() else 0
-
-                # Negative Count
-                neg_count_df = counts_in_partition.filter(
-                    pl.col("meta_label") == 0
-                ).select(pl.col("count"))
-                neg_count = neg_count_df.item() if not neg_count_df.is_empty() else 0
-                # ★★★ 修正ここまで ★★★
-
+                pos_count = (
+                    counts_in_partition.filter(pl.col("meta_label") == 1)
+                    .select(pl.col("count"))
+                    .item()
+                    or 0
+                )
+                neg_count = (
+                    counts_in_partition.filter(pl.col("meta_label") == 0)
+                    .select(pl.col("count"))
+                    .item()
+                    or 0
+                )
                 counts[1] += pos_count
                 counts[0] += neg_count
                 total_samples += pos_count + neg_count
@@ -345,7 +341,6 @@ class FinalAssembler:
 
         self._train_and_calibrate_final_models()
         self._aggregate_m2_oof_predictions()
-        # ★★★ 修正適用済み: AUCロバスト化ロジック搭載 ★★★
         self._generate_performance_report()
 
         if S7_M2_OOF_PREDICTIONS_TMP.exists():
@@ -361,7 +356,9 @@ class FinalAssembler:
             + "=" * 60
         )
 
-    # --- M2 CV の訓練 (lgb.train/Booster API) ---
+    # ---
+    # --- ★★★ 修正 (1): M2 CV を lgb.train (Booster API) に修正 ★★★
+    # ---
     def _train_m2_cv_and_write_to_disk(self):
         logging.info(
             f"--- Starting Disk-Based Sequential Partition Training for M2 (Meta) ---"
@@ -377,7 +374,9 @@ class FinalAssembler:
         for i, (train_dates, val_dates) in enumerate(kfold.split(partitions_to_use)):
             logging.info(f"  [M2 (Meta)] Fold {i + 1}/{self.config.n_splits}...")
 
+            # --- ★ 修正: Booster API に変更 ---
             model: lgb.Booster = None
+            # --- ★ 修正ここまで ---
 
             if self.config.test:
                 logging.warning(
@@ -386,6 +385,7 @@ class FinalAssembler:
                 train_dates = train_dates[:5]
                 val_dates = val_dates[:5]
 
+            # --- ★★★ 新規: 1パーティションあたりの木の数を計算 ★★★
             train_params = self.config.lgbm_params_m2.copy()
             n_estimators_total = train_params.pop("n_estimators", 1000)
             n_partitions_train = len(train_dates)
@@ -405,6 +405,7 @@ class FinalAssembler:
                 logging.info(
                     f"    -> M2 CV Fold: Setting num_boost_round = {num_boost_round_per_partition} per partition."
                 )
+            # --- ★★★ 新規ここまで ★★★
 
             if n_partitions_train > 0:
                 for p_date in tqdm(train_dates, desc=f"  Training M2 Fold {i + 1}"):
@@ -436,6 +437,7 @@ class FinalAssembler:
                         df_chunk["uniqueness"].to_numpy(),
                     )
 
+                    # --- ★ 修正: lgb.train を使用 ---
                     try:
                         model = lgb.train(
                             train_params,  # n_estimators を除外した M2 パラメータ
@@ -450,7 +452,9 @@ class FinalAssembler:
                             exc_info=False,
                         )
                         continue
+                    # --- ★ 修正ここまで ---
 
+            # --- ★ 修正: 訓練成功の判定 ---
             if model is None:
                 logging.warning(
                     f"M2 model for Fold {i + 1} was not trained. Skipping prediction."
@@ -480,6 +484,7 @@ class FinalAssembler:
                     )
                     continue
 
+                # --- ★ 修正: Booster API の predict を使用 ---
                 try:
                     X_val = df_chunk.select(features_to_use).fill_null(0).to_numpy()
                     predictions = model.predict(
@@ -491,6 +496,7 @@ class FinalAssembler:
                         exc_info=False,
                     )
                     predictions = np.full(len(df_chunk), np.nan)
+                # --- ★ 修正ここまで ---
 
                 oof_df = pl.DataFrame(
                     {
@@ -550,10 +556,11 @@ class FinalAssembler:
                 "No partitions available for calibration. Skipping calibration."
             )
 
+    # --- ★ 修正: model の型ヒントを Booster に ---
     def _manual_calibrate(
         self,
         model_name: str,
-        model: lgb.Booster,
+        model: lgb.Booster,  # ★ 型ヒント修正
         save_path: Path,
         dates: List[datetime.date],
         is_m2: bool,
@@ -587,14 +594,18 @@ class FinalAssembler:
                 f"--- SKIPPING {model_name} Calibration: Calibrated model already exists. ---"
             )
 
+    # --- ★ 修正: model の型ヒントと predict 方法を修正 ---
     def _gather_predictions_for_calibration(
         self,
         model_name: str,
         dates: List[datetime.date],
-        model: lgb.Booster,
+        model: lgb.Booster,  # ★ 型ヒント修正
         is_m2: bool,
     ) -> Tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         all_preds, all_labels, all_weights = [], [], []
+        # M1 の較正にも M2 データセット (S7_META_LABELED_OOF_PARTITIONED) を使う
+        # M1予測値(m1_pred_proba)とM2予測に必要な特徴量が揃っているため
+        # M1較正には元の 'label' を、M2較正には 'meta_label' を使う
         base_path = self.config.meta_labeled_oof_path
 
         for p_date in tqdm(dates, desc=f"  Gathering {model_name} calib predictions"):
@@ -604,6 +615,7 @@ class FinalAssembler:
             )
             try:
                 df_chunk = pl.read_parquet(p_path_glob)
+                # M1較正用に 'label' が必要
                 if not is_m2 and "label" not in df_chunk.columns:
                     logging.warning(
                         f"Original 'label' column not found in {p_date} for M1 calibration. Skipping chunk."
@@ -612,6 +624,8 @@ class FinalAssembler:
             except Exception:
                 continue
 
+            # M1の較正には全データ (label があるもの) を使う
+            # M2の較正には meta_label が null でないものだけを使う
             if is_m2:
                 df_chunk = df_chunk.filter(pl.col("meta_label").is_not_null())
 
@@ -630,6 +644,7 @@ class FinalAssembler:
 
             X = df_chunk.select(features_to_use).fill_null(0).to_numpy()
 
+            # --- ★ 修正: Booster API の predict を使用 ---
             try:
                 predictions = model.predict(X)
             except Exception as pred_error:
@@ -638,6 +653,7 @@ class FinalAssembler:
                     exc_info=False,
                 )
                 continue
+            # --- ★ 修正ここまで ---
 
             labels = df_chunk[actual_target_col].to_numpy()
             if not is_m2:
@@ -663,6 +679,7 @@ class FinalAssembler:
             )
             return None, None, None
 
+    # --- ★ 修正: model の型ヒントを Booster に ---
     def _ensure_model_trained(
         self,
         model_name: str,
@@ -670,7 +687,7 @@ class FinalAssembler:
         is_m2: bool,
         partitions_to_train: List[datetime.date],
         lgbm_params: Dict[str, Any],
-    ) -> lgb.Booster:
+    ) -> lgb.Booster:  # ★ 型ヒント修正
         if not model_path.exists():
             if not partitions_to_train:
                 raise ValueError(
@@ -692,7 +709,9 @@ class FinalAssembler:
             model = joblib.load(model_path)
         return model
 
-    # --- 最終モデル訓練を lgb.train (Booster API) で実行 ---
+    # ---
+    # --- ★★★ 修正 (2): 最終モデル訓練を lgb.train (Booster API) に修正 ★★★
+    # ---
     def _train_single_model(
         self,
         model_name: str,
@@ -700,12 +719,14 @@ class FinalAssembler:
         is_m2: bool,
         partitions_to_train: List[datetime.date],
         lgbm_params: Dict[str, Any],
-    ) -> lgb.Booster:
+    ) -> lgb.Booster:  # ★ 型ヒント修正
         logging.info(
             f"  - Training {model_name} on {len(partitions_to_train)} partitions..."
         )
 
+        # --- ★ 修正: Booster API に変更 ---
         model: lgb.Booster = None
+        # --- ★ 修正ここまで ---
 
         input_path = (
             self.config.meta_labeled_oof_path
@@ -713,6 +734,7 @@ class FinalAssembler:
             else self.config.weighted_dataset_path
         )
 
+        # --- ★★★ 新規: 1パーティションあたりの木の数を計算 ★★★
         train_params = lgbm_params.copy()
         n_estimators_total = train_params.pop("n_estimators", 1000)
         n_partitions_train = len(partitions_to_train)
@@ -728,6 +750,7 @@ class FinalAssembler:
         logging.info(
             f"    -> {model_name}: Setting num_boost_round = {num_boost_round_per_partition} per partition."
         )
+        # --- ★★★ 新規ここまで ★★★
 
         for p_date in tqdm(partitions_to_train, desc=f"  Training {model_name}"):
             p_path_glob = str(
@@ -760,6 +783,7 @@ class FinalAssembler:
             if not is_m2:
                 y_chunk = np.where(y_chunk == 1, 1, 0)  # M1 ターゲットを 0/1 に
 
+            # --- ★ 修正: lgb.train を使用 ---
             try:
                 model = lgb.train(
                     train_params,  # n_estimators を除外したパラメータ
@@ -774,7 +798,9 @@ class FinalAssembler:
                     exc_info=False,
                 )
                 continue
+            # --- ★ 修正ここまで ---
 
+        # --- ★ 修正: 訓練成功の判定 ---
         if model is None:
             raise RuntimeError(
                 f"Failed to train {model_name} model. No data processed or all fits failed."
@@ -840,7 +866,7 @@ class FinalAssembler:
                 f"Created empty M2 OOF prediction file due to aggregation error: {S7_M2_OOF_PREDICTIONS}"
             )
 
-    # --- パフォーマンスレポート生成 (AUCロバスト化適用) ---
+    # --- (維持) パフォーマンスレポート生成 ---
     def _generate_performance_report(self):
         logging.info(
             "--- Generating Final Performance Report (M1 optional, M2 primary) ---"
@@ -861,32 +887,15 @@ class FinalAssembler:
                     w_m1 = m1_oof_df["uniqueness"].fill_nan(1.0).to_numpy()
                     del m1_oof_df
                     valid_indices_m1 = ~np.isnan(y_pred_m1) & ~np.isnan(w_m1)
-
                     if np.any(valid_indices_m1):
                         y_true_m1 = y_true_m1[valid_indices_m1]
                         y_pred_m1 = y_pred_m1[valid_indices_m1]
                         w_m1 = w_m1[valid_indices_m1]
-
-                        # ★★★ 修正適用済み: AUC要件チェック ★★★
-                        num_unique_classes = len(np.unique(y_true_m1))
-                        if num_unique_classes < 2:
-                            auc_score = float("nan")
-                            logging.warning(
-                                f"  -> M1 AUC SKIPPED: Only {num_unique_classes} class found in y_true. Data too sparse."
-                            )
-                        else:
-                            # NaN/Infが含まれるとroc_auc_scoreがエラーになるため、事前にチェック
-                            if not np.all(np.isfinite(w_m1)):
-                                raise ValueError(
-                                    "M1 sample_weight contains non-finite values during final AUC calculation."
-                                )
-
-                            auc_score = roc_auc_score(
+                        report["m1_performance"] = {
+                            "auc": roc_auc_score(
                                 y_true_m1, y_pred_m1, sample_weight=w_m1
                             )
-                        # ★★★ 修正ここまで ★★★
-
-                        report["m1_performance"] = {"auc": auc_score}
+                        }
                         logging.info("  -> M1 AUC calculated.")
                     else:
                         logging.warning(
@@ -896,9 +905,9 @@ class FinalAssembler:
                     logging.warning("M1 OOF prediction file is empty.")
             except Exception as e:
                 logging.error(
-                    f"Could not process M1 OOF predictions for report: {e}. Outputting NaN."
+                    f"Could not process M1 OOF predictions for report: {e}",
+                    exc_info=False,
                 )
-                report["m1_performance"] = {"auc": float("nan")}
 
         # M2 Performance (Primary)
         if S7_M2_OOF_PREDICTIONS.exists():
@@ -919,27 +928,11 @@ class FinalAssembler:
                         y_true_m2 = y_true_m2[valid_indices_m2]
                         y_pred_m2 = y_pred_m2[valid_indices_m2]
                         w_m2 = w_m2[valid_indices_m2]
-
-                        # ★★★ 修正適用済み: AUC要件チェック ★★★
-                        num_unique_classes = len(np.unique(y_true_m2))
-                        if num_unique_classes < 2:
-                            auc_score = float("nan")
-                            logging.warning(
-                                f"  -> M2 AUC SKIPPED: Only {num_unique_classes} class found in y_true. Data too sparse."
-                            )
-                        else:
-                            # NaN/Infが含まれるとroc_auc_scoreがエラーになるため、事前にチェック
-                            if not np.all(np.isfinite(w_m2)):
-                                raise ValueError(
-                                    "M2 sample_weight contains non-finite values during final AUC calculation."
-                                )
-
-                            auc_score = roc_auc_score(
+                        report["m2_performance"] = {
+                            "auc": roc_auc_score(
                                 y_true_m2, y_pred_m2, sample_weight=w_m2
                             )
-                        # ★★★ 修正ここまで ★★★
-
-                        report["m2_performance"] = {"auc": auc_score}
+                        }
                         logging.info("  -> M2 AUC calculated.")
                     else:
                         logging.warning(
@@ -951,22 +944,16 @@ class FinalAssembler:
                     )
             except Exception as e:
                 logging.error(
-                    f"Could not process aggregated M2 OOF predictions for report: {e}. Outputting NaN."
+                    f"Could not process aggregated M2 OOF predictions for report: {e}",
+                    exc_info=False,
                 )
-                report["m2_performance"] = {"auc": float("nan")}
 
         S7_MODEL_PERFORMANCE_REPORT.parent.mkdir(parents=True, exist_ok=True)
-        # float('nan')をJSONセーフな文字列に変換して保存
-        json_report = json.dumps(report, indent=4)
-        json_report = json_report.replace(
-            "NaN", "null"
-        )  # float('nan')をJSONのnullとして出力
         with open(S7_MODEL_PERFORMANCE_REPORT, "w") as f:
-            f.write(json_report)
-
+            json.dump(report, f, indent=4)
         logging.info(f"Performance report saved to {S7_MODEL_PERFORMANCE_REPORT}")
         print("\nPerformance Report:")
-        print(json_report)
+        print(json.dumps(report, indent=4))
 
 
 if __name__ == "__main__":

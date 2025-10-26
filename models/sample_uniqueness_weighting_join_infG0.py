@@ -1,5 +1,4 @@
 # /workspace/models/sample_uniqueness_weighting_join.py
-# [MN無効化戦略に合わせたクリーン版 - Inf発生時は行を削除する最小限の防御]
 
 import sys
 import polars as pl
@@ -23,6 +22,7 @@ from blueprint import (
 
 # --- 定数 ---
 CONCURRENCY_RESULTS_PATH = S3_CONCURRENCY_RESULTS
+MAX_SAFE_UNIQUENESS = 5.0  # Inf重みの行を置き換える安全な最大値
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -34,6 +34,7 @@ logging.basicConfig(
 def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
     """各パーティションファイルのオフセットと行数を計算する。"""
     logging.info("Step 1: Calculating row counts and offsets for each partition...")
+    # 日次パーティションを探索するようにglobパターンを修正
     partitions = sorted(input_dir.glob("year=*/month=*/day=*/*.parquet"))
     if not partitions:
         raise FileNotFoundError(
@@ -44,7 +45,9 @@ def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
     total_rows = 0
     for path in partitions:
         try:
-            row_count = pq.ParquetFile(path).metadata.num_rows
+            # 内部 ParquetFile オブジェクトを直接操作して行数を取得
+            pf = pq.ParquetFile(path)
+            row_count = pf.metadata.num_rows
 
             # 各ファイルの年/月/日情報を抽出（ログ出力用）
             day_part = path.parent.name
@@ -64,7 +67,7 @@ def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
             raise
 
     logging.info(
-        f"   -> Found {len(partitions)} daily partitions. Total rows: {total_rows}. Info calculated."
+        f"   -> Found {len(partitions)} daily partitions. Total rows: {total_rows}. Info calculated."
     )
     return partition_info
 
@@ -72,23 +75,21 @@ def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
 def main():
     """メインオーケストレーション関数（日次・逐次処理版）"""
     logging.info("### Final Battle Stage 2: Daily Sequential Assembly ###")
-    logging.warning(
-        "NOTE: MN/W1/D1 labels are now excluded. Inf/NaN uniqueness rows will be physically dropped to ensure model stability (minimal risk)."
-    )
+    logging.info(f"Applying MAX_SAFE_UNIQUENESS clamp value: {MAX_SAFE_UNIQUENESS}")
 
     if not CONCURRENCY_RESULTS_PATH.exists():
         logging.error(
-            f"CRITICAL: Concurrency results not found at {CONCURRENCY_RESULTS_PATH}"
+            f"CRITICAL: Concurrency results not found at {CONCURRENCY_RESULTS_PATH}. Please run stage 1 first."
         )
         return
 
     # --- 準備：出力ディレクトリのクリーンアップと作成 ---
     if S6_WEIGHTED_DATASET.exists():
         logging.warning(
-            f"Output directory {S6_WEIGHTED_DATASET} exists. Removing it for a clean run."
+            f"Output directory {S6_WEIGHTED_DATASET} exists. Cleaning it up."
         )
         shutil.rmtree(S6_WEIGHTED_DATASET)
-    S6_WEIGHTED_DATASET.mkdir(parents=True)
+    S6_WEIGHTED_DATASET.mkdir(parents=True, exist_ok=True)
 
     # --- ステージ1: 各パーティションの情報を取得 ---
     partition_info_map = get_partition_info(S6_LABELED_DATASET)
@@ -116,7 +117,6 @@ def main():
             offset = info["offset"]
             row_count = info["rows"]
 
-            # 行数が0のパーティションはスキップ
             if row_count == 0:
                 logging.warning(f"Skipping empty partition: {partition_name}")
                 continue
@@ -138,12 +138,24 @@ def main():
                 .with_row_count(name="row_num", offset=offset)
                 .with_columns((pl.col("row_num") + 1).alias("event_id"))
                 .join(concurrency_slice_lf, on="event_id", how="left")
-                .with_columns((1.0 / pl.col("concurrency")).alias("uniqueness"))
-                # ★★★ 最小限の防御: Inf重みでシステムがクラッシュするのを防ぐ ★★★
-                # MNラベルが無効化されたため、Inf行は微量であり、削除してもAUCは回復する
-                .filter(pl.col("uniqueness").is_finite())
-                .drop_nulls("uniqueness")
-                # ★★★ 修正ここまで ★★★
+                # --- MODIFICATION START: Clamping Inf/NaN to MAX_SAFE_UNIQUENESS (Simple Polars Expression) ---
+                .with_columns(
+                    # 1. concurrency が 0 または Null の場合は、ユニークネスの最大値 MAX_SAFE_UNIQUENESS に設定
+                    # 2. それ以外の場合は 1.0 / concurrency を計算
+                    pl.when(
+                        pl.col("concurrency").is_null() | (pl.col("concurrency") <= 0)
+                    )
+                    .then(pl.lit(MAX_SAFE_UNIQUENESS))
+                    .otherwise(1.0 / pl.col("concurrency"))
+                    .alias("uniqueness")
+                )
+                # 3. 計算後に念のため MAX_SAFE_UNIQUENESS を超えないようにクリップ (Infはここで発生しないはず)
+                .with_columns(
+                    pl.col("uniqueness")
+                    .clip(0.0, MAX_SAFE_UNIQUENESS)
+                    .alias("uniqueness")
+                )
+                # --- MODIFICATION END: Clamping Inf/NaN to MAX_SAFE_UNIQUENESS (Simple Polars Expression) ---
                 .select(pl.all().exclude(["row_num", "concurrency"]))
             )
 

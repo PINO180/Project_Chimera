@@ -30,7 +30,21 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
         df_columns = pl.read_parquet_schema(source_file).keys()
 
         # 2. 特徴量ではない基本カラムやラベルを除外
-        non_feature_cols = {"timestamp", "t1", "label", "year", "month", "day"}
+        non_feature_cols = {
+            "timestamp",
+            "t1",
+            "label",
+            "year",
+            "month",
+            "day",
+            "close",
+            "timeframe",  # 以前手動で削除していたもの
+            "payoff_ratio",  # ケリー計算/PnL計算用
+            "atr_value",  # ラベル付け時の生ATR (特徴量としては冗長/リークの可能性)
+            "sl_multiplier",  # ラベル付け設定パラメータ
+            "pt_multiplier",  # ラベル付け設定パラメータ
+            "direction",  # ラベル付け時の方向性 (現在は固定)
+        }
         feature_cols = [col for col in df_columns if col not in non_feature_cols]
 
         # 3. 辞書順でソートして一貫性を保つ

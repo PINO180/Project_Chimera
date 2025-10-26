@@ -212,7 +212,7 @@ class ProxyLabelingEngine:
             )
 
             logging.info(
-                f"   -> Found {len(partitions_df)} daily partitions based on S5 structure and filter '{cfg.get_filter_description()}'."
+                f"   -> Found {len(partitions_df)} daily partitions to process for the filter '{cfg.get_filter_description()}'."
             )
 
             if partitions_df.is_empty():
@@ -223,35 +223,6 @@ class ProxyLabelingEngine:
                 self._generate_report()
                 return
 
-            # --- MODIFICATION START: Add start date filter ---
-            known_start_date = dt.date(
-                2021, 8, 1
-            )  # Define the known start date of reliable S2 data
-            logging.info(
-                f"Applying start date filter: Processing partitions on or after {known_start_date}..."
-            )
-            partitions_df_filtered = partitions_df.filter(
-                pl.col("date") >= known_start_date
-            )
-            num_original = len(partitions_df)
-            num_filtered = len(
-                partitions_df_filtered
-            )  # Recalculate based on filtered df
-
-            if num_filtered < num_original:
-                logging.info(
-                    f"   -> Filtered out {num_original - num_filtered} partitions before {known_start_date}."
-                )
-
-            if partitions_df_filtered.is_empty():
-                logging.warning(
-                    f"No partitions remaining after applying start date filter ({known_start_date}). Exiting."
-                )
-                self._log_final_summary()
-                self._generate_report()
-                return
-            # --- MODIFICATION END ---
-
             logging.info(
                 "Step 5: Starting daily processing loop (S2/S5 Hive data scanned per-loop)..."
             )
@@ -259,25 +230,11 @@ class ProxyLabelingEngine:
             max_lookahead_minutes = self._get_duration_in_minutes(cfg.target_duration)
             max_lookahead_delta = dt.timedelta(minutes=max_lookahead_minutes)
 
-            # --- Use the filtered DataFrame and its length for the loop and tqdm ---
-            total_partitions = len(
-                partitions_df_filtered
-            )  # ★★★ CORRECT: Use length of filtered DataFrame ★★★
-            logging.info(
-                f"Processing {total_partitions} partitions from {known_start_date} onwards..."
-            )  # ★★★ CORRECT: Log uses filtered count ★★★
-
-            # Wrap the FILTERED iterator with tqdm, using the CORRECT total
             for row in tqdm(
-                partitions_df_filtered.iter_rows(
-                    named=True
-                ),  # ★★★ CORRECT: Iterate over filtered DataFrame ★★★
-                total=total_partitions,  # ★★★ CORRECT: Use filtered count for total ★★★
+                partitions_df.iter_rows(named=True),
+                total=len(partitions_df),
                 desc="Processing Partitions",
-                unit="partition",
             ):
-                # --- End loop setup correction ---
-
                 current_date = row["date"]
                 year, month, day = (
                     current_date.year,
@@ -288,107 +245,75 @@ class ProxyLabelingEngine:
                 output_partition_dir = (
                     cfg.output_dir / f"year={year}/month={month}/day={day}"
                 )
-                # Check if output already exists for this partition and if resume is enabled
                 if cfg.resume and output_partition_dir.exists():
-                    # If resuming, simply skip this partition
-                    logging.debug(
-                        f"Resuming: Output already exists for {current_date}. Skipping partition."
-                    )
-                    continue  # Skip to the next partition
+                    continue
 
-                # --- Collect data for the current partition ---
-                # Collect from Hive LazyFrame
                 daily_bets_hive_df = unified_hive_lf.filter(
                     pl.col("timestamp").dt.date() == current_date
                 ).collect()
 
-                # Filter from the pre-loaded File DataFrame
                 daily_bets_file_df = unified_file_df.filter(
                     pl.col("timestamp").dt.date() == current_date
                 )
 
-                # Concatenate Hive and File data for the current day
                 daily_bets_df = pl.concat(
                     [daily_bets_hive_df, daily_bets_file_df], how="diagonal"
                 )
 
-                # Skip if no betting data for this day
                 if daily_bets_df.is_empty():
-                    logging.debug(
-                        f"No betting data found for {current_date}. Skipping partition."
-                    )
                     continue
 
-                # --- Prepare price window for this partition ---
-                # Determine required time range for price data (min timestamp to max lookahead + buffer)
                 min_ts_req = daily_bets_df["timestamp"].min()
-                if (
-                    min_ts_req is None
-                ):  # Should not happen if daily_bets_df is not empty
-                    logging.warning(
-                        f"Could not determine minimum timestamp for {current_date}. Skipping partition."
-                    )
+                if min_ts_req is None:
                     continue
 
-                # Calculate the maximum timestamp needed for lookahead + a buffer (e.g., 2 days)
                 max_ts_req = min_ts_req + max_lookahead_delta + dt.timedelta(days=2)
 
-                # Collect required price data from the base LazyFrame (tick data)
                 price_window_df = base_price_lf.filter(
                     pl.col("timestamp").is_between(min_ts_req, max_ts_req)
                 ).collect()
                 if price_window_df.is_empty():
                     logging.warning(
-                        f"No base price data found for {current_date} in the required window ({min_ts_req} to {max_ts_req}). Skipping partition."
+                        f"No base price data found for {current_date}. Skipping partition."
                     )
                     continue
 
-                # Join relevant ATR data from pre-loaded non-tick DataFrames
-                # Iterate through the pre-loaded atr_dfs and join applicable ones
                 for atr_df in atr_dfs:
-                    # Filter ATR data for the relevant time window before joining
                     atr_df_small = atr_df.filter(
                         pl.col("timestamp").is_between(min_ts_req, max_ts_req)
                     )
                     if not atr_df_small.is_empty():
-                        # Use join_asof to merge ATR data based on the closest preceding timestamp
                         price_window_df = price_window_df.join_asof(
                             atr_df_small.sort("timestamp"), on="timestamp"
                         )
 
-                # Forward fill missing ATR/price values, then backward fill remaining NaNs at the start
                 price_window_df = price_window_df.fill_null(
                     strategy="forward"
                 ).fill_null(strategy="backward")
 
-                # --- Calculate labels for the current partition's data ---
                 daily_labeled_df = self._calculate_labels_for_batch(
                     daily_bets_df, price_window_df
                 )
 
-                # --- Write results if labels were generated ---
                 if daily_labeled_df is not None and not daily_labeled_df.is_empty():
                     self._update_label_counts(daily_labeled_df)
                     self._collect_report_data(daily_labeled_df, current_date)
 
                     output_partition_dir.mkdir(parents=True, exist_ok=True)
-                    # Write the labeled data to the partition directory
                     daily_labeled_df.write_parquet(
                         output_partition_dir / "data.parquet", compression="zstd"
                     )
 
-                # --- Clean up memory for the current loop iteration ---
                 del daily_bets_df, price_window_df, daily_labeled_df
-                del daily_bets_hive_df, daily_bets_file_df  # Ensure these are deleted
+                del daily_bets_hive_df, daily_bets_file_df
                 gc.collect()
 
-            # --- Loop finished ---
-            self._log_final_summary()  # Log the final summary counts
-            self._generate_report()  # Generate the markdown report
+            self._log_final_summary()
+            self._generate_report()
 
         except Exception as e:
             logging.error(f"A critical error occurred: {e}", exc_info=True)
-            raise  # Re-raise the exception after logging
+            raise
 
     # =========================================================================
     # コアロジック (変更なし)
@@ -694,48 +619,24 @@ class ProxyLabelingEngine:
         )
 
     def _get_bar_duration_minutes(self, timeframe: str) -> float:
-        """
-        Calculates the approximate duration of a bar in minutes for a given timeframe string.
-
-        NOTE: D1, W1, and MN are EXCLUDED from labeling (Horizon Mismatch Principle).
-              Returning 0.0 for these timeframes ensures no t1_max is calculated,
-              effectively skipping the labeling for them.
-        """
         if timeframe == "tick":
             return 0.0
-
-        # --- MODIFICATION START: H12以上の時間足に対するラベリングを無効化 ---
-        if timeframe in ["D1", "W1", "MN"]:
-            return 0.0  # HR > 1000 の時間足を無効化 (ラベリングをスキップ)
-        # --- MODIFICATION END ---
-
-        # Try to extract numeric value and unit (M, H, D, W)
         value_match = re.search(r"(\d*\.?\d+)", timeframe)
-        unit_match = re.search(r"([A-Z])", timeframe)  # Expecting M, H, D, W
-
+        unit_match = re.search(r"([A-Z])", timeframe)
         if not value_match or not unit_match:
-            logging.warning(
-                f"Could not parse value or unit from timeframe: {timeframe}"
-            )
-            return 0.0  # Safety return
-
-        try:
-            value_str = value_match.group(1)
-            value = float(value_str) if value_str else 1.0
-        except ValueError:
-            logging.warning(
-                f"Could not convert value '{value_match.group(1)}' to float for timeframe: {timeframe}"
-            )
             return 0.0
-
+        value = float(value_match.group(1))
         unit = unit_match.group(1)
-
-        if unit == "M":  # Minute
+        if unit == "M":
             return value
-        if unit == "H":  # Hour
+        if unit == "H":
             return value * 60
-        # W1, D1, MN は上で処理済み
-
+        if unit == "D":
+            return value * 1440
+        if unit == "W":
+            return value * 10080
+        if unit == "N":
+            return value * 43200
         return 0.0
 
     def _calculate_labels_for_batch(
@@ -744,190 +645,111 @@ class ProxyLabelingEngine:
         cfg = self.config
         if daily_bets_df.is_empty():
             return None
-
-        # --- DEBUG CODE REMOVED ---
-
         labeled_chunks = []
-        # Group by timeframe within the daily batch
         for timeframe_tuple, group_df in daily_bets_df.group_by("timeframe"):
             timeframe = timeframe_tuple[0]
             if timeframe is None or group_df.is_empty():
-                continue  # Skip if timeframe is null or group is empty
-
-            # Calculate max lookahead time (t1_max) based on target duration and timeframe
+                continue
             target_duration_minutes = self._get_duration_in_minutes(cfg.target_duration)
             bar_duration_minutes = self._get_bar_duration_minutes(timeframe)
             t1_max_expr: pl.Expr
             if timeframe == "tick":
-                # For tick data, add the exact duration
                 t1_max_expr = pl.col("timestamp") + pl.duration(
                     minutes=target_duration_minutes
                 )
             else:
-                # For bar data, calculate lookahead in bars
                 if bar_duration_minutes == 0:
-                    logging.warning(
-                        f"Skipping timeframe {timeframe} due to zero bar duration calculation."
-                    )
-                    continue  # Skip if bar duration calculation fails
+                    continue
                 lookahead_bars = max(
                     1, int(round(target_duration_minutes / bar_duration_minutes))
                 )
                 t1_max_expr = pl.col("timestamp") + pl.duration(
                     minutes=lookahead_bars * bar_duration_minutes
                 )
-
-            # Define the required ATR column name for this timeframe
             atr_col_name = f"e1c_atr_21_{timeframe}"
             if atr_col_name not in price_window_df.columns:
-                # Only log warning if the timeframe is NOT 'tick' (since skipping tick is intentional)
-                if timeframe != "tick":
-                    logging.warning(
-                        f"Required ATR column '{atr_col_name}' not found in price data. Skipping timeframe '{timeframe}'."
-                    )
-                continue  # Skip if necessary ATR column is missing (for tick or other reasons)
-
-            # Store original columns before join
+                continue
             original_cols = group_df.columns
-
-            # Join betting opportunities with price data (including ATR) using join_asof
-            # This aligns the price/ATR data available *at or just before* the bet timestamp
             bets_with_price_df = group_df.join_asof(
-                price_window_df.select(
-                    ["timestamp", "close", "high", "low", atr_col_name]
-                ).sort("timestamp"),
-                on="timestamp",
-            ).filter(
-                pl.col(atr_col_name).is_not_null()
-                & pl.col(
-                    "close"
-                ).is_not_null()  # Ensure ATR and close are valid after join
-            )
-
-            # If join results in empty dataframe or required columns are missing, skip
+                price_window_df, on="timestamp"
+            ).filter(pl.col(atr_col_name).is_not_null())
             if bets_with_price_df.is_empty():
-                logging.debug(
-                    f"No valid price/ATR data found for timeframe '{timeframe}' after join_asof."
-                )
                 continue
 
-            # --- Drop rows where 'close' became Null after join (Keep this fix) ---
-            rows_before_drop = len(bets_with_price_df)
-            bets_with_price_df = bets_with_price_df.drop_nulls("close")
-            rows_after_drop = len(bets_with_price_df)
-            if rows_before_drop > rows_after_drop:
-                logging.warning(
-                    f"Dropped {rows_before_drop - rows_after_drop} rows for timeframe '{timeframe}' due to missing 'close' price after join_asof."
-                )
-            if bets_with_price_df.is_empty():
-                logging.warning(
-                    f"All rows dropped for timeframe '{timeframe}' after checking for 'close'. Skipping."
-                )
-                continue
-            # --- Keep this fix ---
-
-            # Calculate profit-take (pt) and stop-loss (sl) barriers based on ATR
-            # Keep original ATR value ('atr_value') for potential use later (e.g., logging, risk calc)
+            # ATRの生データを保持
             bets_df = bets_with_price_df.select(
-                pl.col("timestamp").alias("t0"),  # Start time of the event
-                pl.col("close"),  # Keep 'close' column
+                pl.col("timestamp").alias("t0"),
                 (
                     pl.col("close") + pl.col(atr_col_name) * cfg.profit_take_multiplier
-                ).alias("pt_barrier"),  # Upper barrier
+                ).alias("pt_barrier"),
                 (
                     pl.col("close") - pl.col(atr_col_name) * cfg.stop_loss_multiplier
-                ).alias("sl_barrier"),  # Lower barrier
-                t1_max_expr.alias("t1_max"),  # Time barrier (max holding duration)
-                pl.col(atr_col_name).alias(
-                    "atr_value"
-                ),  # Raw ATR value used for barriers
-                pl.col(original_cols).exclude(
-                    "timestamp"
-                ),  # Keep original features, exclude original timestamp
+                ).alias("sl_barrier"),
+                t1_max_expr.alias("t1_max"),
+                pl.col(atr_col_name).alias("atr_value"),
+                pl.col(original_cols).exclude("timestamp"),
             )
 
-            # Determine which barrier was hit first by looking into the future price window
-            # Use join_asof again to efficiently find future price movements relative to each bet's start time (t0)
             hits_df = (
-                price_window_df.select(
-                    ["timestamp", "high", "low"]
-                )  # Only need future high/low
-                .join_asof(
-                    # Select only necessary columns from bets_df for the join
+                price_window_df.join_asof(
                     bets_df.select(["t0", "pt_barrier", "sl_barrier", "t1_max"]),
-                    left_on="timestamp",  # Align future price time with bet start time
+                    left_on="timestamp",
                     right_on="t0",
-                    strategy="forward",  # Look for prices *after* t0
                 )
-                # Filter future prices that are within the event's max duration (t0 to t1_max)
                 .filter(pl.col("timestamp") <= pl.col("t1_max"))
-                # Check if high >= pt_barrier or low <= sl_barrier for each future price point
                 .with_columns(
-                    # Record the timestamp if PT barrier is hit
                     pt_hit_time=pl.when(pl.col("high") >= pl.col("pt_barrier")).then(
                         pl.col("timestamp")
                     ),
-                    # Record the timestamp if SL barrier is hit
                     sl_hit_time=pl.when(pl.col("low") <= pl.col("sl_barrier")).then(
                         pl.col("timestamp")
                     ),
                 )
-                # Group by the original bet start time (t0)
                 .group_by("t0")
-                # Find the *earliest* time each barrier was hit within the duration
                 .agg(
                     pl.col("pt_hit_time").min().alias("first_pt_time"),
                     pl.col("sl_hit_time").min().alias("first_sl_time"),
                 )
             )
-
-            # Join the hit times back to the original bets dataframe
             final_group_df = bets_df.join(hits_df, on="t0", how="left")
 
-            # Determine the final label and event end time (t1) based on which barrier was hit first
+            # ラベル、終了時刻、Payoff比、SL乗数、PT乗数、方向性を計算・保存
             labeled_group = final_group_df.with_columns(
-                # Determine t1: the earlier of first_pt_time or first_sl_time, or t1_max if neither hit
-                t1=pl.when(  # If PT hit...
-                    (pl.col("first_pt_time").is_not_null())
-                    & (  # ...and (SL didn't hit OR PT hit first/simultaneously)
-                        (pl.col("first_sl_time").is_null())
-                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
-                    )
-                )
-                .then(pl.col("first_pt_time"))  # t1 is PT hit time
-                .when(pl.col("first_sl_time").is_not_null())  # Else if SL hit...
-                .then(pl.col("first_sl_time"))  # t1 is SL hit time
-                .otherwise(
-                    pl.col("t1_max")
-                ),  # Else (neither hit), t1 is max duration time
-                # Determine label: 1 for PT, -1 for SL, 0 for timeout
-                label=pl.when(  # If PT hit first/simultaneously...
+                t1=pl.when(
                     (pl.col("first_pt_time").is_not_null())
                     & (
                         (pl.col("first_sl_time").is_null())
                         | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
                     )
                 )
-                .then(pl.lit(1, dtype=pl.Int8))  # Label is 1 (Win)
-                .when(pl.col("first_sl_time").is_not_null())  # Else if SL hit...
-                .then(pl.lit(-1, dtype=pl.Int8))  # Label is -1 (Loss)
-                .otherwise(pl.lit(0, dtype=pl.Int8)),  # Else (timeout), Label is 0
-                # Calculate and store the payoff ratio used for this labeling
+                .then(pl.col("first_pt_time"))
+                .when(pl.col("first_sl_time").is_not_null())
+                .then(pl.col("first_sl_time"))
+                .otherwise(pl.col("t1_max")),
+                label=pl.when(
+                    (pl.col("first_pt_time").is_not_null())
+                    & (
+                        (pl.col("first_sl_time").is_null())
+                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
+                    )
+                )
+                .then(pl.lit(1, dtype=pl.Int8))
+                .when(pl.col("first_sl_time").is_not_null())
+                .then(pl.lit(-1, dtype=pl.Int8))
+                .otherwise(pl.lit(0, dtype=pl.Int8)),
                 payoff_ratio=pl.lit(
                     cfg.profit_take_multiplier / cfg.stop_loss_multiplier,
                     dtype=pl.Float32,
                 ),
-                # Store the SL multiplier used
                 sl_multiplier=pl.lit(cfg.stop_loss_multiplier, dtype=pl.Float32),
-                # Store the PT multiplier used
+                # ★★★ 挿入: PT乗数を保存 ★★★
                 pt_multiplier=pl.lit(cfg.profit_take_multiplier, dtype=pl.Float32),
-                # Store the assumed direction (currently fixed at 1 for Buy)
-                direction=pl.lit(1, dtype=pl.Int8),
-            ).rename({"t0": "timestamp"})  # Rename t0 back to standard 'timestamp'
+                direction=pl.lit(
+                    1, dtype=pl.Int8
+                ),  # 1 = Buy (このスクリプトの暗黙の前提)
+            ).rename({"t0": "timestamp"})
 
-            # Drop intermediate columns used for calculation, keep essential info
-            # Keep: timestamp, t1, label, original features, close, timeframe,
-            #       payoff_ratio, atr_value, sl_multiplier, pt_multiplier, direction
+            # 不要な中間列を削除（atr_value, sl_multiplier, pt_multiplier, direction は残す）
             labeled_chunks.append(
                 labeled_group.drop(
                     [
@@ -939,11 +761,8 @@ class ProxyLabelingEngine:
                     ]
                 )
             )
-
-        # Combine results from all timeframes processed in this batch
         if not labeled_chunks:
-            return None  # Return None if no labels were generated
-        # Concatenate results vertically and sort by the final timestamp
+            return None
         return pl.concat(labeled_chunks).sort("timestamp")
 
     def _update_label_counts(self, df: pl.DataFrame):

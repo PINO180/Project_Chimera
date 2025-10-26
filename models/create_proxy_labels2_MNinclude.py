@@ -694,19 +694,15 @@ class ProxyLabelingEngine:
         )
 
     def _get_bar_duration_minutes(self, timeframe: str) -> float:
-        """
-        Calculates the approximate duration of a bar in minutes for a given timeframe string.
-
-        NOTE: D1, W1, and MN are EXCLUDED from labeling (Horizon Mismatch Principle).
-              Returning 0.0 for these timeframes ensures no t1_max is calculated,
-              effectively skipping the labeling for them.
-        """
+        """Calculates the approximate duration of a bar in minutes for a given timeframe string."""
         if timeframe == "tick":
-            return 0.0
+            return 0.0  # Tick has no fixed duration in this context
 
-        # --- MODIFICATION START: H12以上の時間足に対するラベリングを無効化 ---
-        if timeframe in ["D1", "W1", "MN"]:
-            return 0.0  # HR > 1000 の時間足を無効化 (ラベリングをスキップ)
+        # --- MODIFICATION START: Handle 'MN' specifically first ---
+        if timeframe == "MN":
+            # Use an approximation for month duration (e.g., 30 days)
+            # 60 minutes/hour * 24 hours/day * 30 days/month
+            return 1.0 * 43200  # Approximate minutes in a month (value=1)
         # --- MODIFICATION END ---
 
         # Try to extract numeric value and unit (M, H, D, W)
@@ -717,11 +713,14 @@ class ProxyLabelingEngine:
             logging.warning(
                 f"Could not parse value or unit from timeframe: {timeframe}"
             )
-            return 0.0  # Safety return
+            return 0.0  # Return 0 if parsing fails
 
         try:
+            # Handle cases like 'M0.5' correctly
             value_str = value_match.group(1)
-            value = float(value_str) if value_str else 1.0
+            value = (
+                float(value_str) if value_str else 1.0
+            )  # Default to 1 if no number found (e.g., legacy 'M' might imply 'M1')
         except ValueError:
             logging.warning(
                 f"Could not convert value '{value_match.group(1)}' to float for timeframe: {timeframe}"
@@ -734,9 +733,14 @@ class ProxyLabelingEngine:
             return value
         if unit == "H":  # Hour
             return value * 60
-        # W1, D1, MN は上で処理済み
+        if unit == "D":  # Day
+            return value * 1440  # 60 * 24
+        if unit == "W":  # Week
+            return value * 10080  # 60 * 24 * 7
+        # 'N' (Month) is handled at the beginning now
 
-        return 0.0
+        logging.warning(f"Unhandled timeframe unit '{unit}' in timeframe: {timeframe}")
+        return 0.0  # Return 0 for any other unhandled units
 
     def _calculate_labels_for_batch(
         self, daily_bets_df: pl.DataFrame, price_window_df: pl.DataFrame
