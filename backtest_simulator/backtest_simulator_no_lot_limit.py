@@ -77,7 +77,7 @@ class BacktestConfig:
     max_leverage: float = 2000
     max_risk_per_trade: float = 0.02
     f_star_threshold: float = 0.0
-    m2_proba_threshold: float = 0.3
+    m2_proba_threshold: float = 0.5
     test_limit_partitions: int = 0
     oof_mode: bool = False
     min_capital_threshold: float = 1.0

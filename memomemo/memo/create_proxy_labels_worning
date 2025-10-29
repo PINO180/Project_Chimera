@@ -1,0 +1,214 @@
+💡 警告を解消する最終修正ご指摘の通り、これらの警告は、ロジックとしては意図された動作であるため、システムからのノイズであり、消すべきです。警告が出ている原因は、create_proxy_labels.py 内の _calculate_labels_for_batch 関数が、ラベリング無効化のために $\text{D1}$、$\text{W1}$、$\text{MN}$ の $\text{Bar\_Duration}$ を $\text{0.0}$ に設定した結果、その $\text{0}$ が検出された際に警告を出しているからです。この警告を完全に消し、クリーンな実行ログを達成するための最終修正を提案します。🛠️ 修正スクリプト：create_proxy_labels.py (警告ノイズ除去)create_proxy_labels.py 内の_calculate_labels_for_batch関数（ラベル計算ロジックの中核部分）に、無効化された時間足が検出されたら警告を出さずにスキップするロジックを追加します。以下のコードブロックで、create_proxy_labels.py内の**_calculate_labels_for_batch関数全体**を置き換えてください。Python    def _calculate_labels_for_batch(
+        self, daily_bets_df: pl.DataFrame, price_window_df: pl.DataFrame
+    ) -> pl.DataFrame | None:
+        cfg = self.config
+        if daily_bets_df.is_empty():
+            return None
+
+        labeled_chunks = []
+        # Group by timeframe within the daily batch
+        for timeframe_tuple, group_df in daily_bets_df.group_by("timeframe"):
+            timeframe = timeframe_tuple[0]
+            if timeframe is None or group_df.is_empty():
+                continue  # Skip if timeframe is null or group is empty
+
+            # Calculate max lookahead time (t1_max) based on target duration and timeframe
+            target_duration_minutes = self._get_duration_in_minutes(cfg.target_duration)
+            bar_duration_minutes = self._get_bar_duration_minutes(timeframe)
+            
+            # --- ★★★ 修正箇所: 警告を出す代わりに、サイレントにスキップする ★★★
+            if bar_duration_minutes == 0.0:
+                # D1, W1, MN, または Tick (bar_duration=0.0) の場合の追加チェック
+                if timeframe not in ["tick", "D1", "W1", "MN"]:
+                    logging.warning(f"Skipping timeframe {timeframe} due to unexpected zero bar duration calculation.")
+                # D1, W1, MN の意図的なスキップはサイレントに行う
+                continue 
+            # --- ★★★ 修正ここまで ★★★
+
+            t1_max_expr: pl.Expr
+            if timeframe == "tick":
+                # Tickデータはここで処理しないが、ロジックの整合性のために保持
+                t1_max_expr = pl.col("timestamp") + pl.duration(
+                    minutes=target_duration_minutes
+                )
+            else:
+                # Bar data: Calculate lookahead in bars
+                lookahead_bars = max(
+                    1, int(round(target_duration_minutes / bar_duration_minutes))
+                )
+                t1_max_expr = pl.col("timestamp") + pl.duration(
+                    minutes=lookahead_bars * bar_duration_minutes
+                )
+
+            # Define the required ATR column name for this timeframe
+            atr_col_name = f"e1c_atr_21_{timeframe}"
+            if atr_col_name not in price_window_df.columns:
+                logging.warning(
+                    f"Required ATR column '{atr_col_name}' not found in price data. Skipping timeframe '{timeframe}'."
+                )
+                continue
+
+            # Store original columns before join
+            original_cols = group_df.columns
+
+            # Join betting opportunities with price data (including ATR) using join_asof
+            bets_with_price_df = group_df.join_asof(
+                price_window_df.select(
+                    ["timestamp", "close", "high", "low", atr_col_name]
+                ).sort("timestamp"),
+                on="timestamp",
+            ).filter(
+                pl.col(atr_col_name).is_not_null()
+                & pl.col(
+                    "close"
+                ).is_not_null()  # Ensure ATR and close are valid after join
+            )
+
+            # If join results in empty dataframe or required columns are missing, skip
+            if bets_with_price_df.is_empty():
+                logging.debug(
+                    f"No valid price/ATR data found for timeframe '{timeframe}' after join_asof."
+                )
+                continue
+
+            # --- Drop rows where 'close' became Null after join (Keep this fix) ---
+            rows_before_drop = len(bets_with_price_df)
+            bets_with_price_df = bets_with_price_df.drop_nulls("close")
+            rows_after_drop = len(bets_with_price_df)
+            if rows_before_drop > rows_after_drop:
+                logging.warning(
+                    f"Dropped {rows_before_drop - rows_after_drop} rows for timeframe '{timeframe}' due to missing 'close' price after join_asof."
+                )
+            if bets_with_price_df.is_empty():
+                logging.warning(
+                    f"All rows dropped for timeframe '{timeframe}' after checking for 'close'. Skipping."
+                )
+                continue
+            # --- Keep this fix ---
+
+            # Calculate profit-take (pt) and stop-loss (sl) barriers based on ATR
+            bets_df = bets_with_price_df.select(
+                pl.col("timestamp").alias("t0"),  # Start time of the event
+                pl.col("close"),  # Keep 'close' column
+                (
+                    pl.col("close") + pl.col(atr_col_name) * cfg.profit_take_multiplier
+                ).alias("pt_barrier"),  # Upper barrier
+                (
+                    pl.col("close") - pl.col(atr_col_name) * cfg.stop_loss_multiplier
+                ).alias("sl_barrier"),  # Lower barrier
+                t1_max_expr.alias("t1_max"),  # Time barrier (max holding duration)
+                pl.col(atr_col_name).alias(
+                    "atr_value"
+                ),  # Raw ATR value used for barriers
+                pl.col(original_cols).exclude(
+                    "timestamp", "close", "high", "low"
+                ),  # Keep original features
+            )
+
+            # Determine which barrier was hit first by looking into the future price window
+            hits_df = (
+                price_window_df.select(
+                    ["timestamp", "high", "low"]
+                )  # Only need future high/low
+                .join_asof(
+                    # Select only necessary columns from bets_df for the join
+                    bets_df.select(["t0", "pt_barrier", "sl_barrier", "t1_max"]),
+                    left_on="timestamp",  # Align future price time with bet start time
+                    right_on="t0",
+                    strategy="forward",  # Look for prices *after* t0
+                )
+                # Filter future prices that are within the event's max duration (t0 to t1_max)
+                .filter(pl.col("timestamp") <= pl.col("t1_max"))
+                # Check if high >= pt_barrier or low <= sl_barrier for each future price point
+                .with_columns(
+                    # Record the timestamp if PT barrier is hit
+                    pt_hit_time=pl.when(pl.col("high") >= pl.col("pt_barrier")).then(
+                        pl.col("timestamp")
+                    ),
+                    # Record the timestamp if SL barrier is hit
+                    sl_hit_time=pl.when(pl.col("low") <= pl.col("sl_barrier")).then(
+                        pl.col("timestamp")
+                    ),
+                )
+                # Group by the original bet start time (t0)
+                .group_by("t0")
+                # Find the *earliest* time each barrier was hit within the duration
+                .agg(
+                    pl.col("pt_hit_time").min().alias("first_pt_time"),
+                    pl.col("sl_hit_time").min().alias("first_sl_time"),
+                )
+            )
+
+            # Join the hit times back to the original bets dataframe
+            final_group_df = bets_df.join(hits_df, on="t0", how="left")
+
+            # Determine the final label and event end time (t1) based on which barrier was hit first
+            labeled_group = final_group_df.with_columns(
+                # Determine t1: the earlier of first_pt_time or first_sl_time, or t1_max if neither hit
+                t1=pl.when(  # If PT hit...
+                    (pl.col("first_pt_time").is_not_null())
+                    & (  # ...and (SL didn't hit OR PT hit first/simultaneously)
+                        (pl.col("first_sl_time").is_null())
+                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
+                    )
+                )
+                .then(pl.col("first_pt_time"))  # t1 is PT hit time
+                .when(pl.col("first_sl_time").is_not_null())  # Else if SL hit...
+                .then(pl.col("first_sl_time"))  # t1 is SL hit time
+                .otherwise(
+                    pl.col("t1_max")
+                ),  # Else (neither hit), t1 is max duration time
+                # Determine label: 1 for PT, -1 for SL, 0 for timeout
+                label=pl.when(  # If PT hit first/simultaneously...
+                    (pl.col("first_pt_time").is_not_null())
+                    & (
+                        (pl.col("first_sl_time").is_null())
+                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
+                    )
+                )
+                .then(pl.lit(1, dtype=pl.Int8))  # Label is 1 (Win)
+                .when(pl.col("first_sl_time").is_not_null())  # Else if SL hit...
+                .then(pl.lit(-1, dtype=pl.Int8))  # Label is -1 (Loss)
+                .otherwise(pl.lit(0, dtype=pl.Int8)),  # Else (timeout), Label is 0
+                # Calculate and store the payoff ratio used for this labeling
+                payoff_ratio=pl.lit(
+                    cfg.profit_take_multiplier / cfg.stop_loss_multiplier,
+                    dtype=pl.Float32,
+                ),
+                # Store the SL multiplier used
+                sl_multiplier=pl.lit(cfg.stop_loss_multiplier, dtype=pl.Float32),
+                # Store the PT multiplier used
+                pt_multiplier=pl.lit(cfg.profit_take_multiplier, dtype=pl.Float32),
+                # Store the assumed direction (currently fixed at 1 for Buy)
+                direction=pl.lit(1, dtype=pl.Int8),
+            ).rename({"t0": "timestamp"})  # Rename t0 back to standard 'timestamp'
+
+            # Drop intermediate columns used for calculation, keep essential info
+            labeled_chunks.append(
+                labeled_group.drop(
+                    [
+                        "pt_barrier",
+                        "sl_barrier",
+                        "t1_max",
+                        "first_pt_time",
+                        "first_sl_time",
+                    ]
+                )
+            )
+
+        # Combine results from all timeframes processed in this batch
+        if not labeled_chunks:
+            return None  # Return None if no labels were generated
+        # Concatenate results vertically and sort by the final timestamp
+        return pl.concat(labeled_chunks).sort("timestamp")
+
+
+
+        破壊的ロジックの現状と無効化望ましい状態と $\text{drop\_nulls}$ の扱いあなたが最後に送られたコード（ファイル名なし、$\text{PT} 18.20\%$ を達成した最新の $\text{create\_proxy\_labels.py}$）は、すでに**$\text{drop\_nulls}(' \text{close}')$ の行をコメントアウトで削除**しています .クラッシュの原因であった破壊的な $\text{drop\_nulls}(' \text{close}')$ は、あなたのスクリプトから既に除去されているため、現在の状態が最も望ましいです。善意のノイズ除去の無効化（$4.02 \to 4.58$）$4.02$ の $\text{spw}$ に寄与した**「善意のノイズ除去」**、すなわち $\text{close}$ $\text{is\_not\_null}$ フィルタを無効化し、以前の $4.58$ の状態に戻すには、そのフィルタ条件を削除する必要があります。そのフィルタは、$\text{\_calculate\_labels\_for\_batch}$ 関数内の $\text{bets\_with\_price\_df}$ の定義にあります。無効化する手順:以下のフィルタ条件から、$\text{close}$ $\text{is\_not\_null}$ に関連する部分を削除します。修正前の行 (現在の状態)修正後の行 (無効化)$\text{.filter}(\text{pl}.\text{col}(\text{atr\_col\_name}).\text{is\_not\_null}())}$$\text{.filter}(\text{pl}.\text{col}(\text{atr\_col\_name}).\text{is\_not\_null}())}$$\text{pl}.\text{col}(\text{atr\_col\_name}).\text{is\_not\_null}()$$\text{pl}.\text{col}(\text{atr\_col\_name}).\text{is\_not\_null}()$変更箇所：$\text{create\_proxy\_labels.py}$ の約 $\text{799行目}$ 付近の $\text{join\_asof}$ 後の $\text{filter}$ 節。Python// create_proxy_labels.py の _calculate_labels_for_batch 関数内（約 799行目付近）
+
+// 修正前 (現状: 4.02の原因)
+).filter(pl.col(atr_col_name).is_not_null() & pl.col("close").is_not_null()) 
+ 
+// 修正後 (4.58に戻す)
+).filter(pl.col(atr_col_name).is_not_null())
+$\text{close}$ $\text{is\_not\_null}$ フィルタを削除し、$\text{ATR}$ が $\text{Null}$ でない行のみをフィルタリングすることで、$\text{spw}$ は $4.58$ に戻るはずです。

@@ -81,18 +81,18 @@ class BacktestConfig:
     m2_model_path: Path = S7_M2_MODEL_PKL
     m1_calibrator_path: Path = S7_M1_CALIBRATED
     m2_calibrator_path: Path = S7_M2_CALIBRATED
-    kelly_fraction: float = 0.5
+    kelly_fraction: float = 1.0
     # max_leverage: float = 100 # <- ★★★ 削除: base_leverage を使う ★★★
     max_risk_per_trade: float = 0.02
     f_star_threshold: float = 0.0
-    m2_proba_threshold: float = 0.3
+    m2_proba_threshold: float = 0.5
     test_limit_partitions: int = 0
     oof_mode: bool = False
     min_capital_threshold: float = 1.0
 
     # --- ★★★ 修正: 基本レバレッジとスプレッドを追加 ★★★ ---
     base_leverage: float = 2000.0  # 設定可能な基本レバレッジ
-    spread_pips: float = 16.0  # XAUUSD スタンダード口座のスプレッド
+    spread_pips: float = 0.00  # XAUUSD スタンダード口座のスプレッド
     value_per_pip: float = 10.0
     """
     (ASSUMPTION) 1ロットあたりの1pipの価値 (口座通貨単位)。
@@ -618,48 +618,58 @@ class BacktestSimulator:
                             * spread_pips_decimal
                             * DECIMAL_VALUE_PER_PIP
                         )
-
-                        # 10. スプレッドコストを資本から差し引く
-                        capital_before_pnl = current_capital - spread_cost_decimal
-
-                        # 11. PnLを再計算 (最終ロットサイズに基づいてリスク額を再定義)
-                        #    リスク額 = 最終ロットサイズ * 1ロットあたりSL(通貨)
-                        if (
-                            stop_loss_currency_per_lot > DECIMAL_ZERO
-                        ):  # desired_lot_size計算時にチェック済みだが念のため
-                            risk_amount_final = (
-                                final_lot_size_decimal * stop_loss_currency_per_lot
+                        # ★★★ 追加: スプレッドコスト破綻チェック ★★★
+                        if spread_cost_decimal >= current_capital:
+                            logging.debug(
+                                f"Spread cost ({spread_cost_decimal:,.2f}) exceeds current capital ({current_capital:,.2f}) at {current_timestamp}. Skipping trade."
                             )
+                            should_trade = False  # 取引しない
+                            pnl = DECIMAL_ZERO
+                            actual_label = labels_chunk[i]
+                            # equity_values_chunk.append(current_capital) # ← これはループの最後に移動
+                            # continue や return は不要、ループの残りを実行して資本を記録
                         else:
-                            risk_amount_final = DECIMAL_ZERO
+                            # 10. スプレッドコストを資本から差し引く
+                            capital_before_pnl = current_capital - spread_cost_decimal
 
-                        pnl = DECIMAL_ZERO
-                        actual_label = labels_chunk[i]
-                        if actual_label == 1:
-                            # 利益 = リスク額 * ペイオフレシオ (b = pt_mult / sl_mult)
-                            pnl = risk_amount_final * b
-                        elif actual_label == -1:
-                            # 損失 = -リスク額
-                            pnl = risk_amount_final.copy_negate()
+                            # 11. PnLを再計算 (最終ロットサイズに基づいてリスク額を再定義)
+                            #    リスク額 = 最終ロットサイズ * 1ロットあたりSL(通貨)
+                            if (
+                                stop_loss_currency_per_lot > DECIMAL_ZERO
+                            ):  # desired_lot_size計算時にチェック済みだが念のため
+                                risk_amount_final = (
+                                    final_lot_size_decimal * stop_loss_currency_per_lot
+                                )
+                            else:
+                                risk_amount_final = DECIMAL_ZERO
 
-                        # 12. 次の資本を計算
-                        next_capital = capital_before_pnl + pnl
+                            pnl = DECIMAL_ZERO
+                            actual_label = labels_chunk[i]
+                            if actual_label == 1:
+                                # 利益 = リスク額 * ペイオフレシオ (b = pt_mult / sl_mult)
+                                pnl = risk_amount_final * b
+                            elif actual_label == -1:
+                                # 損失 = -リスク額
+                                pnl = risk_amount_final.copy_negate()
 
-                        # 13. ログ用に float に変換
-                        lot_size_float = (
-                            float(final_lot_size_decimal)
-                            if final_lot_size_decimal.is_finite()
-                            else 0.0
-                        )
+                            # 12. 次の資本を計算
+                            next_capital = capital_before_pnl + pnl
 
-                        # 14. 無限大/NaN チェック
-                        if not next_capital.is_finite():
-                            logging.error(
-                                f"Capital NaN/Inf at {current_timestamp}. Prev: {current_capital:.2E}, Spread: {spread_cost_decimal:.2E}, PnL: {pnl:.2E}"
+                            # 13. ログ用に float に変換
+                            lot_size_float = (
+                                float(final_lot_size_decimal)
+                                if final_lot_size_decimal.is_finite()
+                                else 0.0
                             )
-                            current_capital = DECIMAL_ZERO
-                        else:
-                            current_capital = next_capital
+
+                            # 14. 無限大/NaN チェック
+                            if not next_capital.is_finite():
+                                logging.error(
+                                    f"Capital NaN/Inf at {current_timestamp}. Prev: {current_capital:.2E}, Spread: {spread_cost_decimal:.2E}, PnL: {pnl:.2E}"
+                                )
+                                current_capital = DECIMAL_ZERO
+                            else:
+                                current_capital = next_capital
 
                     else:  # 最終ロットサイズがゼロになった場合
                         should_trade = False  # 取引しないことにする
@@ -774,43 +784,351 @@ class BacktestSimulator:
         return results_chunk_df, trade_log_chunk_df
 
     def _analyze_and_report(self, results_df: pl.DataFrame, trade_log: pl.DataFrame):
-        # (レポート生成部分は変更なし、CSV出力部分のみ修正)
+        # (レポート計算部分は変更なし - 前回の回答と同じ)
         logging.info("Analyzing results and generating report...")
-        # ... (既存のレポート計算ロジックは省略) ...
+        DECIMAL_ONE = Decimal("1.0")
+        DECIMAL_ZERO = Decimal("0.0")
+        DECIMAL_HUNDRED = Decimal("100.0")
+        if results_df.is_empty():
+            logging.error("No simulation results to analyze.")
+            initial_capital = Decimal(str(self.config.initial_capital))
+            final_capital = initial_capital
+            total_return = DECIMAL_ZERO
+            sharpe_ratio = 0.0
+            sortino_ratio = 0.0
+            max_drawdown = 0.0
+            data_period_start = "N/A"
+            data_period_end = "N/A"
+            drawdown = pl.Series(dtype=pl.Float64)
+        else:
+            initial_capital = Decimal(str(self.config.initial_capital))
+            final_capital_raw = results_df["equity"][-1]
+            final_capital = (
+                final_capital_raw
+                if final_capital_raw is not None and final_capital_raw.is_finite()
+                else DECIMAL_ZERO
+            )
+            total_return = (
+                (final_capital / initial_capital - DECIMAL_ONE)
+                if initial_capital > DECIMAL_ZERO and initial_capital.is_finite()
+                else DECIMAL_ZERO
+            )
+            daily_equity = (
+                results_df.group_by(pl.col("timestamp").dt.date().alias("date"))
+                .agg(pl.last("equity"))
+                .sort("date")
+            )
+            daily_equity_list = daily_equity["equity"].to_list()
+            daily_returns_float = []
+            if len(daily_equity_list) > 1:
+                for i in range(1, len(daily_equity_list)):
+                    prev = daily_equity_list[i - 1]
+                    curr = daily_equity_list[i]
+                    if (
+                        prev is not None
+                        and curr is not None
+                        and prev.is_finite()
+                        and curr.is_finite()
+                        and prev > DECIMAL_ZERO
+                    ):
+                        daily_ret_decimal = (curr / prev) - DECIMAL_ONE
+                        daily_ret_float = (
+                            float(daily_ret_decimal)
+                            if daily_ret_decimal.is_finite()
+                            else np.nan
+                        )
+                        daily_returns_float.append(daily_ret_float)
+                    else:
+                        daily_returns_float.append(np.nan)
+            daily_returns = pl.Series(
+                "daily_returns", daily_returns_float, dtype=pl.Float64
+            ).drop_nans()
+            num_trading_days = len(daily_returns)
+            sharpe_ratio = 0.0
+            sortino_ratio = 0.0
+            if num_trading_days > 1:
+                mean_daily_return = daily_returns.mean()
+                std_daily_return = daily_returns.std()
+                if (
+                    mean_daily_return is not None
+                    and std_daily_return is not None
+                    and std_daily_return > 0
+                ):
+                    sharpe_ratio = (mean_daily_return / std_daily_return) * np.sqrt(252)
+                    negative_returns = daily_returns.filter(daily_returns < 0)
+                    downside_std = negative_returns.std()
+                    if downside_std is not None and downside_std > 0:
+                        sortino_ratio = (mean_daily_return / downside_std) * np.sqrt(
+                            252
+                        )
+            equity_list = results_df["equity"].to_list()
+            rolling_max_list = []
+            current_max = initial_capital
+            for e_raw in equity_list:
+                e = e_raw if e_raw is not None and e_raw.is_finite() else current_max
+                current_max = current_max.max(e)
+                rolling_max_list.append(current_max)
+            drawdown_list_float = []
+            for i in range(len(equity_list)):
+                r_max = rolling_max_list[i]
+                e_curr_raw = equity_list[i]
+                e_curr = (
+                    e_curr_raw
+                    if e_curr_raw is not None and e_curr_raw.is_finite()
+                    else r_max
+                )
+                if r_max > DECIMAL_ZERO and r_max.is_finite():
+                    dd_decimal = (e_curr - r_max) / r_max
+                    dd_float = float(dd_decimal) if dd_decimal.is_finite() else 0.0
+                    drawdown_list_float.append(dd_float)
+                else:
+                    drawdown_list_float.append(0.0)
+            drawdown = pl.Series("drawdown", drawdown_list_float, dtype=pl.Float64)
+            max_drawdown_raw = drawdown.min()
+            max_drawdown = (
+                max_drawdown_raw
+                if max_drawdown_raw is not None and np.isfinite(max_drawdown_raw)
+                else 0.0
+            )
+            data_period_start = str(results_df["timestamp"].min())
+            data_period_end = str(results_df["timestamp"].max())
 
-        # ★★★ 修正: CSV出力部分 ★★★
+        total_trades = len(trade_log)
+        win_rate = 0.0
+        avg_profit = 0.0
+        avg_loss = 0.0
+        profit_factor = 0.0
+        avg_bet_fraction = 0.0
+        if total_trades > 0:
+            pnl_list_decimal = trade_log["pnl"].to_list()
+            pnl_list_float = [
+                float(d) if d is not None and d.is_finite() else np.nan
+                for d in pnl_list_decimal
+            ]
+            pnl_series_float = pl.Series(
+                "pnl_float", pnl_list_float, dtype=pl.Float64
+            ).drop_nans()
+            winning_trades = trade_log.filter(pl.col("label") == 1)
+            losing_trades = trade_log.filter(pl.col("label") == -1)
+            num_winning_trades = len(winning_trades)
+            num_losing_trades = len(losing_trades)
+            win_rate = num_winning_trades / total_trades if total_trades > 0 else 0.0
+            winning_pnl_list = winning_trades["pnl"].to_list()
+            winning_pnl_float = [
+                float(d) if d is not None and d.is_finite() else np.nan
+                for d in winning_pnl_list
+            ]
+            winning_pnl_series = pl.Series("win_pnl", winning_pnl_float).drop_nans()
+            losing_pnl_list = losing_trades["pnl"].to_list()
+            losing_pnl_float = [
+                float(d) if d is not None and d.is_finite() else np.nan
+                for d in losing_pnl_list
+            ]
+            losing_pnl_series = pl.Series("lose_pnl", losing_pnl_float).drop_nans()
+            avg_profit = (
+                winning_pnl_series.mean() if not winning_pnl_series.is_empty() else 0.0
+            )
+            avg_loss = (
+                losing_pnl_series.mean() if not losing_pnl_series.is_empty() else 0.0
+            )
+            total_profit = winning_pnl_series.sum()
+            total_loss = losing_pnl_series.sum()
+            if total_loss is not None and total_loss != 0:
+                profit_factor = (
+                    abs(total_profit / total_loss) if total_profit is not None else 0.0
+                )
+            elif total_profit is not None and total_profit > 0:
+                profit_factor = float("inf")
+            else:
+                profit_factor = 0.0
+            bet_list_decimal = trade_log["effective_bet_fraction"].to_list()
+            bet_list_float = [
+                float(d) if d is not None and d.is_finite() else np.nan
+                for d in bet_list_decimal
+            ]
+            bet_frac_float = pl.Series(
+                "bet_frac", bet_list_float, dtype=pl.Float64
+            ).drop_nans()
+            avg_bet_fraction = (
+                bet_frac_float.mean() if not bet_frac_float.is_empty() else 0.0
+            )
+
+        report_data = {
+            "strategy": f"Probabilistic Betting (Kelly Fraction: {self.config.kelly_fraction}, Base Leverage: {self.config.base_leverage}, Max Risk/Trade: {self.config.max_risk_per_trade * 100:.1f}%, Spread: {self.config.spread_pips} pips, f* Thresh: {self.config.f_star_threshold}, M2 Thresh: {self.config.m2_proba_threshold})",
+            "initial_capital": float(initial_capital),
+            "final_capital": float(final_capital),
+            "total_return_pct": float(total_return * DECIMAL_HUNDRED),
+            "sharpe_ratio_annual": sharpe_ratio if np.isfinite(sharpe_ratio) else None,
+            "sortino_ratio_annual": sortino_ratio
+            if np.isfinite(sortino_ratio)
+            else None,
+            "max_drawdown_pct": max_drawdown * 100
+            if np.isfinite(max_drawdown)
+            else None,
+            "total_trades": total_trades,
+            "win_rate_pct": win_rate * 100,
+            "average_profit": avg_profit if np.isfinite(avg_profit) else None,
+            "average_loss": avg_loss if np.isfinite(avg_loss) else None,
+            "profit_factor": profit_factor if np.isfinite(profit_factor) else None,
+            "average_effective_bet_fraction_pct": avg_bet_fraction * 100
+            if np.isfinite(avg_bet_fraction)
+            else None,
+            "data_period_start": data_period_start,
+            "data_period_end": data_period_end,
+        }
+
+        print("\n" + "=" * 50)
+        print("    Backtest Performance Report")
+        print("=" * 50)
+        print(f" Strategy:             {report_data.get('strategy', 'N/A')}")
+        print(f" Initial Capital:      {report_data.get('initial_capital', 0.0):,.2f}")
+        print(f" Final Capital:        {report_data.get('final_capital', 0.0):,.2f}")
+        print(
+            f" Total Return:         {report_data.get('total_return_pct', 0.0):,.2f}%"
+        )
+        print(
+            f" Sharpe Ratio (Ann.):  {report_data.get('sharpe_ratio_annual', 0.0):.2f}"
+        )
+        print(
+            f" Sortino Ratio (Ann.): {report_data.get('sortino_ratio_annual', 0.0):.2f}"
+        )
+        print(
+            f" Max Drawdown:         {report_data.get('max_drawdown_pct', 0.0):,.2f}%"
+        )
+        print("-" * 50)
+        print(f" Total Trades:         {report_data.get('total_trades', 0)}")
+        print(f" Win Rate:             {report_data.get('win_rate_pct', 0.0):.2f}%")
+        print(f" Average Profit:       {report_data.get('average_profit', 0.0):,.3f}")
+        print(f" Average Loss:         {report_data.get('average_loss', 0.0):,.3f}")
+        print(f" Profit Factor:        {report_data.get('profit_factor', 0.0):.2f}")
+        print(
+            f" Avg. Bet Fraction:    {report_data.get('average_effective_bet_fraction_pct', 0.0):.2f}%"
+        )
+        print("-" * 50)
+        print(
+            f" Period:               {report_data.get('data_period_start', 'N/A')} to {report_data.get('data_period_end', 'N/A')}"
+        )
+        print("=" * 50)
+
+        FINAL_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(FINAL_REPORT_PATH, "w") as f:
+                json.dump(report_data, f, indent=4, default=str)
+            logging.info(f"Performance report saved to {FINAL_REPORT_PATH}")
+        except Exception as e:
+            logging.error(f"Failed to save JSON performance report: {e}")
+
+        # --- PNGグラフ出力 (復活&修正) ---
+        logging.info("Generating equity curve and drawdown chart...")
+        if results_df.is_empty() or drawdown.is_empty():
+            logging.warning("No data available to generate equity curve chart.")
+        else:
+            try:
+                sns.set_style("darkgrid")
+                fig, (ax1, ax2) = plt.subplots(
+                    2,
+                    1,
+                    figsize=(15, 10),
+                    sharex=True,
+                    gridspec_kw={"height_ratios": [3, 1]},
+                )
+                timestamps_list = results_df["timestamp"].to_list()
+                equity_list_raw = results_df["equity"].to_list()
+                equity_list_float = [
+                    float(e) if e is not None and e.is_finite() else np.nan
+                    for e in equity_list_raw
+                ]
+                drawdown_list_raw = drawdown.to_list()
+                drawdown_list_float = [
+                    d if np.isfinite(d) else 0.0 for d in drawdown_list_raw
+                ]
+                ax1.plot(
+                    timestamps_list,
+                    equity_list_float,
+                    label="Equity Curve",
+                    color="dodgerblue",
+                )
+                ax1.set_title(
+                    f"Equity Curve (Kelly: {self.config.kelly_fraction}, Lev: {self.config.base_leverage}, Max Risk: {self.config.max_risk_per_trade * 100:.1f}%)",
+                    fontsize=16,
+                )
+                ax1.set_ylabel("Equity")
+                ax1.grid(True)
+                try:
+                    finite_equity = [
+                        e for e in equity_list_float if np.isfinite(e) and e > 0
+                    ]
+                    if not finite_equity:
+                        ax1.ticklabel_format(style="plain", axis="y")
+                    elif any(np.isinf(equity_list_float)) or (
+                        max(finite_equity, default=1)
+                        / max(min(finite_equity, default=1), 1)
+                        > 1000
+                    ):
+                        ax1.set_yscale("log")
+                    else:
+                        ax1.ticklabel_format(style="plain", axis="y")
+                except Exception as scale_err:
+                    logging.warning(
+                        f"Could not determine y-axis scale, using plain: {scale_err}"
+                    )
+                    ax1.ticklabel_format(style="plain", axis="y")
+                ax2.fill_between(
+                    timestamps_list, drawdown_list_float, 0, color="red", alpha=0.3
+                )
+                ax2.set_title("Drawdown", fontsize=16)
+                ax2.set_ylabel("Drawdown (%)")
+                ax2.yaxis.set_major_formatter(
+                    mtick.PercentFormatter(xmax=1.0, decimals=1)
+                )
+                ax2.grid(True)
+                plt.tight_layout()
+                EQUITY_CURVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                plt.savefig(EQUITY_CURVE_PATH)
+                logging.info(f"Saved equity curve chart to {EQUITY_CURVE_PATH}")
+                plt.close(fig)
+            except Exception as e:
+                logging.error(
+                    f"Failed to generate equity curve chart: {e}", exc_info=True
+                )
+        # --- PNGグラフ出力ここまで ---
+
+        # --- CSVログ出力 (列選択と並び替え、フォーマット修正) ---
         if not trade_log.is_empty():
             trade_log_output_path = FINAL_REPORT_PATH.parent / "detailed_trade_log.csv"
+            logging.info(
+                f"Preparing detailed trade log for CSV output ({len(trade_log)} trades)..."
+            )
             try:
-                trade_log_for_csv = trade_log.clone()
+                # --- ★★★ 修正箇所 Start ★★★ ---
 
-                # --- 型変換とフォーマット指定 ---
+                # --- 1. フォーマット処理を先に実行 ---
+                temp_log_formatted = trade_log.clone()  # 元のDataFrameを変更しない
                 format_expressions = []
 
-                # Timestamp
+                # Timestamp -> 文字列
                 format_expressions.append(
                     pl.col("timestamp")
                     .dt.strftime("%Y-%m-%d %H:%M:%S")
                     .alias("timestamp")
                 )
 
-                # Object (Decimal) -> Float & Round
-                decimal_cols = [
-                    ("pnl", 0),
-                    ("capital_after_trade", 0),
-                    ("payoff_ratio", 2),
-                    ("kelly_f_star", 4),
-                    ("f_star", 4),
-                    ("base_bet_fraction", 4),
-                    ("capped_bet_fraction", 4),
-                    ("effective_bet_fraction", 4),
-                    ("margin_required", 2),
-                    ("spread_cost", 2),
-                    ("close_price", 3),  # closeは小数点以下3桁程度
-                ]
-                for col_name, digits in decimal_cols:
-                    if col_name in trade_log_for_csv.columns:
-                        # Nullを許容しつつfloatに変換し、丸める
+                # Decimal/Object -> Float & Round (存在する可能性のある全てのDecimal列を対象)
+                decimal_cols_round = {
+                    "capital_after_trade": 2,
+                    "pnl": 2,
+                    "kelly_f_star": 4,
+                    "spread_cost": 2,
+                    "margin_required": 2,
+                    "payoff_ratio": 2,
+                    "close_price": 3,
+                    "f_star": 4,
+                    "base_bet_fraction": 4,
+                    "capped_bet_fraction": 4,
+                    "effective_bet_fraction": 4,
+                }
+                for col_name, digits in decimal_cols_round.items():
+                    if col_name in temp_log_formatted.columns:  # 列が存在するか確認
                         format_expressions.append(
                             pl.col(col_name)
                             .map_elements(
@@ -823,58 +1141,128 @@ class BacktestSimulator:
                             .alias(col_name)
                         )
 
-                # Float & Round (既存のFloat列 + Objectから変換されたFloat列も含む可能性)
-                float_cols_for_round = [
-                    ("m2_calibrated_proba", 4),
-                    ("lot_size", 2),
-                    ("atr_value", 4),
-                    ("sl_multiplier", 2),
-                    ("pt_multiplier", 2),
-                    ("effective_leverage", 0),  # レバレッジは整数
-                ]
-                for col_name, digits in float_cols_for_round:
-                    if col_name in trade_log_for_csv.columns:
-                        # 既存のfloat列もNullを考慮して丸める
+                # Float & Round
+                float_cols_round = {
+                    "m2_calibrated_proba": 4,
+                    "lot_size": 2,
+                    "atr_value": 4,
+                    "sl_multiplier": 2,
+                    "pt_multiplier": 2,
+                    "effective_leverage": 0,
+                }
+                for col_name, digits in float_cols_round.items():
+                    if col_name in temp_log_formatted.columns:  # 列が存在するか確認
                         format_expressions.append(
                             pl.col(col_name).round(digits).alias(col_name)
                         )
 
-                # Integer (フォーマット不要だが選択はしておく)
-                int_cols = ["label", "direction"]
-                # format_expressions.extend([pl.col(c) for c in int_cols if c in trade_log_for_csv.columns]) # そのまま選択
-
-                # フォーマット適用 (エラーハンドリング強化)
-                try:
-                    if format_expressions:
-                        # 必要な列だけを選択しつつフォーマットを適用
-                        select_cols = [
-                            e.meta.output_name() for e in format_expressions
-                        ] + [c for c in int_cols if c in trade_log_for_csv.columns]
-                        trade_log_formatted = trade_log_for_csv.select(
-                            select_cols
-                        ).with_columns(format_expressions)
-                    else:
-                        trade_log_formatted = trade_log_for_csv
-                except Exception as fmt_e:
-                    logging.error(
-                        f"Error applying formatting: {fmt_e}. Saving raw data instead."
+                # フォーマット適用
+                if format_expressions:
+                    temp_log_formatted = temp_log_formatted.with_columns(
+                        format_expressions
                     )
-                    trade_log_formatted = trade_log_for_csv  # エラー時は生データを出力
 
-                # CSV 書き出し
-                trade_log_formatted.write_csv(
+                # --- 2. 必要な列を選択し、並び替える ---
+                desired_columns_final = [
+                    "timestamp",  # 日付
+                    "capital_after_trade",  # 取引後残高
+                    "pnl",  # 取引損益
+                    "kelly_f_star",  # ケリー (f*)
+                    "m2_calibrated_proba",  # M2 Calibrated Proba
+                    "lot_size",  # ロット
+                    "spread_cost",  # スプレッドコスト
+                    "margin_required",  # 必要証拠金
+                    "label",  # 結果ラベル
+                    "payoff_ratio",  # ペイオフレシオ
+                    "effective_leverage",  # 実効レバレッジ
+                    "direction",  # 方向
+                    "close_price",  # エントリー価格
+                    "atr_value",  # ATR値
+                    "sl_multiplier",  # SL係数
+                    "pt_multiplier",  # PT係数
+                    "effective_bet_fraction",  # 実効ベット割合
+                ]
+                # 存在する列だけを、desired_columns_final の順序で選択
+                available_columns_final = [
+                    col
+                    for col in desired_columns_final
+                    if col in temp_log_formatted.columns
+                ]
+                trade_log_final_csv = temp_log_formatted.select(available_columns_final)
+
+                # --- ★★★ 修正箇所 End ★★★ ---
+
+                # --- CSV書き出し ---
+                trade_log_final_csv.write_csv(
                     trade_log_output_path,
-                    null_value="NaN",
+                    null_value="NaN",  # Null値を 'NaN' 文字列として出力
                 )
-                logging.info(f"Detailed trade log saved to {trade_log_output_path}")
+                logging.info(
+                    f"Formatted detailed trade log saved to {trade_log_output_path}"
+                )
 
+            except PermissionError as pe:
+                logging.error(
+                    f"Permission denied saving trade log to {trade_log_output_path}: {pe}"
+                )
+                logging.error("Please check file/directory permissions.")
             except Exception as e:
-                logging.error(f"Failed to save detailed trade log: {e}", exc_info=True)
+                logging.error(
+                    f"Failed to save formatted detailed trade log: {e}", exc_info=True
+                )
         else:
             logging.info("No trades were executed, skipping detailed trade log output.")
-        # ★★★ CSV出力修正ここまで ★★★
+        # --- CSVログ出力ここまで ---
 
-        # ... (既存のグラフ生成ロジックは省略) ...
+        # --- MT5風テキストレポート出力 ---
+        text_report_path = FINAL_REPORT_PATH.with_suffix(".txt")
+        logging.info(f"Generating text performance report to {text_report_path}...")
+        try:
+            with open(text_report_path, "w", encoding="utf-8") as f:
+                f.write("=" * 60 + "\n")
+                f.write("    Strategy Performance Report (MT5 Style)\n")
+                f.write("=" * 60 + "\n\n")
+                f.write(f"Strategy:\t\t{report_data.get('strategy', 'N/A')}\n")
+                f.write(
+                    f"Period:\t\t\t{report_data.get('data_period_start', 'N/A')} - {report_data.get('data_period_end', 'N/A')}\n\n"
+                )
+                f.write("-" * 30 + " Summary " + "-" * 30 + "\n")
+                initial_cap = report_data.get("initial_capital", 0.0)
+                final_cap = report_data.get("final_capital", 0.0)
+                total_net_profit = final_cap - initial_cap
+                total_ret_pct = report_data.get("total_return_pct", 0.0)
+                f.write(f"Initial Deposit:\t{initial_cap:,.2f}\n")
+                f.write(f"Total Net Profit:\t{total_net_profit:,.2f}\n")
+                f.write(f"Final Balance:\t\t{final_cap:,.2f}\n")
+                f.write(f"Total Return:\t\t{total_ret_pct:,.2f} %\n")
+                profit_factor = report_data.get("profit_factor", 0.0)
+                f.write(f"Profit Factor:\t\t{profit_factor:.2f}\n")
+                sharpe = report_data.get("sharpe_ratio_annual", 0.0)
+                f.write(f"Sharpe Ratio (Ann.):\t{sharpe:.2f}\n")
+                sortino = report_data.get("sortino_ratio_annual", 0.0)
+                f.write(f"Sortino Ratio (Ann.):\t{sortino:.2f}\n")
+                max_dd = report_data.get("max_drawdown_pct", 0.0)
+                f.write(f"Maximal Drawdown:\t{abs(max_dd):,.2f} %\n\n")
+                f.write("-" * 30 + " Trades " + "-" * 30 + "\n")
+                total_trades = report_data.get("total_trades", 0)
+                win_pct = report_data.get("win_rate_pct", 0.0)
+                loss_pct = 100.0 - win_pct if total_trades > 0 else 0.0
+                num_win_trades = int(total_trades * (win_pct / 100.0))
+                num_loss_trades = total_trades - num_win_trades
+                f.write(f"Total Trades:\t\t{total_trades}\n")
+                f.write(f"Winning Trades (%):\t{num_win_trades} ({win_pct:.2f} %)\n")
+                f.write(f"Losing Trades (%):\t{num_loss_trades} ({loss_pct:.2f} %)\n")
+                avg_profit = report_data.get("average_profit", 0.0)
+                avg_loss = report_data.get("average_loss", 0.0)
+                f.write(f"Average Profit:\t\t{avg_profit:,.3f}\n")
+                f.write(f"Average Loss:\t\t{avg_loss:,.3f}\n")
+                avg_bet_pct = report_data.get("average_effective_bet_fraction_pct", 0.0)
+                f.write(f"Avg Bet Size (% Cap):\t{avg_bet_pct:.2f} %\n\n")
+                f.write("=" * 60 + "\n")
+            logging.info(f"Text performance report saved successfully.")
+        except Exception as e:
+            logging.error(f"Failed to save text performance report: {e}", exc_info=True)
+        # --- MT5風テキストレポート出力ここまで ---
 
 
 if __name__ == "__main__":

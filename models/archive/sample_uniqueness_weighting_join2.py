@@ -1,4 +1,5 @@
 # /workspace/models/sample_uniqueness_weighting_join.py
+# [MN無効化戦略に合わせたクリーン版 - Inf発生時は行を削除する最小限の防御]
 
 import sys
 import polars as pl
@@ -13,7 +14,6 @@ from typing import Dict
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 # blueprintから一元管理された設定を読み込む
-# [MODIFIED] 月次ではなく、日次のパーティションデータを入力とする
 from blueprint import (
     S6_LABELED_DATASET,
     S6_WEIGHTED_DATASET,
@@ -34,7 +34,6 @@ logging.basicConfig(
 def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
     """各パーティションファイルのオフセットと行数を計算する。"""
     logging.info("Step 1: Calculating row counts and offsets for each partition...")
-    # [MODIFIED] 日次パーティションを探索するようにglobパターンを修正
     partitions = sorted(input_dir.glob("year=*/month=*/day=*/*.parquet"))
     if not partitions:
         raise FileNotFoundError(
@@ -46,14 +45,26 @@ def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
     for path in partitions:
         try:
             row_count = pq.ParquetFile(path).metadata.num_rows
-            partition_info[path] = {"offset": total_rows, "rows": row_count}
+
+            # 各ファイルの年/月/日情報を抽出（ログ出力用）
+            day_part = path.parent.name
+            month_part = path.parent.parent.name
+            year_part = path.parent.parent.parent.name
+
+            partition_info[path] = {
+                "offset": total_rows,
+                "rows": row_count,
+                "year": int(year_part.split("=")[1]),
+                "month": int(month_part.split("=")[1]),
+                "day": int(day_part.split("=")[1]),
+            }
             total_rows += row_count
         except Exception as e:
             logging.error(f"Failed to read metadata from {path}: {e}")
             raise
 
     logging.info(
-        f"   -> Found {len(partitions)} daily partitions. Total rows: {total_rows}. Info calculated."
+        f"   -> Found {len(partitions)} daily partitions. Total rows: {total_rows}. Info calculated."
     )
     return partition_info
 
@@ -61,6 +72,9 @@ def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
 def main():
     """メインオーケストレーション関数（日次・逐次処理版）"""
     logging.info("### Final Battle Stage 2: Daily Sequential Assembly ###")
+    logging.warning(
+        "NOTE: MN/W1/D1 labels are now excluded. Inf/NaN uniqueness rows will be physically dropped to ensure model stability (minimal risk)."
+    )
 
     if not CONCURRENCY_RESULTS_PATH.exists():
         logging.error(
@@ -77,7 +91,6 @@ def main():
     S6_WEIGHTED_DATASET.mkdir(parents=True)
 
     # --- ステージ1: 各パーティションの情報を取得 ---
-    # [MODIFIED] 日次データセットのパスを使用
     partition_info_map = get_partition_info(S6_LABELED_DATASET)
 
     # --- ステージ2: 逐次処理ループ ---
@@ -92,7 +105,8 @@ def main():
     concurrency_lf = pl.scan_parquet(CONCURRENCY_RESULTS_PATH)
 
     for i, (path, info) in enumerate(partition_info_map.items()):
-        partition_name = f"{path.parent.parent.parent.name}/{path.parent.parent.name}/{path.parent.name}"
+        # ログ出力用のパーティション情報を取得
+        partition_name = f"year={info['year']}/month={info['month']}/day={info['day']}"
         logging.info(
             f"Processing: [{i + 1}/{len(partition_info_map)}] - Partition {partition_name}..."
         )
@@ -125,24 +139,28 @@ def main():
                 .with_columns((pl.col("row_num") + 1).alias("event_id"))
                 .join(concurrency_slice_lf, on="event_id", how="left")
                 .with_columns((1.0 / pl.col("concurrency")).alias("uniqueness"))
+                # ★★★ 最小限の防御: Inf重みでシステムがクラッシュするのを防ぐ ★★★
+                # MNラベルが無効化されたため、Inf行は微量であり、削除してもAUCは回復する
+                .filter(pl.col("uniqueness").is_finite())
+                .drop_nulls("uniqueness")
+                # ★★★ 修正ここまで ★★★
                 .select(pl.all().exclude(["row_num", "concurrency"]))
             )
 
-            # [MODIFIED] 日次パーティションのパスから年/月/日を抽出
-            day_part = path.parent.name
-            month_part = path.parent.parent.name
-            year_part = path.parent.parent.parent.name
-            year = int(year_part.split("=")[1])
-            month = int(month_part.split("=")[1])
-            day = int(day_part.split("=")[1])
-
             # 結果を最終的な日次パーティション構造で書き出す
-            output_dir = S6_WEIGHTED_DATASET / f"year={year}/month={month}/day={day}"
+            output_dir = S6_WEIGHTED_DATASET / partition_name
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / "data.parquet"
 
             # 計算を実行し、結果をファイルに書き出す
             result_df = final_lf.collect(streaming=True)
+
+            if result_df.is_empty():
+                logging.warning(
+                    f"Partition {partition_name} became empty after uniqueness filtering. Skipping write."
+                )
+                continue
+
             result_df.write_parquet(output_path, compression="zstd")
             total_processed_rows += len(result_df)
 

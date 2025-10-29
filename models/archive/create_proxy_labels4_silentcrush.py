@@ -1,7 +1,6 @@
 # /workspace/models/optimal_parameters/create_proxy_labels.py
 # [Gemini 修正版: 非Hiveデータ(単一Parquet)を先にメモリロードし、日次ループでのI/Oを削減]
 # [Gemini 修正版: Ruff F821 (args.no_resume) および E731 (lambda) エラーを修正]
-# [ユーザー修正依頼: drop_nulls("close") を削除し、意図しないデータ削除を回避]
 
 import sys
 from pathlib import Path
@@ -224,34 +223,34 @@ class ProxyLabelingEngine:
                 self._generate_report()
                 return
 
-            # # --- MODIFICATION START: Add start date filter ---
-            # known_start_date = dt.date(
-            #     2021, 8, 1
-            # )  # Define the known start date of reliable S2 data
-            # logging.info(
-            #     f"Applying start date filter: Processing partitions on or after {known_start_date}..."
-            # )
-            # partitions_df_filtered = partitions_df.filter(
-            #     pl.col("date") >= known_start_date
-            # )
-            # num_original = len(partitions_df)
-            # num_filtered = len(
-            #     partitions_df_filtered
-            # )  # Recalculate based on filtered df
+            # --- MODIFICATION START: Add start date filter ---
+            known_start_date = dt.date(
+                2021, 8, 1
+            )  # Define the known start date of reliable S2 data
+            logging.info(
+                f"Applying start date filter: Processing partitions on or after {known_start_date}..."
+            )
+            partitions_df_filtered = partitions_df.filter(
+                pl.col("date") >= known_start_date
+            )
+            num_original = len(partitions_df)
+            num_filtered = len(
+                partitions_df_filtered
+            )  # Recalculate based on filtered df
 
-            # if num_filtered < num_original:
-            #     logging.info(
-            #         f"   -> Filtered out {num_original - num_filtered} partitions before {known_start_date}."
-            #     )
+            if num_filtered < num_original:
+                logging.info(
+                    f"   -> Filtered out {num_original - num_filtered} partitions before {known_start_date}."
+                )
 
-            # if partitions_df_filtered.is_empty():
-            #     logging.warning(
-            #         f"No partitions remaining after applying start date filter ({known_start_date}). Exiting."
-            #     )
-            #     self._log_final_summary()
-            #     self._generate_report()
-            #     return
-            # # --- MODIFICATION END ---
+            if partitions_df_filtered.is_empty():
+                logging.warning(
+                    f"No partitions remaining after applying start date filter ({known_start_date}). Exiting."
+                )
+                self._log_final_summary()
+                self._generate_report()
+                return
+            # --- MODIFICATION END ---
 
             logging.info(
                 "Step 5: Starting daily processing loop (S2/S5 Hive data scanned per-loop)..."
@@ -260,21 +259,20 @@ class ProxyLabelingEngine:
             max_lookahead_minutes = self._get_duration_in_minutes(cfg.target_duration)
             max_lookahead_delta = dt.timedelta(minutes=max_lookahead_minutes)
 
-            # # --- Use the filtered DataFrame and its length for the loop and tqdm ---
-            # total_partitions = len(
-            #     partitions_df_filtered
-            # )  # ★★★ CORRECT: Use length of filtered DataFrame ★★★
-            # # logging.info(
-            # #     f"Processing {total_partitions} partitions from {known_start_date} onwards..."
-            # # )  # ★★★ CORRECT: Log uses filtered count ★★★
+            # --- Use the filtered DataFrame and its length for the loop and tqdm ---
+            total_partitions = len(
+                partitions_df_filtered
+            )  # ★★★ CORRECT: Use length of filtered DataFrame ★★★
+            logging.info(
+                f"Processing {total_partitions} partitions from {known_start_date} onwards..."
+            )  # ★★★ CORRECT: Log uses filtered count ★★★
 
             # Wrap the FILTERED iterator with tqdm, using the CORRECT total
-            total_partitions = len(
-                partitions_df
-            )  # ★★★ フィルター前の total を再定義 ★★★
             for row in tqdm(
-                partitions_df.iter_rows(named=True),  # ★★★ _filtered を削除 ★★★
-                total=total_partitions,  # ★★★ フィルター前の total を使用 ★★★
+                partitions_df_filtered.iter_rows(
+                    named=True
+                ),  # ★★★ CORRECT: Iterate over filtered DataFrame ★★★
+                total=total_partitions,  # ★★★ CORRECT: Use filtered count for total ★★★
                 desc="Processing Partitions",
                 unit="partition",
             ):
@@ -696,13 +694,23 @@ class ProxyLabelingEngine:
         )
 
     def _get_bar_duration_minutes(self, timeframe: str) -> float:
-        """Calculates the approximate duration of a bar in minutes for a given timeframe string."""
+        """
+        Calculates the approximate duration of a bar in minutes for a given timeframe string.
+
+        NOTE: Timeframes in the 'EXCLUDE_LIST' below return 0.0 to enforce silent skipping.
+              Otherwise, accurate duration is returned.
+        """
+        # --- ラベリング無効化リスト（HR > 1000の原則に基づく）---
+        # 実行時にラベリングから除外したい時間足をこのリストで管理する
+        EXCLUDE_LIST = ["D1", "W1", "MN"]
+
+        if timeframe in EXCLUDE_LIST:
+            return 0.0  # 意図的なスキップ（HRミスマッチ原則）
+
         if timeframe == "tick":
-            return 0.0  # Tick has no fixed duration in this context
+            return 0.0
 
-        if timeframe == "MN":
-            return 1.0 * 43200  # Approximate minutes in a month (value=1)
-
+        # Try to extract numeric value and unit (M, H, D, W)
         value_match = re.search(r"(\d*\.?\d+)", timeframe)
         unit_match = re.search(r"([A-Z])", timeframe)  # Expecting M, H, D, W
 
@@ -710,7 +718,7 @@ class ProxyLabelingEngine:
             logging.warning(
                 f"Could not parse value or unit from timeframe: {timeframe}"
             )
-            return 0.0  # Return 0 if parsing fails
+            return 0.0  # Safety return
 
         try:
             value_str = value_match.group(1)
@@ -727,13 +735,18 @@ class ProxyLabelingEngine:
             return value
         if unit == "H":  # Hour
             return value * 60
+
+        # --- 期間計算ロジックの復元 ---
         if unit == "D":  # Day
             return value * 1440  # 60 * 24
         if unit == "W":  # Week
             return value * 10080  # 60 * 24 * 7
+        if unit == "N":  # Month (MNがリストから外れた場合、ここで計算)
+            # 30日近似。ただし、MNは通常EXCLUDE_LISTに入る。
+            return value * 43200
 
-        logging.warning(f"Unhandled timeframe unit '{unit}' in timeframe: {timeframe}")
-        return 0.0  # Return 0 for any other unhandled units
+        # 例外的なユニットの場合
+        return 0.0
 
     def _calculate_labels_for_batch(
         self, daily_bets_df: pl.DataFrame, price_window_df: pl.DataFrame
@@ -742,59 +755,31 @@ class ProxyLabelingEngine:
         if daily_bets_df.is_empty():
             return None
 
-        # --- ▼▼▼ 除外リストを定義 ▼▼▼ ---
-        EXCLUDE_TIMEFRAMES = [
-            "MN",
-            "W1",
-            "D1",
-            "H12",
-            "H6",
-            "H4",
-            "H30",
-            "M0.5",
-            "tick",
-            # "H1",
-            # "M15",
-            # "M8",
-            # "M5",
-            # "M3",
-            # "M1",
-        ]  # ここに除外したい時間足を追加
-        # --- ▲▲▲ 除外リストここまで ▲▲▲ ---
+        # --- DEBUG CODE REMOVED ---
 
         labeled_chunks = []
         # Group by timeframe within the daily batch
         for timeframe_tuple, group_df in daily_bets_df.group_by("timeframe"):
             timeframe = timeframe_tuple[0]
             if timeframe is None or group_df.is_empty():
-                continue
+                continue  # Skip if timeframe is null or group is empty
 
-            # # --- ▼▼▼ ここからデバッグプリントを追加 ▼▼▼ ---
-            # logging.info(f"Checking Timeframe: '{timeframe}' (Type: {type(timeframe)})")
-            # logging.info(f"Current Exclude List: {EXCLUDE_TIMEFRAMES}")
-            # # --- ▲▲▲ デバッグプリントここまで ▲▲▲ ---
-
-            # --- ▼▼▼ ここで除外チェック ▼▼▼ ---
-            if timeframe in EXCLUDE_TIMEFRAMES:
-                logging.debug(f"Skipping labeling for excluded timeframe: {timeframe}")
-                continue  # この時間足の処理をスキップ
-            # --- ▲▲▲ 除外チェックここまで ▲▲▲ ---
-
+            # Calculate max lookahead time (t1_max) based on target duration and timeframe
             target_duration_minutes = self._get_duration_in_minutes(cfg.target_duration)
             bar_duration_minutes = self._get_bar_duration_minutes(timeframe)
             t1_max_expr: pl.Expr
             if timeframe == "tick":
+                # For tick data, add the exact duration
                 t1_max_expr = pl.col("timestamp") + pl.duration(
                     minutes=target_duration_minutes
                 )
             else:
+                # For bar data, calculate lookahead in bars
                 if bar_duration_minutes == 0:
-                    # This warning handles cases where duration calc fails (e.g., parsing error)
-                    # It will also catch excluded timeframes if _get_bar_duration_minutes returns 0 for them.
                     logging.warning(
                         f"Skipping timeframe {timeframe} due to zero bar duration calculation."
                     )
-                    continue
+                    continue  # Skip if bar duration calculation fails
                 lookahead_bars = max(
                     1, int(round(target_duration_minutes / bar_duration_minutes))
                 )
@@ -802,122 +787,157 @@ class ProxyLabelingEngine:
                     minutes=lookahead_bars * bar_duration_minutes
                 )
 
+            # Define the required ATR column name for this timeframe
             atr_col_name = f"e1c_atr_21_{timeframe}"
             if atr_col_name not in price_window_df.columns:
+                # Only log warning if the timeframe is NOT 'tick' (since skipping tick is intentional)
                 if timeframe != "tick":
-                    # Keep this warning for missing *required* ATR columns
                     logging.warning(
                         f"Required ATR column '{atr_col_name}' not found in price data. Skipping timeframe '{timeframe}'."
                     )
-                continue
+                continue  # Skip if necessary ATR column is missing (for tick or other reasons)
 
+            # Store original columns before join
             original_cols = group_df.columns
 
-            # join_asof を実行
+            # Join betting opportunities with price data (including ATR) using join_asof
+            # This aligns the price/ATR data available *at or just before* the bet timestamp
             bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
                     ["timestamp", "close", "high", "low", atr_col_name]
                 ).sort("timestamp"),
                 on="timestamp",
-            ).filter(  # join_asof 後に Null でないことを確認 (close を含む)
-                pl.col(atr_col_name).is_not_null()  # & pl.col("close").is_not_null()
+            ).filter(
+                pl.col(atr_col_name).is_not_null()
+                & pl.col(
+                    "close"
+                ).is_not_null()  # Ensure ATR and close are valid after join
             )
 
-            # --- ★★★ drop_nulls("close") は削除済み (コメントアウト) ★★★ ---
-            # rows_before_drop = len(bets_with_price_df)
-            # bets_with_price_df = bets_with_price_df.drop_nulls("close") # 問題の行
-            # rows_after_drop = len(bets_with_price_df)
-            # if rows_before_drop > rows_after_drop:
-            #     logging.warning(
-            #         f"Dropped {rows_before_drop - rows_after_drop} rows for timeframe '{timeframe}' due to missing 'close' price after join_asof."
-            #     )
-            # --- ★★★ 削除 (コメントアウト) ここまで ★★★ ---
-
+            # If join results in empty dataframe or required columns are missing, skip
             if bets_with_price_df.is_empty():
-                # --- ▼▼▼ ここで該当の Warning を削除 (コメントアウト) ▼▼▼ ---
-                # logging.debug( # または logging.warning(...) だったかもしれません
-                #     f"No valid price/ATR data found for timeframe '{timeframe}' after join_asof and filtering."
-                # )
-                # --- ▲▲▲ Warning 削除ここまで ▲▲▲ ---
-                continue  # DataFrameが空なら次の時間足へ
+                logging.debug(
+                    f"No valid price/ATR data found for timeframe '{timeframe}' after join_asof."
+                )
+                continue
+
+            # --- Drop rows where 'close' became Null after join (Keep this fix) ---
+            rows_before_drop = len(bets_with_price_df)
+            bets_with_price_df = bets_with_price_df.drop_nulls("close")
+            rows_after_drop = len(bets_with_price_df)
+            if rows_before_drop > rows_after_drop:
+                logging.warning(
+                    f"Dropped {rows_before_drop - rows_after_drop} rows for timeframe '{timeframe}' due to missing 'close' price after join_asof."
+                )
+            if bets_with_price_df.is_empty():
+                logging.warning(
+                    f"All rows dropped for timeframe '{timeframe}' after checking for 'close'. Skipping."
+                )
+                continue
+            # --- Keep this fix ---
 
             # Calculate profit-take (pt) and stop-loss (sl) barriers based on ATR
+            # Keep original ATR value ('atr_value') for potential use later (e.g., logging, risk calc)
             bets_df = bets_with_price_df.select(
-                pl.col("timestamp").alias("t0"),
-                pl.col("close"),  # close列はバリア計算に必要なので保持
+                pl.col("timestamp").alias("t0"),  # Start time of the event
+                pl.col("close"),  # Keep 'close' column
                 (
                     pl.col("close") + pl.col(atr_col_name) * cfg.profit_take_multiplier
-                ).alias("pt_barrier"),
+                ).alias("pt_barrier"),  # Upper barrier
                 (
                     pl.col("close") - pl.col(atr_col_name) * cfg.stop_loss_multiplier
-                ).alias("sl_barrier"),
-                t1_max_expr.alias("t1_max"),
-                pl.col(atr_col_name).alias("atr_value"),
-                pl.col(original_cols).exclude("timestamp"),
+                ).alias("sl_barrier"),  # Lower barrier
+                t1_max_expr.alias("t1_max"),  # Time barrier (max holding duration)
+                pl.col(atr_col_name).alias(
+                    "atr_value"
+                ),  # Raw ATR value used for barriers
+                pl.col(original_cols).exclude(
+                    "timestamp"
+                ),  # Keep original features, exclude original timestamp
             )
 
-            # Determine which barrier was hit first
+            # Determine which barrier was hit first by looking into the future price window
+            # Use join_asof again to efficiently find future price movements relative to each bet's start time (t0)
             hits_df = (
-                price_window_df.select(["timestamp", "high", "low"])
+                price_window_df.select(
+                    ["timestamp", "high", "low"]
+                )  # Only need future high/low
                 .join_asof(
+                    # Select only necessary columns from bets_df for the join
                     bets_df.select(["t0", "pt_barrier", "sl_barrier", "t1_max"]),
-                    left_on="timestamp",
+                    left_on="timestamp",  # Align future price time with bet start time
                     right_on="t0",
-                    # strategy="forward",
+                    strategy="forward",  # Look for prices *after* t0
                 )
+                # Filter future prices that are within the event's max duration (t0 to t1_max)
                 .filter(pl.col("timestamp") <= pl.col("t1_max"))
+                # Check if high >= pt_barrier or low <= sl_barrier for each future price point
                 .with_columns(
+                    # Record the timestamp if PT barrier is hit
                     pt_hit_time=pl.when(pl.col("high") >= pl.col("pt_barrier")).then(
                         pl.col("timestamp")
                     ),
+                    # Record the timestamp if SL barrier is hit
                     sl_hit_time=pl.when(pl.col("low") <= pl.col("sl_barrier")).then(
                         pl.col("timestamp")
                     ),
                 )
+                # Group by the original bet start time (t0)
                 .group_by("t0")
+                # Find the *earliest* time each barrier was hit within the duration
                 .agg(
                     pl.col("pt_hit_time").min().alias("first_pt_time"),
                     pl.col("sl_hit_time").min().alias("first_sl_time"),
                 )
             )
 
-            # Join hit times back
+            # Join the hit times back to the original bets dataframe
             final_group_df = bets_df.join(hits_df, on="t0", how="left")
 
-            # Determine final label and t1
+            # Determine the final label and event end time (t1) based on which barrier was hit first
             labeled_group = final_group_df.with_columns(
-                t1=pl.when(
+                # Determine t1: the earlier of first_pt_time or first_sl_time, or t1_max if neither hit
+                t1=pl.when(  # If PT hit...
+                    (pl.col("first_pt_time").is_not_null())
+                    & (  # ...and (SL didn't hit OR PT hit first/simultaneously)
+                        (pl.col("first_sl_time").is_null())
+                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
+                    )
+                )
+                .then(pl.col("first_pt_time"))  # t1 is PT hit time
+                .when(pl.col("first_sl_time").is_not_null())  # Else if SL hit...
+                .then(pl.col("first_sl_time"))  # t1 is SL hit time
+                .otherwise(
+                    pl.col("t1_max")
+                ),  # Else (neither hit), t1 is max duration time
+                # Determine label: 1 for PT, -1 for SL, 0 for timeout
+                label=pl.when(  # If PT hit first/simultaneously...
                     (pl.col("first_pt_time").is_not_null())
                     & (
                         (pl.col("first_sl_time").is_null())
                         | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
                     )
                 )
-                .then(pl.col("first_pt_time"))
-                .when(pl.col("first_sl_time").is_not_null())
-                .then(pl.col("first_sl_time"))
-                .otherwise(pl.col("t1_max")),
-                label=pl.when(
-                    (pl.col("first_pt_time").is_not_null())
-                    & (
-                        (pl.col("first_sl_time").is_null())
-                        | (pl.col("first_pt_time") <= pl.col("first_sl_time"))
-                    )
-                )
-                .then(pl.lit(1, dtype=pl.Int8))
-                .when(pl.col("first_sl_time").is_not_null())
-                .then(pl.lit(-1, dtype=pl.Int8))
-                .otherwise(pl.lit(0, dtype=pl.Int8)),
+                .then(pl.lit(1, dtype=pl.Int8))  # Label is 1 (Win)
+                .when(pl.col("first_sl_time").is_not_null())  # Else if SL hit...
+                .then(pl.lit(-1, dtype=pl.Int8))  # Label is -1 (Loss)
+                .otherwise(pl.lit(0, dtype=pl.Int8)),  # Else (timeout), Label is 0
+                # Calculate and store the payoff ratio used for this labeling
                 payoff_ratio=pl.lit(
                     cfg.profit_take_multiplier / cfg.stop_loss_multiplier,
                     dtype=pl.Float32,
                 ),
+                # Store the SL multiplier used
                 sl_multiplier=pl.lit(cfg.stop_loss_multiplier, dtype=pl.Float32),
+                # Store the PT multiplier used
                 pt_multiplier=pl.lit(cfg.profit_take_multiplier, dtype=pl.Float32),
+                # Store the assumed direction (currently fixed at 1 for Buy)
                 direction=pl.lit(1, dtype=pl.Int8),
-            ).rename({"t0": "timestamp"})
+            ).rename({"t0": "timestamp"})  # Rename t0 back to standard 'timestamp'
 
-            # Drop intermediate columns
+            # Drop intermediate columns used for calculation, keep essential info
+            # Keep: timestamp, t1, label, original features, close, timeframe,
+            #       payoff_ratio, atr_value, sl_multiplier, pt_multiplier, direction
             labeled_chunks.append(
                 labeled_group.drop(
                     [
@@ -930,8 +950,10 @@ class ProxyLabelingEngine:
                 )
             )
 
+        # Combine results from all timeframes processed in this batch
         if not labeled_chunks:
-            return None
+            return None  # Return None if no labels were generated
+        # Concatenate results vertically and sort by the final timestamp
         return pl.concat(labeled_chunks).sort("timestamp")
 
     def _update_label_counts(self, df: pl.DataFrame):
