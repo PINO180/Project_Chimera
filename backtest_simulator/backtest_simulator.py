@@ -81,7 +81,7 @@ class BacktestConfig:
     m2_model_path: Path = S7_M2_MODEL_PKL
     m1_calibrator_path: Path = S7_M1_CALIBRATED
     m2_calibrator_path: Path = S7_M2_CALIBRATED
-    kelly_fraction: float = 1.0
+    kelly_fraction: float = 0.5
     # max_leverage: float = 100 # <- ★★★ 削除: base_leverage を使う ★★★
     max_risk_per_trade: float = 0.02
     f_star_threshold: float = 0.0
@@ -92,7 +92,7 @@ class BacktestConfig:
 
     # --- ★★★ 修正: 基本レバレッジとスプレッドを追加 ★★★ ---
     base_leverage: float = 2000.0  # 設定可能な基本レバレッジ
-    spread_pips: float = 0.00  # XAUUSD スタンダード口座のスプレッド
+    spread_pips: float = 1.60  # XAUUSD スタンダード口座のスプレッド
     value_per_pip: float = 10.0
     """
     (ASSUMPTION) 1ロットあたりの1pipの価値 (口座通貨単位)。
@@ -461,6 +461,10 @@ class BacktestSimulator:
         DECIMAL_MIN_CAPITAL = Decimal(str(self.config.min_capital_threshold))
         DECIMAL_VALUE_PER_PIP = Decimal(str(self.config.value_per_pip))
 
+        # ★★★ 修正: CONTRACT_SIZE を Decimal 型で定義 ★★★
+        DECIMAL_CONTRACT_SIZE = CONTRACT_SIZE
+        # ★★★ 修正ここまで ★★★
+
         timestamps_chunk = df_chunk["timestamp"].to_list()
         close_prices_chunk = df_chunk[
             "close"
@@ -540,10 +544,10 @@ class BacktestSimulator:
                 capped_bet_fraction = effective_bet_fraction  # ログ用
 
                 if effective_bet_fraction > DECIMAL_ZERO:
-                    # --- ★★★ 修正: 動的ロットサイズ計算 + 制約適用 (ここから) ★★★ ---
+                    # --- ★★★ 修正: 動的ロットサイズ計算 (ここから) ★★★ ---
                     risk_amount_decimal = current_capital * effective_bet_fraction
 
-                    # 1. 動的SL幅 (pips) を計算
+                    # 1. 動的SL幅 (価格単位) を計算
                     if (
                         atr_value_float is None
                         or not np.isfinite(atr_value_float)
@@ -556,15 +560,23 @@ class BacktestSimulator:
                             f"Invalid ATR ({atr_value_float}) or SL mult ({sl_multiplier_float}) at {current_timestamp}, cannot calculate lot size."
                         )
                         desired_lot_size_decimal = DECIMAL_ZERO
+                        stop_loss_currency_per_lot = DECIMAL_ZERO  # ★ 追加
                     else:
-                        dynamic_sl_pips_decimal = Decimal(
+                        # atr_value (例: 1.80) は「価格単位」
+                        dynamic_sl_PRICE_decimal = Decimal(
                             str(atr_value_float)
                         ) * Decimal(str(sl_multiplier_float))
-                        stop_loss_currency_per_lot = (
-                            dynamic_sl_pips_decimal * DECIMAL_VALUE_PER_PIP
-                        )
 
-                        # 2. リスクベースの希望ロットサイズ計算
+                        # 2. 1ロットあたりのストップロス価値（通貨）を計算
+                        # ★★★ これがバグ修正箇所 ★★★
+                        # (誤) ... * DECIMAL_VALUE_PER_PIP (10.0)
+                        # (正) ... * DECIMAL_CONTRACT_SIZE (100.0)
+                        stop_loss_currency_per_lot = (
+                            dynamic_sl_PRICE_decimal * DECIMAL_CONTRACT_SIZE
+                        )
+                        # ★★★ 修正完了 ★★★
+
+                        # 3. リスクベースの希望ロットサイズ計算
                         if stop_loss_currency_per_lot > DECIMAL_ZERO:
                             desired_lot_size_decimal = (
                                 risk_amount_decimal / stop_loss_currency_per_lot
@@ -572,29 +584,29 @@ class BacktestSimulator:
                         else:
                             desired_lot_size_decimal = DECIMAL_ZERO
 
-                    # 3. 実効レバレッジを決定
+                    # 4. 実効レバレッジを決定
                     effective_leverage_decimal = self._get_effective_leverage(
                         current_capital
                     )
 
-                    # 4. 証拠金ベースの最大許容ロットサイズを計算
+                    # 5. 証拠金ベースの最大許容ロットサイズを計算
                     # Lot = (Equity * Leverage) / (Price * ContractSize)
                     if effective_leverage_decimal > DECIMAL_ZERO:
                         max_lot_by_margin = (
                             current_capital * effective_leverage_decimal
-                        ) / (current_price_decimal * CONTRACT_SIZE)
+                        ) / (current_price_decimal * DECIMAL_CONTRACT_SIZE)
                         max_lot_by_margin = max_lot_by_margin.copy_abs().max(
                             DECIMAL_ZERO
                         )  # 負にならないように
                     else:
                         max_lot_by_margin = DECIMAL_ZERO
 
-                    # 5. 時間帯ベースの最大許容ロット数を取得
+                    # 6. 時間帯ベースの最大許容ロット数を取得
                     max_lot_allowed_by_broker = self._get_max_lot_allowed(
                         current_timestamp
                     )
 
-                    # 6. 最終的なロットサイズを決定 (希望ロット vs 証拠金上限 vs ブローカー上限)
+                    # 7. 最終的なロットサイズを決定 (希望ロット vs 証拠金上限 vs ブローカー上限)
                     final_lot_size_decimal = desired_lot_size_decimal.min(
                         max_lot_by_margin
                     ).min(max_lot_allowed_by_broker)
@@ -602,16 +614,16 @@ class BacktestSimulator:
                         DECIMAL_ZERO
                     )  # 念のためゼロ以上を保証
 
-                    # 7. 最終ロットサイズがゼロより大きいか？
+                    # 8. 最終ロットサイズがゼロより大きいか？
                     if final_lot_size_decimal > DECIMAL_ZERO:
-                        # 8. 必要証拠金を計算 [cite: 45]
+                        # 9. 必要証拠金を計算
                         margin_required_decimal = (
                             current_price_decimal
                             * final_lot_size_decimal
-                            * CONTRACT_SIZE
+                            * DECIMAL_CONTRACT_SIZE
                         ) / effective_leverage_decimal
 
-                        # 9. スプレッドコストを計算
+                        # 10. スプレッドコストを計算
                         spread_pips_decimal = Decimal(str(self.config.spread_pips))
                         spread_cost_decimal = (
                             final_lot_size_decimal
@@ -629,10 +641,10 @@ class BacktestSimulator:
                             # equity_values_chunk.append(current_capital) # ← これはループの最後に移動
                             # continue や return は不要、ループの残りを実行して資本を記録
                         else:
-                            # 10. スプレッドコストを資本から差し引く
+                            # 11. スプレッドコストを資本から差し引く
                             capital_before_pnl = current_capital - spread_cost_decimal
 
-                            # 11. PnLを再計算 (最終ロットサイズに基づいてリスク額を再定義)
+                            # 12. PnLを再計算 (最終ロットサイズに基づいてリスク額を再定義)
                             #    リスク額 = 最終ロットサイズ * 1ロットあたりSL(通貨)
                             if (
                                 stop_loss_currency_per_lot > DECIMAL_ZERO
@@ -652,17 +664,17 @@ class BacktestSimulator:
                                 # 損失 = -リスク額
                                 pnl = risk_amount_final.copy_negate()
 
-                            # 12. 次の資本を計算
+                            # 13. 次の資本を計算
                             next_capital = capital_before_pnl + pnl
 
-                            # 13. ログ用に float に変換
+                            # 14. ログ用に float に変換
                             lot_size_float = (
                                 float(final_lot_size_decimal)
                                 if final_lot_size_decimal.is_finite()
                                 else 0.0
                             )
 
-                            # 14. 無限大/NaN チェック
+                            # 15. 無限大/NaN チェック
                             if not next_capital.is_finite():
                                 logging.error(
                                     f"Capital NaN/Inf at {current_timestamp}. Prev: {current_capital:.2E}, Spread: {spread_cost_decimal:.2E}, PnL: {pnl:.2E}"
@@ -676,7 +688,7 @@ class BacktestSimulator:
                         pnl = DECIMAL_ZERO
                         actual_label = labels_chunk[i]
                         # lot_size_float, margin_required_decimal, spread_cost_decimal はゼロのまま
-                    # --- ★★★ 修正: 動的ロットサイズ計算 + 制約適用 (ここまで) ★★★ ---
+                    # --- ★★★ 修正: 動的ロットサイズ計算 (ここまで) ★★★ ---
 
                 else:  # ケリー推奨がゼロ以下 or M2確率が閾値以下
                     should_trade = False

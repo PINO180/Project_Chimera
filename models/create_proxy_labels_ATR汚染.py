@@ -580,10 +580,6 @@ class ProxyLabelingEngine:
             return None
 
     def _load_all_price_data(self) -> Dict[str, Any]:
-        """
-        [修正版] S2の価格データ(Tick)と、
-        各時間足の「価格単位ATR (e1c_atr_21)」のみを明示的に読み込む。
-        """
         price_dir = self.config.price_data_source_dir / "feature_value_a_vast_universeC"
         tick_dir = price_dir / "features_e1c_tick"
         if not tick_dir.exists():
@@ -598,14 +594,11 @@ class ProxyLabelingEngine:
             .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
             .unique("timestamp", keep="first", maintain_order=True)
         )
-
-        # S2 (engine_1_C) が出力した全 .parquet ファイルを検索
         atr_files = list(price_dir.glob("features_e1c_*.parquet"))
         if not atr_files:
             raise FileNotFoundError(
                 f"No ATR parquet files (standard or dedicated tick) found in {price_dir} or specified path."
             )
-
         timeframe_pattern = re.compile(
             r"features_e1c_([a-zA-Z0-9\.]+)(?:_atr_only_tick_fixed)?\.parquet"
         )
@@ -613,12 +606,6 @@ class ProxyLabelingEngine:
         logging.info(
             f"   -> Processing {len(atr_files)} potential S2 ATR source files (S2 Non-Tick)."
         )
-
-        # ★★★ 修正箇所 ★★★
-        # 読み込むべき「価格単位」のATRカラム名を明示的に定義
-        # engine_1_C はこの名前で価格単位ATRを保存している
-        SOURCE_ATR_COLUMN_NAME = "e1c_atr_21"
-        # ★★★ 修正箇所 ★★★
 
         for f_path in atr_files:
             is_dedicated_tick_file = "_atr_only_tick_fixed" in f_path.name
@@ -631,13 +618,7 @@ class ProxyLabelingEngine:
             timeframe = match.group(1)
             if is_dedicated_tick_file:
                 timeframe = "tick"
-
-            # ★★★ 修正箇所 ★★★
-            # このスクリプト内で使用する、時間足サフィックス付きの
-            # 「ターゲット（最終的な）」カラム名を定義
             target_atr_name = f"e1c_atr_21_{timeframe}"
-            # ★★★ 修正箇所 ★★★
-
             lf_original = pl.scan_parquet(str(f_path))
             schema_names = lf_original.collect_schema().names()
             if is_dedicated_tick_file:
@@ -666,34 +647,35 @@ class ProxyLabelingEngine:
                         f"   -> Dedicated tick ATR file {f_path.name} does not contain required columns ('datetime' or 'timestamp', and '{expected_tick_atr_col}'). Found: {schema_names}"
                     )
             else:
-                # --- ▼▼▼ 修正ブロック ▼▼▼ ---
-                # (修正前は "e1c_atr_21" を含むカラムを曖昧に検索していた)
-
                 lf = lf_original.with_columns(
                     pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
                 )
-
-                # 読み込むべき「価格単位」のカラム (e1c_atr_21) が
-                # ファイル内に存在するかを明示的に確認
-                if SOURCE_ATR_COLUMN_NAME in schema_names:
-                    # 存在する場合、そのカラム (e1c_atr_21) を選択し、
-                    # ターゲット名 (e1c_atr_21_H1など) にリネームする
+                atr_col_to_rename = next(
+                    (
+                        col
+                        for col in schema_names
+                        if "e1c_atr_21" in col and col != target_atr_name
+                    ),
+                    None,
+                )
+                if target_atr_name in schema_names:
+                    all_atr_lfs.append(lf.select(["timestamp", target_atr_name]))
+                    logging.info(
+                        f"   -> Prepared ATR blueprint for timeframe '{timeframe}' from standard file {f_path.name} (Exact match)"
+                    )
+                elif atr_col_to_rename:
                     all_atr_lfs.append(
-                        lf.select(["timestamp", SOURCE_ATR_COLUMN_NAME]).rename(
-                            {SOURCE_ATR_COLUMN_NAME: target_atr_name}
+                        lf.select(["timestamp", atr_col_to_rename]).rename(
+                            {atr_col_to_rename: target_atr_name}
                         )
                     )
                     logging.info(
-                        f"   -> Prepared ATR blueprint for timeframe '{timeframe}' from {f_path.name} (Loaded '{SOURCE_ATR_COLUMN_NAME}' -> Renamed to '{target_atr_name}')"
+                        f"   -> Prepared ATR blueprint for timeframe '{timeframe}' from standard file {f_path.name} (Renamed '{atr_col_to_rename}')"
                     )
                 else:
-                    # 目的の「価格単位」カラムが見つからない場合は警告し、スキップする
-                    # (これにより e1c_atr_pct_21 が誤って読み込まれるのを防ぐ)
                     logging.warning(
-                        f"   -> Required ATR column '{SOURCE_ATR_COLUMN_NAME}' not found in {f_path.name}. Skipping."
+                        f"   -> No ATR column found in {f_path.name}. Skipping."
                     )
-                # --- ▲▲▲ 修正ブロック ▲▲▲ ---
-
         if not all_atr_lfs:
             raise ValueError(
                 "FATAL: No valid ATR columns were extracted from any price files."
