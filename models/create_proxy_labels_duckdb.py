@@ -15,6 +15,7 @@ import polars as pl
 from tqdm import tqdm
 import re
 import gc
+import duckdb  # <--- 指示1: インポートの追加
 import datetime as dt
 
 # --- Project Path Setup ---
@@ -766,6 +767,7 @@ class ProxyLabelingEngine:
         logging.warning(f"Unhandled timeframe unit '{unit}' in timeframe: {timeframe}")
         return 0.0  # Return 0 for any other unhandled units
 
+    # --- ▼▼▼ 指示2: メソッドの置換 (戦略2: DuckDB) ▼▼▼ ---
     def _calculate_labels_for_batch(
         self, daily_bets_df: pl.DataFrame, price_window_df: pl.DataFrame
     ) -> pl.DataFrame | None:
@@ -860,48 +862,71 @@ class ProxyLabelingEngine:
                 ).alias("sl_barrier"),
                 t1_max_expr.alias("t1_max"),
                 pl.col(atr_col_name).alias("atr_value"),
-                pl.col(original_cols).exclude("timestamp"),
+                pl.col("close"),  # <-- ★★★ join_asof した close を明示的に保持する
+                pl.col(original_cols).exclude("timestamp"),  # S5由来の特徴量を保持
             )
 
-            # --- ▼▼▼ 修正ブロック: join_where を使用した区間結合 ▼▼▼ ---
-            # (レポートで推奨された正しい実装)
+            # --- ▼▼▼ 修正ブロック: DuckDB を使用した区間結合 (戦略2) ▼▼▼ ---
 
             # price_window_df (ティックデータ) は run() でソート済み
             ticks_df = price_window_df.select(["timestamp", "high", "low"])
 
-            # hits_df: ベット(bets_df)を起点とし、
-            # [t0, t1_max] の区間に入る全てのティックを結合する
-            hits_df = (
-                bets_df.join_where(
-                    ticks_df,
-                    # 述語1: ティックはベット開始以降
-                    pl.col("timestamp") >= pl.col("t0"),
-                    # 述語2: ティックは時間バリア以前
-                    pl.col("timestamp") <= pl.col("t1_max"),
+            if bets_df.is_empty() or ticks_df.is_empty():
+                logging.debug(
+                    f"Skipping timeframe {timeframe}: No bets or ticks for DuckDB join."
                 )
-                .with_columns(
-                    # ヒット判定
-                    pt_hit_time=pl.when(pl.col("high") >= pl.col("pt_barrier")).then(
-                        pl.col("timestamp")
-                    ),
-                    sl_hit_time=pl.when(pl.col("low") <= pl.col("sl_barrier")).then(
-                        pl.col("timestamp")
-                    ),
+                continue
+
+            con = None  # 接続変数を初期化
+            try:
+                # DuckDB接続 (in-memory)
+                con = duckdb.connect()
+
+                # タイムゾーンをUTCに設定 (UTC vs Asia/Tokyoエラー回避)
+                con.execute("SET TimeZone='UTC'")
+
+                # Polars DataFrameをDuckDBに登録
+                # .to_arrow() を挟むとTIMESTAMP_USがArrowのTIMESTAMP[us]に正しく変換される
+                con.register("b", bets_df.to_arrow())
+                con.register("p", ticks_df.to_arrow())
+
+                # SQLクエリの実行
+                # レポートで提案されたJOINベースのクエリ
+                # 1. [t0, t1_max] の範囲で価格ティック(p)にヒットするベット(b)をJOIN
+                # 2. ヒットしたティック(p)がバリアに到達したかを判定
+                # 3. ベット(b.t0)ごとにグループ化し、最初にバリアにヒットした時間(MIN)を見つける
+                query = """
+                SELECT
+                    b.t0,
+                    MIN(CASE WHEN p.high >= b.pt_barrier THEN p.timestamp ELSE NULL END) AS first_pt_time,
+                    MIN(CASE WHEN p.low <= b.sl_barrier THEN p.timestamp ELSE NULL END) AS first_sl_time
+                FROM b
+                JOIN p ON p.timestamp >= b.t0 AND p.timestamp <= b.t1_max
+                GROUP BY b.t0
+                """
+
+                # 結果をPolars DataFrameとして取得
+                hits_df = con.execute(query).pl()
+
+            except Exception as e:
+                logging.error(
+                    f"DuckDB execution failed for timeframe {timeframe}: {e}",
+                    exc_info=True,
                 )
-                .group_by("t0")  # 元のベット(t0)ごとに集計
-                .agg(
-                    # 最初にヒットした時間を探す
-                    pl.col("pt_hit_time").min().alias("first_pt_time"),
-                    pl.col("sl_hit_time").min().alias("first_sl_time"),
-                )
-            )
+                # OOM killer などで失敗した場合、このバッチをスキップ
+                continue
+            finally:
+                # 接続を閉じる
+                if con:
+                    con.close()
+
             # --- ▲▲▲ 修正ブロック ▲▲▲ ---
 
             # Join hit times back to the original bets_df
             # (hits_dfにはヒットしなかったベット(TO)が含まれないため、left joinが必須)
             final_group_df = bets_df.join(hits_df, on="t0", how="left")
 
-            # Determine final label and t1
+            # Determine final label and t1 (元のコードと同じロジック)
             labeled_group = final_group_df.with_columns(
                 t1=pl.when(
                     (pl.col("first_pt_time").is_not_null())
@@ -935,6 +960,8 @@ class ProxyLabelingEngine:
             ).rename({"t0": "timestamp"})
 
             # Drop intermediate columns
+            # close カラムは original_cols の一部として保持されており、
+            # この drop リストには含まれていないため、削除されない
             labeled_chunks.append(
                 labeled_group.drop(
                     [
@@ -950,6 +977,8 @@ class ProxyLabelingEngine:
         if not labeled_chunks:
             return None
         return pl.concat(labeled_chunks).sort("timestamp")
+
+    # --- ▲▲▲ 指示2: メソッドの置換 (戦略2: DuckDB) ▲▲▲ ---
 
     def _update_label_counts(self, df: pl.DataFrame):
         counts = df.group_by("label").len()

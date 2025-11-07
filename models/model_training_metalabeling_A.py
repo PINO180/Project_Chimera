@@ -146,6 +146,7 @@ class M1CrossValidator:
     def _calculate_scale_pos_weight(self) -> float:
         """
         全パーティションをスキャンして M1 の scale_pos_weight (勝ち=1 vs それ以外=0) を計算する。
+        [修正版: .item() の呼び出しをロバスト化]
         """
         logging.info(
             "Calculating scale_pos_weight for M1 (label == 1 vs label != 1)..."
@@ -175,18 +176,19 @@ class M1CrossValidator:
                 )
                 counts_in_partition = binary_labels["binary_label"].value_counts()
 
-                pos_count = (
-                    counts_in_partition.filter(pl.col("binary_label") == 1)
-                    .select(pl.col("count"))
-                    .item()
-                    or 0
-                )
-                neg_count = (
-                    counts_in_partition.filter(pl.col("binary_label") == 0)
-                    .select(pl.col("count"))
-                    .item()
-                    or 0
-                )
+                # --- ▼▼▼ [バグ修正] .item() の呼び出しを安全にする ▼▼▼ ---
+                # Positive Count
+                pos_count_df = counts_in_partition.filter(
+                    pl.col("binary_label") == 1
+                ).select(pl.col("count"))
+                pos_count = pos_count_df.item() if not pos_count_df.is_empty() else 0
+
+                # Negative Count
+                neg_count_df = counts_in_partition.filter(
+                    pl.col("binary_label") == 0
+                ).select(pl.col("count"))
+                neg_count = neg_count_df.item() if not neg_count_df.is_empty() else 0
+                # --- ▲▲▲ 修正ここまで ▲▲▲ ---
 
                 counts[1] += pos_count
                 counts[0] += neg_count

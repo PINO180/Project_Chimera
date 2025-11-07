@@ -17,6 +17,24 @@ import re
 import gc
 import datetime as dt
 
+# --- ▼▼▼ Numba移行のためのインポート追加 ▼▼▼ ---
+import numpy as np
+
+try:
+    from numba import njit, prange
+    from numba.core.errors import NumbaPerformanceWarning
+
+    # Numba が JIT コンパイル中に発生させる特定の警告を抑制
+    warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
+    NUMBA_AVAILABLE = True
+except ImportError:
+    logging.warning(
+        "Numba not found. Labeling performance will be significantly degraded."
+    )
+    NUMBA_AVAILABLE = False
+# --- ▲▲▲ インポート追加ここまで ▲▲▲ ---
+
+
 # --- Project Path Setup ---
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
@@ -77,6 +95,94 @@ class ProxyLabelConfig:
             return "All Time"
         else:
             return f"Invalid or Incomplete Filter ({self.filter_mode}, Year: {self.filter_year}, Month: {self.filter_month})"
+
+
+# --- ▼▼▼ Numbaヘルパー関数 (戦略2) ▼▼▼ ---
+# Numbaが利用可能な場合のみ@njitデコレータを適用
+def _njit_if_available(func):
+    """Applies @njit decorator only if Numba is available."""
+    if NUMBA_AVAILABLE:
+        # fastmath=True は積極的な浮動小数点最適化を許可 (精度より速度)
+        # cache=True はコンパイル結果をキャッシュ
+        return njit(func, parallel=True, fastmath=True, cache=True)
+    else:
+        # Numbaがない場合は、デコレートされていない元の関数を返す
+        return func
+
+
+@_njit_if_available
+def _numba_find_hits(
+    # Bets (Numpy Arrays)
+    bets_t0: np.ndarray,  # ベット開始時間 (int64, ナノ秒)
+    bets_t1_max: np.ndarray,  # ベット時間バリア (int64, ナノ秒)
+    bets_pt_barrier: np.ndarray,  # 利益確定バリア価格 (float64)
+    bets_sl_barrier: np.ndarray,  # 損切りバリア価格 (float64)
+    # Ticks (Numpy Arrays)
+    ticks_ts: np.ndarray,  # ティック時間 (int64, ナノ秒)
+    ticks_high: np.ndarray,  # ティック高値 (float64)
+    ticks_low: np.ndarray,  # ティック安値 (float64)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Numba JIT (Just-In-Time) compiled function to find barrier hits.
+    Iterates through each bet and scans the tick data for hits.
+    """
+    n_bets = len(bets_t0)
+    n_ticks = len(ticks_ts)
+
+    # 戻り値用の配列を初期化 (ヒットなし=0)
+    out_first_pt_time = np.zeros(n_bets, dtype=np.int64)
+    out_first_sl_time = np.zeros(n_bets, dtype=np.int64)
+
+    if n_ticks == 0:
+        # ティックデータが空なら、何もせずゼロ配列を返す
+        return out_first_pt_time, out_first_sl_time
+
+    # prange でベットごとに並列処理
+    for i in prange(n_bets):
+        t0 = bets_t0[i]
+        t1_max = bets_t1_max[i]
+        pt = bets_pt_barrier[i]
+        sl = bets_sl_barrier[i]
+
+        # 1. np.searchsorted (二分探索) を使い、
+        #    t0 に最も近いティックのインデックスを高速に検索
+        #    side='left' は t0 <= ticks_ts となる最初のインデックスを返す
+        start_idx = np.searchsorted(ticks_ts, t0, side="left")
+
+        first_pt_found = np.int64(0)
+        first_sl_found = np.int64(0)
+
+        # 2. start_idx からティックデータを線形スキャン
+        for j in range(start_idx, n_ticks):
+            tick_time = ticks_ts[j]
+
+            # 3. 時間バリア (t1_max) を超えたら、このベットのスキャンを終了
+            if tick_time > t1_max:
+                break
+
+            tick_high = ticks_high[j]
+            tick_low = ticks_low[j]
+
+            # 4. PT/SLヒット判定
+            if first_pt_found == 0 and tick_high >= pt:
+                first_pt_found = tick_time
+
+            if first_sl_found == 0 and tick_low <= sl:
+                first_sl_found = tick_time
+
+            # 5. 両方のバリアに（同じティックで）ヒットした場合、
+            #    このベットのスキャンを終了
+            if first_pt_found != 0 and first_sl_found != 0:
+                break
+
+        # 6. 結果を格納
+        out_first_pt_time[i] = first_pt_found
+        out_first_sl_time[i] = first_sl_found
+
+    return out_first_pt_time, out_first_sl_time
+
+
+# --- ▲▲▲ Numbaヘルパー関数ここまで ▲▲▲ ---
 
 
 class ProxyLabelingEngine:
@@ -766,32 +872,54 @@ class ProxyLabelingEngine:
         logging.warning(f"Unhandled timeframe unit '{unit}' in timeframe: {timeframe}")
         return 0.0  # Return 0 for any other unhandled units
 
+    # --- ▼▼▼ ここからが置換後の関数 (戦略2: Numba) ▼▼▼ ---
     def _calculate_labels_for_batch(
         self, daily_bets_df: pl.DataFrame, price_window_df: pl.DataFrame
     ) -> pl.DataFrame | None:
+        """
+        [戦略2: Numpy + Numba 版]
+        Polarsのjoin_where (OOMの原因) を使わず、Numpy配列に変換してから
+        Numba JITコンパイラで最適化されたループ処理でヒット判定を行う。
+        """
         cfg = self.config
         if daily_bets_df.is_empty():
             return None
 
-        # --- ▼▼▼ 除外リストを定義 ▼▼▼ ---
+        if not NUMBA_AVAILABLE:
+            logging.error(
+                "Numba is required for labeling but not found. Skipping labeling."
+            )
+            return None
+
+        # --- 除外リストを定義 ---
         EXCLUDE_TIMEFRAMES = [
-            "MN",
-            "W1",
-            "D1",
-            "H12",
-            "H6",
-            "H4",
-            "H30",
-            "M0.5",
-            "tick",
-            # "H1",
-            # "M15",
-            # "M8",
-            # "M5",
-            # "M3",
-            # "M1",
-        ]  # ここに除外したい時間足を追加
-        # --- ▲▲▲ 除外リストここまで ▲▲▲ ---
+            # "MN",
+            # "W1",
+            # "D1",
+            # "H12",
+            # "H6",
+            # "H4",
+            # "H30",
+            # "M0.5",
+            # "tick",
+        ]
+        # --- 除外リストここまで ---
+
+        # Numbaに渡すため、ティックデータをNumpy配列に変換
+        # (これは日次ループで1回だけ実行)
+        # NumbaはDatetime型を直接扱えないため、int64 (ナノ秒) に変換
+        try:
+            ticks_df_np = price_window_df.select(
+                pl.col("timestamp").cast(pl.Int64).alias("ticks_ts"),
+                pl.col("high").alias("ticks_high"),
+                pl.col("low").alias("ticks_low"),
+            )
+            ticks_ts_np = ticks_df_np["ticks_ts"].to_numpy()
+            ticks_high_np = ticks_df_np["ticks_high"].to_numpy()
+            ticks_low_np = ticks_df_np["ticks_low"].to_numpy()
+        except Exception as e:
+            logging.error(f"Failed to convert tick data to Numpy arrays: {e}")
+            return None
 
         labeled_chunks = []
         # daily_bets_df は run() でソート済み
@@ -800,11 +928,11 @@ class ProxyLabelingEngine:
             if timeframe is None or group_df.is_empty():
                 continue
 
-            # --- ▼▼▼ ここで除外チェック ▼▼▼ ---
+            # --- 除外チェック ---
             if timeframe in EXCLUDE_TIMEFRAMES:
                 logging.debug(f"Skipping labeling for excluded timeframe: {timeframe}")
-                continue  # この時間足の処理をスキップ
-            # --- ▲▲▲ 除外チェックここまで ▲▲▲ ---
+                continue
+            # --- 除外チェックここまで ---
 
             target_duration_minutes = self._get_duration_in_minutes(cfg.target_duration)
             bar_duration_minutes = self._get_bar_duration_minutes(timeframe)
@@ -836,21 +964,21 @@ class ProxyLabelingEngine:
 
             original_cols = group_df.columns
 
-            # ATR/Price 結合 (これは join_asof で正しい)
-            # group_df (left) はソート済み
-            # price_window_df (right) も run() でソート済み
+            # 1. ATR/Price 結合 (join_asof)
+            # ★★★ 厳守事項: close カラムはここで結合する ★★★
             bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
                     ["timestamp", "close", "high", "low", atr_col_name]
-                ),  # .sort("timestamp") は不要 (run()でソート済み)
+                ),
                 on="timestamp",
             ).filter(pl.col(atr_col_name).is_not_null())
 
             if bets_with_price_df.is_empty():
                 continue
 
-            # バリアと時間制限 (t1_max) を計算
-            bets_df = bets_with_price_df.select(
+            # 2. バリアと時間制限 (t1_max) を計算
+            #    (この時点ではまだ `close` カラムを保持)
+            bets_df = bets_with_price_df.with_columns(
                 pl.col("timestamp").alias("t0"),
                 (
                     pl.col("close") + pl.col(atr_col_name) * cfg.profit_take_multiplier
@@ -860,48 +988,68 @@ class ProxyLabelingEngine:
                 ).alias("sl_barrier"),
                 t1_max_expr.alias("t1_max"),
                 pl.col(atr_col_name).alias("atr_value"),
+            ).select(
+                pl.col("t0"),
+                pl.col("pt_barrier"),
+                pl.col("sl_barrier"),
+                pl.col("t1_max"),
+                pl.col("atr_value"),
+                pl.col("close"),
+                # 元のカラム (features, timeframe, close) をすべて保持
+                # ただし、'timestamp' は 't0' にリネームしたので除外する
                 pl.col(original_cols).exclude("timestamp"),
             )
 
-            # --- ▼▼▼ 修正ブロック: join_where を使用した区間結合 ▼▼▼ ---
-            # (レポートで推奨された正しい実装)
+            if bets_df.is_empty():
+                continue
 
-            # price_window_df (ティックデータ) は run() でソート済み
-            ticks_df = price_window_df.select(["timestamp", "high", "low"])
+            # 3. ベット情報を Numpy 配列に変換 (Numbaに渡すため)
+            try:
+                # Numba は Datetime型 を扱えないため int64 (ナノ秒) に変換
+                bets_t0_np = bets_df["t0"].cast(pl.Int64).to_numpy()
+                bets_t1_max_np = bets_df["t1_max"].cast(pl.Int64).to_numpy()
+                bets_pt_np = bets_df["pt_barrier"].to_numpy(writable=True)
+                bets_sl_np = bets_df["sl_barrier"].to_numpy(writable=True)
+            except Exception as e:
+                logging.error(
+                    f"Failed to convert bets data to Numpy arrays for timeframe {timeframe}: {e}"
+                )
+                continue
 
-            # hits_df: ベット(bets_df)を起点とし、
-            # [t0, t1_max] の区間に入る全てのティックを結合する
-            hits_df = (
-                bets_df.join_where(
-                    ticks_df,
-                    # 述語1: ティックはベット開始以降
-                    pl.col("timestamp") >= pl.col("t0"),
-                    # 述語2: ティックは時間バリア以前
-                    pl.col("timestamp") <= pl.col("t1_max"),
+            # 4. Numba 関数を呼び出してヒット判定を実行
+            first_pt_time_np, first_sl_time_np = _numba_find_hits(
+                bets_t0_np,
+                bets_t1_max_np,
+                bets_pt_np,
+                bets_sl_np,
+                ticks_ts_np,
+                ticks_high_np,
+                ticks_low_np,
+            )
+
+            # 5. Numba の結果 (Numpy配列) を Polars に戻す
+            #    ヒットしなかった (0) を None (null) に変換
+            final_group_df = (
+                bets_df.with_columns(
+                    pl.Series("first_pt_time_int", first_pt_time_np),
+                    pl.Series("first_sl_time_int", first_sl_time_np),
                 )
                 .with_columns(
-                    # ヒット判定
-                    pt_hit_time=pl.when(pl.col("high") >= pl.col("pt_barrier")).then(
-                        pl.col("timestamp")
-                    ),
-                    sl_hit_time=pl.when(pl.col("low") <= pl.col("sl_barrier")).then(
-                        pl.col("timestamp")
-                    ),
+                    # 0 (ヒットなし) を null に変換し、
+                    # int64 (ナノ秒) を Datetime にキャストバック
+                    first_pt_time=pl.when(pl.col("first_pt_time_int") > 0)
+                    .then(pl.col("first_pt_time_int"))
+                    .otherwise(None)
+                    .cast(pl.Datetime("us", "UTC")),
+                    first_sl_time=pl.when(pl.col("first_sl_time_int") > 0)
+                    .then(pl.col("first_sl_time_int"))
+                    .otherwise(None)
+                    .cast(pl.Datetime("us", "UTC")),
                 )
-                .group_by("t0")  # 元のベット(t0)ごとに集計
-                .agg(
-                    # 最初にヒットした時間を探す
-                    pl.col("pt_hit_time").min().alias("first_pt_time"),
-                    pl.col("sl_hit_time").min().alias("first_sl_time"),
-                )
+                .drop("first_pt_time_int", "first_sl_time_int")
             )
-            # --- ▲▲▲ 修正ブロック ▲▲▲ ---
 
-            # Join hit times back to the original bets_df
-            # (hits_dfにはヒットしなかったベット(TO)が含まれないため、left joinが必須)
-            final_group_df = bets_df.join(hits_df, on="t0", how="left")
-
-            # Determine final label and t1
+            # 6. ラベルとt1を決定 (元のロジックと同じ)
             labeled_group = final_group_df.with_columns(
                 t1=pl.when(
                     (pl.col("first_pt_time").is_not_null())
@@ -934,7 +1082,7 @@ class ProxyLabelingEngine:
                 direction=pl.lit(1, dtype=pl.Int8),
             ).rename({"t0": "timestamp"})
 
-            # Drop intermediate columns
+            # 中間カラムを削除 (★重要: 'close' は original_cols に含まれているため保持される)
             labeled_chunks.append(
                 labeled_group.drop(
                     [
@@ -950,6 +1098,8 @@ class ProxyLabelingEngine:
         if not labeled_chunks:
             return None
         return pl.concat(labeled_chunks).sort("timestamp")
+
+    # --- ▲▲▲ 置換後の関数はここまで ▲▲▲ ---
 
     def _update_label_counts(self, df: pl.DataFrame):
         counts = df.group_by("label").len()

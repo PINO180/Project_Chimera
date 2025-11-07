@@ -3,7 +3,7 @@ from pathlib import Path
 
 # ログに出力されたパスを指定
 output_dir = Path(
-    "/workspace/data/XAUUSD/stratum_6_training/1A_2B/weighted_dataset_partitioned"
+    "/workspace/data/XAUUSD/stratum_6_training/1A_2B/labeled_dataset_partitioned"
 )
 
 # ★★★ 修正箇所 ★★★

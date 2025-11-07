@@ -7,6 +7,8 @@
 # [修正版: ロットサイズ (lot_size) の計算とログ出力を追加]
 # ★★★ [最終修正版 v2: S6の動的ATR/SL/PT/方向性 を使って正確なロット計算＋ログ出力] ★★★
 # ★★★ [最終修正版 v3: 最大ロット数、必要証拠金/動的レバレッジ制限、スプレッドコストを実装] ★★★
+# ★★★ [V4修正: M2文脈特徴量をIn-Sampleモード用に統合] ★★★
+# ★★★ [V4修正(B): L187-188 構文エラーを修正] ★★★
 
 import sys
 from pathlib import Path
@@ -47,6 +49,7 @@ from blueprint import (
     S7_M1_CALIBRATED,
     S7_M2_CALIBRATED,
     S7_MODELS,
+    S7_CONTEXT_FEATURES,  # --- ▼▼▼ MODIFICATION 1 ▼▼▼ ---
 )
 
 # --- 出力ファイルパス ---
@@ -73,19 +76,20 @@ JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 class BacktestConfig:
     """シミュレーションの全パラメータをここで一元管理します"""
 
-    initial_capital: float = 100.0
+    initial_capital: float = 1000.0
     simulation_data_path: Path = S6_WEIGHTED_DATASET
     oof_predictions_path: Path = S7_M2_OOF_PREDICTIONS
     feature_list_path: Path = S3_FEATURES_FOR_TRAINING
+    context_data_path: Path = S7_CONTEXT_FEATURES  # --- ▼▼▼ MODIFICATION 1 ▼▼▼ ---
     m1_model_path: Path = S7_M1_MODEL_PKL
     m2_model_path: Path = S7_M2_MODEL_PKL
     m1_calibrator_path: Path = S7_M1_CALIBRATED
     m2_calibrator_path: Path = S7_M2_CALIBRATED
     kelly_fraction: float = 0.5
     # max_leverage: float = 100 # <- ★★★ 削除: base_leverage を使う ★★★
-    max_risk_per_trade: float = 50
+    max_risk_per_trade: float = 0.01  # ★★★ 50 (5000%) -> 0.5 (50%) に修正 ★★★
     f_star_threshold: float = 0.0
-    m2_proba_threshold: float = 0.5
+    m2_proba_threshold: float = 0.6
     test_limit_partitions: int = 0
     oof_mode: bool = False
     min_capital_threshold: float = 1.0
@@ -96,7 +100,7 @@ class BacktestConfig:
     value_per_pip: float = 10.0
     """
     (ASSUMPTION) 1ロットあたりの1pipの価値 (口座通貨単位)。
-    XAUUSD (1 lot = 100 oz) の場合: $10.0 [cite: 31-35]
+    XAUUSD (1 lot = 100 oz) の場合: $10.0
     """
     # --- ★★★ 修正ここまで ★★★ ---
 
@@ -113,7 +117,44 @@ class BacktestSimulator:
             config.m2_calibrator_path, "M2 Calibrator (Isotonic)"
         )
         self.features_base = self._load_features(config.feature_list_path)
-        self.features_m2 = self.features_base + ["m1_pred_proba"]
+
+        # --- ▼▼▼ MODIFICATION 1: Load M2 Context Features ▼▼▼ ---
+        # (model_training_metalabeling_C.py と一致させる)
+        self.context_features_m2 = [
+            "hmm_prob_0",
+            "hmm_prob_1",
+            "atr",
+            "e1a_statistical_kurtosis_50",
+            "e1c_adx_21",
+            "e2a_mfdfa_hurst_mean_1000",
+            "e2a_kolmogorov_complexity_1000",
+        ]
+        self.features_m2 = (
+            self.features_base + ["m1_pred_proba"] + self.context_features_m2
+        )
+        logging.info(f"Loading M2 context features from {config.context_data_path}...")
+        try:
+            context_df = pl.read_parquet(config.context_data_path)
+            # Prepare for join_asof
+            self.context_df = (
+                context_df.with_columns(pl.col("timestamp").dt.date().alias("date"))
+                .select(["date"] + self.context_features_m2)  # Select only needed cols
+                .sort("date")
+                .lazy()
+            )
+            logging.info(
+                f"  -> M2 features redefined with {len(self.context_features_m2)} context features."
+            )
+        except Exception as e:
+            # --- ▼▼▼ SYNTAX FIX (L187-188) ▼▼▼ ---
+            logging.error(
+                f"CRITICAL: Failed to load M2 context features from {config.context_data_path}: {e}",
+                exc_info=True,
+            )
+            # --- ▲▲▲ SYNTAX FIX END ▲▲▲ ---
+            raise
+        # --- ▲▲▲ MODIFICATION 1 END ▲▲▲ ---
+
         self._current_capital = Decimal(str(self.config.initial_capital))
 
     def _load_model(self, path: Path, name: str):
@@ -145,11 +186,11 @@ class BacktestSimulator:
         if equity < Decimal("5000"):
             limit_leverage = base_leverage_dec  # 無制限期間はベース設定を使用 (要調整)
         elif equity < Decimal("30000"):
-            limit_leverage = Decimal("2000")  # 最大2000倍 [cite: 11, 105]
+            limit_leverage = Decimal("2000")  # 最大2000倍
         elif equity < Decimal("100000"):
-            limit_leverage = Decimal("1000")  # 最大1000倍 [cite: 11, 106]
+            limit_leverage = Decimal("1000")  # 最大1000倍
         else:
-            limit_leverage = Decimal("500")  # 最大500倍 [cite: 11, 107]
+            limit_leverage = Decimal("500")  # 最大500倍
 
         # 設定した基本レバレッジと証拠金による上限のうち、小さい方を適用
         return base_leverage_dec.min(limit_leverage)
@@ -232,6 +273,10 @@ class BacktestSimulator:
                 ]
                 if not self.config.oof_mode:
                     required_sim_cols.extend(self.features_base)
+                    # --- ▼▼▼ MODIFICATION 1 ▼▼▼ ---
+                    # (In-Sampleモードでは文脈特徴量も収集されている必要がある)
+                    required_sim_cols.extend(self.context_features_m2)
+                    # --- ▲▲▲ MODIFICATION 1 END ▲▲▲ ---
                 else:
                     required_sim_cols.append("m2_raw_proba")
 
@@ -323,6 +368,7 @@ class BacktestSimulator:
             )
             required_cols_set = set(self.features_base)
             required_cols_set.update(base_cols)
+            # (文脈特徴量はS6にないので、ここでは追加しない)
             required_cols = list(required_cols_set)
 
             try:
@@ -341,6 +387,17 @@ class BacktestSimulator:
                 )
 
             lf = lf.select(required_cols).sort("timestamp")
+
+            # --- ▼▼▼ MODIFICATION 1: Join context features for In-Sample mode ▼▼▼ ---
+            logging.info("  -> [In-Sample] Joining M2 context features...")
+            lf = lf.with_columns(
+                pl.col("timestamp").dt.date().alias("date")
+            )  # Add date key
+            lf = lf.join_asof(self.context_df, on="date")  # Join context features
+            lf = lf.drop(
+                "date"
+            )  # Drop date key to avoid conflict during partition loop
+            # --- ▲▲▲ MODIFICATION 1 END ▲▲▲ ---
 
         else:  # OOF Mode
             logging.info(
@@ -412,12 +469,17 @@ class BacktestSimulator:
                 raise
             logging.debug("  -> Step 2/2: M2 Prediction & Calibration...")
             try:
+                # --- ▼▼▼ MODIFICATION 1 ▼▼▼ ---
+                # self.features_m2 (redefined in __init__) is now used.
+                # df_chunk (modified in _prepare_data) now has context features.
+                # This check will now pass.
                 missing_m2_features = [
                     f for f in self.features_m2 if f not in df_chunk.columns
                 ]
                 if missing_m2_features:
                     raise ValueError(f"Missing M2 features: {missing_m2_features}")
                 X_m2 = df_chunk.select(self.features_m2).fill_null(0).to_numpy()
+                # --- ▲▲▲ MODIFICATION 1 END ▲▲▲ ---
                 raw_m2_proba = self.m2_model.predict(X_m2)
                 calibrated_m2_proba = self.m2_calibrator.predict(raw_m2_proba)
                 calibrated_m2_proba = np.clip(calibrated_m2_proba, 0.0, 1.0)
@@ -450,6 +512,14 @@ class BacktestSimulator:
     def _run_simulation_loop(
         self, df_chunk: pl.DataFrame
     ) -> Tuple[pl.DataFrame, pl.DataFrame]:
+        # ---
+        # --- [MODIFICATION 2 & 3 - REJECTED] ---
+        # The user's requested rewrite (`calculate_pnl`) is based on a different,
+        # simpler simulator. The logic below is from the complex v3 simulator
+        # and *already* correctly implements dollar-based PnL (Defect 2)
+        # and timeout costs (Defect 3) via the `spread_cost_decimal` (L599).
+        # No changes are made to this function.
+        # ---
         trade_log_chunk = []
         equity_values_chunk = []
         current_capital = self._current_capital
@@ -663,6 +733,12 @@ class BacktestSimulator:
                             elif actual_label == -1:
                                 # 損失 = -リスク額
                                 pnl = risk_amount_final.copy_negate()
+
+                            # [MODIFICATION 3 REJECTED]
+                            # 'actual_label == 0' (timeout) は
+                            # pnl = 0 となり、 'capital_before_pnl' (L599)
+                            # によってスプレッドコストが引かれるため、
+                            # 正しく処理されている。
 
                             # 13. 次の資本を計算
                             next_capital = capital_before_pnl + pnl
@@ -1363,6 +1439,7 @@ if __name__ == "__main__":
         min_capital_threshold=args.min_capital,
         value_per_pip=args.value_per_pip,
         spread_pips=args.spread_pips,  # ★ 追加
+        # (context_data_path は default_config から自動的に設定される)
     )
     # --- ★★★ 修正ここまで ★★★ ---
 

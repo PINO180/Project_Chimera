@@ -194,8 +194,7 @@ class ProxyLabelingEngine:
                 f"   -> Pre-loading {len(atr_lfs)} non-tick S2 ATR files into memory..."
             )
             try:
-                # ★★★ 修正: ATR DF の collect 時にソートを追加 ★★★
-                atr_dfs = [lf.collect().sort("timestamp") for lf in atr_lfs]
+                atr_dfs = [lf.collect() for lf in atr_lfs]
                 logging.info(
                     f"   -> Successfully pre-loaded {len(atr_dfs)} S2 ATR DataFrames."
                 )
@@ -310,12 +309,10 @@ class ProxyLabelingEngine:
                     pl.col("timestamp").dt.date() == current_date
                 )
 
-                # --- ▼▼▼ 修正ブロック 1 ▼▼▼ ---
                 # Concatenate Hive and File data for the current day
                 daily_bets_df = pl.concat(
                     [daily_bets_hive_df, daily_bets_file_df], how="diagonal"
-                ).sort("timestamp")  # ★★★ 修正: .sort("timestamp") を追加 ★★★
-                # --- ▲▲▲ 修正ブロック 1 ▲▲▲ ---
+                )
 
                 # Skip if no betting data for this day
                 if daily_bets_df.is_empty():
@@ -338,17 +335,10 @@ class ProxyLabelingEngine:
                 # Calculate the maximum timestamp needed for lookahead + a buffer (e.g., 2 days)
                 max_ts_req = min_ts_req + max_lookahead_delta + dt.timedelta(days=2)
 
-                # --- ▼▼▼ 修正ブロック 2 ▼▼▼ ---
                 # Collect required price data from the base LazyFrame (tick data)
-                price_window_df = (
-                    base_price_lf.filter(
-                        pl.col("timestamp").is_between(min_ts_req, max_ts_req)
-                    )
-                    .collect()
-                    .sort("timestamp")  # ★★★ 修正: .sort("timestamp") を追加 ★★★
-                )
-                # --- ▲▲▲ 修正ブロック 2 ▲▲▲ ---
-
+                price_window_df = base_price_lf.filter(
+                    pl.col("timestamp").is_between(min_ts_req, max_ts_req)
+                ).collect()
                 if price_window_df.is_empty():
                     logging.warning(
                         f"No base price data found for {current_date} in the required window ({min_ts_req} to {max_ts_req}). Skipping partition."
@@ -364,11 +354,8 @@ class ProxyLabelingEngine:
                     )
                     if not atr_df_small.is_empty():
                         # Use join_asof to merge ATR data based on the closest preceding timestamp
-                        # price_window_df (left) はソート済み
-                        # atr_df (right) も collect 時にソート済み
                         price_window_df = price_window_df.join_asof(
-                            atr_df_small,
-                            on="timestamp",  # .sort("timestamp") は不要
+                            atr_df_small.sort("timestamp"), on="timestamp"
                         )
 
                 # Forward fill missing ATR/price values, then backward fill remaining NaNs at the start
@@ -794,11 +781,16 @@ class ProxyLabelingEngine:
         # --- ▲▲▲ 除外リストここまで ▲▲▲ ---
 
         labeled_chunks = []
-        # daily_bets_df は run() でソート済み
+        # Group by timeframe within the daily batch
         for timeframe_tuple, group_df in daily_bets_df.group_by("timeframe"):
             timeframe = timeframe_tuple[0]
             if timeframe is None or group_df.is_empty():
                 continue
+
+            # # --- ▼▼▼ ここからデバッグプリントを追加 ▼▼▼ ---
+            # logging.info(f"Checking Timeframe: '{timeframe}' (Type: {type(timeframe)})")
+            # logging.info(f"Current Exclude List: {EXCLUDE_TIMEFRAMES}")
+            # # --- ▲▲▲ デバッグプリントここまで ▲▲▲ ---
 
             # --- ▼▼▼ ここで除外チェック ▼▼▼ ---
             if timeframe in EXCLUDE_TIMEFRAMES:
@@ -815,6 +807,8 @@ class ProxyLabelingEngine:
                 )
             else:
                 if bar_duration_minutes == 0:
+                    # This warning handles cases where duration calc fails (e.g., parsing error)
+                    # It will also catch excluded timeframes if _get_bar_duration_minutes returns 0 for them.
                     logging.warning(
                         f"Skipping timeframe {timeframe} due to zero bar duration calculation."
                     )
@@ -829,6 +823,7 @@ class ProxyLabelingEngine:
             atr_col_name = f"e1c_atr_21_{timeframe}"
             if atr_col_name not in price_window_df.columns:
                 if timeframe != "tick":
+                    # Keep this warning for missing *required* ATR columns
                     logging.warning(
                         f"Required ATR column '{atr_col_name}' not found in price data. Skipping timeframe '{timeframe}'."
                     )
@@ -836,22 +831,38 @@ class ProxyLabelingEngine:
 
             original_cols = group_df.columns
 
-            # ATR/Price 結合 (これは join_asof で正しい)
-            # group_df (left) はソート済み
-            # price_window_df (right) も run() でソート済み
+            # join_asof を実行
             bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
                     ["timestamp", "close", "high", "low", atr_col_name]
-                ),  # .sort("timestamp") は不要 (run()でソート済み)
+                ).sort("timestamp"),
                 on="timestamp",
-            ).filter(pl.col(atr_col_name).is_not_null())
+            ).filter(  # join_asof 後に Null でないことを確認 (close を含む)
+                pl.col(atr_col_name).is_not_null()  # & pl.col("close").is_not_null()
+            )
+
+            # --- ★★★ drop_nulls("close") は削除済み (コメントアウト) ★★★ ---
+            # rows_before_drop = len(bets_with_price_df)
+            # bets_with_price_df = bets_with_price_df.drop_nulls("close") # 問題の行
+            # rows_after_drop = len(bets_with_price_df)
+            # if rows_before_drop > rows_after_drop:
+            #     logging.warning(
+            #         f"Dropped {rows_before_drop - rows_after_drop} rows for timeframe '{timeframe}' due to missing 'close' price after join_asof."
+            #     )
+            # --- ★★★ 削除 (コメントアウト) ここまで ★★★ ---
 
             if bets_with_price_df.is_empty():
-                continue
+                # --- ▼▼▼ ここで該当の Warning を削除 (コメントアウト) ▼▼▼ ---
+                # logging.debug( # または logging.warning(...) だったかもしれません
+                #     f"No valid price/ATR data found for timeframe '{timeframe}' after join_asof and filtering."
+                # )
+                # --- ▲▲▲ Warning 削除ここまで ▲▲▲ ---
+                continue  # DataFrameが空なら次の時間足へ
 
-            # バリアと時間制限 (t1_max) を計算
+            # Calculate profit-take (pt) and stop-loss (sl) barriers based on ATR
             bets_df = bets_with_price_df.select(
                 pl.col("timestamp").alias("t0"),
+                pl.col("close"),  # close列はバリア計算に必要なので保持
                 (
                     pl.col("close") + pl.col(atr_col_name) * cfg.profit_take_multiplier
                 ).alias("pt_barrier"),
@@ -863,24 +874,23 @@ class ProxyLabelingEngine:
                 pl.col(original_cols).exclude("timestamp"),
             )
 
-            # --- ▼▼▼ 修正ブロック: join_where を使用した区間結合 ▼▼▼ ---
-            # (レポートで推奨された正しい実装)
-
-            # price_window_df (ティックデータ) は run() でソート済み
-            ticks_df = price_window_df.select(["timestamp", "high", "low"])
-
-            # hits_df: ベット(bets_df)を起点とし、
-            # [t0, t1_max] の区間に入る全てのティックを結合する
+            # --- ▼▼▼ 修正ブロック ▼▼▼ ---
+            # Determine which barrier was hit first
             hits_df = (
-                bets_df.join_where(
-                    ticks_df,
-                    # 述語1: ティックはベット開始以降
-                    pl.col("timestamp") >= pl.col("t0"),
-                    # 述語2: ティックは時間バリア以前
-                    pl.col("timestamp") <= pl.col("t1_max"),
+                # ★★★ 修正: 左テーブル (price_window_df) も .sort("timestamp") が必須 ★★★
+                price_window_df.select(["timestamp", "high", "low"])
+                .sort("timestamp")
+                .join_asof(
+                    # ★★★ 修正: 右テーブル (bets_df) も .sort("t0") が必須 ★★★
+                    bets_df.select(["t0", "pt_barrier", "sl_barrier", "t1_max"]).sort(
+                        "t0"
+                    ),
+                    left_on="timestamp",
+                    right_on="t0",
+                    # strategy="backward" (default) が正しい
                 )
+                .filter(pl.col("timestamp") <= pl.col("t1_max"))
                 .with_columns(
-                    # ヒット判定
                     pt_hit_time=pl.when(pl.col("high") >= pl.col("pt_barrier")).then(
                         pl.col("timestamp")
                     ),
@@ -888,17 +898,15 @@ class ProxyLabelingEngine:
                         pl.col("timestamp")
                     ),
                 )
-                .group_by("t0")  # 元のベット(t0)ごとに集計
+                .group_by("t0")
                 .agg(
-                    # 最初にヒットした時間を探す
                     pl.col("pt_hit_time").min().alias("first_pt_time"),
                     pl.col("sl_hit_time").min().alias("first_sl_time"),
                 )
             )
             # --- ▲▲▲ 修正ブロック ▲▲▲ ---
 
-            # Join hit times back to the original bets_df
-            # (hits_dfにはヒットしなかったベット(TO)が含まれないため、left joinが必須)
+            # Join hit times back
             final_group_df = bets_df.join(hits_df, on="t0", how="left")
 
             # Determine final label and t1

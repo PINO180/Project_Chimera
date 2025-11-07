@@ -76,10 +76,12 @@ S7_M1_CALIBRATED = S7_MODELS / "m1_calibrated.pkl"
 S7_M2_CALIBRATED = S7_MODELS / "m2_calibrated.pkl"
 S7_MODEL_PERFORMANCE_REPORT = S7_MODELS / "model_performance_report.json"
 S7_REGIME_MODEL = S7_MODELS / "regime_detector_hmm.pkl"
+S7_CONTEXT_FEATURES = S7_MODELS / "context_features.parquet"
 S7_M1_OOF_PREDICTIONS = S7_MODELS / "m1_oof_predictions.parquet"
 S7_META_LABELED_OOF_PARTITIONED = S7_MODELS / "meta_labeled_oof_partitioned"
 S7_M2_OOF_PREDICTIONS_TMP = S7_MODELS / "tmp_m2_oof_predictions"
 S7_M2_OOF_PREDICTIONS = S7_MODELS / "m2_oof_predictions.parquet"
+
 # =================================================================
 # 実行系ファイルパス
 # =================================================================
