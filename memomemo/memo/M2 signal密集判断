@@ -1,0 +1,127 @@
+修正案2（M2モデルの再訓練）が、戦略のポテンシャルを最大限に引き出す上で「最も正確」かつ「根本的な」解決策です。
+
+修正案1（ティック除外）は、問題を回避する（＝ティック取引を諦める）対症療法ですが、修正案2は、AI（M2モデル）に「危険な取引パターン」そのものを学習させて対処する根本治療にあたります。
+
+🎯 目的：M2モデルを「HFTのノイズ」に強くする
+現在のM2モデルは、「市場の文脈（HMM状態やHurst指数など）」は見ていますが、「シグナルの密集度」は見ていませんでした。
+
+そこで、M2モデルに**「今、シグナルが危険なほど密集していないか？」**を判断するための新しい特徴量を与え、再訓練します。
+
+具体的な実行ステップ
+この修正は、M2の学習データを作成する Script B と、M2を訓練する Script C の2段階にわたる修正が必要です。
+
+ステップ1：Script B を修正し、「密集度」特徴量を追加する
+まず、model_training_metalabeling_B_contextplus.py を修正し、M2の学習データ（S7_META_LABELED_OOF_PARTITIONED）に「密集度」を測る特徴量を追加します。
+
+ロジック: S6_WEIGHTED_DATASET（全てのシグナル）を読み込んだ後、M1予測を結合する前に、Polarsの強力なウィンドウ関数（rolling や over）を使って、各シグナルの「密集度」を計算します。
+
+model_training_metalabeling_B_contextplus.py の修正箇所 (run 関数内):
+
+S6データの読み込み: _discover_partitions でパーティションを見つけた後、run 関数のメインループ（for partition_date in tqdm(...)）の中核ロジックを修正します。
+
+特徴量エンジニアリングの追加: df_chunk = pl.read_parquet(partition_path_glob) の直後に、以下の特徴量計算ロジックを挿入します。
+
+Python
+
+# (元々のコード)
+try:
+    df_chunk = pl.read_parquet(partition_path_glob)
+except Exception:
+    continue
+if df_chunk.is_empty():
+    continue
+
+# --- ▼▼▼ [新規追加] 密集度（Density）特徴量の計算 ▼▼▼ ---
+
+# 処理を高速化するため、タイムスタンプとタイムフレームのみに絞る
+density_features_lf = df_chunk.lazy().select(["timestamp", "timeframe"])
+
+# timeframe ごとにグループ化し、時系列順にソート
+density_features_lf = density_features_lf.sort("timestamp").group_by(
+    "timeframe", maintain_order=True
+)
+
+density_features_lf = density_features_lf.agg(
+    # 1. 直前のシグナルからの経過時間（秒）
+    #    (非常に密集しているシグナルほど 0 に近くなる)
+    pl.col("timestamp")
+    .diff()
+    .dt.total_seconds()
+    .fill_null(3600)  # 最初のシグナルは1時間（3600秒）前とする
+    .alias("time_since_last_signal_sec"),
+
+    # 2. 過去1分間（"1m"）に発生したシグナル数
+    #    (HFT的な連発を検出する)
+    pl.col("timestamp")
+    .rolling_count(
+        window_size="1m",  # 1分間のローリングウィンドウ
+        on="timestamp",
+        closed="left", # 現在の行を含まない
+    )
+    .alias("signals_in_last_1min"),
+)
+
+# 元のデータに新しい特徴量を結合
+df_chunk = df_chunk.join(
+    density_features_lf.collect(), on=["timestamp", "timeframe"]
+)
+# --- ▲▲▲ [新規追加] ここまで ▲▲▲ ---
+
+# (この後、try: ... daily_m1_oof = ... のロジックが続く)
+ステップ2：Script C を修正し、新特徴量を学習させる
+次に、model_training_metalabeling_C_contextplus.py を修正し、M2モデルが新しい特徴量を学習に使うようにします。
+
+model_training_metalabeling_C_contextplus.py の修正箇所 (FinalAssembler クラスの __init__):
+
+self.features_m2 の定義（L124あたり）に、ステップ1で作成した特徴量名を追加します。
+
+Python
+
+# (修正前)
+# self.features_m2: List[str] = (
+#     self.features_base
+#     + ["m1_pred_proba"]
+#     + [
+#         "hmm_prob_0",
+#         "hmm_prob_1",
+#         ...
+#     ]
+# )
+
+# (修正後)
+self.features_m2: List[str] = (
+    self.features_base
+    + ["m1_pred_proba"]
+    + [
+        # 元々の文脈特徴量
+        "hmm_prob_0",
+        "hmm_prob_1",
+        "atr",
+        "e1a_statistical_kurtosis_50",
+        "e1c_adx_21",
+        "e2a_mfdfa_hurst_mean_1000",
+        "e2a_kolmogorov_complexity_1000",
+
+        # --- ▼▼▼ [新規追加] 密集度特徴量 ▼▼▼ ---
+        "time_since_last_signal_sec",
+        "signals_in_last_1min",
+        # --- ▲▲▲ [新規追加] ここまで ▲▲▲ ---
+    ]
+)
+ステップ3：モデルの再訓練とシミュレーション
+Script B の実行: 修正した model_training_metalabeling_B_contextplus.py を実行します。
+
+これにより、S7_META_LABELED_OOF_PARTITIONED が「密集度」特徴量を含んだ形で再生成されます。
+
+Script C の実行: 修正した model_training_metalabeling_C_contextplus.py を実行します。
+
+これにより、S7_M1_OOF_PREDICTIONS（M1のOOF）と S7_M2_OOF_PREDICTIONS（M2のOOF）、そして**S7_M2_MODEL_PKL**（最終M2モデル）が、新しい特徴量を考慮して再生成されます。
+
+シミュレータの実行: backtest_simulator_contextplus.py を（変更せずに）--oof で実行します。
+
+期待される結果
+新しいM2モデル（S7_M2_MODEL_PKL）は、「signals_in_last_1min が 100 を超えている」かつ「time_since_last_signal_sec が 0.5 秒未満」といったシグナルは、たとえM1予測が 0.9 でも、過去のデータ（label=0 または label=-1 が多かった）から「危険なシグナルだ」と学習します。
+
+その結果、M2モデルはこれらの危険なシグナルに対して低い確率（例: 0.3）を出力します。
+
+シミュレータ（M2 Thresh: 0.6）がこれらのシグナルを自動的にフィルタリングし、1時間に2455回といった異常な取引が抑制され、破産を回避できる可能性が劇的に高まります。
