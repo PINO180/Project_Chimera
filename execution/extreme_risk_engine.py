@@ -39,8 +39,8 @@ JST = zoneinfo.ZoneInfo("Asia/Tokyo")  # JST時間帯
 
 # 独自モジュール
 # (state_manager, market_regime_detector は main.py から渡される)
-from state_manager import StateManager, SystemState, Position, EventType
-from market_regime_detector import MarketRegimeDetector
+from execution.state_manager import StateManager, SystemState, Trade, EventType
+# from models.market_regime_detector import MarketRegimeDetector
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -75,7 +75,7 @@ class ExtremeRiskEngineV2:
         self,
         config_path: str = str(config.CONFIG_RISK),
         state_manager: Optional[StateManager] = None,
-        regime_detector: Optional[MarketRegimeDetector] = None,
+        # regime_detector: Optional[MarketRegimeDetector] = None,
         m1_model_path: Optional[str] = str(
             config.S7_M1_CALIBRATED
         ),  # デフォルトパス追加
@@ -95,7 +95,7 @@ class ExtremeRiskEngineV2:
         self.state_manager = state_manager or StateManager()
 
         # 市場レジーム検知
-        self.regime_detector = regime_detector
+        # self.regime_detector = regime_detector
 
         # 較正済みモデル
         self.m1_calibrated: Optional[CalibratedClassifierCV] = None
@@ -683,17 +683,17 @@ class ExtremeRiskEngineV2:
 
         # 市場レジームの検知
         regime_params = None
-        if self.regime_detector and market_data_for_regime is not None:
-            try:
-                # (V4では主にM2モデルに文脈が組み込まれたが、
-                #  念のため旧レジームロジックも残し、確信度閾値などに使用する)
-                regime_info = self.regime_detector.detect_current_regime(
-                    market_data_for_regime
-                )
-                regime_params = regime_info["risk_params"]
-                logger.info(f"現在の市場レジーム: {regime_info['regime_name']}")
-            except Exception as e:
-                logger.warning(f"レジーム検知失敗: {e}。デフォルトパラメータを使用。")
+        # if self.regime_detector and market_data_for_regime is not None:
+        #     try:
+        #         # (V4では主にM2モデルに文脈が組み込まれたが、
+        #         #  念のため旧レジームロジックも残し、確信度閾値などに使用する)
+        #         regime_info = self.regime_detector.detect_current_regime(
+        #             market_data_for_regime
+        #         )
+        #         regime_params = regime_info["risk_params"]
+        #         logger.info(f"現在の市場レジーム: {regime_info['regime_name']}")
+        #     except Exception as e:
+        #         logger.warning(f"レジーム検知失敗: {e}。デフォルトパラメータを使用。")
 
         # AI予測（較正済み確率）
         try:
@@ -706,7 +706,7 @@ class ExtremeRiskEngineV2:
         # エントリー条件チェック
         entry_check = self.check_entry_conditions(
             p_m2=p_m2,
-            current_positions=len(state.open_positions),
+            current_positions=len(state.trades),
             current_time=current_time,
             news_times=news_times,
             regime_params=regime_params,

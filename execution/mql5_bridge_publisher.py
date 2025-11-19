@@ -1,9 +1,12 @@
+# /workspace/execution/mql5_bridge_publisher.py
 """
-MQL5ブリッジ 2.0 - 高信頼性通信
-レイジー・パイレートパターンと双方向ハートビートによるミッションクリティカル通信
+MQL5ブリッジ 3.0 - 高信頼性通信 (V11.0 アーキテクチャ)
+ハイブリッドZMQパターン（制御/データ分離）とゼロ・シリアライズ転送の実装
 """
+
 import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import blueprint as config
@@ -11,19 +14,24 @@ import zmq
 import json
 import time
 import threading
+import numpy as np  # [V11.0] ゼロ・デシリアライズ用
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any, Optional, Callable
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
 class MessageType(Enum):
     """メッセージタイプの定義"""
+
     TRADE_COMMAND = "TRADE_COMMAND"
     PING = "PING"
     PONG = "PONG"
@@ -31,543 +39,475 @@ class MessageType(Enum):
     NACK = "NACK"
     REQUEST_BROKER_STATE = "REQUEST_BROKER_STATE"
     BROKER_STATE_RESPONSE = "BROKER_STATE_RESPONSE"
+    M1_BAR_DATA = "M1_BAR_DATA"
 
 
 @dataclass
 class BridgeConfig:
-    """通信設定"""
-    trade_endpoint: str = "tcp://127.0.0.1:5555"
-    heartbeat_endpoint: str = "tcp://127.0.0.1:5556"
-    request_timeout: int = 2500  # ミリ秒
+    """通信設定 (V11.0)"""
+
+    # blueprint.py の ZMQ 設定に対応
+    control_endpoint: str = config.ZMQ.get("control_endpoint", "tcp://127.0.0.1:5555")
+    data_endpoint: str = config.ZMQ.get("data_endpoint", "tcp://127.0.0.1:5556")
+    # [V11.02] デフォルトを5558に変更
+    heartbeat_endpoint: str = config.ZMQ.get(
+        "heartbeat_endpoint", "tcp://127.0.0.1:5558"
+    )
+
+    request_timeout: int = 9000  # 9秒
     request_retries: int = 3
-    heartbeat_interval: int = 10  # 秒
-    heartbeat_timeout: int = 30  # 秒
+    heartbeat_interval: int = 10
     log_dir: str = str(config.LOGS_ZMQ_BRIDGE)
 
 
-class MQL5BridgePublisherV2:
+def clean_zmq_json(response_json: str) -> str:
+    """ZMQ フレームから余分なバイトを削除し、JSONを抽出"""
+    json_start = response_json.find("{")
+    json_end = response_json.rfind("}") + 1
+    if json_start == -1 or json_end <= json_start:
+        # 単純な文字列応答の場合（ACKなど）はそのまま返す
+        if "ACK" in response_json or "NACK" in response_json:
+            return response_json
+        # JSON構造がない場合はエラーとせず、生の文字列として扱う（V11.0対応）
+        return response_json
+    return response_json[json_start:json_end]
+
+
+def parse_response(response_bytes: bytes) -> Any:
+    """ZMQ レスポンスをパース"""
+    try:
+        response_str = response_bytes.decode("utf-8")
+        # JSON形式か単純テキストかを簡易判定
+        if response_str.strip().startswith("{"):
+            clean_json = clean_zmq_json(response_str)
+            return json.loads(clean_json)
+        return response_str
+    except Exception as e:
+        logger.warning(f"レスポンスパース警告: {e}")
+        return None
+
+
+class MQL5BridgePublisherV3:
     """
-    ZeroMQを介したPython-MQL5高信頼性通信
-    レイジー・パイレートパターンによる送達確認と双方向ハートビート
+    MQL5BridgePublisher V3 (V11.0 Architecture)
+    - Control Channel (REQ/REP): コマンド、ハンドシェイク
+    - Data Channel (PUSH/PULL): バルクデータ転送 (ゼロ・シリアライズ)
+    - Heartbeat Channel (REQ/REP): 接続監視
     """
-    
+
+    # MQL5 MqlRates 構造体のメモリレイアウト定義 (60 bytes, pack=1)
+    # long time, double open, double high, double low, double close,
+    # long tick_volume, int spread, long real_volume
+    MQL_RATES_DTYPE = np.dtype(
+        [
+            ("time", "<i8"),  # datetime (8 bytes)
+            ("open", "<f8"),  # double (8 bytes)
+            ("high", "<f8"),  # double (8 bytes)
+            ("low", "<f8"),  # double (8 bytes)
+            ("close", "<f8"),  # double (8 bytes)
+            ("tick_volume", "<i8"),  # long (8 bytes)
+            ("spread", "<i4"),  # int (4 bytes)
+            ("real_volume", "<i8"),  # long (8 bytes)
+        ]
+    )  # Total 60 bytes, Little Endian
+
     def __init__(self, config: Optional[BridgeConfig] = None):
-        """
-        Args:
-            config: 通信設定
-        """
         self.config = config or BridgeConfig()
-        
-        # ログディレクトリ
         self.log_dir = Path(self.config.log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # ZeroMQコンテキスト
+
         self.context: Optional[zmq.Context] = None
-        
-        # 取引コマンド用ソケット（REQパターン）
-        self.trade_socket: Optional[zmq.Socket] = None
-        
-        # ハートビート用ソケット（DEALER/ROUTERパターン）
-        self.heartbeat_socket: Optional[zmq.Socket] = None
-        
-        # 接続状態
+
+        # V11.0 ソケット構成
+        self.control_socket: Optional[zmq.Socket] = None  # REQ (5555)
+        self.data_socket: Optional[zmq.Socket] = None  # PULL (5556)
+        self.heartbeat_socket: Optional[zmq.Socket] = None  # REQ (5558)
+
         self.is_connected = False
-        self.last_heartbeat_sent: Optional[datetime] = None
-        self.last_heartbeat_received: Optional[datetime] = None
-        
-        # 統計情報
+        self.heartbeat_thread: Optional[threading.Thread] = None
+        self.heartbeat_running = False
+
+        # 統計
         self.messages_sent = 0
         self.messages_acked = 0
         self.messages_failed = 0
         self.heartbeats_sent = 0
         self.heartbeats_received = 0
-        
-        # ハートビートスレッド
-        self.heartbeat_thread: Optional[threading.Thread] = None
-        self.heartbeat_running = False
-        
-        # コールバック（型付け改善）
-        self.on_connection_lost: Optional[Callable[[], None]] = None
-        self.on_connection_restored: Optional[Callable[[], None]] = None
-        
-        logger.info("MQL5BridgePublisherV2を初期化しました。")
-    
+        self.last_heartbeat_sent: Optional[datetime] = None
+        self.last_heartbeat_received: Optional[datetime] = None
+
+        logger.info("MQL5BridgePublisherV3 (V11.0) を初期化しました。")
+
     # ========== 接続管理 ==========
-    
+
     def connect(self) -> bool:
-        """
-        ZeroMQソケットを初期化し、エンドポイントに接続
-        
-        Returns:
-            接続成功の場合True
-        """
         try:
-            logger.info(f"ZeroMQ高信頼性通信を初期化中...")
-            logger.info(f"  取引エンドポイント: {self.config.trade_endpoint}")
-            logger.info(f"  ハートビートエンドポイント: {self.config.heartbeat_endpoint}")
-            
-            # コンテキスト作成
+            logger.info("ZeroMQ通信 (V11.0) を初期化中...")
             self.context = zmq.Context()
-            
-            # 取引コマンド用REQソケット
-            self.trade_socket = self.context.socket(zmq.REQ)
-            self.trade_socket.connect(self.config.trade_endpoint)
-            
-            # ハートビート用DEALERソケット
-            self.heartbeat_socket = self.context.socket(zmq.DEALER)
-            self.heartbeat_socket.setsockopt(zmq.IDENTITY, b"PythonCore")
+
+            # 1. 制御チャネル (REQ)
+            self.control_socket = self.context.socket(zmq.REQ)
+            self.control_socket.connect(self.config.control_endpoint)
+            logger.info(f"  Control Endpoint: {self.config.control_endpoint}")
+
+            # 2. データチャネル (PULL) - 受信専用
+            self.data_socket = self.context.socket(zmq.PULL)
+            self.data_socket.connect(self.config.data_endpoint)
+            # HWM (High Water Mark) を設定してバッファ溢れを防ぐ
+            self.data_socket.set_hwm(10000)
+            logger.info(f"  Data Endpoint: {self.config.data_endpoint}")
+
+            # 3. ハートビートチャネル (REQ)
+            self.heartbeat_socket = self.context.socket(zmq.REQ)
             self.heartbeat_socket.connect(self.config.heartbeat_endpoint)
-            
+            logger.info(f"  Heartbeat Endpoint: {self.config.heartbeat_endpoint}")
+
             self.is_connected = True
-            
-            # ハートビートスレッドを開始
             self._start_heartbeat_thread()
-            
-            logger.info("✓ ZeroMQ高信頼性通信の起動に成功しました。")
-            
+
             return True
-            
+
         except Exception as e:
-            logger.error(f"✗ ZeroMQ通信の起動に失敗しました: {e}")
+            logger.error(f"✗ ZeroMQ通信の起動に失敗: {e}")
             self.is_connected = False
             return False
-    
+
     def disconnect(self) -> None:
-        """ZeroMQソケットとコンテキストをクリーンアップ"""
-        # ハートビートスレッドを停止
         self._stop_heartbeat_thread()
-        
-        if self.trade_socket:
-            self.trade_socket.close()
-            logger.info("取引ソケットをクローズしました。")
-        
+
+        if self.control_socket:
+            self.control_socket.close()
+        if self.data_socket:
+            self.data_socket.close()
         if self.heartbeat_socket:
             self.heartbeat_socket.close()
-            logger.info("ハートビートソケットをクローズしました。")
-        
         if self.context:
             self.context.term()
-            logger.info("ZeroMQコンテキストを終了しました。")
-        
+
         self.is_connected = False
-    
-    # ========== レイジー・パイレート: 取引コマンド送信 ==========
-    
-    def send_trade_command(self, trade_command: Dict[str, Any]) -> bool:
+        logger.info("ZeroMQ通信を切断しました。")
+
+    # ========== V11.0 履歴データ取得 (ゼロ・シリアライズ) ==========
+
+    def request_historical_data(
+        self, symbol: str, timeframe_name: str, lookback_bars: int
+    ) -> Optional[pd.DataFrame]:
         """
-        取引コマンドをREQソケットで送信（レイジー・パイレートパターン）
-        
-        Args:
-            trade_command: 取引コマンド辞書
-        
-        Returns:
-            送信成功（ACK受信）の場合True
+        V11.0 プロトコルによる履歴データ取得
+        1. Handshake (REQ): データ転送をリクエスト
+        2. Streaming (PULL): 生バイトデータを受信 (numpy.frombuffer)
+        3. Completion: EoSシグナル待機と確認
         """
-        if not self.is_connected or self.trade_socket is None:
-            logger.error("ZeroMQソケットが接続されていません。")
-            self.messages_failed += 1
-            return False
-        
-        # タイムスタンプとメッセージIDを追加
-        if 'timestamp' not in trade_command:
-            trade_command['timestamp'] = datetime.now().isoformat()
-        
-        trade_command['message_id'] = self.messages_sent + 1
-        trade_command['message_type'] = MessageType.TRADE_COMMAND.value
-        
-        # レイジー・パイレート: リトライループ
-        for attempt in range(self.config.request_retries):
-            try:
-                # JSON形式でメッセージ送信
-                json_message = json.dumps(trade_command, ensure_ascii=False)
-                self.trade_socket.send_string(json_message)
-                
-                logger.debug(f"取引コマンド送信 [#{trade_command['message_id']}, 試行{attempt + 1}]: "
-                           f"{trade_command['action']}")
-                
-                # Pollerで応答待機（タイムアウト付き）
-                poller = zmq.Poller()
-                poller.register(self.trade_socket, zmq.POLLIN)
-                
-                socks = dict(poller.poll(self.config.request_timeout))
-                
-                # 応答受信
-                if self.trade_socket in socks and socks[self.trade_socket] == zmq.POLLIN:
-                    response = self.trade_socket.recv_string()
-                    response_data = json.loads(response)
-                    
-                    # ACK確認
-                    if response_data.get('message_type') == MessageType.ACK.value:
-                        self.messages_sent += 1
-                        self.messages_acked += 1
-                        
-                        self._log_message(trade_command, status='sent_acked')
-                        
-                        logger.info(f"✓ 取引コマンド送信成功 [#{trade_command['message_id']}]: "
-                                  f"{trade_command['action']} {trade_command.get('lots', 0):.2f}ロット")
-                        
-                        return True
-                    
-                    # NACK受信
-                    elif response_data.get('message_type') == MessageType.NACK.value:
-                        logger.warning(f"MQL5 EAから拒否されました: {response_data.get('reason')}")
-                        self.messages_failed += 1
-                        self._log_message(trade_command, status='nack', 
-                                        error=response_data.get('reason'))
-                        return False
-                
-                # タイムアウト
-                logger.warning(f"応答タイムアウト（試行{attempt + 1}/{self.config.request_retries}）")
-                
-                # ソケットを再作成（ZeroMQ REQソケットの状態をリセット）
-                if attempt < self.config.request_retries - 1:
-                    self._recreate_trade_socket()
-                
-            except Exception as e:
-                logger.error(f"取引コマンド送信エラー（試行{attempt + 1}）: {e}")
-        
-        # すべてのリトライが失敗
-        self.messages_failed += 1
-        self._log_message(trade_command, status='failed', error='all_retries_exhausted')
-        logger.error(f"✗ 取引コマンド送信失敗 [#{trade_command['message_id']}]: "
-                   f"すべてのリトライが失敗しました。")
-        
-        return False
-    
-    def _recreate_trade_socket(self) -> None:
-        """取引ソケットを再作成（状態リセット）"""
+        if not self.is_connected:
+            logger.error("接続されていません。")
+            return None
+
+        # 1. ハンドシェイク: 履歴リクエスト送信 (制御チャネル)
+        request_msg = f"REQ_HISTORY:{timeframe_name}"
+
         try:
-            if self.trade_socket:
-                self.trade_socket.close()
-            
-            self.trade_socket = self.context.socket(zmq.REQ)
-            self.trade_socket.connect(self.config.trade_endpoint)
-            
-            logger.debug("取引ソケットを再作成しました。")
-        
-        except Exception as e:
-            logger.error(f"取引ソケット再作成失敗: {e}")
-    
-    # ========== 双方向ハートビート ==========
-    
-    def _start_heartbeat_thread(self) -> None:
-        """ハートビートスレッドを開始"""
-        self.heartbeat_running = True
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
-        logger.info("ハートビートスレッドを開始しました。")
-    
-    def _stop_heartbeat_thread(self) -> None:
-        """ハートビートスレッドを停止"""
-        self.heartbeat_running = False
-        if self.heartbeat_thread:
-            self.heartbeat_thread.join(timeout=5.0)
-        logger.info("ハートビートスレッドを停止しました。")
-    
-    def _heartbeat_loop(self) -> None:
-        """ハートビートループ（別スレッド）"""
-        poller = zmq.Poller()
-        poller.register(self.heartbeat_socket, zmq.POLLIN)
-        
-        while self.heartbeat_running:
-            try:
-                # PINGを送信
-                self._send_ping()
-                
-                # PONGを受信（ノンブロッキング）
-                socks = dict(poller.poll(1000))  # 1秒タイムアウト
-                
-                if self.heartbeat_socket in socks and socks[self.heartbeat_socket] == zmq.POLLIN:
-                    # マルチパートメッセージ受信（DEALER/ROUTERパターン）
-                    frames = self.heartbeat_socket.recv_multipart()
-                    
-                    if len(frames) >= 1:
-                        message = json.loads(frames[-1].decode('utf-8'))
-                        
-                        if message.get('message_type') == MessageType.PONG.value:
-                            self.last_heartbeat_received = datetime.now()
-                            self.heartbeats_received += 1
-                            logger.debug(f"PONGを受信 (累計: {self.heartbeats_received})")
-                
-                # 接続喪失チェック
-                if self.last_heartbeat_received:
-                    time_since_last = (datetime.now() - self.last_heartbeat_received).total_seconds()
-                    
-                    if time_since_last > self.config.heartbeat_timeout:
-                        logger.error(f"ハートビートタイムアウト（{time_since_last:.1f}秒）")
-                        
-                        if self.on_connection_lost:
-                            self.on_connection_lost()
-                        
-                        # 再接続を試みる
-                        self._attempt_reconnection()
-                
-                # インターバル
-                time.sleep(self.config.heartbeat_interval)
-            
-            except Exception as e:
-                logger.error(f"ハートビートループエラー: {e}")
-                time.sleep(1.0)
-    
-    def _send_ping(self) -> None:
-        """PINGメッセージを送信"""
-        try:
-            ping_message = {
-                'message_type': MessageType.PING.value,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # DEALERソケットで送信（エンベロープなし）
-            self.heartbeat_socket.send_string(json.dumps(ping_message))
-            
-            self.last_heartbeat_sent = datetime.now()
-            self.heartbeats_sent += 1
-            
-            logger.debug(f"PINGを送信 (累計: {self.heartbeats_sent})")
-        
-        except Exception as e:
-            logger.error(f"PING送信エラー: {e}")
-    
-    def _attempt_reconnection(self) -> None:
-        """再接続を試みる"""
-        logger.info("再接続を試みています...")
-        
-        try:
-            self.disconnect()
-            time.sleep(2.0)
-            
-            if self.connect():
-                logger.info("✓ 再接続成功")
-                
-                if self.on_connection_restored:
-                    self.on_connection_restored()
+            # REQUEST送信
+            self.control_socket.send_string(request_msg)
+
+            # ACK受信 (メタデータを含む)
+            poller = zmq.Poller()
+            poller.register(self.control_socket, zmq.POLLIN)
+
+            if not poller.poll(self.config.request_timeout):
+                logger.error("履歴リクエストがタイムアウトしました (ACK未受信)")
+                self._recreate_control_socket()
+                return None
+
+            ack_response = self.control_socket.recv_string()
+
+            if not ack_response.startswith("ACK:"):
+                logger.error(f"MQL5からの応答がACKではありません: {ack_response}")
+                return None
+
+            # メタデータのパース
+            meta = {}
+            parts = ack_response[4:].split(";")
+            for part in parts:
+                if "=" in part:
+                    k, v = part.split("=")
+                    meta[k] = v
+
+            total_bars = int(meta.get("TOTAL_BARS", 0))
+            total_chunks = int(meta.get("TOTAL_CHUNKS", 0))
+
+            logger.info(
+                f"転送開始: {total_bars} bars, {total_chunks} chunks (via PULL)"
+            )
+
+            # 2. データストリーミング受信 (データチャネル)
+            all_chunks = []
+            received_bars = 0
+            chunk_count = 0
+
+            # 受信ループ
+            while True:
+                if self.data_socket.poll(10000) == 0:
+                    logger.warning("データ受信タイムアウト (ストリーム中断)")
+                    break
+
+                message = self.data_socket.recv()
+                msg_len = len(message)
+
+                # デバッグ: バイト数を出力 (最初の数回のみ)
+                if chunk_count < 3:
+                    logger.info(f"DEBUG: 受信メッセージサイズ: {msg_len} bytes")
+
+                if message == b"END_OF_STREAM":
+                    logger.info(
+                        f"転送完了シグナル (EoS) を受信。受信済みチャンク: {chunk_count}/{total_chunks}"
+                    )
+                    break
+
+                try:
+                    if msg_len == 0:
+                        logger.warning("サイズ0の空メッセージを受信しました。")
+                        continue
+
+                    if msg_len % 60 != 0:
+                        logger.warning(
+                            f"不正なサイズのチャンクを受信: {msg_len} bytes (60の倍数ではありません)"
+                        )
+                        continue
+
+                    chunk_array = np.frombuffer(message, dtype=self.MQL_RATES_DTYPE)
+
+                    # デバッグ: 生成された配列の長さを確認
+                    current_bars = len(chunk_array)
+                    # if chunk_count < 3:
+                    #    logger.info(f"DEBUG: NumPy配列変換結果: {current_bars} bars")
+
+                    all_chunks.append(chunk_array)
+
+                    received_bars += current_bars
+                    chunk_count += 1
+
+                    if chunk_count % 10 == 0 or chunk_count == total_chunks:
+                        logger.info(
+                            f"受信中... {chunk_count}/{total_chunks} chunks ({received_bars} bars)"
+                        )
+
+                except Exception as e:
+                    logger.error(f"チャンクデコードエラー: {e}")
+                    break
+
+            # 3. データ結合とDataFrame化
+            if not all_chunks:
+                logger.error("データを受信できませんでした (all_chunks is empty)。")
+                # 完了通知を送らずに終了（再送を促すため）
+                return None
+
+            full_array = np.concatenate(all_chunks)
+
+            # DataFrame変換
+            df = pd.DataFrame(full_array)
+
+            # [修正] エンジンが期待する 'volume' にリネーム (tick_volume を使用)
+            if "tick_volume" in df.columns:
+                df = df.rename(columns={"tick_volume": "volume"})
+
+            # タイムスタンプ変換 (MQL5 time は Unix Timestamp)
+            df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+            logger.info(f"✓ 全データ受信完了: {len(df)} 行 (期待値: {total_bars})")
+
+            # 4. 完了確認通知 (制御チャネル)
+            self.control_socket.send_string("CONFIRM_HISTORY:OK")
+            # ACK_CONFIRMED を待つ (タイムアウト付き)
+            if self.control_socket.poll(5000):
+                self.control_socket.recv_string()
             else:
-                logger.error("✗ 再接続失敗")
-        
+                logger.warning("完了確認のACKを受信できませんでした")
+
+            return df
+
         except Exception as e:
-            logger.error(f"再接続エラー: {e}")
-    
-    # ========== ブローカー状態リクエスト ==========
-    
+            logger.error(f"履歴データ取得エラー: {e}", exc_info=True)
+            self._recreate_control_socket()
+            return None
+
+    # ========== その他のリクエスト (V11.0 互換実装) ==========
+
+    def request_latest_m1_bar(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """最新のM1バーリクエスト"""
+        # V11.0ではフリーズ回避優先のため、この機能は一時的に無効化または
+        # MQL5側で実装されるまで None を返す
+        return None
+
+    def send_trade_command(self, trade_command: Dict[str, Any]) -> bool:
+        """取引コマンド送信 (V11.0: 制御チャネル使用)"""
+        if not self.is_connected:
+            return False
+
+        # 簡易テキストプロトコルでの実装例 (MQL5側未実装のためプレースホルダー)
+        # V11.0 の焦点は起動時のデータ転送にあるため、ここではログ出力のみ
+        logger.warning("V11.0: 取引コマンド送信機能は現在プレースホルダーです。")
+        self._log_message(trade_command, status="failed", error="V11_NOT_IMPLEMENTED")
+        return False
+
     def request_broker_state(self) -> Optional[Dict[str, Any]]:
         """
-        MQL5 EAにブローカー状態をリクエスト
-        
-        Returns:
-            ブローカー状態辞書、失敗時None
+        ブローカー状態（残高・ポジション）を取得
+        V11.02: MQL5側の手動JSON構築に対応
         """
-        if not self.is_connected or self.trade_socket is None:
-            logger.error("ZeroMQソケットが接続されていません。")
+        if not self.is_connected:
             return None
-        
-        request = {
-            'message_type': MessageType.REQUEST_BROKER_STATE.value,
-            'timestamp': datetime.now().isoformat()
-        }
-        
+
         try:
             # リクエスト送信
-            self.trade_socket.send_string(json.dumps(request))
-            
-            # Pollerで応答待機
+            self.control_socket.send_string("REQUEST_BROKER_STATE")
+
+            # レスポンス待機
             poller = zmq.Poller()
-            poller.register(self.trade_socket, zmq.POLLIN)
-            
-            socks = dict(poller.poll(self.config.request_timeout))
-            
-            if self.trade_socket in socks and socks[self.trade_socket] == zmq.POLLIN:
-                response = self.trade_socket.recv_string()
-                response_data = json.loads(response)
-                
-                if response_data.get('message_type') == MessageType.BROKER_STATE_RESPONSE.value:
-                    logger.info("✓ ブローカー状態を取得しました。")
-                    return response_data.get('data')
-            
-            logger.warning("ブローカー状態リクエストがタイムアウトしました。")
-            return None
-        
+            poller.register(self.control_socket, zmq.POLLIN)
+
+            if poller.poll(self.config.request_timeout):
+                response_bytes = self.control_socket.recv()
+
+                # JSONパース (parse_responseヘルパーを使用)
+                state = parse_response(response_bytes)
+
+                if isinstance(state, dict):
+                    logger.info(
+                        f"✓ ブローカー状態取得: Equity={state.get('equity')}, Pos={len(state.get('positions', []))}"
+                    )
+                    return state
+                else:
+                    logger.warning(f"ブローカー状態の形式が不正です: {state}")
+                    return None
+            else:
+                logger.warning("ブローカー状態リクエストがタイムアウトしました")
+                self._recreate_control_socket()
+                return None
+
         except Exception as e:
-            logger.error(f"ブローカー状態リクエストエラー: {e}")
+            logger.error(f"ブローカー状態リクエスト失敗: {e}")
+            self._recreate_control_socket()
             return None
-    
-    # ========== ログ記録 ==========
-    
-    def _log_message(self,
-                    trade_command: Dict[str, Any],
-                    status: str,
-                    error: Optional[str] = None) -> None:
-        """
-        送信メッセージをログファイルに記録
-        
-        Args:
-            trade_command: 取引コマンド
-            status: ステータス（'sent_acked', 'nack', 'failed'）
-            error: エラーメッセージ（オプション）
-        """
+
+    # ========== 内部メソッド ==========
+
+    def _recreate_control_socket(self):
+        """制御ソケットの再作成"""
+        self.control_socket.close(linger=0)
+        self.control_socket = self.context.socket(zmq.REQ)
+        self.control_socket.connect(self.config.control_endpoint)
+        logger.warning("制御ソケットを再作成しました。")
+
+    def _start_heartbeat_thread(self):
+        self.heartbeat_running = True
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True
+        )
+        self.heartbeat_thread.start()
+
+    def _stop_heartbeat_thread(self):
+        self.heartbeat_running = False
+        if self.heartbeat_thread:
+            self.heartbeat_thread.join(timeout=2.0)
+
+    def _heartbeat_loop(self):
+        """ハートビートループ (Simple Text PING/PONG)"""
+        while self.heartbeat_running:
+            try:
+                if self.heartbeat_socket:
+                    # PING送信
+                    self.heartbeat_socket.send_string("PING")
+                    self.last_heartbeat_sent = datetime.now()
+                    self.heartbeats_sent += 1
+
+                    # PONG受信待機
+                    # [修正] 固定値ではなく config.request_timeout (9000) を使用
+                    if self.heartbeat_socket.poll(self.config.request_timeout):
+                        pong = self.heartbeat_socket.recv_string()
+                        if "PONG" in pong:
+                            self.last_heartbeat_received = datetime.now()
+                            self.heartbeats_received += 1
+                    else:
+                        logger.warning("Heartbeat timeout")
+                        # 必要ならソケット再作成
+                        self.heartbeat_socket.close(linger=0)
+                        self.heartbeat_socket = self.context.socket(zmq.REQ)
+                        self.heartbeat_socket.connect(self.config.heartbeat_endpoint)
+
+                time.sleep(self.config.heartbeat_interval)
+            except Exception as e:
+                logger.error(f"Heartbeat loop error: {e}")
+                time.sleep(1)
+
+    def _log_message(
+        self, trade_command: Dict[str, Any], status: str, error: Optional[str] = None
+    ) -> None:
+        """ログ記録"""
         log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'status': status,
-            'message_id': trade_command.get('message_id'),
-            'command': trade_command,
-            'error': error
+            "timestamp": datetime.now().isoformat(),
+            "status": status,
+            "message_id": trade_command.get("message_id"),
+            "command": trade_command,
+            "error": error,
         }
-        
-        # 日付ごとのログファイル
-        log_file = self.log_dir / f"zmq_publisher_v2_{datetime.now().strftime('%Y%m%d')}.jsonl"
-        
+        log_file = (
+            Path(self.config.log_dir)
+            / f"zmq_publisher_v11_{datetime.now().strftime('%Y%m%d')}.jsonl"
+        )
         try:
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.warning(f"ログファイル書き込み失敗: {e}")
-    
-    # ========== 統計情報 ==========
-    
+
     def get_statistics(self) -> Dict[str, Any]:
-        """
-        通信統計情報を取得
-        
-        Returns:
-            統計情報辞書
-        """
-        success_rate = (self.messages_acked / self.messages_sent 
-                       if self.messages_sent > 0 else 0.0)
-        
+        """統計情報取得"""
         return {
-            'messages_sent': self.messages_sent,
-            'messages_acked': self.messages_acked,
-            'messages_failed': self.messages_failed,
-            'success_rate': success_rate,
-            'heartbeats_sent': self.heartbeats_sent,
-            'heartbeats_received': self.heartbeats_received,
-            'last_heartbeat_sent': (self.last_heartbeat_sent.isoformat() 
-                                   if self.last_heartbeat_sent else None),
-            'last_heartbeat_received': (self.last_heartbeat_received.isoformat() 
-                                       if self.last_heartbeat_received else None),
-            'is_connected': self.is_connected
+            "messages_sent": self.messages_sent,
+            "messages_acked": self.messages_acked,
+            "messages_failed": self.messages_failed,
+            "heartbeats_sent": self.heartbeats_sent,
+            "heartbeats_received": self.heartbeats_received,
+            "last_heartbeat_sent": self.last_heartbeat_sent,
+            "last_heartbeat_received": self.last_heartbeat_received,
+            "is_connected": self.is_connected,
         }
-    
-    # ========== コンテキストマネージャー ==========
-    
-    def __enter__(self):
-        """コンテキストマネージャーのエントリー"""
-        self.connect()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """コンテキストマネージャーの終了"""
-        self.disconnect()
 
 
 # ========== フォールバックメカニズム ==========
+
 
 class FileBasedBridge:
     """
     ZeroMQ通信が失敗した場合のフォールバック
     JSONファイルを介した通信
     """
-    
+
     def __init__(self, file_path: str = str(config.BRIDGE_FALLBACK_FILE)):
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         logger.info(f"ファイルベースBridgeを初期化: {self.file_path}")
-    
+
     def write_command(self, trade_command: Dict[str, Any]) -> bool:
         """
         取引コマンドをJSONファイルに書き込み
-        
+
         Args:
             trade_command: 取引コマンド辞書
-        
+
         Returns:
             書き込み成功の場合True
         """
         try:
-            if 'timestamp' not in trade_command:
-                trade_command['timestamp'] = datetime.now().isoformat()
-            
-            with open(self.file_path, 'w', encoding='utf-8') as f:
+            if "timestamp" not in trade_command:
+                trade_command["timestamp"] = datetime.now().isoformat()
+
+            with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump(trade_command, f, indent=2, ensure_ascii=False)
-            
+
             logger.info(f"✓ ファイルベース通信: コマンドを書き込みました")
             return True
-            
+
         except Exception as e:
             logger.error(f"✗ ファイルベース通信失敗: {e}")
             return False
-
-
-# 使用例
-if __name__ == '__main__':
-    # サンプル取引コマンド
-    sample_command = {
-        'action': 'BUY',
-        'lots': 1.25,
-        'entry_price': 150.25,
-        'stop_loss': 149.40,
-        'take_profit': 151.95,
-        'confidence_m2': 0.72,
-        'predicted_time': 45,
-        'reason': 'M2確信度72%、Kelly2.0%、BUYシグナル'
-    }
-    
-    # コールバック関数の定義
-    def on_connection_lost():
-        print("\n⚠ 警告: MQL5 EAとの接続が失われました。")
-    
-    def on_connection_restored():
-        print("\n✓ 情報: MQL5 EAとの接続が復旧しました。")
-    
-    # コンテキストマネージャーを使用した安全な通信
-    print("=" * 60)
-    print("高信頼性通信のテスト")
-    print("=" * 60)
-    
-    config = BridgeConfig(
-        trade_endpoint="tcp://127.0.0.1:5555",
-        heartbeat_endpoint="tcp://127.0.0.1:5556",
-        request_timeout=2500,
-        request_retries=3
-    )
-    
-    with MQL5BridgePublisherV2(config=config) as publisher:
-        # コールバック設定
-        publisher.on_connection_lost = on_connection_lost
-        publisher.on_connection_restored = on_connection_restored
-        
-        # 取引コマンドを送信
-        success = publisher.send_trade_command(sample_command)
-        
-        if success:
-            print("\n✓ 取引コマンドの送信に成功しました（ACK受信）。")
-        else:
-            print("\n✗ 取引コマンドの送信に失敗しました。")
-            print("フォールバックメカニズムを起動します...")
-            
-            fallback = FileBasedBridge()
-            fallback.write_command(sample_command)
-        
-        # ブローカー状態をリクエスト
-        print("\nブローカー状態をリクエスト中...")
-        broker_state = publisher.request_broker_state()
-        
-        if broker_state:
-            print("✓ ブローカー状態:")
-            print(json.dumps(broker_state, indent=2, ensure_ascii=False))
-        
-        # 統計情報を表示
-        stats = publisher.get_statistics()
-        print(f"\n通信統計:")
-        print(f"  - 送信: {stats['messages_sent']}")
-        print(f"  - ACK受信: {stats['messages_acked']}")
-        print(f"  - 失敗: {stats['messages_failed']}")
-        print(f"  - 成功率: {stats['success_rate']:.2%}")
-        print(f"  - ハートビート送信: {stats['heartbeats_sent']}")
-        print(f"  - ハートビート受信: {stats['heartbeats_received']}")
-        
-        # ハートビートの動作を観察（10秒間）
-        print("\nハートビートの動作を観察中（10秒間）...")
-        time.sleep(10)
-    
-    print("\n✓ すべてのテスト完了")

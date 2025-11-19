@@ -105,10 +105,9 @@ CONFIG_RISK = CONFIG_DIR / "risk_config.json"
 CONFIG_REGIME = CONFIG_DIR / "regime_config.json"
 
 # =================================================================
-# 実行設定 (V11.0: Hybrid ZMQ)
+# 実行設定
 # =================================================================
 ZMQ = {
-    "control_endpoint": "tcp://host.docker.internal:5555",  # コマンド/ハンドシェイク
-    "data_endpoint": "tcp://host.docker.internal:5556",  # バルクデータ転送 (PUSH/PULL)
-    "heartbeat_endpoint": "tcp://host.docker.internal:5558",  # ハートビート
+    "trade_endpoint": "tcp://host.docker.internal:5555",
+    "heartbeat_endpoint": "tcp://host.docker.internal:5556",
 }

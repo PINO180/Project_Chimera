@@ -14,7 +14,7 @@ import polars as pl
 from dataclasses import dataclass, field
 from datetime import datetime
 import pandas as pd  # リサンプリングで使用
-import MetaTrader5 as mt5  # MT5時間足定数で使用
+
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
 project_root = Path(__file__).resolve().parents[1]
@@ -667,8 +667,15 @@ def calculate_tsi_numba(
 ) -> np.ndarray:
     n = len(prices)
     out = np.full(n, np.nan)
-    momentum = np.diff(prices)
-    momentum = np.insert(momentum, 0, 0.0)
+    # Numbaがサポートする np.zeros とスライスで np.insert を代替
+    n = len(prices)  # 👈 この行を追加
+    momentum = np.zeros(n, dtype=np.float64)  # 👈 この行を追加
+    if n > 1:  # 👈 この行を追加
+        momentum[1:] = np.diff(prices)  # 👈 この行を追加
+
+    # ⬆️ (momentum = np.diff(prices) と momentum = np.insert(...) の2行を上記4行で置き換え)
+
+    alpha_long = 2.0 / (long_period + 1.0)
     alpha_long = 2.0 / (long_period + 1.0)
     alpha_short = 2.0 / (short_period + 1.0)
     ema1_mom = np.zeros(n)
@@ -2099,38 +2106,39 @@ class RealtimeFeatureEngine:
     """
 
     # main.py と同じ定義
+    # [V5.2 修正] mt5.TIMEFRAME... の定数を削除し、Linux依存を解消
     ALL_TIMEFRAMES = {
-        "M1": mt5.TIMEFRAME_M1,
-        "M3": mt5.TIMEFRAME_M3,
-        "M5": mt5.TIMEFRAME_M5,
-        "M8": mt5.TIMEFRAME_M8,
-        "M15": mt5.TIMEFRAME_M15,
-        "M30": mt5.TIMEFRAME_M30,
-        "H1": mt5.TIMEFRAME_H1,
-        "H4": mt5.TIMEFRAME_H4,
-        "H6": mt5.TIMEFRAME_H6,
-        "H12": mt5.TIMEFRAME_H12,
-        "D1": mt5.TIMEFRAME_D1,
-        "W1": mt5.TIMEFRAME_W1,
-        "MN": mt5.TIMEFRAME_MN,
-        "tick": None,
-        "M0.5": None,
+        "M1": 1,  # 値は何でも良い（None以外）
+        "M3": 3,
+        "M5": 5,
+        "M8": 8,
+        "M15": 15,
+        "M30": 30,
+        "H1": 60,
+        "H4": 240,
+        "H6": 360,
+        "H12": 720,
+        "D1": 1440,
+        "W1": 10080,
+        "MN": 43200,
+        "tick": None,  # スキップ対象
+        "M0.5": None,  # スキップ対象
     }
 
     # Pandas.resample() のためのルール定義
     TF_RESAMPLE_RULES = {
-        "M3": "3T",
-        "M5": "5T",
-        "M8": "8T",
-        "M15": "15T",
-        "M30": "30T",
-        "H1": "1H",
-        "H4": "4H",
-        "H6": "6H",
-        "H12": "12H",
-        "D1": "1D",
-        "W1": "1W",
-        "MN": "1MS",  # 月初 (Month Start)
+        "M3": "3min",
+        "M5": "5min",
+        "M8": "8min",
+        "M15": "15min",
+        "M30": "30min",
+        "H1": "1h",
+        "H4": "4h",
+        "H6": "6h",
+        "H12": "12h",
+        "D1": "1D",  # (変更なし)
+        "W1": "1W",  # (変更なし)
+        "MN": "1MS",  # (変更なし)
     }
 
     # OHLCVカラム
@@ -2215,10 +2223,13 @@ class RealtimeFeatureEngine:
 
         for tf_name in self.data_buffers.keys():
             lookback = self.lookbacks_by_tf[tf_name]
-            # 5a. Dequeを初期化
+            # [修正後] 'market_proxy' (x変数) のDequeも初期化する
+            # 5a. Dequeを初期化 (y変数)
             self.proxy_feature_buffers[tf_name] = {
                 feat: deque(maxlen=lookback) for feat in PROXY_FEATURES
             }
+            # 5a. (続き) market_proxy (x変数) のDequeも追加
+            self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(maxlen=lookback)
             # 5b. OLS状態を初期化
             self.ols_state[tf_name] = {}
             for feat in PROXY_FEATURES:
@@ -2389,8 +2400,14 @@ class RealtimeFeatureEngine:
             self.data_buffers[tf_name][col].clear()
             self.data_buffers[tf_name][col].extend(df_slice[col].values)
         self.last_bar_timestamps[tf_name] = df_slice.index[-1]
-        if len(df_slice) >= buffer_len:
+
+        # [修正] データが少しでもあれば計算許可を出す (MN不足対応)
+        if len(df_slice) > 0:
             self.is_buffer_filled[tf_name] = True
+            if len(df_slice) < buffer_len:
+                self.logger.warning(
+                    f"  ⚠️ {tf_name} はデータ不足 ({len(df_slice)}/{buffer_len}) ですが、計算を許可します。"
+                )
 
         self.logger.info(
             f"  -> {tf_name} OHLCVバッファを {len(df_slice)} 行で充填しました。"
@@ -2467,47 +2484,54 @@ class RealtimeFeatureEngine:
 
     def fill_all_buffers(
         self,
-        history_data_map: Dict[str, pl.DataFrame],
+        history_data_map: Dict[str, pd.DataFrame],  # 修正
         market_proxy_cache: pd.DataFrame,
     ) -> None:
         """
-        [I/F] main.py から呼び出され、起動時に全バッファを履歴データで充填する
+        [V8.0 修正]
+        1. M1データのみを history_data_map から受け取る
+        2. M1バッファを充填
+        3. M1データから M3～MN のすべてをリサンプリングして充填する
         """
-        self.logger.info("全時間足の履歴データでNumpyバッファを一括充填中...")
+        self.logger.info(
+            "全時間足の履歴データでNumpyバッファを一括充填中 (V8.0: M1 Only)..."
+        )
 
-        # M1データをPandas DFに変換して保存 (リサンプリング元)
         if "M1" not in history_data_map:
             raise ValueError("履歴データに M1 がありません。リサンプリングできません。")
 
-        m1_history_pl = history_data_map["M1"]
-        m1_history_pd = m1_history_pl.to_pandas()
-        m1_history_pd["timestamp"] = pd.to_datetime(
-            m1_history_pd["time"], unit="s", utc=True
-        )
-        m1_history_pd = m1_history_pd.set_index("timestamp").drop(columns="time")
+        # 1. M1データをPandas DFに変換 (リサンプリング元として保持)
+        m1_history_pd = history_data_map["M1"]
+        if "timestamp" not in m1_history_pd.columns:
+            raise ValueError("M1履歴データに 'timestamp' カラムが見つかりません。")
+        m1_history_pd = m1_history_pd.set_index("timestamp")
 
-        # M1バッファを充填 (Deque)
-        self._replace_buffer_from_dataframe("M1", m1_history_pd)
-        # M1のグローバルDequeを更新 (pd.concat回避)
+        # 2. M1バッファを充填
+        self.logger.info(f"  -> M1 バッファをMT5データから充填中...")
+        self._replace_buffer_from_dataframe("M1", m1_history_pd, market_proxy_cache)
+
+        # 3. M1 Dequeを更新 (リアルタイムループ用)
         self.m1_dataframe.clear()
-        # (m1_history_pd は timestamp が index になっている)
         m1_records = m1_history_pd.reset_index().to_dict("records")
         self.m1_dataframe.extend(m1_records)
 
-        # M1以外の時間足のバッファを「リサンプリング」によって生成・充填
-        self.logger.info("M1データから他の全時間足をリサンプリングして充填中...")
+        # 4. M1データから「M1以外」の全バッファをリサンプリング
+        self.logger.info(
+            "M1データから M3～MN の全バッファをリサンプリングして充填中..."
+        )
         for tf_name, rule in self.TF_RESAMPLE_RULES.items():
             if tf_name not in self.data_buffers:
-                continue  # この時間足は不要
+                continue  # (e.g., 'M30' が名簿になければスキップ)
 
+            # (M1は既に充填済みなのでスキップ)
+            if tf_name == "M1":
+                continue
+
+            # ★ M3, M5, M8, H1, H4, H6, H12, D1, W1, MN がここでリサンプリングされる
             try:
-                # Pandasリサンプリング
+                self.logger.info(f"  -> {tf_name} をM1からリサンプリング中...")
                 resampled_df = (
-                    # --- [V6.4 修正] ---
-                    # 誤: self.m1_dataframe (deque)
-                    # 正: m1_history_pd (L1237で生成したPandas DF)
                     m1_history_pd.resample(rule)
-                    # --- [修正ここまで] ---
                     .agg(
                         {
                             "open": "first",
@@ -2518,17 +2542,16 @@ class RealtimeFeatureEngine:
                         }
                     )
                     .dropna()
-                )  # 取引時間外のNaNを削除
+                )
 
                 if resampled_df.empty:
                     self.logger.warning(f"{tf_name} のリサンプリング結果が空です。")
                     continue
 
-                # バッファを置換 (V6.5: OLSバックフィルも実行)
+                # バッファを置換
                 self._replace_buffer_from_dataframe(
                     tf_name, resampled_df, market_proxy_cache
                 )
-
             except Exception as e:
                 self.logger.error(f"{tf_name} のリサンプリング充填に失敗: {e}")
 
@@ -2573,13 +2596,10 @@ class RealtimeFeatureEngine:
                 )
 
             # 4. 充填状態を更新
-            if (
-                not self.is_buffer_filled[tf_name]
-                and len(self.data_buffers[tf_name]["close"])
-                >= self.lookbacks_by_tf[tf_name]
-            ):
+            # [修正] データが入ってきた時点で常にTrueにする
+            if not self.is_buffer_filled[tf_name]:
                 self.is_buffer_filled[tf_name] = True
-                self.logger.info(f"✅ {tf_name} バッファが充填されました。")
+                self.logger.info(f"✅ {tf_name} バッファ計算開始 (Best-Effort)。")
 
         except KeyError as e:
             self.logger.error(f"バーデータ {tf_name} にキーがありません: {e}")
@@ -2777,8 +2797,8 @@ class RealtimeFeatureEngine:
         [Helper] (V4戦略)
         指定された時間足のバッファがR4レジーム (atr_value >= 5.0) かを判定する。
         """
-        if not self.is_buffer_filled[tf_name]:
-            return {"is_r4": False, "reason": "buffer_not_filled"}
+        # if not self.is_buffer_filled[tf_name]:
+        #     return {"is_r4": False, "reason": "buffer_not_filled"}
 
         try:
             # R4判定用に、最新のATR(21)を計算
@@ -2990,25 +3010,33 @@ class RealtimeFeatureEngine:
 
             # サフィックス付きの名簿 (e.g., "e1a_statistical_kurtosis_50_neutralized_D1")
             for feature_name_in_list in self.feature_list:
-                # 特徴量の時間足が、現在処理中の時間足(tf_name)と一致するか？
-                if not feature_name_in_list.endswith(f"_{tf_name}"):
-                    continue  # (e.g., D1 の特徴量は M15 ループでは無視)
+                # [修正] 該当する時間足かチェック
+                if feature_name_in_list.endswith(f"_{tf_name}"):
+                    # 該当する場合: 計算済みの値をセット
 
-                # サフィックスを除去 (e.g., "e1a_statistical_kurtosis_50")
-                base_name = feature_name_in_list.split("_neutralized_")[0]
+                    # --- ▼▼▼ [V11.1 堅牢化] ベース名抽出ロジックの修正 ▼▼▼ ---
+                    if "_neutralized_" in feature_name_in_list:
+                        # 純化済み特徴量の場合: "feat_neutralized_M15" -> "feat"
+                        base_name = feature_name_in_list.split("_neutralized_")[0]
+                    else:
+                        # 生の特徴量の場合 (フォールバック): "feat_M15" -> "feat"
+                        # 右側から最初の "_" で分割してサフィックスを除去
+                        base_name = feature_name_in_list.rsplit("_", 1)[0]
+                    # --- ▲▲▲ 修正ここまで ▲▲▲ ---
 
-                if base_name in neutralized_features:
-                    feature_vector.append(neutralized_features[base_name])
+                    if base_name in neutralized_features:
+                        feature_vector.append(neutralized_features[base_name])
+                    else:
+                        # 計算マップになかった場合
+                        # self.logger.warning(f"特徴量 {base_name} が見つかりません。0.0 を使用します。")
+                        feature_vector.append(0.0)
                 else:
-                    # この時間足で計算すべき特徴量だが、計算マップになかった
-                    self.logger.warning(
-                        f"特徴量 {base_name} (元: {feature_name_in_list}) が純化マップに見つかりません。0.0 を使用します。"
-                    )
+                    # [修正] 該当しない時間足の場合:
+                    # AIの入力次元数を保つために 0.0 で埋める (Padding)
                     feature_vector.append(0.0)
 
-            if not feature_vector:
-                # この時間足(tf_name)で計算すべき特徴量は名簿になかった
-                return None
+            # ベクトルが空、または全て0の場合のチェックは必要だが、
+            # 304個埋めているので empty チェックは不要になる
 
             # 5. 最終的なベクトルをNaNチェック (0で埋める)
             final_vector = np.nan_to_num(
