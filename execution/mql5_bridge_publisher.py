@@ -333,10 +333,47 @@ class MQL5BridgePublisherV3:
     # ========== その他のリクエスト (V11.0 互換実装) ==========
 
     def request_latest_m1_bar(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """最新のM1バーリクエスト"""
-        # V11.0ではフリーズ回避優先のため、この機能は一時的に無効化または
-        # MQL5側で実装されるまで None を返す
-        return None
+        """最新のM1バーリクエスト (V11.02 修正版)"""
+        if not self.is_connected:
+            return None
+
+        try:
+            # 1. リクエスト送信 (Control Channel)
+            # JSON形式ではなく単純なコマンド文字列を送る
+            self.control_socket.send_string("REQUEST_M1_BAR")
+
+            # 2. レスポンス待機
+            poller = zmq.Poller()
+            poller.register(self.control_socket, zmq.POLLIN)
+
+            if poller.poll(self.config.request_timeout):
+                response_bytes = self.control_socket.recv()
+
+                # 既存のヘルパーでパース (JSON文字列 -> Dict)
+                bar_data = parse_response(response_bytes)
+
+                if isinstance(bar_data, dict) and "time" in bar_data:
+                    # エンジン側の仕様に合わせてキー名を調整
+                    if "tick_volume" in bar_data:
+                        bar_data["volume"] = bar_data.pop("tick_volume")
+
+                    # datetimeオブジェクトを追加 (main.pyで必要)
+                    bar_data["timestamp"] = datetime.fromtimestamp(
+                        bar_data["time"], timezone.utc
+                    )
+                    return bar_data
+                else:
+                    # エラー応答の場合など
+                    return None
+            else:
+                logger.warning("M1バーリクエストがタイムアウトしました")
+                self._recreate_control_socket()
+                return None
+
+        except Exception as e:
+            logger.error(f"M1バーリクエストエラー: {e}")
+            self._recreate_control_socket()
+            return None
 
     def send_trade_command(self, trade_command: Dict[str, Any]) -> bool:
         """取引コマンド送信 (V11.0: 制御チャネル使用)"""

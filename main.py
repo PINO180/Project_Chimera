@@ -389,7 +389,7 @@ def main():
 
         # --- 7. リアルタイム取引ループ開始 (M1ループ) ---
         logger.info("=" * 60)
-        logger.info(f"🔥 リアルタイム取引ループ開始 (M1ポーリング) (Ctrl+Cで終了)")
+        logger.info(f"🚀 リアルタイム取引ループ開始 ")
         logger.info("=" * 60)
 
         while True:
