@@ -24,7 +24,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple, TypedDict
 import logging
 import joblib
-import lightgbm as lgb  # 追加: Baseモデルロード用
 from sklearn.calibration import CalibratedClassifierCV
 from collections import deque
 from decimal import Decimal, getcontext
@@ -41,6 +40,7 @@ JST = zoneinfo.ZoneInfo("Asia/Tokyo")  # JST時間帯
 # 独自モジュール
 # (state_manager, market_regime_detector は main.py から渡される)
 from execution.state_manager import StateManager, SystemState, Trade, EventType
+# from models.market_regime_detector import MarketRegimeDetector
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -75,38 +75,40 @@ class ExtremeRiskEngineV2:
         self,
         config_path: str = str(config.CONFIG_RISK),
         state_manager: Optional[StateManager] = None,
-        # [修正] BaseモデルとCalibratorの両方のパスを受け取るよう拡張
-        m1_base_path: Optional[str] = str(config.S7_M1_MODEL_PKL),
-        m1_calib_path: Optional[str] = str(config.S7_M1_CALIBRATED),
-        m2_base_path: Optional[str] = str(config.S7_M2_MODEL_PKL),
-        m2_calib_path: Optional[str] = str(config.S7_M2_CALIBRATED),
-    ):
+        # regime_detector: Optional[MarketRegimeDetector] = None,
+        m1_model_path: Optional[str] = str(
+            config.S7_M1_CALIBRATED
+        ),  # デフォルトパス追加
+        m2_model_path: Optional[str] = str(config.S7_M2_CALIBRATED),
+    ):  # デフォルトパス追加
         """
         Args:
             config_path: リスク管理設定ファイル
             state_manager: 状態管理マネージャー
-            m1_base_path: M1ベースモデル(LightGBM)のパス
-            m1_calib_path: M1較正器(Isotonic)のパス
-            m2_base_path: M2ベースモデル(LightGBM)のパス
-            m2_calib_path: M2較正器(Isotonic)のパス
+            regime_detector: 市場レジーム検知器
+            m1_model_path: M1較正済みモデルのパス
+            m2_model_path: M2較正済みモデルのパス
         """
         self.config = self._load_config(config_path)
 
         # 状態管理
         self.state_manager = state_manager or StateManager()
 
-        # モデル格納変数 (Base + Calibrated)
-        self.m1_base_model: Any = None
-        self.m1_calibrated: Any = None
-        self.m2_base_model: Any = None
-        self.m2_calibrated: Any = None
+        # 市場レジーム検知
+        # self.regime_detector = regime_detector
+
+        # 較正済みモデル
+        self.m1_calibrated: Optional[CalibratedClassifierCV] = None
+        self.m2_calibrated: Optional[CalibratedClassifierCV] = None
 
         # M1性能履歴（ローリング統計用）
         self.m1_precision_history: deque = deque(maxlen=20)
         self.m1_f1_history: deque = deque(maxlen=20)
 
-        # 初期化時に全モデルをロード
-        self._load_all_models(m1_base_path, m1_calib_path, m2_base_path, m2_calib_path)
+        if m1_model_path:
+            self.load_calibrated_model(m1_model_path, model_type="M1")
+        if m2_model_path:
+            self.load_calibrated_model(m2_model_path, model_type="M2")
 
         logger.info("ExtremeRiskEngineV2を初期化しました。")
 
@@ -151,114 +153,37 @@ class ExtremeRiskEngineV2:
         with open(config_file, "r") as f:
             return json.load(f)
 
-    # ========== モデル管理 (修正: Base+Calib 両対応) ==========
-
-    def _load_all_models(
-        self, m1_base: str, m1_calib: str, m2_base: str, m2_calib: str
-    ) -> None:
-        """
-        全モデル（Base + Calibrator）を一括ロード
-        """
-        # M1 Load
-        try:
-            if m1_base and Path(m1_base).exists():
-                self.m1_base_model = joblib.load(m1_base)
-                logger.info(f"✓ M1 Baseモデル読み込み: {m1_base}")
-            if m1_calib and Path(m1_calib).exists():
-                self.m1_calibrated = joblib.load(m1_calib)
-                logger.info(f"✓ M1 較正器読み込み: {m1_calib}")
-        except Exception as e:
-            logger.error(f"✗ M1モデル群ロード失敗: {e}")
-
-        # M2 Load
-        try:
-            if m2_base and Path(m2_base).exists():
-                self.m2_base_model = joblib.load(m2_base)
-                logger.info(f"✓ M2 Baseモデル読み込み: {m2_base}")
-            if m2_calib and Path(m2_calib).exists():
-                self.m2_calibrated = joblib.load(m2_calib)
-                logger.info(f"✓ M2 較正器読み込み: {m2_calib}")
-        except Exception as e:
-            logger.error(f"✗ M2モデル群ロード失敗: {e}")
+    # ========== モデル管理 (変更なし) ==========
 
     def load_calibrated_model(self, model_path: str, model_type: str) -> None:
         """
-        [修正] main.py からの呼び出し互換性を維持しつつ、Baseモデルも自動ロードする
+        較正済みモデルを読み込む
+
+        Args:
+            model_path: モデルファイルパス
+            model_type: 'M1' or 'M2'
         """
         try:
-            # 1. 指定されたパス（較正器）をロード
+            model = joblib.load(model_path)
+
             if model_type == "M1":
-                self.m1_calibrated = joblib.load(model_path)
-                logger.info(f"✓ M1 較正器読み込み (Legacy call): {model_path}")
-
-                # 2. 対になるBaseモデルを config から自動推論してロード
-                base_path = str(config.S7_M1_MODEL_PKL)
-                if Path(base_path).exists():
-                    self.m1_base_model = joblib.load(base_path)
-                    logger.info(f"✓ M1 Baseモデル自動ロード: {base_path}")
-                else:
-                    logger.warning(f"⚠ M1 Baseモデルが見つかりません: {base_path}")
-
+                self.m1_calibrated = model
+                logger.info(f"✓ M1較正済みモデル読み込み: {model_path}")
             elif model_type == "M2":
-                self.m2_calibrated = joblib.load(model_path)
-                logger.info(f"✓ M2 較正器読み込み (Legacy call): {model_path}")
-
-                # 2. 対になるBaseモデルを config から自動推論してロード
-                base_path = str(config.S7_M2_MODEL_PKL)
-                if Path(base_path).exists():
-                    self.m2_base_model = joblib.load(base_path)
-                    logger.info(f"✓ M2 Baseモデル自動ロード: {base_path}")
-                else:
-                    logger.warning(f"⚠ M2 Baseモデルが見つかりません: {base_path}")
-
+                self.m2_calibrated = model
+                logger.info(f"✓ M2較正済みモデル読み込み: {model_path}")
             else:
                 raise ValueError(f"無効なモデルタイプ: {model_type}")
 
         except Exception as e:
             logger.error(f"✗ モデル読み込み失敗 ({model_type}): {e}")
 
-    def _get_calibrated_probability(
-        self, base_model: Any, calibrator: Any, features: np.ndarray
-    ) -> float:
-        """
-        [新規] Baseモデル -> Calibrator の順で推論を行い、較正済み確率を返すヘルパー
-        """
-        if base_model is None or calibrator is None:
-            # モデル未ロード時は安全に 0.0 を返すかエラーにする
-            # ここではエラーを発生させ、呼び出し元でハンドリングさせる
-            raise ValueError("Baseモデルまたは較正器がロードされていません")
-
-        # 1. Base Model 推論 (Raw Score取得)
-        # LightGBM(sklearn API)の場合は predict_proba、Boosterなら predict
-        if hasattr(base_model, "predict_proba"):
-            # [n_samples, n_classes] -> class 1 probability
-            raw_score = base_model.predict_proba(features)[:, 1]
-        else:
-            # Regressor or Booster -> raw score/probability
-            raw_score = base_model.predict(features)
-
-        # 2. Calibrator 推論
-        # IsotonicRegression は 1D array (n_samples,) を期待する
-        # raw_score が (1, 1) や (1,) の場合があるので flatten で整える
-        score_input = np.array(raw_score).flatten()
-
-        if hasattr(calibrator, "predict_proba"):
-            # Platt Scaling (Logistic) 等
-            calibrated_prob = calibrator.predict_proba(score_input.reshape(-1, 1))[
-                :, 1
-            ][0]
-        else:
-            # IsotonicRegression (predict_probaを持たない)
-            calibrated_prob = calibrator.predict(score_input)[0]
-
-        return float(calibrated_prob)
-
     def predict_with_confidence(
         self, features: np.ndarray, market_info: MarketInfo
     ) -> Tuple[float, float]:
         """
         較正済みモデルで予測と確信度を取得 (M2文脈特徴量を使用)
-        [修正] IsotonicRegression対応 (Baseモデル -> Calibrator パイプライン)
+        [修正] IsotonicRegression対応 (predict_probaがない場合のフォールバックを追加)
 
         Args:
             features: 基本特徴量ベクトル (S3_FEATURES_FOR_TRAINING)
@@ -267,21 +192,19 @@ class ExtremeRiskEngineV2:
         Returns:
             (M1予測確率, M2成功確率)
         """
-        # モデル存在チェック
-        if self.m1_base_model is None or self.m1_calibrated is None:
-            raise ValueError("M1モデル群が正しくロードされていません。")
-        if self.m2_base_model is None or self.m2_calibrated is None:
-            raise ValueError("M2モデル群が正しくロードされていません。")
+        if self.m1_calibrated is None or self.m2_calibrated is None:
+            raise ValueError("較正済みモデルが読み込まれていません。")
 
         # --- M1予測（利食い確率） ---
-        # Base -> Calibrator のパイプラインを使用
-        p_m1 = self._get_calibrated_probability(
-            self.m1_base_model, self.m1_calibrated, features
-        )
+        # IsotonicRegressionはpredict_probaを持たず、predictが直接確率を返す
+        if hasattr(self.m1_calibrated, "predict_proba"):
+            p_m1 = self.m1_calibrated.predict_proba(features)[0, 1]
+        else:
+            p_m1 = self.m1_calibrated.predict(features)[0]
 
         # M2用拡張特徴量の構築 (model_training_metalabeling_C_contextplus.py と一致させる)
         # 1. 基本特徴量 (features[0])
-        # 2. M1出力 (p_m1) -> ★ 較正済みの値を使用
+        # 2. M1出力 (p_m1)
         # 3. 文脈特徴量 (market_info から取得)
 
         context_features_m2_names = [
@@ -295,7 +218,7 @@ class ExtremeRiskEngineV2:
         ]
 
         extended_features_list = list(features[0])  # 1. 基本特徴量
-        extended_features_list.append(float(p_m1))  # 2. M1出力 (較正済み)
+        extended_features_list.append(float(p_m1))  # 2. M1出力
 
         # 3. 文脈特徴量
         try:
@@ -312,10 +235,10 @@ class ExtremeRiskEngineV2:
         extended_features = np.array([extended_features_list])
 
         # --- M2予測（M1シグナルの成功確率） ---
-        # Base -> Calibrator のパイプラインを使用
-        p_m2 = self._get_calibrated_probability(
-            self.m2_base_model, self.m2_calibrated, extended_features
-        )
+        if hasattr(self.m2_calibrated, "predict_proba"):
+            p_m2 = self.m2_calibrated.predict_proba(extended_features)[0, 1]
+        else:
+            p_m2 = self.m2_calibrated.predict(extended_features)[0]
 
         return float(p_m1), float(p_m2)
 
@@ -380,8 +303,7 @@ class ExtremeRiskEngineV2:
         self, p_win: float, win_loss_ratio: float, kelly_fraction: float = 0.5
     ) -> float:
         """
-        ケリー基準で最適な資本配分比率を計算
-        [修正] 低ペイオフレシオ・高勝率戦略のため、期待値マイナス時も絶対値を用いてエントリーする
+        ケリー基準で最適な資本配分比率を計算 (変更なし)
 
         Args:
             p_win: 勝利確率（較正済み）
@@ -403,16 +325,12 @@ class ExtremeRiskEngineV2:
         # ケリー基準
         kelly_f = (win_loss_ratio * p_win - q_lose) / win_loss_ratio
 
-        # --- [修正箇所] 絶対値ロジック（Aggressive Mode） ---
-        # バックテストで確認された「低ペイオフレシオ・高勝率」局面での
-        # 「絶対値をとってエントリーする」挙動を再現するため、
-        # マイナスの場合も絶対値（abs）を採用してエントリーさせる。
-        if kelly_f < 0:
+        # 負の値（期待値マイナス）の場合は0
+        if kelly_f <= 0:
             logger.info(
-                f"期待値マイナス（Kelly={kelly_f:.4f}）だが、絶対値モードにより反転してエントリー。"
+                f"期待値マイナスのシグナル（Kelly={kelly_f:.4f}）。エントリー不可。"
             )
-            kelly_f = abs(kelly_f)
-        # ------------------------------------------------
+            return 0.0
 
         # 分数ケリー（リスク軽減）
         fractional_kelly = kelly_f * kelly_fraction
@@ -764,14 +682,6 @@ class ExtremeRiskEngineV2:
         if current_time is None:
             current_time = datetime.now(datetime.timezone.utc)
 
-        # --- [修正] ATR参照先の適正化 (日足ATRによる汚染を防止) ---
-        # 文脈結合により market_info["atr"] には日足ATR(約30-40)が入ってしまっている可能性がある。
-        # リアルタイムエンジンが算出した "atr_value"(約5-10) が存在する場合、
-        # それを優先して "atr" キーに上書きし、後続の計算(SL/ロット/AI)で使用させる。
-        if "atr_value" in market_info and market_info["atr_value"] > 0:
-            market_info["atr"] = market_info["atr_value"]
-        # -------------------------------------------------------
-
         # 状態の取得
         if self.state_manager.current_state is None:
             logger.error("システム状態が初期化されていません。")
@@ -798,7 +708,7 @@ class ExtremeRiskEngineV2:
             p_m1, p_m2 = self.predict_with_confidence(features, market_info)
             logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}")
         except Exception as e:
-            logger.error(f"AI予測失敗: {e}", exc_info=True)
+            logger.error(f"AI予測失敗: {e}")
             return self._generate_hold_command("prediction_failed")
 
         # エントリー条件チェック
@@ -819,7 +729,6 @@ class ExtremeRiskEngineV2:
         direction_str = "BUY" if direction_int == 1 else "SELL"
 
         # SL/TPの計算 (V4: S6の 'atr', 'sl_multiplier', 'pt_multiplier' を使用)
-        # 注: 上部で market_info["atr"] を補正済みのため、ここではそのまま使用できる
         sl_tp = self.calculate_sl_tp(
             entry_price=market_info["current_price"],
             atr=market_info["atr"],
@@ -830,7 +739,6 @@ class ExtremeRiskEngineV2:
         )
 
         # ポジションサイズの計算（V4: ケリー基準）
-        # 注: 内部で market_info["atr"] を参照するため、補正済みの値が使われる
         lots, calc_details = self.calculate_position_size_kelly(
             account_balance=state.current_balance,
             p_m2=p_m2,

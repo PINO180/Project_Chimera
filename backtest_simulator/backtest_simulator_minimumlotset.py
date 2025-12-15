@@ -89,7 +89,7 @@ class BacktestConfig:
     # max_leverage: float = 100 # <- ★★★ 削除: base_leverage を使う ★★★
     max_risk_per_trade: float = 0.20  # ★★★ 50 (5000%) -> 0.5 (50%) に修正 ★★★
     f_star_threshold: float = 0.0
-    m2_proba_threshold: float = 0.5
+    m2_proba_threshold: float = 0.6
     test_limit_partitions: int = 0
     oof_mode: bool = False
     min_capital_threshold: float = 1.0
@@ -98,7 +98,7 @@ class BacktestConfig:
     # --- ★★★ 修正: 基本レバレッジとスプレッドを追加 ★★★ ---
     base_leverage: float = 2000.0  # 設定可能な基本レバレッジ
     spread_pips: float = 16.0  # XAUUSD スタンダード口座のスプレッド
-    value_per_pip: float = 10.0
+    value_per_pip: float = 1.0
     """
     (ASSUMPTION) 1ロットあたりの1pipの価値 (口座通貨単位)。
     XAUUSD (1 lot = 100 oz) の場合: $10.0

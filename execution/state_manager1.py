@@ -1,9 +1,7 @@
-# /workspace/execution/state_manager.py
 """
 状態管理とフォールトトレランス
 チェックポインティングとイベントソーシングによる状態永続化
 + ブローカー状態整合性対応版 [V3.2]
-+ ドローダウン管理フィールド追加 [V3.3]
 """
 
 import sys
@@ -92,19 +90,7 @@ class SystemState:
     current_balance: float
     current_margin: float
     free_margin: float
-    current_drawdown: float  # [V3.3 追加]
     trades: List[Trade]
-
-    # [V3.3 追加] 他の統計情報も拡張しやすいように kwargs を受け取る
-    m1_rolling_precision: List[float] = None
-    m2_rolling_auc: List[float] = None
-    recent_trades_count: int = 0
-
-    def __post_init__(self):
-        if self.m1_rolling_precision is None:
-            self.m1_rolling_precision = []
-        if self.m2_rolling_auc is None:
-            self.m2_rolling_auc = []
 
     def to_dict(self) -> Dict[str, Any]:
         """辞書形式に変換"""
@@ -114,8 +100,6 @@ class SystemState:
             "current_balance": self.current_balance,
             "current_margin": self.current_margin,
             "free_margin": self.free_margin,
-            "current_drawdown": self.current_drawdown,  # [V3.3 追加]
-            "recent_trades_count": self.recent_trades_count,  # [V3.3 追加]
             "trades": [
                 {
                     "ticket": t.ticket,
@@ -156,11 +140,7 @@ class SystemState:
             current_balance=data["current_balance"],
             current_margin=data.get("current_margin", 0.0),
             free_margin=data.get("free_margin", 0.0),
-            current_drawdown=data.get(
-                "current_drawdown", 0.0
-            ),  # [V3.3 追加] 安全に取得
             trades=trades,
-            recent_trades_count=data.get("recent_trades_count", 0),
         )
 
 
@@ -169,7 +149,6 @@ class StateManager:
     状態管理マネージャー
     チェックポインティングとイベントソーシングの両方をサポート
     + ブローカー状態整合性対応版 [V3.2]
-    + ドローダウン管理対応 [V3.3]
     """
 
     def __init__(
@@ -286,8 +265,7 @@ class StateManager:
             logger.info(f"✓ チェックポイント読み込み成功: {checkpoint_path}")
             logger.info(
                 f"  エクイティ: {state.current_equity:.2f}, "
-                f"DD: {state.current_drawdown:.2%}, "
-                f"ポジション数: {len(state.trades)}"
+                f"保有ポジション数: {len(state.trades)}"
             )
 
             return state
@@ -368,7 +346,6 @@ class StateManager:
                     current_balance=0.0,
                     current_margin=0.0,
                     free_margin=0.0,
-                    current_drawdown=0.0,  # [V3.3]
                     trades=[],
                 )
             else:
@@ -411,7 +388,6 @@ class StateManager:
                 unrealized_pnl=data.get("unrealized_pnl", 0.0),
             )
             state.trades.append(trade)
-            state.recent_trades_count += 1  # [V3.3]
 
         elif event_type == EventType.POSITION_CLOSED:
             # ポジション削除
@@ -424,9 +400,6 @@ class StateManager:
             state.current_margin = data.get("margin", 0.0)
             state.free_margin = data.get("free_margin", 0.0)
 
-        elif event_type == EventType.DRAWDOWN_UPDATED:  # [V3.3]
-            state.current_drawdown = data.get("drawdown", 0.0)
-
         state.timestamp = timestamp
         return state
 
@@ -437,7 +410,6 @@ class StateManager:
         ローカル状態とブローカー状態の整合性を確保
 
         ✨ [V3.2 修正] positions キーが存在しない場合の処理を追加
-        ✨ [修正版] ブローカーにあってローカルにないポジションのインポート処理を追加
 
         Args:
             broker_state: ブローカーから取得した状態
@@ -459,21 +431,12 @@ class StateManager:
                 broker_state.get("equity", 0.0) - self.current_state.current_equity
             )
 
-            # [修正] Balanceもチェックして更新する
-            balance_diff = abs(
-                broker_state.get("balance", 0.0) - self.current_state.current_balance
-            )
-
-            if equity_diff > 0.01 or balance_diff > 0.01:  # 差分があれば更新
+            if equity_diff > 0.01:  # 0.01 ドル以上の差分があれば更新
                 logger.warning(
-                    f"口座情報の差分を検出して同期します。\n"
-                    f"  Equity: {self.current_state.current_equity:.2f} -> {broker_state.get('equity', 0.0):.2f}\n"
-                    f"  Balance: {self.current_state.current_balance:.2f} -> {broker_state.get('balance', 0.0):.2f}"
+                    f"Equity の差分を検出（ローカル: {self.current_state.current_equity:.2f}, "
+                    f"ブローカー: {broker_state.get('equity', 0.0):.2f}）"
                 )
                 self.current_state.current_equity = broker_state.get("equity", 0.0)
-                self.current_state.current_balance = broker_state.get(
-                    "balance", 0.0
-                )  # ★ここを追加
 
             # ✨ [V3.2 修正] positions キーが存在するかチェック
             broker_positions = broker_state.get("positions", [])
@@ -484,15 +447,14 @@ class StateManager:
                 )
                 broker_positions = []
 
-            # ポジション整合性チェック
+            # ポジション整合性チェック（簡易版）
             broker_tickets = {pos.get("ticket") for pos in broker_positions}
             local_tickets = {trade.ticket for trade in self.current_state.trades}
 
-            # 1. ブローカーに存在しないポジションをローカルから削除 (決済検知)
             missing_in_broker = local_tickets - broker_tickets
             if missing_in_broker:
                 logger.warning(
-                    f"ブローカーに存在しないポジションが検出(削除): {missing_in_broker}"
+                    f"ブローカーに存在しないポジションが検出: {missing_in_broker}"
                 )
                 # ローカル側から削除
                 self.current_state.trades = [
@@ -500,58 +462,6 @@ class StateManager:
                     for trade in self.current_state.trades
                     if trade.ticket not in missing_in_broker
                 ]
-
-            # 2. ブローカーにあるがローカルにないポジションを追加 (インポート)
-            # ★★★ ここが今回追加される重要な修正箇所です ★★★
-            missing_in_local = broker_tickets - local_tickets
-            if missing_in_local:
-                logger.warning(
-                    f"ローカルに存在しないポジションを検出(インポート): {missing_in_local}"
-                )
-                for pos_data in broker_positions:
-                    ticket = pos_data.get("ticket")
-                    if ticket in missing_in_local:
-                        try:
-                            # [修正] MT5の日付形式 "YYYY.MM.DD HH:MM:SS" に対応
-                            entry_time_str = pos_data.get("entry_time", "")
-                            if "." in entry_time_str:
-                                # "2025.11.27 03:00:07" -> datetime
-                                entry_time_dt = datetime.strptime(
-                                    entry_time_str, "%Y.%m.%d %H:%M:%S"
-                                )
-                                # タイムゾーン情報を付与 (UTCと仮定、またはJSTなら調整)
-                                entry_time_dt = entry_time_dt.replace(
-                                    tzinfo=timezone.utc
-                                )
-                            else:
-                                # ISO形式の場合のフォールバック
-                                entry_time_dt = datetime.fromisoformat(entry_time_str)
-
-                            # Tradeオブジェクトを作成して追加
-                            new_trade = Trade(
-                                ticket=ticket,
-                                symbol=pos_data.get("symbol", "UNKNOWN"),
-                                direction=pos_data.get("direction", "BUY"),
-                                lots=pos_data.get("lots", 0.0),
-                                entry_price=pos_data.get("entry_price", 0.0),
-                                stop_loss=pos_data.get("stop_loss", 0.0),
-                                take_profit=pos_data.get("take_profit", 0.0),
-                                entry_time=entry_time_dt,
-                                unrealized_pnl=pos_data.get("unrealized_pnl", 0.0),
-                            )
-                            self.current_state.trades.append(new_trade)
-
-                            # 取引回数カウントも増やしておく
-                            self.current_state.recent_trades_count += 1
-
-                            logger.info(
-                                f"  -> ポジションをインポートしました: Ticket={ticket}"
-                            )
-
-                        except Exception as e:
-                            logger.error(
-                                f"  -> ポジションインポート失敗 (Ticket={ticket}): {e}"
-                            )
 
             # 状態を保存
             self.save_checkpoint(self.current_state)
@@ -568,7 +478,6 @@ class StateManager:
         ブローカー状態からシステム状態を初期化
 
         ✨ [V3.2 修正] positions キーが存在しない場合の処理を追加
-        ✨ [V3.3 修正] current_drawdown を初期化
 
         Args:
             broker_state: ブローカー状態辞書
@@ -636,7 +545,6 @@ class StateManager:
                 current_balance=balance,
                 current_margin=margin,
                 free_margin=free_margin,
-                current_drawdown=0.0,  # [V3.3 追加] 初期化時は0.0
                 trades=trades,
             )
 
@@ -655,7 +563,7 @@ class StateManager:
 if __name__ == "__main__":
     # チェックポインティングのテスト
     print("=" * 60)
-    print("チェックポインティングのテスト (V3.3)")
+    print("チェックポインティングのテスト")
     print("=" * 60)
 
     manager = StateManager(use_event_sourcing=False)
@@ -667,7 +575,6 @@ if __name__ == "__main__":
         current_balance=1000000.0,
         current_margin=50000.0,
         free_margin=950000.0,
-        current_drawdown=0.05,  # [V3.3]
         trades=[
             Trade(
                 ticket=12345,
@@ -692,7 +599,6 @@ if __name__ == "__main__":
     if loaded_state:
         print(f"\n復元された状態:")
         print(f"  エクイティ: {loaded_state.current_equity:.2f}")
-        print(f"  Drawdown: {loaded_state.current_drawdown:.2%}")
         print(f"  保有ポジション: {len(loaded_state.trades)}個")
 
     print("\n✓ すべてのテスト完了")

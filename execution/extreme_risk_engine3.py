@@ -764,14 +764,6 @@ class ExtremeRiskEngineV2:
         if current_time is None:
             current_time = datetime.now(datetime.timezone.utc)
 
-        # --- [修正] ATR参照先の適正化 (日足ATRによる汚染を防止) ---
-        # 文脈結合により market_info["atr"] には日足ATR(約30-40)が入ってしまっている可能性がある。
-        # リアルタイムエンジンが算出した "atr_value"(約5-10) が存在する場合、
-        # それを優先して "atr" キーに上書きし、後続の計算(SL/ロット/AI)で使用させる。
-        if "atr_value" in market_info and market_info["atr_value"] > 0:
-            market_info["atr"] = market_info["atr_value"]
-        # -------------------------------------------------------
-
         # 状態の取得
         if self.state_manager.current_state is None:
             logger.error("システム状態が初期化されていません。")
@@ -819,7 +811,6 @@ class ExtremeRiskEngineV2:
         direction_str = "BUY" if direction_int == 1 else "SELL"
 
         # SL/TPの計算 (V4: S6の 'atr', 'sl_multiplier', 'pt_multiplier' を使用)
-        # 注: 上部で market_info["atr"] を補正済みのため、ここではそのまま使用できる
         sl_tp = self.calculate_sl_tp(
             entry_price=market_info["current_price"],
             atr=market_info["atr"],
@@ -830,7 +821,6 @@ class ExtremeRiskEngineV2:
         )
 
         # ポジションサイズの計算（V4: ケリー基準）
-        # 注: 内部で market_info["atr"] を参照するため、補正済みの値が使われる
         lots, calc_details = self.calculate_position_size_kelly(
             account_balance=state.current_balance,
             p_m2=p_m2,
