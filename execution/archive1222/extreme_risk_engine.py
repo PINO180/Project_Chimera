@@ -128,9 +128,10 @@ class ExtremeRiskEngineV2:
                 "base_atr_tp_multiplier": 2.0,
                 "kelly_fraction": 0.5,  # ハーフケリー
                 "max_risk_per_trade": 0.05,  # 1取引あたり最大5%
-                "max_positions": 1,  # ★ 1ポジルール
+                "max_positions": 50,  # ★ 修正: デフォルトを50に引き上げ
                 "contract_size": 100.0,  # (Decimal(CONTRACT_SIZE) と一致させる)
-                "pip_value_per_lot": 10.0,  # (XAUUSDの1pip=$10)
+                "pip_value_per_lot": 1.0,  # (シミュレーターの value_per_pip と一致させる)
+                "spread_pips": 16.0,  # ★ 追加: スプレッドコスト計算用
                 "pip_multiplier": 100.0,  # 価格差→pips変換係数（USD/JPY: 100, XAU/USD: 100, EUR/USD: 10000）
                 "min_lot_size": 0.01,
                 "base_leverage": 2000.0,
@@ -149,7 +150,11 @@ class ExtremeRiskEngineV2:
             return default_config
 
         with open(config_file, "r") as f:
-            return json.load(f)
+            loaded_config = json.load(f)
+            # 後方互換性: spread_pips がない場合はデフォルトを追加
+            if "spread_pips" not in loaded_config:
+                loaded_config["spread_pips"] = 16.0
+            return loaded_config
 
     # ========== モデル管理 (修正: Base+Calib 両対応) ==========
 
@@ -257,67 +262,56 @@ class ExtremeRiskEngineV2:
         self, features: np.ndarray, market_info: MarketInfo
     ) -> Tuple[float, float]:
         """
-        較正済みモデルで予測と確信度を取得 (M2文脈特徴量を使用)
-        [修正] IsotonicRegression対応 (Baseモデル -> Calibrator パイプライン)
-
-        Args:
-            features: 基本特徴量ベクトル (S3_FEATURES_FOR_TRAINING)
-            market_info: 市場情報 (V4文脈特徴量を含む)
-
-        Returns:
-            (M1予測確率, M2成功確率)
+        較正済みモデルで予測と確信度を取得
+        [修正] M2モデルが存在しない場合、シミュレーターの挙動に合わせて
+        M2スコアとしてM1スコア(p_m1)をそのまま返すように変更。
         """
-        # モデル存在チェック
+        # --- M1モデルチェック ---
         if self.m1_base_model is None or self.m1_calibrated is None:
             raise ValueError("M1モデル群が正しくロードされていません。")
-        if self.m2_base_model is None or self.m2_calibrated is None:
-            raise ValueError("M2モデル群が正しくロードされていません。")
 
         # --- M1予測（利食い確率） ---
-        # Base -> Calibrator のパイプラインを使用
         p_m1 = self._get_calibrated_probability(
             self.m1_base_model, self.m1_calibrated, features
         )
 
-        # M2用拡張特徴量の構築 (model_training_metalabeling_C_contextplus.py と一致させる)
-        # 1. 基本特徴量 (features[0])
-        # 2. M1出力 (p_m1) -> ★ 較正済みの値を使用
-        # 3. 文脈特徴量 (market_info から取得)
-
-        # [修正] 学習データ(m2_Feature Importance.py出力)に基づく正しい文脈特徴量リスト
-        context_features_m2_names = [
-            "hmm_prob_0",
-            "hmm_prob_1",
-            "atr_ratio",  # [変更] atr -> atr_ratio
-            "e1a_statistical_kurtosis_50",
-            "e1c_adx_21",
-            "e2a_mfdfa_hurst_mean_250",  # [変更] 1000 -> 250
-            "e2a_kolmogorov_complexity_60",  # [変更] 1000 -> 60
-            "trend_bias_25",  # [追加] 不足していた特徴量
-        ]
-
-        extended_features_list = list(features[0])  # 1. 基本特徴量
-        extended_features_list.append(float(p_m1))  # 2. M1出力 (較正済み)
-
-        # 3. 文脈特徴量
-        try:
-            for feature_name in context_features_m2_names:
-                # market_info から文脈特徴量を取得
-                # (main.py が S7_CONTEXT_FEATURES から取得して market_info に詰める前提)
-                value = market_info.get(feature_name, 0.0)
-                extended_features_list.append(value)
-        except Exception as e:
-            logger.error(f"M2文脈特徴量の構築に失敗: {e}。market_info: {market_info}")
-            raise ValueError("M2文脈特徴量の構築エラー")
-
-        # 配列に変換
-        extended_features = np.array([extended_features_list])
-
         # --- M2予測（M1シグナルの成功確率） ---
-        # Base -> Calibrator のパイプラインを使用
-        p_m2 = self._get_calibrated_probability(
-            self.m2_base_model, self.m2_calibrated, extended_features
-        )
+        # [修正] シミュレーター動作に合わせ、M2がない場合は p_m1 を代用する
+        # (p_m2 = 0.0 だと不自然なため、p_m1 をデフォルトとする)
+        p_m2 = float(p_m1)
+
+        if self.m2_base_model is not None and self.m2_calibrated is not None:
+            try:
+                # M2用拡張特徴量の構築
+                context_features_m2_names = [
+                    "hmm_prob_0",
+                    "hmm_prob_1",
+                    "atr",
+                    "e1a_statistical_kurtosis_50",
+                    "e1c_adx_21",
+                    "e2a_mfdfa_hurst_mean_1000",
+                    "e2a_kolmogorov_complexity_1000",
+                ]
+
+                extended_features_list = list(features[0])
+                extended_features_list.append(float(p_m1))
+
+                for feature_name in context_features_m2_names:
+                    value = market_info.get(feature_name, 0.0)
+                    extended_features_list.append(value)
+
+                extended_features = np.array([extended_features_list])
+
+                # M2予測実行
+                p_m2 = self._get_calibrated_probability(
+                    self.m2_base_model, self.m2_calibrated, extended_features
+                )
+            except Exception as e:
+                # M2計算エラーはログに出すが、M1単体運用なら p_m1 で続行
+                logger.warning(
+                    f"M2予測の計算に失敗しました (M1スコアで代用します): {e}"
+                )
+                p_m2 = float(p_m1)
 
         return float(p_m1), float(p_m2)
 
@@ -487,6 +481,9 @@ class ExtremeRiskEngineV2:
         DECIMAL_KELLY_FRACTION = Decimal(str(self.config["kelly_fraction"]))
         DECIMAL_MIN_LOT_SIZE = Decimal(str(self.config["min_lot_size"]))
         DECIMAL_CONTRACT_SIZE = Decimal(str(self.config["contract_size"]))
+        # スプレッドコスト計算用
+        DECIMAL_VALUE_PER_PIP = Decimal(str(self.config.get("pip_value_per_lot", 1.0)))
+        DECIMAL_SPREAD_PIPS = Decimal(str(self.config.get("spread_pips", 16.0)))
 
         # ドローダウンチェック
         if current_drawdown >= self.config["max_drawdown"]:
@@ -587,6 +584,18 @@ class ExtremeRiskEngineV2:
             logger.info(f"最終ロットサイズが最小単位未満: {final_lot_size_float:.4f}")
             return 0.0, {"reason": "lots_below_minimum_after_constraints"}
 
+        # --- 7. スプレッドコストによる破綻チェック (★追加) ---
+        # コスト = ロット * スプレッドpips * pip価値
+        spread_cost_decimal = (
+            final_lot_size_decimal * DECIMAL_SPREAD_PIPS * DECIMAL_VALUE_PER_PIP
+        )
+
+        if spread_cost_decimal >= current_capital:
+            logger.warning(
+                f"スプレッドコスト({spread_cost_decimal:.2f})が資本({current_capital:.2f})を超過するためエントリー見送り。"
+            )
+            return 0.0, {"reason": "spread_cost_exceeds_capital"}
+
         details = {
             "kelly_f_fractional": float(kelly_f_fractional_decimal),
             "effective_bet_fraction": float(effective_bet_fraction),
@@ -597,6 +606,7 @@ class ExtremeRiskEngineV2:
             "max_lot_by_margin": float(max_lot_by_margin),
             "max_lot_by_broker": float(max_lot_allowed_by_broker),
             "final_lot_size": final_lot_size_float,
+            "spread_cost": float(spread_cost_decimal),
             "reason": "success",
         }
 
@@ -732,11 +742,11 @@ class ExtremeRiskEngineV2:
                         }
 
             # 週末前後
-            if current_time.weekday() == 4 and current_time.hour >= 20:
+            if current_time.weekday() == 4 and current_time.hour >= 21:
                 return {"allowed": False, "reason": "週末クローズ前の取引禁止時間帯"}
 
-            # if current_time.weekday() == 0 and current_time.hour < 9:
-            #     return {"allowed": False, "reason": "週明けオープン後の取引禁止時間帯"}
+            if current_time.weekday() == 0 and current_time.hour < 9:
+                return {"allowed": False, "reason": "週明けオープン後の取引禁止時間帯"}
 
         return {"allowed": True, "reason": "すべての条件をクリア"}
 
@@ -801,8 +811,7 @@ class ExtremeRiskEngineV2:
             # logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}") # ログがうるさければコメントアウト
 
             # ★追加: ログ保存用にスコアを確保
-            # [修正] シミュレーターに合わせて M2スコア を記録・使用する
-            ai_score = float(p_m2)
+            ai_score = float(p_m1)
 
         except Exception as e:
             logger.error(f"AI予測失敗: {e}", exc_info=True)
@@ -810,7 +819,7 @@ class ExtremeRiskEngineV2:
 
         # エントリー条件チェック
         entry_check = self.check_entry_conditions(
-            p_m2=p_m2,  # [修正] シミュレーターに合わせて M2スコア を使用
+            p_m2=p_m1,  # ★ M1に変更
             current_positions=len(state.trades),
             current_time=current_time,
             news_times=news_times,
@@ -842,7 +851,7 @@ class ExtremeRiskEngineV2:
         # 注: 内部で market_info["atr"] を参照するため、補正済みの値が使われる
         lots, calc_details = self.calculate_position_size_kelly(
             account_balance=state.current_balance,
-            p_m2=p_m2,  # [修正] シミュレーターに合わせて M2スコア を使用
+            p_m2=p_m1,  # ★ M1に変更
             market_info=market_info,  # V4: S6データ(atr, multipliers, payoff_ratio)を渡す
             current_drawdown=state.current_drawdown,
             timestamp_utc=current_time,  # V4: 時間帯制限のため

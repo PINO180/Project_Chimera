@@ -85,33 +85,35 @@ g_market_proxy: Optional[pd.DataFrame] = (
 )
 
 # ==================================================================
-# 🚨 リアルタイムデータ取得 (ZMQ経由) 🚨
+# 🚨 リアルタイムデータ取得 (ZMQ経由) & 文脈計算 🚨
 # ==================================================================
+
+# グローバル変数: HMMモデル（学習済み）と市場プロキシ
+g_hmm_model: Any = None
+g_market_proxy: Optional[pd.DataFrame] = None
 
 
 def load_static_data() -> bool:
     """
-    [新規]
-    起動時に、D1文脈データとM5市場プロキシデータをメモリに一括ロードする。
-    (矛盾①, 矛盾③ 解決のため)
-
-    [V6.0 修正] パフォーマンス向上のため、M5プロキシをPandas DFに事前変換してキャッシュ
-    [V6.6 修正] 致命的なデータ漏洩バグを修正
+    [V12.0 修正]
+    過去の文脈ファイル(parquet)のロードを廃止。
+    代わりに「学習済みHMMモデル」と「M5市場プロキシ」をロードする。
     """
-    global g_context_features, g_market_proxy
+    global g_hmm_model, g_market_proxy
     try:
-        # 1. D1文脈データをロード (M2予測用)
-        logger.info(f"S7 D1文脈特徴量 {config.S7_CONTEXT_FEATURES} をロード中...")
-        g_context_features = pl.read_parquet(config.S7_CONTEXT_FEATURES).sort(
-            "timestamp"
-        )
-        # join_asof のため 'date' キーを 'timestamp' と同じにする
-        g_context_features = g_context_features.with_columns(
-            pl.col("timestamp").alias("date_key_for_join")
-        )
-        logger.info(f"✓ D1文脈特徴量をキャッシュ ({len(g_context_features)}行)。")
+        # 1. 学習済みHMMモデル (市場レジーム判定用) をロード
+        # (文脈はリアルタイム計算するため、モデルそのものが必要)
+        logger.info(f"S7 レジームモデル {config.S7_REGIME_MODEL} をロード中...")
+        if Path(config.S7_REGIME_MODEL).exists():
+            g_hmm_model = joblib.load(config.S7_REGIME_MODEL)
+            logger.info("✓ HMMモデルをロードしました。")
+        else:
+            logger.warning(
+                "⚠ HMMモデルが見つかりません。レジーム確率はデフォルト値になります。"
+            )
+            g_hmm_model = None
 
-        # 2. M5市場プロキシデータをロード (アルファ純化用)
+        # 2. M5市場プロキシデータ (アルファ純化用) をロード
         logger.info("S2 M5市場プロキシデータ (アルファ純化用) をロード中...")
         proxy_source_path = (
             config.S2_FEATURES_AFTER_AV
@@ -123,32 +125,24 @@ def load_static_data() -> bool:
                 f"市場プロキシファイルが見つかりません: {proxy_source_path}"
             )
 
-        # Polarsで計算
+        # Polarsで計算 (PCT Change)
         g_market_proxy_pl = (
             pl.read_parquet(proxy_source_path)
             .select(["timestamp", "close"])
             .sort("timestamp")
             .with_columns(
-                # --- [V6.6 致命的バグ修正] ---
-                # 誤: (pl.col("close").shift(-MARKET_PROXY_LOOKBACK) / pl.col("close") - 1)
-                #     -> 将来のリターン (データ漏洩)
-                # 正: (pl.col("close").pct_change(MARKET_PROXY_LOOKBACK))
-                #     -> 過去のリターン ( (close[t] - close[t-5]) / close[t-5] )
                 (pl.col("close").pct_change(MARKET_PROXY_LOOKBACK)).alias(
                     "market_proxy"
                 )
-                # --- [修正ここまで] ---
             )
             .select(["timestamp", "market_proxy"])
-            .drop_nulls()  # 計算不能な先頭のNaNを削除
+            .drop_nulls()
         )
 
-        # --- [パフォーマンス修正] ---
-        # [修正] .tz_localize("UTC") を追加し、TZ-Aware (UTC) に統一する
+        # TZ-Aware (UTC) に統一
         g_market_proxy = (
             g_market_proxy_pl.to_pandas().set_index("timestamp").tz_localize("UTC")
         )
-        # ------------------------
 
         logger.info(
             f"✓ M5市場プロキシデータをPandas DFとしてキャッシュ ({len(g_market_proxy)}行)。"
@@ -157,9 +151,25 @@ def load_static_data() -> bool:
 
     except Exception as e:
         logger.critical(
-            f"静的データ (文脈/プロキシ) のロードに失敗: {e}", exc_info=True
+            f"静的データ (HMMモデル/プロキシ) のロードに失敗: {e}", exc_info=True
         )
         return False
+
+
+def get_realtime_d1_context(
+    engine: RealtimeFeatureEngine,
+) -> Dict[str, Any]:
+    """
+    [V12.0 新規]
+    過去のファイルから検索するのではなく、
+    エンジンのD1バッファを使って「今この瞬間」の文脈特徴量を計算する。
+    """
+    global g_hmm_model
+
+    # エンジンに計算を依頼 (HMMモデルを渡す)
+    context_data = engine.calculate_dynamic_context(g_hmm_model)
+
+    return context_data
 
 
 def initialize_data_buffer(
@@ -169,9 +179,12 @@ def initialize_data_buffer(
 ) -> bool:
     """
     [V11.0 修正]
-    M1データのみを可能な限り（5万本）取得し、
-    エンジンが M3～MN のすべてをリサンプリングする。
-    ゼロ・シリアライズ（V11.0）により、5万本の転送は一瞬で完了する。
+    M1データのみを可能な限り取得し、エンジンが M3～MN のすべてをリサンプリングする。
+    ゼロ・シリアライズ（V11.0）により、大量のバー転送も高速に行われる。
+
+    【修正点】
+    特徴量エンジンの要求する最大ルックバック（特にD1で1000日分など）を満たすため、
+    必要なM1バー数を動的に計算してリクエストする。
     """
     logger.info(
         "ZMQ経由で全時間足の履歴データを取得中 (V11.0: M1 Only / Zero-Serialization)..."
@@ -182,19 +195,56 @@ def initialize_data_buffer(
     # 1. M1データのみをリクエストする
     tf_name = "M1"
 
-    # 2. 必要なM1本数を計算
-    # 5万本取得する (V11.0アーキテクチャなら300万本でも可能だが、まずは5万で起動確認)
-    lookback = 50000
+    # 2. 必要なM1本数を計算 (修正箇所)
+    # エンジンから各時間足の必要Lookbackを取得
+    lookbacks = engine.get_max_lookback_for_all_timeframes()
+
+    # 時間足ごとの「分換算」係数
+    tf_minutes_map = {
+        "M1": 1,
+        "M3": 3,
+        "M5": 5,
+        "M8": 8,
+        "M15": 15,
+        "M30": 30,
+        "H1": 60,
+        "H4": 240,
+        "H6": 360,
+        "H12": 720,
+        "D1": 1440,
+        "W1": 10080,
+        "MN": 43200,
+    }
+
+    max_m1_needed = 0
+
+    # 各時間足の要求ルックバックを「M1本数」に換算し、最大値を求める
+    for tf_key, lookback_val in lookbacks.items():
+        minutes = tf_minutes_map.get(tf_key, 1440)  # デフォルトはD1換算
+        m1_count = lookback_val * minutes
+        if m1_count > max_m1_needed:
+            max_m1_needed = m1_count
+
+    # 安全マージンを追加 (+5000本)
+    request_bars = max_m1_needed + 5000
+
+    # 上限キャップ (MT5側のメモリ保護のため、例えば300万本に制限)
+    # MFDFA(1000日) = 1,440,000本 なので 3,000,000本あれば十分
+    LIMIT_BARS = 3000000
+    request_bars = min(request_bars, LIMIT_BARS)
+
+    # 下限ガード (最低でも5万本は取る)
+    request_bars = max(request_bars, 50000)
 
     logger.info(
-        f"  -> {tf_name} の履歴データを {lookback} 本取得中 (全時間足の生成元)..."
+        f"  -> {tf_name} の履歴データを {request_bars} 本取得中 (最大Lookbackに基づく必要数)..."
     )
 
     # ✨ [V11.0] ZMQ リクエスト (PULLによるストリーミング受信)
     df_rates_m1 = bridge.request_historical_data(
         symbol=STRATEGY_SYMBOL,
         timeframe_name=tf_name,
-        lookback_bars=lookback,
+        lookback_bars=request_bars,
     )
 
     if df_rates_m1 is None or len(df_rates_m1) == 0:
@@ -206,14 +256,13 @@ def initialize_data_buffer(
     # 3. history_data_map には M1 だけを格納
     history_data_map[tf_name] = df_rates_m1
 
-    # (M3, M5, M8, H6, H12, D1, W1, MN のリクエストは一切行わない)
-
-    # エンジンに全履歴データを一括で渡す
+    # エンジンに全履歴データを一括で渡す (ここでリサンプリングが行われる)
     engine.fill_all_buffers(history_data_map, market_proxy_cache)
 
     # M1ループの開始時刻をセット
     global g_last_processed_bar_time
     if len(history_data_map["M1"]) > 0:
+        # Pandas TimestampをUNIX時間に変換
         g_last_processed_bar_time = int(
             history_data_map["M1"]["timestamp"].iloc[-1].timestamp()
         )
@@ -364,21 +413,17 @@ def main():
             )
 
         # --- 4. リスクエンジン (ExtremeRiskEngineV2) の初期化 ---
+        # [修正] M2モデルは使用しないため None を渡す
         logger.info("--- 4. リスクエンジン (ExtremeRiskEngineV2) の初期化 ---")
         risk_engine = ExtremeRiskEngineV2(
             config_path=str(config.CONFIG_RISK),
             state_manager=state_manager,
             m1_base_path=str(config.S7_M1_MODEL_PKL),
             m1_calib_path=str(config.S7_M1_CALIBRATED),
-            m2_base_path=str(config.S7_M2_MODEL_PKL),
-            m2_calib_path=str(config.S7_M2_CALIBRATED),
+            m2_base_path=None,  # 🚫 修正: ロードしない
+            m2_calib_path=None,  # 🚫 修正: ロードしない
         )
         logger.info("✓ リスクエンジンを初期化しました（Base+Calibratorロード完了）。")
-
-        # --- 5. AIモデルのロード ---
-        # (初期化時に一括ロード済みのため、個別の呼び出しは削除)
-        logger.info("--- 5. AIモデル (ロード済み) ---")
-        logger.info("✓ AIモデルのロード完了。")
 
         # --- 6. リアルタイム特徴量エンジン (マルチバッファ) の初期化 ---
         logger.info(
@@ -401,22 +446,16 @@ def main():
                 # (A) M1の新しいバーの確定を待機
                 new_m1_bar = get_latest_m1_bar(bridge)
                 if new_m1_bar is None:
-                    time.sleep(0.5)  # 【推奨】1秒間隔に変更（または 0.5）
+                    time.sleep(10)  # (10秒ポーリング)
                     continue
 
-                # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ [修正箇所] ここに追加 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-                # 新しい足が確定したタイミングで、ブローカーと状態を同期する
-                # これにより、TP/SLで決済されたポジションがローカル状態から削除される
-                broker_state_sync = bridge.request_broker_state()
-                if broker_state_sync:
-                    state_manager.reconcile_with_broker(broker_state_sync)
-                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+                # --- [追加修正] 毎分ブローカー状態を同期 ---
+                broker_state = bridge.request_broker_state()
+                if broker_state:
+                    state_manager.reconcile_with_broker(broker_state)
+                # -----------------------------------------
 
                 # (B) M1バーをエンジンに渡し、シグナルを待つ
-                # ※ (矛盾①解決のため) 純化用のM5プロキシデータも渡す
-                # ※ (矛盾②解決のため) エンジンは内部で全15バッファを更新
-                # ※ (B案戦略のため) エンジンは内部で全時間足のR4判定とシグナル生成
-                # (g_market_proxy は pd.DataFrame として渡される)
                 signal_list = feature_engine.process_new_m1_bar(
                     new_m1_bar, g_market_proxy
                 )
@@ -426,25 +465,36 @@ def main():
 
                 # (C) シグナル処理ループ
                 for signal in signal_list:
-                    # `signal` は以下を含むと仮定:
-                    #   - signal.features (純化済みの [1, 304] ベクトル)
-                    #   - signal.timestamp (datetime)
-                    #   - signal.timeframe (例: "M15")
-                    #   - signal.market_info (V4 R4ルールの PT/SL/Payoff, ATR値など)
-
-                    logger.info("-" * 30)
-                    logger.info(
-                        f"🔥 {signal.timeframe} R4 シグナル検知 @ {signal.market_info['current_price']:.3f} (ATR: {signal.market_info['atr_value']:.2f})"
-                    )
-
                     # (D) M2文脈を結合 (矛盾③ GIGOの解決)
-                    d1_context = get_correct_d1_context(signal.timestamp)
+                    d1_context = get_realtime_d1_context(feature_engine)
+
+                    # ▼▼▼ [追加] AIの「相場観」をログに出力 ▼▼▼
+                    if d1_context:
+                        # 重要な指標をピックアップして表示
+                        h_prob = d1_context.get(
+                            "hmm_prob_0", 0.0
+                        )  # レジーム0(通常は下落・調整局面)の確率
+                        hurst = d1_context.get(
+                            "e2a_mfdfa_hurst_mean_1000", 0.0
+                        )  # トレンド持続性 (0.5以上でトレンド)
+                        comp = d1_context.get(
+                            "e2a_kolmogorov_complexity_1000", 0.0
+                        )  # 相場のランダム性
+                        d1_atr = d1_context.get(
+                            "atr", 0.0
+                        )  # 日足ATR (バグの原因だった値)
+
+                        logger.info(
+                            f"🧠 AI市場認識: HMM(下落警戒)={h_prob:.1%}, Hurst={hurst:.3f}, 複雑性={comp:.3f}, 日足ATR={d1_atr:.2f}"
+                        )
+                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
                     signal.market_info.update(d1_context)
 
                     # (E) AIとリスクエンジンによるコマンド生成
                     command = risk_engine.generate_trade_command(
-                        features=signal.features,  # (純化済み)
-                        market_info=signal.market_info,  # (R4ルール + D1文脈)
+                        features=signal.features,
+                        market_info=signal.market_info,
                         current_time=signal.timestamp,
                     )
 
@@ -457,7 +507,9 @@ def main():
                         if success:
                             logger.info("✓ コマンド送信成功 (ACK受信)")
 
-                            # ▼▼▼▼▼▼ 追加箇所 (main3.pyより移植) ▼▼▼▼▼▼
+                            # --- [ここが修正ポイント] ---
+                            # 注文成功直後、MT5側の処理完了を待つために長めにスリープする。
+                            # これにより、同じタイミングで発生した他時間足のシグナルによる連打を防ぐ。
                             logger.info("⏳ ポジション反映待ち (5秒待機)...")
                             time.sleep(5.0)
 
@@ -465,12 +517,12 @@ def main():
                             broker_state_after = bridge.request_broker_state()
                             if broker_state_after:
                                 state_manager.reconcile_with_broker(broker_state_after)
-                            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+                            # --------------------------
                         else:
                             logger.error("✗ コマンド送信失敗 (NACKまたはタイムアウト)")
                     else:
-                        logger.info(f"-> HOLD (エントリー見送り): {command['reason']}")
-
+                        # [修正] HOLDログは DEBUG レベルに下げて、普段は表示しない
+                        logger.debug(f"-> HOLD (エントリー見送り): {command['reason']}")
             except Exception as loop_error:
                 logger.error(f"取引ループでエラーが発生: {loop_error}", exc_info=True)
                 time.sleep(10)

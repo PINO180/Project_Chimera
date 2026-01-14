@@ -257,67 +257,56 @@ class ExtremeRiskEngineV2:
         self, features: np.ndarray, market_info: MarketInfo
     ) -> Tuple[float, float]:
         """
-        較正済みモデルで予測と確信度を取得 (M2文脈特徴量を使用)
-        [修正] IsotonicRegression対応 (Baseモデル -> Calibrator パイプライン)
-
-        Args:
-            features: 基本特徴量ベクトル (S3_FEATURES_FOR_TRAINING)
-            market_info: 市場情報 (V4文脈特徴量を含む)
-
-        Returns:
-            (M1予測確率, M2成功確率)
+        較正済みモデルで予測と確信度を取得
+        [修正] M2モデルが存在しない場合、シミュレーターの挙動に合わせて
+        M2スコアとしてM1スコア(p_m1)をそのまま返すように変更。
         """
-        # モデル存在チェック
+        # --- M1モデルチェック ---
         if self.m1_base_model is None or self.m1_calibrated is None:
             raise ValueError("M1モデル群が正しくロードされていません。")
-        if self.m2_base_model is None or self.m2_calibrated is None:
-            raise ValueError("M2モデル群が正しくロードされていません。")
 
         # --- M1予測（利食い確率） ---
-        # Base -> Calibrator のパイプラインを使用
         p_m1 = self._get_calibrated_probability(
             self.m1_base_model, self.m1_calibrated, features
         )
 
-        # M2用拡張特徴量の構築 (model_training_metalabeling_C_contextplus.py と一致させる)
-        # 1. 基本特徴量 (features[0])
-        # 2. M1出力 (p_m1) -> ★ 較正済みの値を使用
-        # 3. 文脈特徴量 (market_info から取得)
-
-        # [修正] 学習データ(m2_Feature Importance.py出力)に基づく正しい文脈特徴量リスト
-        context_features_m2_names = [
-            "hmm_prob_0",
-            "hmm_prob_1",
-            "atr_ratio",  # [変更] atr -> atr_ratio
-            "e1a_statistical_kurtosis_50",
-            "e1c_adx_21",
-            "e2a_mfdfa_hurst_mean_250",  # [変更] 1000 -> 250
-            "e2a_kolmogorov_complexity_60",  # [変更] 1000 -> 60
-            "trend_bias_25",  # [追加] 不足していた特徴量
-        ]
-
-        extended_features_list = list(features[0])  # 1. 基本特徴量
-        extended_features_list.append(float(p_m1))  # 2. M1出力 (較正済み)
-
-        # 3. 文脈特徴量
-        try:
-            for feature_name in context_features_m2_names:
-                # market_info から文脈特徴量を取得
-                # (main.py が S7_CONTEXT_FEATURES から取得して market_info に詰める前提)
-                value = market_info.get(feature_name, 0.0)
-                extended_features_list.append(value)
-        except Exception as e:
-            logger.error(f"M2文脈特徴量の構築に失敗: {e}。market_info: {market_info}")
-            raise ValueError("M2文脈特徴量の構築エラー")
-
-        # 配列に変換
-        extended_features = np.array([extended_features_list])
-
         # --- M2予測（M1シグナルの成功確率） ---
-        # Base -> Calibrator のパイプラインを使用
-        p_m2 = self._get_calibrated_probability(
-            self.m2_base_model, self.m2_calibrated, extended_features
-        )
+        # [修正] シミュレーター動作に合わせ、M2がない場合は p_m1 を代用する
+        # (p_m2 = 0.0 だと不自然なため、p_m1 をデフォルトとする)
+        p_m2 = float(p_m1)
+
+        if self.m2_base_model is not None and self.m2_calibrated is not None:
+            try:
+                # M2用拡張特徴量の構築
+                context_features_m2_names = [
+                    "hmm_prob_0",
+                    "hmm_prob_1",
+                    "atr",
+                    "e1a_statistical_kurtosis_50",
+                    "e1c_adx_21",
+                    "e2a_mfdfa_hurst_mean_1000",
+                    "e2a_kolmogorov_complexity_1000",
+                ]
+
+                extended_features_list = list(features[0])
+                extended_features_list.append(float(p_m1))
+
+                for feature_name in context_features_m2_names:
+                    value = market_info.get(feature_name, 0.0)
+                    extended_features_list.append(value)
+
+                extended_features = np.array([extended_features_list])
+
+                # M2予測実行
+                p_m2 = self._get_calibrated_probability(
+                    self.m2_base_model, self.m2_calibrated, extended_features
+                )
+            except Exception as e:
+                # M2計算エラーはログに出すが、M1単体運用なら p_m1 で続行
+                logger.warning(
+                    f"M2予測の計算に失敗しました (M1スコアで代用します): {e}"
+                )
+                p_m2 = float(p_m1)
 
         return float(p_m1), float(p_m2)
 
@@ -732,11 +721,11 @@ class ExtremeRiskEngineV2:
                         }
 
             # 週末前後
-            if current_time.weekday() == 4 and current_time.hour >= 20:
+            if current_time.weekday() == 4 and current_time.hour >= 21:
                 return {"allowed": False, "reason": "週末クローズ前の取引禁止時間帯"}
 
-            # if current_time.weekday() == 0 and current_time.hour < 9:
-            #     return {"allowed": False, "reason": "週明けオープン後の取引禁止時間帯"}
+            if current_time.weekday() == 0 and current_time.hour < 9:
+                return {"allowed": False, "reason": "週明けオープン後の取引禁止時間帯"}
 
         return {"allowed": True, "reason": "すべての条件をクリア"}
 
@@ -798,19 +787,14 @@ class ExtremeRiskEngineV2:
         # AI予測（較正済み確率）
         try:
             p_m1, p_m2 = self.predict_with_confidence(features, market_info)
-            # logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}") # ログがうるさければコメントアウト
-
-            # ★追加: ログ保存用にスコアを確保
-            # [修正] シミュレーターに合わせて M2スコア を記録・使用する
-            ai_score = float(p_m2)
-
+            logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}")
         except Exception as e:
             logger.error(f"AI予測失敗: {e}", exc_info=True)
             return self._generate_hold_command("prediction_failed")
 
         # エントリー条件チェック
         entry_check = self.check_entry_conditions(
-            p_m2=p_m2,  # [修正] シミュレーターに合わせて M2スコア を使用
+            p_m2=p_m1,  # ★ M1に変更
             current_positions=len(state.trades),
             current_time=current_time,
             news_times=news_times,
@@ -820,8 +804,7 @@ class ExtremeRiskEngineV2:
         if not entry_check["allowed"]:
             # [修正] 頻出する「エントリー不可」ログを DEBUG レベルに下げる
             logger.debug(f"エントリー不可: {entry_check['reason']}")
-            # ★修正: スコアを渡す
-            return self._generate_hold_command(entry_check["reason"], score=ai_score)
+            return self._generate_hold_command(entry_check["reason"])
 
         # 取引方向の決定 (V4: S6の 'direction' を使用)
         direction_int = market_info["direction"]
@@ -842,7 +825,7 @@ class ExtremeRiskEngineV2:
         # 注: 内部で market_info["atr"] を参照するため、補正済みの値が使われる
         lots, calc_details = self.calculate_position_size_kelly(
             account_balance=state.current_balance,
-            p_m2=p_m2,  # [修正] シミュレーターに合わせて M2スコア を使用
+            p_m2=p_m1,  # ★ M1に変更
             market_info=market_info,  # V4: S6データ(atr, multipliers, payoff_ratio)を渡す
             current_drawdown=state.current_drawdown,
             timestamp_utc=current_time,  # V4: 時間帯制限のため
@@ -853,9 +836,8 @@ class ExtremeRiskEngineV2:
             logger.debug(
                 f"ポジションサイズ計算でエントリー不可: {calc_details.get('reason')}"
             )
-            # ★修正: スコアを渡す
             return self._generate_hold_command(
-                calc_details.get("reason", "zero_position_size"), score=ai_score
+                calc_details.get("reason", "zero_position_size")
             )
 
         # 取引コマンドの生成
@@ -879,7 +861,6 @@ class ExtremeRiskEngineV2:
             "timestamp": (
                 current_time.isoformat() if current_time else datetime.now().isoformat()
             ),
-            "score": ai_score,  # ★追加: 発注時もスコアを含める
         }
 
         logger.info(
@@ -898,8 +879,8 @@ class ExtremeRiskEngineV2:
 
         return trade_command
 
-    def _generate_hold_command(self, reason: str, score: float = 0.0) -> Dict[str, Any]:
-        """HOLDコマンドを生成 (スコア対応版)"""
+    def _generate_hold_command(self, reason: str) -> Dict[str, Any]:
+        """HOLDコマンドを生成"""
         return {
             "action": "HOLD",
             "lots": 0.0,
@@ -912,7 +893,6 @@ class ExtremeRiskEngineV2:
             "reason": reason,
             "risk_amount": 0.0,
             "timestamp": datetime.now().isoformat(),
-            "score": score,  # ★追加
         }
 
 

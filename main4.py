@@ -47,6 +47,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ProjectForge.Main")
 
+# ★★★ [ログ抑制] StateManagerの定型ログ(保存成功など)をWARNING以上のみにする ★★★
+logging.getLogger("ProjectForge.StateManager").setLevel(logging.WARNING)
+
+# ==================================================================
+# 📊 AI判断 可視化用 トップ50特徴量リスト
+# ==================================================================
+TOP_50_FEATURES = [
+    "e1d_hv_standard_50_neutralized_H4",
+    "e1e_hilbert_freq_energy_ratio_100_neutralized_H4",
+    "e1c_wma_200_neutralized_H6",
+    "e1a_statistical_variance_10_neutralized_H1",
+    "e1e_signal_peak_to_peak_100_neutralized_H6",
+    "e1b_theil_sen_slope_100_neutralized_H6",
+    "e1a_fast_volume_mean_50_neutralized_H6",
+    "m1_pred_proba",  # (Rank 8)
+    "e1f_network_clustering_50_neutralized_H1",
+    "e1c_atr_volatility_13_neutralized_H1",
+    "e1a_statistical_moment_7_20_neutralized_H6",
+    "e1f_tonality_48_neutralized_H12",
+    "e1f_network_density_20_neutralized_H1",
+    "e1f_harmony_48_neutralized_H1",
+    "e1e_signal_rms_50_neutralized_H1",
+    "e1c_rvi_signal_10_neutralized_H1",
+    "e1b_theil_sen_slope_50_neutralized_H12",
+    "e1f_golden_ratio_adherence_55_neutralized_M15",
+    "e1f_semantic_flow_25_neutralized_H1",
+    "e1e_hilbert_phase_stability_50_neutralized_H1",
+    "e1a_statistical_moment_7_50_neutralized_H12",
+    "e1e_spectral_energy_64_neutralized_H6",
+    "e1b_adf_statistic_100_neutralized_H6",
+    "e1c_bb_width_pct_30_2.5_neutralized_M15",
+    "e1e_spectral_bandwidth_128_neutralized_H1",
+    "e1c_relative_vigor_index_20_neutralized_H1",
+    "e1c_relative_vigor_index_10_neutralized_H1",
+    "e1e_spectral_energy_128_neutralized_H1",
+    "e1e_wavelet_entropy_64_neutralized_H12",
+    "e1e_hilbert_phase_var_50_neutralized_H1",
+    "e1e_spectral_rolloff_128_neutralized_M15",
+    "e1c_di_plus_13_neutralized_H12",
+    "e1e_acoustic_power_128_neutralized_H4",
+    "e1c_trend_strength_50_neutralized_H1",
+    "e1e_hilbert_amp_cv_100_neutralized_H6",
+    "e1e_spectral_energy_512_neutralized_H1",
+    "e1e_spectral_centroid_128_neutralized_M15",
+    "e1e_acoustic_frequency_256_neutralized_H1",
+    "e1c_sma_deviation_200_neutralized_M8",
+    "e1e_wavelet_mean_256_neutralized_H4",
+    "e1c_ema_deviation_50_neutralized_H12",
+    "e1e_acoustic_frequency_128_neutralized_H12",
+    "log_return_neutralized_M15",
+    "e1c_rvi_signal_20_neutralized_M8",
+    "e1d_intraday_return_neutralized_H12",
+    "e1c_rate_of_change_20_neutralized_H12",
+    "e1e_wavelet_mean_128_neutralized_H12",
+    "e1c_trix_14_neutralized_H12",
+    "e1a_statistical_moment_8_50_neutralized_H12",
+    "e1e_wavelet_std_32_neutralized_H12",
+]
+
 # ==================================================================
 # 🚨 B案戦略のためのグローバル変数とパラメータ 🚨
 # ==================================================================
@@ -302,6 +361,44 @@ def get_correct_d1_context(
 
 
 # ==================================================================
+# 📊 [新規] AI判断 マトリックスログ出力 (横型CSV)
+# ==================================================================
+def save_ai_judgment_matrix(all_feats_dict: Dict[str, float], timestamp: datetime):
+    """
+    特徴量(A列固定)に対し、新しいシグナルを右列に追加していく形式で保存
+    """
+    csv_path = config.LOGS_DIR / "ai_judgment_matrix.csv"
+    ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+
+    try:
+        # 1. 既存データの読み込み (なければ作成)
+        if csv_path.exists():
+            # A列(Feature_Name)をインデックスとして読む
+            df = pd.read_csv(csv_path, index_col=0)
+        else:
+            # 初期化: A列のみ作成
+            df = pd.DataFrame(index=TOP_50_FEATURES)
+            df.index.name = "Feature_Name"
+
+        # 2. 新しい列データの作成
+        new_col_data = []
+        for feat in df.index:
+            # 辞書から値を取得 (なければNaN)
+            val = all_feats_dict.get(feat, np.nan)
+            new_col_data.append(val)
+
+        # 3. 新しい列を追加 (列名は日時)
+        df[ts_str] = new_col_data
+
+        # 4. 保存
+        df.to_csv(csv_path)
+        # logger.info(f"AI Matrix Log Updated: {csv_path}")
+
+    except Exception as e:
+        logger.error(f"マトリックスログ保存エラー: {e}")
+
+
+# ==================================================================
 # メイン実行関数 (V11.0修正)
 # ==================================================================
 
@@ -339,7 +436,6 @@ def main():
 
         # --- 2. 通信 (MQL5BridgeV3) の初期化 ---
         logger.info("--- 2. 通信 (MQL5BridgeV3 - V11.0) の初期化 ---")
-        # [V11.0] 3系統のエンドポイントを設定
         bridge_config = BridgeConfig(
             control_endpoint=config.ZMQ["control_endpoint"],
             data_endpoint=config.ZMQ["data_endpoint"],
@@ -375,11 +471,6 @@ def main():
         )
         logger.info("✓ リスクエンジンを初期化しました（Base+Calibratorロード完了）。")
 
-        # --- 5. AIモデルのロード ---
-        # (初期化時に一括ロード済みのため、個別の呼び出しは削除)
-        logger.info("--- 5. AIモデル (ロード済み) ---")
-        logger.info("✓ AIモデルのロード完了。")
-
         # --- 6. リアルタイム特徴量エンジン (マルチバッファ) の初期化 ---
         logger.info(
             "--- 6. リアルタイム特徴量エンジンの初期化 (ゼロ・シリアライズ) ---"
@@ -387,89 +478,124 @@ def main():
         feature_engine = RealtimeFeatureEngine(
             feature_list_path=str(config.S3_FEATURES_FOR_TRAINING)
         )
-        # ✨ V3 bridge と g_market_proxy を渡す
         if not initialize_data_buffer(feature_engine, bridge, g_market_proxy):
             raise RuntimeError("特徴量エンジンのマルチバッファ充填に失敗しました。")
 
         # --- 7. リアルタイム取引ループ開始 (M1ループ) ---
         logger.info("=" * 60)
-        logger.info(f"🚀 リアルタイム取引ループ開始 ")
+        logger.info("🚀 リアルタイム取引ループ開始 (Always Monitor ATR)")
         logger.info("=" * 60)
+
+        # ループ内で制御するロガーを取得（名前を正確に指定）
+        logger_bridge = logging.getLogger("execution.mql5_bridge_publisher")
+        logger_sm = logging.getLogger("execution.state_manager")
 
         while True:
             try:
-                # (A) M1の新しいバーの確定を待機
+                # (A) 監視: M1の新しいバーの確定を待機
                 new_m1_bar = get_latest_m1_bar(bridge)
                 if new_m1_bar is None:
-                    time.sleep(0.5)  # 【推奨】1秒間隔に変更（または 0.5）
+                    time.sleep(10)  # (10秒ポーリング)
                     continue
 
-                # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ [修正箇所] ここに追加 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-                # 新しい足が確定したタイミングで、ブローカーと状態を同期する
-                # これにより、TP/SLで決済されたポジションがローカル状態から削除される
-                broker_state_sync = bridge.request_broker_state()
-                if broker_state_sync:
-                    state_manager.reconcile_with_broker(broker_state_sync)
-                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+                # --- [修正] ログを抑制してブローカー同期 ---
+                # 現在のログレベルを退避
+                original_lvl_bridge = logger_bridge.level
+                original_lvl_sm = logger_sm.level
 
-                # (B) M1バーをエンジンに渡し、シグナルを待つ
-                # ※ (矛盾①解決のため) 純化用のM5プロキシデータも渡す
-                # ※ (矛盾②解決のため) エンジンは内部で全15バッファを更新
-                # ※ (B案戦略のため) エンジンは内部で全時間足のR4判定とシグナル生成
-                # (g_market_proxy は pd.DataFrame として渡される)
-                signal_list = feature_engine.process_new_m1_bar(
+                # 一時的にWARNING以上のみ表示（INFO定型文を消す）
+                logger_bridge.setLevel(logging.WARNING)
+                logger_sm.setLevel(logging.WARNING)
+
+                try:
+                    broker_state = bridge.request_broker_state()
+                    if broker_state:
+                        state_manager.reconcile_with_broker(broker_state)
+                finally:
+                    # 必ず元のレベルに戻す（重要なトレードログ等は表示させるため）
+                    logger_bridge.setLevel(original_lvl_bridge)
+                    logger_sm.setLevel(original_lvl_sm)
+                # ----------------------------------------
+
+                # (B) 発火判定 & ATR取得
+                current_atr, signal_list = feature_engine.process_new_m1_bar(
                     new_m1_bar, g_market_proxy
                 )
 
+                threshold = feature_engine.ATR_REGIME_CUTOFF
+
+                # Trigger OFF: 静寂時 (ATR < 5.0)
                 if not signal_list:
-                    continue  # シグナルなし
-
-                # (C) シグナル処理ループ
-                for signal in signal_list:
-                    # `signal` は以下を含むと仮定:
-                    #   - signal.features (純化済みの [1, 304] ベクトル)
-                    #   - signal.timestamp (datetime)
-                    #   - signal.timeframe (例: "M15")
-                    #   - signal.market_info (V4 R4ルールの PT/SL/Payoff, ATR値など)
-
-                    logger.info("-" * 30)
+                    # ATRステータスのみ表示して次へ
                     logger.info(
-                        f"🔥 {signal.timeframe} R4 シグナル検知 @ {signal.market_info['current_price']:.3f} (ATR: {signal.market_info['atr_value']:.2f})"
+                        f"💤 Status: M1 ATR={current_atr:.2f} (Threshold: {threshold:.1f}). Waiting..."
                     )
+                    continue
 
-                    # (D) M2文脈を結合 (矛盾③ GIGOの解決)
+                # (C) 審査開始 (Trigger ON: ATR >= 5.0)
+                # 詳細ログはCSVに出るので、画面はシンプルに
+                logger.info(
+                    f"🚀 TRIGGER: ATR={current_atr:.2f} (> {threshold}). Details recorded to ai_judgment_matrix.csv"
+                )
+
+                # (D) シグナル処理ループ
+                for signal in signal_list:
+                    # (D-1) 文脈結合
                     d1_context = get_correct_d1_context(signal.timestamp)
+
+                    if d1_context:
+                        h_prob = d1_context.get("hmm_prob_0", 0.0)
+                        hurst = d1_context.get("e2a_mfdfa_hurst_mean_1000", 0.0)
+                        comp = d1_context.get("e2a_kolmogorov_complexity_1000", 0.0)
+                        d1_atr = d1_context.get("atr", 0.0)
+                        logger.info(
+                            f"🧠 Context: HMM(警戒)={h_prob:.1%}, Hurst={hurst:.3f}, Comp={comp:.3f}, D1_ATR={d1_atr:.2f}"
+                        )
+
                     signal.market_info.update(d1_context)
 
-                    # (E) AIとリスクエンジンによるコマンド生成
+                    # (E) AI判断
                     command = risk_engine.generate_trade_command(
-                        features=signal.features,  # (純化済み)
-                        market_info=signal.market_info,  # (R4ルール + D1文脈)
+                        features=signal.features,
+                        market_info=signal.market_info,
                         current_time=signal.timestamp,
                     )
 
-                    # (F) 発注
+                    # ▼▼▼ [マトリックスCSVログ保存 (横型)] ▼▼▼
+                    try:
+                        all_feats_dict = dict(
+                            zip(feature_engine.feature_list, signal.features[0])
+                        )
+                        all_feats_dict["m1_pred_proba"] = command.get(
+                            "confidence_m1", 0.0
+                        )
+                        all_feats_dict["ai_score"] = command.get("confidence_m2", 0.0)
+
+                        save_ai_judgment_matrix(all_feats_dict, signal.timestamp)
+                    except Exception as e_log:
+                        logger.error(f"ログ保存失敗: {e_log}")
+                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+                    # (F) 実行
                     if command["action"] != "HOLD":
                         logger.info(
-                            f"-> 発注コマンドを送信: {command['action']} {command['lots']} lots"
+                            f"-> ⚡ ACTION: {command['action']} {command['lots']} lots (Reason: {command.get('reason', 'AI Signal')})"
                         )
                         success = bridge.send_trade_command(command)
                         if success:
                             logger.info("✓ コマンド送信成功 (ACK受信)")
-
-                            # ▼▼▼▼▼▼ 追加箇所 (main3.pyより移植) ▼▼▼▼▼▼
-                            logger.info("⏳ ポジション反映待ち (5秒待機)...")
                             time.sleep(5.0)
 
-                            # 待機後、即座に状態を同期して「ポジション保有中」であることを認識させる
+                            # 発注直後の同期は重要なのでログ抑制しない
                             broker_state_after = bridge.request_broker_state()
                             if broker_state_after:
                                 state_manager.reconcile_with_broker(broker_state_after)
-                            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                         else:
                             logger.error("✗ コマンド送信失敗 (NACKまたはタイムアウト)")
                     else:
-                        logger.info(f"-> HOLD (エントリー見送り): {command['reason']}")
+                        logger.info(
+                            f"-> 🛡️ JUDGMENT: HOLD (Reason: {command['reason']})"
+                        )
 
             except Exception as loop_error:
                 logger.error(f"取引ループでエラーが発生: {loop_error}", exc_info=True)

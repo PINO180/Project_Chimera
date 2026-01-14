@@ -144,22 +144,20 @@ class FinalAssembler:
         self.config = config
         self.features_base: List[str] = self._load_features()
 
-        # --- ★★★ [修正] M2の特徴量リストに文脈特徴量を追加 ★★★ ---
-        self.features_m2: List[str] = (
-            self.features_base
-            + ["m1_pred_proba"]
-            + [
-                "hmm_prob_0",
-                "hmm_prob_1",
-                "atr_ratio",  # 修正: atr -> atr_ratio
-                "trend_bias_25",  # 追加: トレンドバイアス
-                "e1a_statistical_kurtosis_50",
-                "e1c_adx_21",
-                "e2a_mfdfa_hurst_mean_250",
-                "e2a_kolmogorov_complexity_60",
-            ]
-        )
-        # --- ★★★ [修正] ここまで ★★★ ---
+        # --- ★★★ [修正] Stage 1: 環境認識専任モデルの定義 (完全分離) ★★★ ---
+        # M1スコアや分足特徴量(features_base)は一切入れない。
+        # AIに「環境認識特徴量」だけを見て勝ち負けを判断させる。
+        self.features_m2: List[str] = [
+            "hmm_prob_0",
+            "hmm_prob_1",
+            "atr_ratio",
+            "trend_bias_25",
+            "e1a_statistical_kurtosis_50",
+            "e1c_adx_21",
+            "e2a_mfdfa_hurst_mean_250",
+            "e2a_kolmogorov_complexity_60",
+        ]
+        # --- ★★★ 修正ここまで ★★★ ---
 
         # M1 と M2 で使用するパーティションリストを個別に検出
         self.partitions_m1_final = self._discover_partitions_for_m1_final_train()
@@ -509,10 +507,15 @@ class FinalAssembler:
                     )
                     predictions = np.full(len(df_chunk), np.nan)
 
+                # --- ★★★ [修正] Stage 2用に m1_pred_proba も保存する ★★★ ---
+                # prediction は「環境認識スコア(0~1)」
+                # m1_pred_proba は「M1スコア(0~1)」
+                # 後でこれらを掛け合わせる。
                 oof_df = pl.DataFrame(
                     {
                         "timestamp": df_chunk["timestamp"],
                         "prediction": predictions,
+                        "m1_pred_proba": df_chunk["m1_pred_proba"],  # ここに追加
                         "true_label": df_chunk["meta_label"],
                         "uniqueness": df_chunk["uniqueness"],
                         "payoff_ratio": df_chunk["payoff_ratio"],
@@ -892,12 +895,10 @@ class FinalAssembler:
                                 f"  -> M1 AUC SKIPPED: Only {num_unique_classes} class found in y_true. Data too sparse."
                             )
                         else:
-                            # NaN/Infが含まれるとroc_auc_scoreがエラーになるため、事前にチェック
                             if not np.all(np.isfinite(w_m1)):
                                 raise ValueError(
                                     "M1 sample_weight contains non-finite values during final AUC calculation."
                                 )
-
                             auc_score = roc_auc_score(
                                 y_true_m1, y_pred_m1, sample_weight=w_m1
                             )
@@ -917,7 +918,7 @@ class FinalAssembler:
                 )
                 report["m1_performance"] = {"auc": float("nan")}
 
-        # M2 Performance (Primary)
+        # M2 Performance (Primary - Now Two-Stage Ensemble)
         if S7_M2_OOF_PREDICTIONS.exists():
             try:
                 logging.info(
@@ -926,38 +927,68 @@ class FinalAssembler:
                 m2_oof_df = pl.read_parquet(S7_M2_OOF_PREDICTIONS)
                 m2_oof_df = m2_oof_df.filter(pl.col("true_label").is_not_null())
                 if not m2_oof_df.is_empty():
-                    logging.info("  -> Calculating M2 performance metrics...")
+                    logging.info(
+                        "  -> Calculating Two-Stage Ensemble performance metrics..."
+                    )
+
+                    # --- ★★★ [修正] Stage 2 Ensemble Logic ★★★ ---
+                    # 最終スコア = M1スコア * 環境認識スコア(M2)
+                    # M2が「0」と判断すれば、どんなにM1が高くても最終スコアは0になる。
+                    m2_oof_df = m2_oof_df.with_columns(
+                        (pl.col("prediction") * pl.col("m1_pred_proba")).alias(
+                            "ensemble_prediction"
+                        )
+                    )
+
                     y_true_m2 = m2_oof_df["true_label"].to_numpy()
-                    y_pred_m2 = m2_oof_df["prediction"].fill_nan(0.5).to_numpy()
+                    y_pred_ensemble = (
+                        m2_oof_df["ensemble_prediction"].fill_nan(0.0).to_numpy()
+                    )  # Ensemble Score
+                    y_pred_context = (
+                        m2_oof_df["prediction"].fill_nan(0.5).to_numpy()
+                    )  # Context Only Score
                     w_m2 = m2_oof_df["uniqueness"].fill_nan(1.0).to_numpy()
+
                     del m2_oof_df
-                    valid_indices_m2 = ~np.isnan(y_pred_m2) & ~np.isnan(w_m2)
+                    valid_indices_m2 = ~np.isnan(y_pred_ensemble) & ~np.isnan(w_m2)
+
                     if np.any(valid_indices_m2):
                         y_true_m2 = y_true_m2[valid_indices_m2]
-                        y_pred_m2 = y_pred_m2[valid_indices_m2]
+                        y_pred_ensemble = y_pred_ensemble[valid_indices_m2]
+                        y_pred_context = y_pred_context[valid_indices_m2]
                         w_m2 = w_m2[valid_indices_m2]
 
                         # ★★★ 修正適用済み: AUC要件チェック ★★★
                         num_unique_classes = len(np.unique(y_true_m2))
                         if num_unique_classes < 2:
-                            auc_score = float("nan")
+                            ensemble_auc = float("nan")
+                            context_auc = float("nan")
                             logging.warning(
-                                f"  -> M2 AUC SKIPPED: Only {num_unique_classes} class found in y_true. Data too sparse."
+                                f"  -> M2 AUC SKIPPED: Only {num_unique_classes} class found in y_true."
                             )
                         else:
-                            # NaN/Infが含まれるとroc_auc_scoreがエラーになるため、事前にチェック
                             if not np.all(np.isfinite(w_m2)):
                                 raise ValueError(
-                                    "M2 sample_weight contains non-finite values during final AUC calculation."
+                                    "M2 sample_weight contains non-finite values."
                                 )
 
-                            auc_score = roc_auc_score(
-                                y_true_m2, y_pred_m2, sample_weight=w_m2
+                            # アンサンブル(最終)AUC
+                            ensemble_auc = roc_auc_score(
+                                y_true_m2, y_pred_ensemble, sample_weight=w_m2
                             )
-                        # ★★★ 修正ここまで ★★★
+                            # 環境認識単体のAUC（参考用）
+                            context_auc = roc_auc_score(
+                                y_true_m2, y_pred_context, sample_weight=w_m2
+                            )
 
-                        report["m2_performance"] = {"auc": auc_score}
-                        logging.info("  -> M2 AUC calculated.")
+                        report["ensemble_performance"] = {"auc": ensemble_auc}
+                        report["context_only_performance"] = {"auc": context_auc}
+                        logging.info(
+                            f"  -> Ensemble AUC calculated: {ensemble_auc:.4f}"
+                        )
+                        logging.info(
+                            f"  -> Context-Only AUC calculated: {context_auc:.4f}"
+                        )
                     else:
                         logging.warning(
                             "No valid M2 OOF predictions found after handling NaNs."
@@ -970,7 +1001,7 @@ class FinalAssembler:
                 logging.error(
                     f"Could not process aggregated M2 OOF predictions for report: {e}. Outputting NaN."
                 )
-                report["m2_performance"] = {"auc": float("nan")}
+                report["ensemble_performance"] = {"auc": float("nan")}
 
         S7_MODEL_PERFORMANCE_REPORT.parent.mkdir(parents=True, exist_ok=True)
         # float('nan')をJSONセーフな文字列に変換して保存

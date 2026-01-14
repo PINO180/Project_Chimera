@@ -87,20 +87,31 @@ class FinalTrainingConfig:
             # 今回は M1 の scale_pos_weight は Script A から引き継がない (別途計算)
         }
     )
+    # M2モデル（メタラベリング）用のハイパーパラメータ
     lgbm_params_m2: Dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary",
             "metric": "auc",
             "boosting_type": "gbdt",
             "n_estimators": 1000,
-            "learning_rate": 0.01,
+            "learning_rate": 0.05,  # ハンデ戦に合わせて少し学習率を上げる
             "num_leaves": 31,
             "max_depth": -1,
             "seed": 42,
             "n_jobs": -1,
             "verbose": -1,
-            "colsample_bytree": 0.8,
+            # --- ★★★ [重要修正] ハンデ戦の設定 ★★★ ---
+            # 1. エース(M1)封じ: 特徴量の60%をランダムに隠し、環境認識特徴量に出番を与える
+            "colsample_bytree": 0.4,
+            # 2. サブサンプル: 過学習抑制（既存設定を維持）
             "subsample": 0.8,
+            # 3. プレフィルタリング無効化: 定数に近い日次データが削除されるのを防ぐ
+            "feature_pre_filter": False,
+            # 4. ビン数調整: 粗くすることで日次データのパターンを捉えやすくする
+            "max_bin": 127,
+            # 5. 葉のデータ数緩和: 日次データ特有の「同じ値の連続」に対応
+            "min_data_in_leaf": 50,
+            # --- ★★★ 修正ここまで ★★★ ---
         }
     )
     test: bool = False

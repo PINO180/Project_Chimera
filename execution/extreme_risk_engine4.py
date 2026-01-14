@@ -284,16 +284,14 @@ class ExtremeRiskEngineV2:
         # 2. M1出力 (p_m1) -> ★ 較正済みの値を使用
         # 3. 文脈特徴量 (market_info から取得)
 
-        # [修正] 学習データ(m2_Feature Importance.py出力)に基づく正しい文脈特徴量リスト
         context_features_m2_names = [
             "hmm_prob_0",
             "hmm_prob_1",
-            "atr_ratio",  # [変更] atr -> atr_ratio
+            "atr",
             "e1a_statistical_kurtosis_50",
             "e1c_adx_21",
-            "e2a_mfdfa_hurst_mean_250",  # [変更] 1000 -> 250
-            "e2a_kolmogorov_complexity_60",  # [変更] 1000 -> 60
-            "trend_bias_25",  # [追加] 不足していた特徴量
+            "e2a_mfdfa_hurst_mean_1000",
+            "e2a_kolmogorov_complexity_1000",
         ]
 
         extended_features_list = list(features[0])  # 1. 基本特徴量
@@ -732,11 +730,11 @@ class ExtremeRiskEngineV2:
                         }
 
             # 週末前後
-            if current_time.weekday() == 4 and current_time.hour >= 20:
+            if current_time.weekday() == 4 and current_time.hour >= 21:
                 return {"allowed": False, "reason": "週末クローズ前の取引禁止時間帯"}
 
-            # if current_time.weekday() == 0 and current_time.hour < 9:
-            #     return {"allowed": False, "reason": "週明けオープン後の取引禁止時間帯"}
+            if current_time.weekday() == 0 and current_time.hour < 9:
+                return {"allowed": False, "reason": "週明けオープン後の取引禁止時間帯"}
 
         return {"allowed": True, "reason": "すべての条件をクリア"}
 
@@ -798,19 +796,14 @@ class ExtremeRiskEngineV2:
         # AI予測（較正済み確率）
         try:
             p_m1, p_m2 = self.predict_with_confidence(features, market_info)
-            # logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}") # ログがうるさければコメントアウト
-
-            # ★追加: ログ保存用にスコアを確保
-            # [修正] シミュレーターに合わせて M2スコア を記録・使用する
-            ai_score = float(p_m2)
-
+            logger.info(f"AI予測: P(M1)={p_m1:.4f}, P(M2)={p_m2:.4f}")
         except Exception as e:
             logger.error(f"AI予測失敗: {e}", exc_info=True)
             return self._generate_hold_command("prediction_failed")
 
         # エントリー条件チェック
         entry_check = self.check_entry_conditions(
-            p_m2=p_m2,  # [修正] シミュレーターに合わせて M2スコア を使用
+            p_m2=p_m2,
             current_positions=len(state.trades),
             current_time=current_time,
             news_times=news_times,
@@ -818,10 +811,8 @@ class ExtremeRiskEngineV2:
         )
 
         if not entry_check["allowed"]:
-            # [修正] 頻出する「エントリー不可」ログを DEBUG レベルに下げる
-            logger.debug(f"エントリー不可: {entry_check['reason']}")
-            # ★修正: スコアを渡す
-            return self._generate_hold_command(entry_check["reason"], score=ai_score)
+            logger.info(f"エントリー不可: {entry_check['reason']}")
+            return self._generate_hold_command(entry_check["reason"])
 
         # 取引方向の決定 (V4: S6の 'direction' を使用)
         direction_int = market_info["direction"]
@@ -842,20 +833,18 @@ class ExtremeRiskEngineV2:
         # 注: 内部で market_info["atr"] を参照するため、補正済みの値が使われる
         lots, calc_details = self.calculate_position_size_kelly(
             account_balance=state.current_balance,
-            p_m2=p_m2,  # [修正] シミュレーターに合わせて M2スコア を使用
+            p_m2=p_m2,
             market_info=market_info,  # V4: S6データ(atr, multipliers, payoff_ratio)を渡す
             current_drawdown=state.current_drawdown,
             timestamp_utc=current_time,  # V4: 時間帯制限のため
         )
 
         if lots <= 0:
-            # [修正] ログレベルを info から debug に変更して静音化
-            logger.debug(
+            logger.info(
                 f"ポジションサイズ計算でエントリー不可: {calc_details.get('reason')}"
             )
-            # ★修正: スコアを渡す
             return self._generate_hold_command(
-                calc_details.get("reason", "zero_position_size"), score=ai_score
+                calc_details.get("reason", "zero_position_size")
             )
 
         # 取引コマンドの生成
@@ -879,7 +868,6 @@ class ExtremeRiskEngineV2:
             "timestamp": (
                 current_time.isoformat() if current_time else datetime.now().isoformat()
             ),
-            "score": ai_score,  # ★追加: 発注時もスコアを含める
         }
 
         logger.info(
@@ -898,8 +886,8 @@ class ExtremeRiskEngineV2:
 
         return trade_command
 
-    def _generate_hold_command(self, reason: str, score: float = 0.0) -> Dict[str, Any]:
-        """HOLDコマンドを生成 (スコア対応版)"""
+    def _generate_hold_command(self, reason: str) -> Dict[str, Any]:
+        """HOLDコマンドを生成"""
         return {
             "action": "HOLD",
             "lots": 0.0,
@@ -912,7 +900,6 @@ class ExtremeRiskEngineV2:
             "reason": reason,
             "risk_amount": 0.0,
             "timestamp": datetime.now().isoformat(),
-            "score": score,  # ★追加
         }
 
 

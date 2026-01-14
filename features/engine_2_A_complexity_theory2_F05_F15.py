@@ -85,18 +85,9 @@ def get_default_timeframes() -> List[str]:
 
 
 def get_default_window_sizes() -> Dict[str, List[int]]:
-    """
-    ウィンドウサイズ設定 - Project Forge 戦略的最適化版
-    """
     return {
-        # MFDFA: 環境認識用 (スケール200を含むため、最低250は必要)
-        # Tickデータの場合: 250tick=数秒〜数分, 1250tick=数十分 (スキャルピングに適正)
-        # D1データの場合: 250日=1年, 1250日=5年 (長期環境認識に適正)
-        "mfdfa": [250, 500, 1250],
-        # Complexity: エントリートリガー用 (感度重視)
-        # 短い期間で「異常な規則性（トレンド）」が発生した瞬間を捉える
-        # D1データの場合: 24日=1ヶ月, 60日=3ヶ月, 120日=半年
-        "complexity": [24, 60, 120, 250],
+        "mfdfa": [1000, 2500, 5000],  # MFDFA用ウィンドウ
+        "complexity": [500, 1000, 1500],  # 複雑性指標用ウィンドウ
         "general": [1000, 2500, 5000],
     }
 
@@ -373,9 +364,6 @@ def mfdfa_rolling_udf(
 ) -> np.ndarray:
     """
     MFDFAローリング計算(map_batches対応版)
-    【修正済み】
-    - 入力: 生価格 -> 対数収益率に変換して計算
-    - 出力: Hurst指数 (0.0〜1.0の範囲を想定), NaN/Infは0.0で埋める
 
     Args:
         prices: 価格時系列全体
@@ -390,61 +378,15 @@ def mfdfa_rolling_udf(
 
     # デフォルトパラメータ
     q_values = np.array([-5.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0])
-    # 修正前
-    # scales = np.array([10.0, 20.0, 50.0, 100.0, 200.0])
-
-    # 修正後: ウィンドウサイズに応じて安全なスケールのみを採用するロジック
-    # (例: windowが250なら200までOKだが、windowが100なら50までにするなど)
-    # 簡易的には、小さいウィンドウでも動くように最大スケールを少し落とす
-    scales = np.array([10.0, 20.0, 40.0, 80.0, 160.0])
+    scales = np.array([10.0, 20.0, 50.0, 100.0, 200.0])
 
     # prange並列化:各ウィンドウ位置を並列処理
     for i in nb.prange(window, n + 1):
-        # 生価格のウィンドウを取得
-        window_prices = prices[i - window : i]
-
-        # 1. 対数収益率の計算 (入力データを非定常から定常過程へ変換)
-        # 価格が0以下の場合は0.0として扱う安全策付き
-        w_len = len(window_prices)
-        returns = np.zeros(w_len - 1)
-        valid_data = True
-
-        for k in range(w_len - 1):
-            p_curr = window_prices[k]
-            p_next = window_prices[k + 1]
-
-            if p_curr > 1e-10 and p_next > 1e-10:
-                val = np.log(p_next / p_curr)
-                if np.isfinite(val):
-                    returns[k] = val
-                else:
-                    returns[k] = 0.0
-            else:
-                returns[k] = 0.0
-
-        # データ長が不足している場合はスキップ
-        if len(returns) < 20:
-            result[i - 1] = 0.0
-            continue
-
-        # 2. MFDFAコア計算 (対数収益率を渡す)
+        window_data = prices[i - window : i]
         mfdfa_result = mfdfa_core_single_window(
-            returns, q_values, scales, poly_degree=1
+            window_data, q_values, scales, poly_degree=1
         )
-
-        # 3. 結果の取得とサニタイズ (NaN/Inf -> 0.0)
-        val = mfdfa_result[component_idx]
-
-        if np.isfinite(val):
-            # Hurst指数などの異常値クリッピング (理論値範囲外の極端な値を丸める)
-            if component_idx == 0 or component_idx == 2:  # Hurst, Holder
-                if val < 0.0:
-                    val = 0.0
-                if val > 1.5:
-                    val = 1.5  # 通常1.0付近が上限だが多少のブレを許容
-            result[i - 1] = val
-        else:
-            result[i - 1] = 0.0
+        result[i - 1] = mfdfa_result[component_idx]
 
     return result
 
@@ -464,11 +406,16 @@ def mfdfa_rolling_udf(
 
 
 @nb.njit(fastmath=True, cache=True)
-def binarize_series(values: np.ndarray) -> np.ndarray:
+def binarize_series(values: np.ndarray, method: int = 0) -> np.ndarray:
     """
-    時系列のバイナリ化 (中央値基準)
-    - トレンド相場(構造あり) -> 000111 (ラン連長が長い)
-    - レンジ相場(構造なし) -> 010101 (スイッチが多い)
+    時系列のバイナリ化/多値符号化
+
+    Args:
+        values: 入力時系列
+        method: 0=中央値基準, 1=分位基準(3値), 2=変化基準
+
+    Returns:
+        符号化された整数配列
     """
     n = len(values)
     encoded = np.zeros(n, dtype=np.int32)
@@ -476,16 +423,35 @@ def binarize_series(values: np.ndarray) -> np.ndarray:
     if n < 2:
         return encoded
 
-    # 中央値を基準にバイナリ化
-    # ※中央値を使うことで、トレンド時には前半0/後半1のように綺麗に分かれやすく、
-    #   レンジ時には0/1が頻繁に入れ替わるため、LZ複雑性による検知と相性が良い。
-    median_val = np.median(values)
+    if method == 0:  # 中央値基準 (2値)
+        median_val = np.median(values)
+        for i in range(n):
+            encoded[i] = 1 if values[i] > median_val else 0
 
-    for i in range(n):
-        if values[i] >= median_val:
-            encoded[i] = 1
-        else:
-            encoded[i] = 0
+    elif method == 1:  # 分位基準 (3値: 0, 1, 2)
+        valid_vals = values[np.isfinite(values)]
+        if len(valid_vals) < 3:
+            return encoded
+
+        q33 = np.percentile(valid_vals, 33.33)
+        q67 = np.percentile(valid_vals, 66.67)
+
+        for i in range(n):
+            if values[i] < q33:
+                encoded[i] = 0
+            elif values[i] < q67:
+                encoded[i] = 1
+            else:
+                encoded[i] = 2
+
+    elif method == 2:  # 変化基準 (3値: -1, 0, +1)
+        for i in range(1, n):
+            if values[i] > values[i - 1]:
+                encoded[i] = 1
+            elif values[i] < values[i - 1]:
+                encoded[i] = -1
+            else:
+                encoded[i] = 0
 
     return encoded
 
@@ -493,98 +459,113 @@ def binarize_series(values: np.ndarray) -> np.ndarray:
 @nb.njit(fastmath=True, cache=True)
 def lempel_ziv_complexity(sequence: np.ndarray) -> float:
     """
-    Lempel-Ziv複雑性計算 (LZ76) - 修正版
+    Lempel-Ziv複雑性計算(LZ76アルゴリズム)
 
-    修正点:
-    - 短期ウィンドウでの飽和を防ぐため、漸近的な正規化係数(n/log2n)を廃止。
-    - 代わりに単純な「Complexity Rate (C / n)」を返す。
+    Args:
+        sequence: 整数符号化された時系列
+
+    Returns:
+        正規化されたLZ複雑性 (0〜1)
     """
     n = len(sequence)
     if n < 2:
         return 0.0
 
+    # 辞書サイズのカウント
     complexity = 1
-    i = 0
+    prefix_length = 1
 
+    i = 0
     while i < n:
-        # 現在位置 i から始まる最長一致パターンを探す
+        # 現在の位置から可能な限り長い既知パターンを検索
         max_match_length = 0
 
-        # 探索範囲: 系列の先頭から現在位置の前まで
-        # (Numbaでの高速化のため、単純なループ探索を採用)
-        limit = i  # 探索範囲の上限
-
-        # ヒューリスティック: 直近のデータの方がマッチしやすい傾向があるため、逆順探索も有効だが、
-        # ここでは標準的なLZ76の実装を維持しつつボトルネックにならないよう配慮
-        for start in range(limit):
+        for start in range(i):
             match_length = 0
-            # 境界チェックを含めたマッチング
-            while (i + match_length < n) and (
-                sequence[i + match_length] == sequence[start + match_length]
+            j = 0
+            while (
+                i + j < n and start + j < i and sequence[i + j] == sequence[start + j]
             ):
                 match_length += 1
-                # 最長一致更新の可能性がなくなったらbreak等の最適化も可能だが、
-                # バイナリデータかつ短ウィンドウ(N=60)ならこのままで十分高速
+                j += 1
 
             if match_length > max_match_length:
                 max_match_length = match_length
 
-        if max_match_length > 0:
-            complexity += 1
-            i += max_match_length + 1
-        else:
+        # 新しいパターンが見つかった
+        if max_match_length == 0:
             complexity += 1
             i += 1
+        else:
+            complexity += 1
+            i += max_match_length + 1
 
-    # 【重要修正】
-    # 以前の n / log2(n) は N=60 程度では値が小さすぎて(約10)、
-    # 実際の複雑性(15程度)がそれを上回ってしまい 1.0 に張り付く原因となっていた。
-    # 飽和を防ぐため、単純に n で割る (値域は概ね 0.0 ～ 0.5 程度になる)
-    return complexity / n
+    # 正規化: 理論的最大複雑性で割る
+    # ランダム系列の場合の複雑性: n / log2(n)
+    if n > 1:
+        max_complexity = n / (np.log2(n) + 1e-10)
+        normalized_complexity = (
+            complexity / max_complexity if max_complexity > 0 else 0.0
+        )
+        return min(normalized_complexity, 1.0)
+
+    return 0.0
 
 
 @nb.njit(fastmath=True, cache=True)
 def kolmogorov_complexity_single_window(prices: np.ndarray) -> np.ndarray:
     """
-    単一ウィンドウのコルモゴロフ複雑性計算
-    出力:
-      0: LZ Complexity Rate (低い=トレンド/規則的, 高い=レンジ/ランダム)
-      1: Compression Ratio (1.0 - Complexity Rate) ※疑似的な圧縮率
-      2: Pattern Diversity (スイッチ密度)
-    """
-    result = np.zeros(3)
-    n = len(prices)
+    単一ウィンドウのコルモゴロフ複雑性計算(ヘルパー関数)
 
+    Returns:
+        [complexity, compression_ratio, pattern_diversity]
+    """
+    result = np.full(3, np.nan)
+
+    n = len(prices)
     if n < 10:
         return result
 
-    # 1. バイナリ化
-    encoded = binarize_series(prices)
+    # 1. 対数リターン計算
+    returns = np.zeros(n - 1)
+    for i in range(n - 1):
+        if prices[i] > 1e-10:
+            returns[i] = np.log(prices[i + 1] / prices[i])
 
-    # 2. LZ複雑性 (修正版: 飽和しない)
-    complexity_rate = lempel_ziv_complexity(encoded)
+    # 2. 標準化
+    returns_mean = np.mean(returns)
+    returns_std = np.std(returns)
 
-    # 3. 圧縮率 (疑似的)
-    # 複雑性が低いほど圧縮率は高い
-    # complexity_rate は概ね 0.0 ~ 0.4 の範囲を取るため、
-    # 0.5 を基準に反転させるなどでスケーリングしても良いが、単純な逆相関として定義
-    compression_ratio = 1.0 - (
-        complexity_rate * 2.0
-    )  # 0.5以上を0にクリップしないようスケーリング調整
-    if compression_ratio < 0.0:
-        compression_ratio = 0.0
+    if returns_std < 1e-10:
+        return result
 
-    # 4. パターン多様性 (スイッチ回数)
-    # トレンドなら 00001111 (switch=1)
-    # レンジなら 01010101 (switch=7)
-    switch_count = 0
-    for i in range(1, n):
-        if encoded[i] != encoded[i - 1]:
-            switch_count += 1
+    standardized = np.zeros(len(returns))
+    for i in range(len(returns)):
+        standardized[i] = (returns[i] - returns_mean) / returns_std
 
-    pattern_diversity = switch_count / (n - 1.0) if n > 1 else 0.0
+    # 3. バイナリ化(中央値基準)
+    encoded = binarize_series(standardized, method=0)
 
-    result[0] = complexity_rate
+    # 4. LZ複雑性計算
+    complexity = lempel_ziv_complexity(encoded)
+
+    # 5. 圧縮率推定(複雑性から逆算)
+    compression_ratio = 1.0 - complexity  # 低複雑性 = 高圧縮率
+
+    # 6. パターン多様性(ユニーク値の割合)
+    unique_count = 0
+    for i in range(len(encoded)):
+        is_unique = True
+        for j in range(i):
+            if encoded[i] == encoded[j]:
+                is_unique = False
+                break
+        if is_unique:
+            unique_count += 1
+
+    pattern_diversity = unique_count / len(encoded) if len(encoded) > 0 else 0.0
+
+    result[0] = complexity
     result[1] = compression_ratio
     result[2] = pattern_diversity
 
@@ -596,24 +577,24 @@ def kolmogorov_complexity_rolling_udf(
     prices: np.ndarray, window: int, component_idx: int
 ) -> np.ndarray:
     """
-    並列ローリング計算
+    コルモゴロフ複雑性ローリング計算(map_batches対応版)
+
+    Args:
+        prices: 価格時系列全体
+        window: ウィンドウサイズ
+        component_idx: 結果成分インデックス(0=complexity, 1=compression_ratio, 2=pattern_diversity)
+
+    Returns:
+        結果配列(最初のwindow-1個はNaN)
     """
     n = len(prices)
     result = np.full(n, np.nan)
 
-    # 並列実行
+    # prange並列化:各ウィンドウ位置を並列処理
     for i in nb.prange(window, n + 1):
         window_data = prices[i - window : i]
-        # 標準偏差が0（価格が不変）の場合は複雑性0とする安全策
-        if np.std(window_data) < 1e-9:
-            # 価格が一定 -> 完全に規則的 -> 複雑性0
-            if component_idx == 1:  # compression
-                result[i - 1] = 1.0
-            else:
-                result[i - 1] = 0.0
-        else:
-            feat = kolmogorov_complexity_single_window(window_data)
-            result[i - 1] = feat[component_idx]
+        kolmogorov_result = kolmogorov_complexity_single_window(window_data)
+        result[i - 1] = kolmogorov_result[component_idx]
 
     return result
 

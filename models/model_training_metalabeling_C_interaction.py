@@ -1,6 +1,7 @@
 # /workspace/models/model_training_metalabeling_C.py
 # [修正版: M2/M1訓練を lgb.train (Booster API) + n_estimators 分配に修正]
 # [修正版: フェーズ7 (V4) - M2の特徴量に市場文脈カラムを追加]
+# [修正版: フェーズ7 (V5) - M2モデルに交互作用特徴量 (Interaction Features) を追加]
 
 import sys
 from pathlib import Path
@@ -87,20 +88,31 @@ class FinalTrainingConfig:
             # 今回は M1 の scale_pos_weight は Script A から引き継がない (別途計算)
         }
     )
+    # M2モデル（メタラベリング）用のハイパーパラメータ
     lgbm_params_m2: Dict[str, Any] = field(
         default_factory=lambda: {
             "objective": "binary",
             "metric": "auc",
             "boosting_type": "gbdt",
             "n_estimators": 1000,
-            "learning_rate": 0.01,
+            "learning_rate": 0.05,  # ハンデ戦に合わせて少し学習率を上げる
             "num_leaves": 31,
             "max_depth": -1,
             "seed": 42,
             "n_jobs": -1,
             "verbose": -1,
-            "colsample_bytree": 0.8,
+            # --- ★★★ [重要修正] ハンデ戦の設定 ★★★ ---
+            # 1. エース(M1)封じ: 特徴量の60%をランダムに隠し、環境認識特徴量に出番を与える
+            "colsample_bytree": 0.4,
+            # 2. サブサンプル: 過学習抑制（既存設定を維持）
             "subsample": 0.8,
+            # 3. プレフィルタリング無効化: 定数に近い日次データが削除されるのを防ぐ
+            "feature_pre_filter": False,
+            # 4. ビン数調整: 粗くすることで日次データのパターンを捉えやすくする
+            "max_bin": 127,
+            # 5. 葉のデータ数緩和: 日次データ特有の「同じ値の連続」に対応
+            "min_data_in_leaf": 50,
+            # --- ★★★ 修正ここまで ★★★ ---
         }
     )
     test: bool = False
@@ -341,6 +353,26 @@ class FinalAssembler:
         )
         return scale_pos_weight
 
+    def _add_interaction_features(
+        self, df: pl.DataFrame
+    ) -> Tuple[pl.DataFrame, List[str]]:
+        """M1予測値とコンテキスト特徴量の交互作用項を作成する"""
+        interact_specs = [
+            ("trend_bias_25", "interact_m1_trend"),
+            ("atr_ratio", "interact_m1_atr"),
+            ("hmm_prob_0", "interact_m1_hmm0"),
+        ]
+        new_feats = []
+        for src_col, new_col in interact_specs:
+            if src_col in df.columns:
+                df = df.with_columns(
+                    (pl.col("m1_pred_proba") * pl.col(src_col)).alias(new_col)
+                )
+            else:
+                df = df.with_columns(pl.lit(0.0).alias(new_col))
+            new_feats.append(new_col)
+        return df, new_feats
+
     def run(self):
         logging.info(
             "### Script 3/3: M2 CV, Final Training, Calibration, and Reporting ###"
@@ -423,6 +455,9 @@ class FinalAssembler:
                     f"    -> M2 CV Fold: Setting num_boost_round = {num_boost_round_per_partition} per partition."
                 )
 
+            # =========================================================================
+            # [前半] 学習ループ
+            # =========================================================================
             if n_partitions_train > 0:
                 for p_date in tqdm(train_dates, desc=f"  Training M2 Fold {i + 1}"):
                     p_path_glob = str(
@@ -437,7 +472,13 @@ class FinalAssembler:
                     if df_chunk.is_empty():
                         continue
 
-                    features_to_use = self.features_m2
+                    # --- ★★★ [修正] 交互作用特徴量の作成 (M1 x Context) ★★★ ---
+                    # ヘルパーメソッドを使用して特徴量を追加
+                    df_chunk, new_feats = self._add_interaction_features(df_chunk)
+                    # 特徴量リストを拡張
+                    features_to_use = self.features_m2 + new_feats
+                    # --- ★★★ 修正ここまで ★★★ ---
+
                     missing_features = [
                         f for f in features_to_use if f not in df_chunk.columns
                     ]
@@ -455,7 +496,7 @@ class FinalAssembler:
 
                     try:
                         model = lgb.train(
-                            train_params,  # n_estimators を除外した M2 パラメータ
+                            train_params,
                             lgb.Dataset(X_chunk, label=y_chunk, weight=w_chunk),
                             num_boost_round=num_boost_round_per_partition,
                             init_model=model,
@@ -474,6 +515,9 @@ class FinalAssembler:
                 )
                 continue
 
+            # =========================================================================
+            # [後半] 予測ループ (Validation)
+            # =========================================================================
             for p_date in tqdm(val_dates, desc=f"  Predicting M2 Fold {i + 1}"):
                 p_path_glob = str(
                     self.config.meta_labeled_oof_path
@@ -487,7 +531,11 @@ class FinalAssembler:
                 if df_chunk.is_empty():
                     continue
 
-                features_to_use = self.features_m2
+                # --- ★★★ [修正] 予測時にも同じ特徴量を作成 ★★★ ---
+                df_chunk, new_feats = self._add_interaction_features(df_chunk)
+                features_to_use = self.features_m2 + new_feats
+                # --- ★★★ 修正ここまで ★★★ ---
+
                 missing_features = [
                     f for f in features_to_use if f not in df_chunk.columns
                 ]
@@ -635,7 +683,16 @@ class FinalAssembler:
             if df_chunk.is_empty():
                 continue
 
-            features_to_use = self.features_m2 if is_m2 else self.features_base
+            # --- ★★★ [修正] 交互作用特徴量の作成 (M1 x Context) ★★★ ---
+            # M2の場合のみ適用して、特徴量リストを拡張する
+            if is_m2:
+                df_chunk, new_feats = self._add_interaction_features(df_chunk)
+                # 今回のチャンクで使用する特徴量リスト（ベース + 新規）
+                features_to_use = self.features_m2 + new_feats
+            else:
+                features_to_use = self.features_base
+            # --- ★★★ 修正ここまで ★★★ ---
+
             actual_target_col = "meta_label" if is_m2 else "label"
 
             missing_features = [f for f in features_to_use if f not in df_chunk.columns]
@@ -761,7 +818,16 @@ class FinalAssembler:
             if df_chunk.is_empty():
                 continue
 
-            features_to_use = self.features_m2 if is_m2 else self.features_base
+            # --- ★★★ [修正] 交互作用特徴量の作成 (M1 x Context) ★★★ ---
+            # M2の場合のみ適用して、特徴量リストを拡張する
+            if is_m2:
+                df_chunk, new_feats = self._add_interaction_features(df_chunk)
+                # 今回のチャンクで使用する特徴量リスト（ベース + 新規）
+                features_to_use = self.features_m2 + new_feats
+            else:
+                features_to_use = self.features_base
+            # --- ★★★ 修正ここまで ★★★ ---
+
             missing_features = [f for f in features_to_use if f not in df_chunk.columns]
             if missing_features:
                 logging.warning(

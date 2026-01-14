@@ -366,18 +366,14 @@ def main():
         # --- 4. リスクエンジン (ExtremeRiskEngineV2) の初期化 ---
         logger.info("--- 4. リスクエンジン (ExtremeRiskEngineV2) の初期化 ---")
         risk_engine = ExtremeRiskEngineV2(
-            config_path=str(config.CONFIG_RISK),
-            state_manager=state_manager,
-            m1_base_path=str(config.S7_M1_MODEL_PKL),
-            m1_calib_path=str(config.S7_M1_CALIBRATED),
-            m2_base_path=str(config.S7_M2_MODEL_PKL),
-            m2_calib_path=str(config.S7_M2_CALIBRATED),
+            config_path=str(config.CONFIG_RISK), state_manager=state_manager
         )
-        logger.info("✓ リスクエンジンを初期化しました（Base+Calibratorロード完了）。")
+        logger.info("✓ リスクエンジンを初期化しました。")
 
         # --- 5. AIモデルのロード ---
-        # (初期化時に一括ロード済みのため、個別の呼び出しは削除)
-        logger.info("--- 5. AIモデル (ロード済み) ---")
+        logger.info("--- 5. AIモデル (較正済み) のロード ---")
+        risk_engine.load_calibrated_model(str(config.S7_M1_CALIBRATED), "M1")
+        risk_engine.load_calibrated_model(str(config.S7_M2_CALIBRATED), "M2")
         logger.info("✓ AIモデルのロード完了。")
 
         # --- 6. リアルタイム特徴量エンジン (マルチバッファ) の初期化 ---
@@ -401,16 +397,8 @@ def main():
                 # (A) M1の新しいバーの確定を待機
                 new_m1_bar = get_latest_m1_bar(bridge)
                 if new_m1_bar is None:
-                    time.sleep(0.5)  # 【推奨】1秒間隔に変更（または 0.5）
+                    time.sleep(10)  # (10秒ポーリング)
                     continue
-
-                # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ [修正箇所] ここに追加 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-                # 新しい足が確定したタイミングで、ブローカーと状態を同期する
-                # これにより、TP/SLで決済されたポジションがローカル状態から削除される
-                broker_state_sync = bridge.request_broker_state()
-                if broker_state_sync:
-                    state_manager.reconcile_with_broker(broker_state_sync)
-                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
                 # (B) M1バーをエンジンに渡し、シグナルを待つ
                 # ※ (矛盾①解決のため) 純化用のM5プロキシデータも渡す

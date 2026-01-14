@@ -43,7 +43,7 @@ from blueprint import (
 )
 
 S7_M2_OOF_PREDICTIONS_TMP = S7_MODELS / "tmp_m2_oof_predictions"
-S7_M2_OOF_PREDICTIONS = S7_MODELS / "m2_oof_predictions_v2.parquet"
+S7_M2_OOF_PREDICTIONS = S7_MODELS / "m2_oof_predictions.parquet"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -151,12 +151,11 @@ class FinalAssembler:
             + [
                 "hmm_prob_0",
                 "hmm_prob_1",
-                "atr_ratio",  # 修正: atr -> atr_ratio
-                "trend_bias_25",  # 追加: トレンドバイアス
+                "atr",
                 "e1a_statistical_kurtosis_50",
                 "e1c_adx_21",
-                "e2a_mfdfa_hurst_mean_250",
-                "e2a_kolmogorov_complexity_60",
+                "e2a_mfdfa_hurst_mean_1000",
+                "e2a_kolmogorov_complexity_1000",
             ]
         )
         # --- ★★★ [修正] ここまで ★★★ ---
