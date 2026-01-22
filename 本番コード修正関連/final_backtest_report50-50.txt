@@ -1,0 +1,26 @@
+============================================================
+    Strategy Performance Report (MT5 Style)
+============================================================
+
+Strategy:		Probabilistic Betting (Kelly Fraction: 1.0, Base Leverage: 2000.0, Max Risk/Trade: 2.0%, Spread: 16.0 pips, f* Thresh: 0.0, M2 Thresh: 0.6)
+Period:			2021-08-02 04:00:00+00:00 - 2025-09-03 13:00:00+00:00
+
+------------------------------ Summary ------------------------------
+Initial Deposit:	1,000.00
+Total Net Profit:	415,404,078.92
+Final Balance:		415,405,078.92
+Total Return:		41,540,407.89 %
+Profit Factor:		4.77
+Sharpe Ratio (Ann.):	5.93
+Sortino Ratio (Ann.):	4.61
+Maximal Drawdown:	28.88 %
+
+------------------------------ Trades ------------------------------
+Total Trades:		10668
+Winning Trades (%):	6057 (56.78 %)
+Losing Trades (%):	4611 (43.22 %)
+Average Profit:		89,077.510
+Average Loss:		-325,698.002
+Avg Bet Size (% Cap):	2.00 %
+
+============================================================

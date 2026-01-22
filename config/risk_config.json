@@ -7,7 +7,7 @@
   "base_atr_sl_multiplier": 5.0,
   "base_atr_tp_multiplier": 1.0,
   "kelly_fraction": 1.0,
-  "max_risk_per_trade": 0.2,
+  "max_risk_per_trade": 0.02,
   "max_positions": 5,
   "contract_size": 100.0,
   "pip_value_per_lot": 1.0,

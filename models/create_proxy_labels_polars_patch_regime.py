@@ -1,8 +1,8 @@
 # /workspace/models/create_proxy_labels_polars_patch_regime.py
 # [フェーズ3: 最終ラベリングスクリプト]
 # - ATRレジーム（V4ルールブック）をハードコード
-# - R1, R2, R3 (atr_value < 5.0) を切り捨て
-# - R4 (atr_value >= 5.0) に (PT=1.0, SL=5.0, TD="1200m") を適用
+# - [修正済み] 変動ATRフィルター (0.28%) を適用
+# - [修正済み] 行増殖バグ (64x) を GroupBy + Coalesce で修正
 
 import sys
 from pathlib import Path
@@ -60,11 +60,12 @@ except ImportError:
 
 # --- ▼▼▼ [フェーズ3 改造] V4ルールブックのハードコード ▼▼▼ ---
 
-# R4レジームの最小ATR値
-ATR_REGIME_CUTOFF = 5.0
+# [新規] 変動ATRフィルターの基準比率
+# 2026年現在の相場感 ($4900付近での ATR 7-8ドル) に合わせ、0.15%に調整
+# 4900 * 0.0015 = 7.35ドル以上の変動でシグナル点灯
+ATR_RATIO_THRESHOLD = 0.0015
 
 # R4レジームに適用する単一のルール
-# (APF=732.6389 を記録した PT=1.0, SL=5.0, TD=1200m)
 REGIME_RULE_R4 = {
     "pt": 1.0,
     "sl": 5.0,
@@ -82,8 +83,6 @@ class ProxyLabelConfig:
     input_dir: Path = S5_NEUTRALIZED_ALPHA_SET
     price_data_source_dir: Path = S2_FEATURES_FIXED
     output_dir: Path = S6_LABELED_DATASET
-
-    # --- [フェーズ3 改造] PT/SL/Duration はハードコードされたため削除 ---
 
     # Filtering options
     filter_mode: str = "year"  # 'year', 'month', 'all'
@@ -208,8 +207,6 @@ class ProxyLabelingEngine:
                 f"Invalid filter_mode: {cfg.filter_mode}. Choose 'year', 'month', or 'all'."
             )
 
-        # --- [フェーズ3 改造] duration チェックを削除 ---
-
     def _get_duration_in_minutes(self, duration_str: str) -> float:
         """Converts a duration string (e.g., '300m', '90s') to a float value in minutes."""
         match = re.match(r"^(\d+)([ms])$", duration_str)
@@ -231,13 +228,13 @@ class ProxyLabelingEngine:
 
     def run(self):
         # --- [フェーズ3 改造] ログメッセージを更新 ---
-        logging.info(f"### Phase 3: Final Labeling (ATR Regime V4) ###")
+        logging.info(f"### Phase 3: Final Labeling (ATR Regime V4 - Dynamic) ###")
         logging.info(f"Applying filter: {self.config.get_filter_description()}")
         logging.info(
-            f"ATR Cutoff: R1-R3 (atr < {ATR_REGIME_CUTOFF}) will be DISCARDED."
+            f"ATR Cutoff: Dynamic Ratio >= {ATR_RATIO_THRESHOLD:.4%} of Price (e.g., Price $2000 -> ATR>5.6)"
         )
         logging.info(
-            f"R4 Rule (atr >= {ATR_REGIME_CUTOFF}): PT={REGIME_RULE_R4['pt']}, SL={REGIME_RULE_R4['sl']}, TD={REGIME_RULE_R4['td']}"
+            f"R4 Rule: PT={REGIME_RULE_R4['pt']}, SL={REGIME_RULE_R4['sl']}, TD={REGIME_RULE_R4['td']}"
         )
         # --- ▲▲▲ 改造ここまで ▲▲▲ ---
 
@@ -257,13 +254,14 @@ class ProxyLabelingEngine:
             logging.info(
                 "Step 2: Building unified bet/feature frames (separating Hive vs. Files)..."
             )
-            unified_hive_lf, unified_file_df = self._build_unified_lazyframe(
+            # ★★★ [修正済み] LazyFrameのまま受け取る ★★★
+            unified_hive_lf, unified_file_lf = self._build_unified_lazyframe(
                 all_feature_paths
             )
 
             if (
                 unified_hive_lf.collect_schema().names() == []
-                and unified_file_df.is_empty()
+                and unified_file_lf.collect_schema().names() == []
             ):
                 logging.warning(
                     f"No data found for the specified filter '{cfg.get_filter_description()}'. Exiting."
@@ -293,7 +291,7 @@ class ProxyLabelingEngine:
 
             logging.info("Step 4: Discovering daily partitions for processing...")
             partitions_df_hive = self._discover_partitions(unified_hive_lf)
-            partitions_df_file = self._discover_partitions(unified_file_df.lazy())
+            partitions_df_file = self._discover_partitions(unified_file_lf)
 
             partitions_df = (
                 pl.concat([partitions_df_hive, partitions_df_file])
@@ -347,15 +345,26 @@ class ProxyLabelingEngine:
                     )
                     continue
 
+                # --- 修正: LazyFrameから当日の分だけ filter して collect する ---
                 daily_bets_hive_df = unified_hive_lf.filter(
                     pl.col("timestamp").dt.date() == current_date
                 ).collect()
-                daily_bets_file_df = unified_file_df.filter(
+
+                daily_bets_file_df = unified_file_lf.filter(
                     pl.col("timestamp").dt.date() == current_date
+                ).collect()
+
+                # --- ★★★ [修正] 日次データロード後に「行増殖バグ」を修正する (Coalesce) ★★★ ---
+                # concat するとカラム不一致で行が増えるため、ここで GroupBy + First で凝縮する
+                # これにより、メモリ使用量は「1日分」に抑えられ、PCが落ちない
+                daily_bets_df = (
+                    pl.concat([daily_bets_hive_df, daily_bets_file_df], how="diagonal")
+                    .group_by(["timestamp", "timeframe"])
+                    .agg(pl.all().drop_nulls().first())  # ここが行増殖バグの修正箇所
+                    .sort("timestamp")
                 )
-                daily_bets_df = pl.concat(
-                    [daily_bets_hive_df, daily_bets_file_df], how="diagonal"
-                ).sort("timestamp")
+                # ---------------------------------------------------------------
+
                 if daily_bets_df.is_empty():
                     logging.debug(
                         f"No betting data found for {current_date}. Skipping partition."
@@ -423,7 +432,6 @@ class ProxyLabelingEngine:
 
     # =========================================================================
     # コアロジック (S5/S2読み込み、パーティション発見など)
-    # (このセクションは `create_proxy_labels_polars_patch.py` と同一)
     # =========================================================================
 
     def _discover_feature_paths(self) -> List[Path]:
@@ -443,22 +451,20 @@ class ProxyLabelingEngine:
 
     def _build_unified_lazyframe(
         self, feature_paths: List[Path]
-    ) -> Tuple[pl.LazyFrame, pl.DataFrame]:
+    ) -> Tuple[pl.LazyFrame, pl.LazyFrame]:
         """
-        [★★★ 修正版 ★★★]
-        S5の特徴量データを、Hiveパーティション(Lazy)と
-        単一ファイル(Eager, メモリにロード)に分離する。
+        [修正版] S5の特徴量データを、Hiveパーティション(Lazy)と
+        単一ファイル(Lazy)に分離する。
+
+        ★メモリ対策: ここでは .collect() をせず、LazyFrameのまま返す。
+        行増殖バグの修正(GroupBy)は、メモリ溢れを防ぐため run() の日次ループ内で行う。
         """
         all_lazy_frames_hive = []
         all_lazy_frames_file = []
 
-        # --- ▼▼▼ [バグ修正] 正規表現を「元のスクリKリプト」の定義に戻す ▼▼▼ ---
-        # (create_proxy_labels_polars_patch.py と同じ定義)
         timeframe_pattern = re.compile(
             r"features_e\d+[a-z]?_([a-zA-Z0-9\.]+)(?:_neutralized)?"
         )
-        # --- ▲▲▲ 修正ここまで ▲▲▲ ---
-
         cfg = self.config
 
         logging.info("   -> Separating Hive partitions vs. single files for S5...")
@@ -541,9 +547,8 @@ class ProxyLabelingEngine:
         unified_hive_lf = pl.LazyFrame()
         if all_lazy_frames_hive:
             try:
-                unified_hive_lf = pl.concat(all_lazy_frames_hive, how="diagonal").sort(
-                    "timestamp"
-                )
+                # LazyFrameのまま結合 (ここでは集約しない)
+                unified_hive_lf = pl.concat(all_lazy_frames_hive, how="diagonal")
                 logging.info(
                     f"   -> Prepared S5 Hive LazyFrame ({len(all_lazy_frames_hive)} sources)."
                 )
@@ -555,19 +560,13 @@ class ProxyLabelingEngine:
         else:
             logging.warning("No S5 Hive (tick) data found for the filter.")
 
-        unified_file_df = pl.DataFrame()
+        unified_file_lf = pl.LazyFrame()
         if all_lazy_frames_file:
             try:
+                # LazyFrameのまま結合 (ここでは集約しない)
+                unified_file_lf = pl.concat(all_lazy_frames_file, how="diagonal")
                 logging.info(
-                    f"   -> Pre-loading {len(all_lazy_frames_file)} S5 non-tick files into memory..."
-                )
-                unified_file_df = (
-                    pl.concat(all_lazy_frames_file, how="diagonal")
-                    .collect()
-                    .sort("timestamp")
-                )
-                logging.info(
-                    f"   -> Successfully pre-loaded {len(unified_file_df):,} S5 non-tick bet records."
+                    f"   -> Prepared S5 non-tick LazyFrame ({len(all_lazy_frames_file)} sources)."
                 )
             except pl.exceptions.ComputeError as e:
                 if "cannot concat empty list" in str(e).lower():
@@ -576,21 +575,14 @@ class ProxyLabelingEngine:
                     )
                 else:
                     raise e
-            except Exception as e:
-                logging.error(
-                    f"Failed to pre-load S5 non-tick files (OutOfMemory?): {e}",
-                    exc_info=True,
-                )
-                raise
         else:
             logging.warning("No S5 non-tick (single file) data found for the filter.")
 
-        return unified_hive_lf, unified_file_df
+        return unified_hive_lf, unified_file_lf
 
     def _rename_features(
         self, lf: pl.LazyFrame, timeframe_suffix: str
     ) -> Optional[pl.LazyFrame]:
-        """Helper to apply feature renaming and timestamp casting."""
         try:
             current_schema = lf.collect_schema()
             if not current_schema.names():
@@ -702,23 +694,15 @@ class ProxyLabelingEngine:
         return {"base_lf": base_lf, "atr_lfs": all_atr_lfs}
 
     def _discover_partitions(self, unified_lf: pl.LazyFrame) -> pl.DataFrame:
-        # --- ▼▼▼ [バグ修正] スキーマが空、またはcollect結果が空の場合に対応 ▼▼▼ ---
         if unified_lf.collect_schema().names() == []:
-            # スキーマが空の場合、Null型ではなくDate型の空DFを返す
             return pl.DataFrame({"date": []}).select(pl.col("date").cast(pl.Date))
-
-        # データを収集
         df_dates = (
             unified_lf.select(pl.col("timestamp").dt.date().alias("date"))
             .unique()
             .collect()
         )
-
         if df_dates.is_empty():
-            # 収集結果が空の場合も、Date型の空DFを返す
             return df_dates.select(pl.col("date").cast(pl.Date))
-        # --- ▲▲▲ 修正ここまで ▲▲▲ ---
-
         return df_dates.sort("date")
 
     def _get_bar_duration_minutes(self, timeframe: str) -> float:
@@ -761,15 +745,15 @@ class ProxyLabelingEngine:
         logging.warning(f"Unhandled timeframe unit '{unit}' in timeframe: {timeframe}")
         return 0.0  # Return 0 for any other unhandled units
 
-    # --- ▼▼▼ [フェーズ3 改造] コアロジックの大幅修正 ▼▼▼ ---
+    # --- コアロジック (変動ATR対応) ---
     def _calculate_labels_for_batch(
         self, daily_bets_df: pl.DataFrame, price_window_df: pl.DataFrame
     ) -> pl.DataFrame | None:
         """
-        [フェーズ3: Numba + ハードコード版]
-        ATRレジームルール(V4)に基づき、ベットをフィルタリング＆ラベリングする。
+        [フェーズ3: Numba + 変動ATR版]
+        修正済み: .with_columns ではなく .select を使用し、
+        元の 'timestamp' を確実に除外してから 't0' を作成することで重複エラーを回避。
         """
-        # cfg = self.config (cfg を使わなくなった)
         if daily_bets_df.is_empty():
             return None
 
@@ -798,13 +782,11 @@ class ProxyLabelingEngine:
             if timeframe is None or group_df.is_empty():
                 continue
 
-            # R4ルールブックからPT/SL/TDの値を取得
             rule_pt = REGIME_RULE_R4["pt"]
             rule_sl = REGIME_RULE_R4["sl"]
             rule_td_str = REGIME_RULE_R4["td"]
             rule_payoff = REGIME_RULE_R4["payoff"]
 
-            # 時間バリアを計算
             target_duration_minutes = self._get_duration_in_minutes(rule_td_str)
             bar_duration_minutes = self._get_bar_duration_minutes(timeframe)
             t1_max_expr: pl.Expr
@@ -825,7 +807,6 @@ class ProxyLabelingEngine:
                     minutes=lookahead_bars * bar_duration_minutes
                 )
 
-            # ATRカラムを特定
             atr_col_name = f"e1c_atr_21_{timeframe}"
             if atr_col_name not in price_window_df.columns:
                 if timeframe != "tick":
@@ -834,9 +815,11 @@ class ProxyLabelingEngine:
                     )
                 continue
 
-            original_cols = group_df.columns
+            # 元の特徴量カラムリストを作成（timestamp, close は手動で扱うため除外）
+            original_cols = [
+                c for c in group_df.columns if c not in ["timestamp", "close"]
+            ]
 
-            # 1. ATR/Price 結合 (join_asof)
             bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
                     ["timestamp", "close", "high", "low", atr_col_name]
@@ -847,47 +830,34 @@ class ProxyLabelingEngine:
             if bets_with_price_df.is_empty():
                 continue
 
-            # 2. バリアと時間制限 (t1_max) を計算
             bets_df_with_atr = bets_with_price_df.with_columns(
                 pl.col(atr_col_name).alias("atr_value")
             )
 
-            # 3. [重要] レジームフィルタリング
-            # ATR_CUTOFF (5.0) 未満のベットを切り捨て
+            # --- [重要] レジームフィルタリング (変動ATR) ---
             bets_df_filtered = bets_df_with_atr.filter(
-                pl.col("atr_value") >= ATR_REGIME_CUTOFF
+                pl.col("atr_value") >= (pl.col("close") * ATR_RATIO_THRESHOLD)
             )
 
             if bets_df_filtered.is_empty():
-                # このタイムフレームにはR4のベットがなかった
                 continue
 
-            # 4. R4ルールを適用してバリア計算
-            bets_df = bets_df_filtered.with_columns(
+            # R4ルール適用 & カラム整理
+            # ★★★ 修正箇所: .with_columns ではなく .select を使用 ★★★
+            # これにより、元の 'timestamp' は捨てられ、't0' だけが残る。
+            bets_df = bets_df_filtered.select(
                 pl.col("timestamp").alias("t0"),
-                (
-                    pl.col("close")
-                    + pl.col("atr_value") * rule_pt  # ハードコード (1.0)
-                ).alias("pt_barrier"),
-                (
-                    pl.col("close")
-                    - pl.col("atr_value") * rule_sl  # ハードコード (5.0)
-                ).alias("sl_barrier"),
-                t1_max_expr.alias("t1_max"),  # ハードコード (1200m)
-            ).select(
-                pl.col("t0"),
-                pl.col("pt_barrier"),
-                pl.col("sl_barrier"),
-                pl.col("t1_max"),
+                (pl.col("close") + pl.col("atr_value") * rule_pt).alias("pt_barrier"),
+                (pl.col("close") - pl.col("atr_value") * rule_sl).alias("sl_barrier"),
+                t1_max_expr.alias("t1_max"),
                 pl.col("atr_value"),
                 pl.col("close"),
-                pl.col(original_cols).exclude("timestamp"),
+                pl.col(original_cols),  # その他の特徴量を展開
             )
 
             if bets_df.is_empty():
                 continue
 
-            # 5. Numba用のNumpy配列に変換
             try:
                 bets_t0_np = bets_df["t0"].cast(pl.Int64).to_numpy()
                 bets_t1_max_np = bets_df["t1_max"].cast(pl.Int64).to_numpy()
@@ -899,7 +869,6 @@ class ProxyLabelingEngine:
                 )
                 continue
 
-            # 6. Numba 関数でヒット判定
             first_pt_time_np, first_sl_time_np = _numba_find_hits(
                 bets_t0_np,
                 bets_t1_max_np,
@@ -910,7 +879,6 @@ class ProxyLabelingEngine:
                 ticks_low_np,
             )
 
-            # 7. Numba の結果を Polars に戻す
             final_group_df = (
                 bets_df.with_columns(
                     pl.Series("first_pt_time_int", first_pt_time_np),
@@ -929,7 +897,6 @@ class ProxyLabelingEngine:
                 .drop("first_pt_time_int", "first_sl_time_int")
             )
 
-            # 8. ラベルとt1を決定
             labeled_group = final_group_df.with_columns(
                 t1=pl.when(
                     (pl.col("first_pt_time").is_not_null())
@@ -953,11 +920,9 @@ class ProxyLabelingEngine:
                 .when(pl.col("first_sl_time").is_not_null())
                 .then(pl.lit(-1, dtype=pl.Int8))
                 .otherwise(pl.lit(0, dtype=pl.Int8)),
-                # --- [フェーズ3 改造] ハードコードした値を保存 ---
                 payoff_ratio=pl.lit(rule_payoff, dtype=pl.Float32),
                 sl_multiplier=pl.lit(rule_sl, dtype=pl.Float32),
                 pt_multiplier=pl.lit(rule_pt, dtype=pl.Float32),
-                # --- ▲▲▲ 改造ここまで ▲▲▲ ---
                 direction=pl.lit(1, dtype=pl.Int8),
             ).rename({"t0": "timestamp"})
 
@@ -976,8 +941,6 @@ class ProxyLabelingEngine:
         if not labeled_chunks:
             return None
         return pl.concat(labeled_chunks).sort("timestamp")
-
-    # --- ▲▲▲ 修正されたコアロジックはここまで ▲▲▲ ---
 
     def _update_label_counts(self, df: pl.DataFrame):
         counts = df.group_by("label").len()
@@ -1013,7 +976,6 @@ class ProxyLabelingEngine:
         logging.info(summary)
 
     def _collect_report_data(self, df: pl.DataFrame, current_date: dt.date):
-        """Collects data from the daily labeled dataframe for the final report."""
         try:
             required_cols = ["timestamp", "t1", "timeframe", "label"]
             if not all(col in df.columns for col in required_cols):
@@ -1032,15 +994,13 @@ class ProxyLabelingEngine:
             logging.warning(f"Error collecting report data for {current_date}: {e}")
 
     def _generate_report(self):
-        """Generates a detailed markdown report of the execution results."""
         logging.info("Generating detailed execution report...")
         cfg = self.config
-        report_filename = "execution_report_regime_v4.md"  # レポート名を変更
+        report_filename = "execution_report_regime_v4.md"
         report_path = cfg.output_dir / report_filename
 
-        # --- [フェーズ3 改造] レポート内容をV4ルールに更新 ---
         rule = REGIME_RULE_R4
-        cutoff = ATR_REGIME_CUTOFF
+
         summary_table = f"""
 | Item | Value |
 |:---|:---|
@@ -1048,11 +1008,10 @@ class ProxyLabelingEngine:
 | **Script Path** | `{" / ".join(Path(__file__).parts[-4:])}` |
 | **Data Filter Applied** | `{cfg.get_filter_description()}` |
 | **Labeling Strategy** | `ATR Regime V4 (R4 Only)` |
-| **ATR Cutoff** | `Discard if atr_value < {cutoff}` |
+| **ATR Cutoff** | `Dynamic: > {ATR_RATIO_THRESHOLD:.4%} of Price` |
 | **Target Duration (R4)** | `{rule["td"]}` |
 | **Payoff Ratio (PT/SL) (R4)** | `{rule["payoff"]:.2f}` (`PT mult: {rule["pt"]}`, `SL mult: {rule["sl"]}`) |
 """
-        # --- ▲▲▲ 改造ここまで ▲▲▲ ---
 
         if not self.report_data:
             logging.warning("No data available for report generation.")
@@ -1076,7 +1035,6 @@ class ProxyLabelingEngine:
 | **(0) Timed-Out (TO)** | `{to:,}` (`{to / total:.2%}`) |
 | **`scale_pos_weight` (calc)** | `{scale_pos_weight:.4f}` |
 """
-            # (Timeframe Breakdown, Duration Analysis, Daily Activity... のロジックは変更なし)
             tf_breakdown = (
                 df.group_by("timeframe")
                 .agg(
@@ -1178,13 +1136,9 @@ This table analyzes the time it took for an event to conclude (hit a barrier or 
             logging.error(f"Failed to generate report: {e}", exc_info=True)
 
 
-# --- [フェーズ3 改造] インタラクティブモードと argparse を簡略化 ---
-
-
 def _get_interactive_config() -> ProxyLabelConfig:
-    """Gets configuration from the user interactively (filter options only)."""
-    print("\n[ Interactive Configuration Mode - ATR Regime V4 ]")
-    print("ATR rules are hardcoded. Please select data filter mode.")
+    print("\n[ Interactive Configuration Mode - ATR Regime V4 (Dynamic Ratio) ]")
+    print("ATR rules are based on Price Ratio. Please select data filter mode.")
     print("   [1] Year  - Process data for a specific year.")
     print("   [2] Month - Process data for a specific month within a specific year.")
     print("   [3] All   - Process data for all available data.")
@@ -1270,7 +1224,9 @@ def _get_interactive_config() -> ProxyLabelConfig:
     print("\n" + "-" * 50)
     print("Configuration Summary:")
     print(f"  - Data Filter: {config.get_filter_description()}")
-    print(f"  - ATR Cutoff: < {ATR_REGIME_CUTOFF} (Discarded)")
+    print(
+        f"  - ATR Cutoff: Dynamic Ratio < {ATR_RATIO_THRESHOLD:.4%} of Price (Discarded)"
+    )
     print(
         f"  - R4 Rule: PT={REGIME_RULE_R4['pt']}, SL={REGIME_RULE_R4['sl']}, TD={REGIME_RULE_R4['td']}"
     )
@@ -1310,8 +1266,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable resume and start from scratch.",
     )
-
-    # --- [フェーズ3 改造] PT/SL/Duration/ATR引数を削除 ---
 
     args = parser.parse_args()
     run_interactive = args.filter_mode is None

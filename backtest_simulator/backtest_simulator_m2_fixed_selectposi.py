@@ -49,7 +49,6 @@ from blueprint import (
     S7_M1_CALIBRATED,
     S7_M2_CALIBRATED,
     S7_MODELS,
-    S7_CONTEXT_FEATURES,  # --- ▼▼▼ MODIFICATION 1 ▼▼▼ ---
 )
 
 # --- 出力ファイルパス ---
@@ -76,18 +75,18 @@ JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 class BacktestConfig:
     """シミュレーションの全パラメータをここで一元管理します"""
 
-    initial_capital: float = 100.0
+    initial_capital: float = 1000.0
     simulation_data_path: Path = S6_WEIGHTED_DATASET
     oof_predictions_path: Path = S7_M2_OOF_PREDICTIONS
     feature_list_path: Path = S3_FEATURES_FOR_TRAINING
-    context_data_path: Path = S7_CONTEXT_FEATURES  # --- ▼▼▼ MODIFICATION 1 ▼▼▼ ---
+    top_50_features_path: Path = project_root / "models" / "TOP_50_FEATURES.json"
     m1_model_path: Path = S7_M1_MODEL_PKL
     m2_model_path: Path = S7_M2_MODEL_PKL
     m1_calibrator_path: Path = S7_M1_CALIBRATED
     m2_calibrator_path: Path = S7_M2_CALIBRATED
-    kelly_fraction: float = 1.0
+    kelly_fraction: float = 0.5
     # max_leverage: float = 100 # <- ★★★ 削除: base_leverage を使う ★★★
-    max_risk_per_trade: float = 0.01  # ★★★ 50 (5000%) -> 0.5 (50%) に修正 ★★★
+    max_risk_per_trade: float = 0.005  # ★★★ 50 (5000%) -> 0.5 (50%) に修正 ★★★
     f_star_threshold: float = 0.0
     m2_proba_threshold: float = 0.6
     test_limit_partitions: int = 0
@@ -96,7 +95,7 @@ class BacktestConfig:
     min_lot_size: float = 0.01  # ★★★ 最小ロット(0.01)を追加 ★★★
 
     # ★★★ 追加: 最大同時保有ポジション数 ★★★
-    max_positions: int = 100  # ここを好きな数に変更（例: 3, 5, 10）
+    max_positions: int = 50  # ここを好きな数に変更（例: 3, 5, 10）
 
     # --- ★★★ 修正: 基本レバレッジとスプレッドを追加 ★★★ ---
     base_leverage: float = 2000.0  # 設定可能な基本レバレッジ
@@ -122,45 +121,32 @@ class BacktestSimulator:
         )
         self.features_base = self._load_features(config.feature_list_path)
 
-        # --- ▼▼▼ MODIFICATION 1: Load M2 Context Features ▼▼▼ ---
-        # (model_training_metalabeling_C.py と一致させる)
-        self.context_features_m2 = [
-            "hmm_prob_0",
-            "hmm_prob_1",
-            "atr_ratio",  # 修正: atr -> atr_ratio
-            "trend_bias_25",  # 追加: トレンドバイアス
-            "e1a_statistical_kurtosis_50",
-            "e1c_adx_21",
-            "e2a_mfdfa_hurst_mean_250",
-            "e2a_kolmogorov_complexity_60",
-        ]
-        self.features_m2 = (
-            self.features_base + ["m1_pred_proba"] + self.context_features_m2
+        # --- [修正] Top 50特徴量のロードとM2特徴量定義の更新 ---
+        self.top_50_features = self._load_top_50_features()
+        # M2の入力: M1予測確率 + Top 50特徴量
+        self.features_m2 = ["m1_pred_proba"] + self.top_50_features
+
+        logging.info(
+            f"M2 features redefined with {len(self.top_50_features)} Top 50 features + m1_pred_proba."
         )
-        logging.info(f"Loading M2 context features from {config.context_data_path}...")
-        try:
-            context_df = pl.read_parquet(config.context_data_path)
-            # Prepare for join_asof
-            self.context_df = (
-                context_df.with_columns(pl.col("timestamp").dt.date().alias("date"))
-                .select(["date"] + self.context_features_m2)  # Select only needed cols
-                .sort("date")
-                .lazy()
-            )
-            logging.info(
-                f"  -> M2 features redefined with {len(self.context_features_m2)} context features."
-            )
-        except Exception as e:
-            # --- ▼▼▼ SYNTAX FIX (L187-188) ▼▼▼ ---
-            logging.error(
-                f"CRITICAL: Failed to load M2 context features from {config.context_data_path}: {e}",
-                exc_info=True,
-            )
-            # --- ▲▲▲ SYNTAX FIX END ▲▲▲ ---
-            raise
-        # --- ▲▲▲ MODIFICATION 1 END ▲▲▲ ---
 
         self._current_capital = Decimal(str(self.config.initial_capital))
+
+    # --- [追加] Top 50特徴量ロード用メソッド ---
+    def _load_top_50_features(self) -> List[str]:
+        logging.info(
+            f"Loading Top 50 features list from {self.config.top_50_features_path}..."
+        )
+        if not self.config.top_50_features_path.exists():
+            raise FileNotFoundError(
+                f"Top 50 features file not found at: {self.config.top_50_features_path}"
+            )
+
+        with open(self.config.top_50_features_path, "r", encoding="utf-8") as f:
+            features = json.load(f)
+
+        logging.info(f"  -> Loaded {len(features)} Top 50 features.")
+        return features
 
     def _load_model(self, path: Path, name: str):
         logging.info(f"Loading {name} from {path}...")
@@ -374,7 +360,9 @@ class BacktestSimulator:
             )
             required_cols_set = set(self.features_base)
             required_cols_set.update(base_cols)
-            # (文脈特徴量はS6にないので、ここでは追加しない)
+            # --- [修正] M2用 Top 50 特徴量もロード対象に追加 ---
+            required_cols_set.update(self.top_50_features)
+
             required_cols = list(required_cols_set)
 
             try:
@@ -393,17 +381,7 @@ class BacktestSimulator:
                 )
 
             lf = lf.select(required_cols).sort("timestamp")
-
-            # --- ▼▼▼ MODIFICATION 1: Join context features for In-Sample mode ▼▼▼ ---
-            logging.info("  -> [In-Sample] Joining M2 context features...")
-            lf = lf.with_columns(
-                pl.col("timestamp").dt.date().alias("date")
-            )  # Add date key
-            lf = lf.join_asof(self.context_df, on="date")  # Join context features
-            lf = lf.drop(
-                "date"
-            )  # Drop date key to avoid conflict during partition loop
-            # --- ▲▲▲ MODIFICATION 1 END ▲▲▲ ---
+            # --- [修正] 外部文脈(S7_CONTEXT_FEATURES)の結合処理を削除 ---
 
         else:  # OOF Mode
             logging.info(
