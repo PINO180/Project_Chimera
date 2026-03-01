@@ -135,7 +135,7 @@ def _numba_find_hits_dual(
     n_bets = len(bets_t0)
     n_ticks = len(ticks_ts)
 
-    # ロング用とショート用の出力配列を準備
+    # ロング用とショート用の出力配列を準備（duration配列は削除）
     out_pt_long = np.zeros(n_bets, dtype=np.int64)
     out_sl_long = np.zeros(n_bets, dtype=np.int64)
     out_pt_short = np.zeros(n_bets, dtype=np.int64)
@@ -143,7 +143,6 @@ def _numba_find_hits_dual(
 
     if n_ticks == 0:
         return out_pt_long, out_sl_long, out_pt_short, out_sl_short
-
     for i in prange(n_bets):
         t0 = bets_t0[i]
 
@@ -201,6 +200,7 @@ def _numba_find_hits_dual(
                         short_active = False  # どちらかのバリアに当たったら終了
 
             # 早期退出: ロングもショートも決着がついていればループを抜ける
+            # （durationのNumba内計算は削除し、breakのみを維持）
             if not long_active and not short_active:
                 break
 
@@ -209,6 +209,7 @@ def _numba_find_hits_dual(
         out_pt_short[i] = pt_s_found
         out_sl_short[i] = sl_s_found
 
+    # duration配列を削除し、純粋な到達時刻(マイクロ秒)の4つだけを返す
     return out_pt_long, out_sl_long, out_pt_short, out_sl_short
 
 
@@ -787,12 +788,17 @@ class ProxyLabelingEngine:
             bets_df_with_atr = bets_with_price_df.with_columns(
                 pl.col(atr_col_name).alias("atr_value")
             )
-
-            # --- [重要] エントリー条件: ATR(13)の極小収縮 (<= 0.5) ---
-            bets_df_filtered = bets_df_with_atr.filter(
-                pl.col("atr_value") <= ATR_SHRINK_THRESHOLD
+            # --- [変更] 全行を保持しつつ、エントリー起点に is_trigger=1 を付与 ---
+            bets_df_all = bets_df_with_atr.with_columns(
+                pl.when(pl.col("atr_value") <= ATR_SHRINK_THRESHOLD)
+                .then(1)
+                .otherwise(0)
+                .cast(pl.Int8)
+                .alias("is_trigger")
             )
 
+            # Numbaに渡して重い計算をするのは is_trigger==1 の行だけにする
+            bets_df_filtered = bets_df_all.filter(pl.col("is_trigger") == 1)
             if bets_df_filtered.is_empty():
                 continue
 
@@ -850,9 +856,8 @@ class ProxyLabelingEngine:
                 ticks_low_np,
             )
 
-            # Polars上で結果を組み立て (1 or 0 のバイナリラベリング)
-            # 要件: PTに先当たり=1, それ以外(SL先当たり or タイムアウト)=0
-            final_group_df = (
+            # 計算済みトリガー行の DataFrame 作成
+            calculated_df = (
                 bets_df.with_columns(
                     pl.Series("pt_l_time", out_pt_l),
                     pl.Series("sl_l_time", out_sl_l),
@@ -860,7 +865,7 @@ class ProxyLabelingEngine:
                     pl.Series("sl_s_time", out_sl_s),
                 )
                 .with_columns(
-                    # ロング用ラベル: pt_l_timeが存在(>0)し、かつ (slに当たっていない(=0) または slより先に当たった)
+                    # ロング用ラベルと「正確な決済時刻(マイクロ秒)」の特定
                     label_long=pl.when(
                         (pl.col("pt_l_time") > 0)
                         & (
@@ -870,7 +875,18 @@ class ProxyLabelingEngine:
                     )
                     .then(pl.lit(1, dtype=pl.Int8))
                     .otherwise(pl.lit(0, dtype=pl.Int8)),
-                    # ショート用ラベル: pt_s_timeが存在(>0)し、かつ (slに当たっていない(=0) または slより先に当たった)
+                    end_l=pl.when(
+                        (pl.col("pt_l_time") > 0)
+                        & (
+                            (pl.col("sl_l_time") == 0)
+                            | (pl.col("pt_l_time") <= pl.col("sl_l_time"))
+                        )
+                    )
+                    .then(pl.col("pt_l_time"))
+                    .when(pl.col("sl_l_time") > 0)
+                    .then(pl.col("sl_l_time"))
+                    .otherwise(pl.col("t1_max_long")),
+                    # ショート用ラベルと「正確な決済時刻(マイクロ秒)」の特定
                     label_short=pl.when(
                         (pl.col("pt_s_time") > 0)
                         & (
@@ -880,27 +896,47 @@ class ProxyLabelingEngine:
                     )
                     .then(pl.lit(1, dtype=pl.Int8))
                     .otherwise(pl.lit(0, dtype=pl.Int8)),
+                    end_s=pl.when(
+                        (pl.col("pt_s_time") > 0)
+                        & (
+                            (pl.col("sl_s_time") == 0)
+                            | (pl.col("pt_s_time") <= pl.col("sl_s_time"))
+                        )
+                    )
+                    .then(pl.col("pt_s_time"))
+                    .when(pl.col("sl_s_time") > 0)
+                    .then(pl.col("sl_s_time"))
+                    .otherwise(pl.col("t1_max_short")),
                 )
-                .rename({"t0": "timestamp"})
-            )
-
-            # 不要な計算用カラムをドロップしてクリーンアップ
-            labeled_chunks.append(
-                final_group_df.drop(
+                .with_columns(
+                    # マイクロ秒の差分から「実経過時間（分）」を算出して Float32 で保持
+                    duration_long=(
+                        (pl.col("end_l") - pl.col("t0")) / 1_000_000 / 60.0
+                    ).cast(pl.Float32),
+                    duration_short=(
+                        (pl.col("end_s") - pl.col("t0")) / 1_000_000 / 60.0
+                    ).cast(pl.Float32),
+                )
+                .select(
                     [
-                        "pt_long",
-                        "sl_long",
-                        "t1_max_long",
-                        "pt_short",
-                        "sl_short",
-                        "t1_max_short",
-                        "pt_l_time",
-                        "sl_l_time",
-                        "pt_s_time",
-                        "sl_s_time",
+                        "t0",
+                        "label_long",
+                        "label_short",
+                        "duration_long",
+                        "duration_short",
                     ]
                 )
             )
+
+            # 全データ（M1のすべての足）へ Left Join (非トリガー行は自動的にNullになる)
+            final_group_df = (
+                bets_df_all.rename({"timestamp": "t0"})
+                .join(calculated_df, on="t0", how="left")
+                .rename({"t0": "timestamp"})
+            )
+
+            # 不要な計算用カラムをドロップ（atr_value等）してリストに追加
+            labeled_chunks.append(final_group_df.drop(["atr_value"]))
 
         if not labeled_chunks:
             return None
@@ -925,11 +961,32 @@ class ProxyLabelingEngine:
 
     def _collect_report_data_dual(self, df: pl.DataFrame, current_date: dt.date):
         try:
-            required_cols = ["timestamp", "timeframe", "label_long", "label_short"]
+            required_cols = [
+                "timestamp",
+                "timeframe",
+                "is_trigger",
+                "label_long",
+                "label_short",
+                "duration_long",
+                "duration_short",
+            ]
             if not all(col in df.columns for col in required_cols):
                 return
-            report_df = df.with_columns(pl.lit(current_date).alias("date")).select(
-                ["timeframe", "label_long", "label_short", "date"]
+
+            # --- [修正] OOM回避: トリガーが発火した行(is_trigger==1)だけをレポート用に抽出 ---
+            report_df = (
+                df.filter(pl.col("is_trigger") == 1)
+                .with_columns(pl.lit(current_date).alias("date"))
+                .select(
+                    [
+                        "timeframe",
+                        "label_long",
+                        "label_short",
+                        "duration_long",
+                        "duration_short",
+                        "date",
+                    ]
+                )
             )
             self.report_data.extend(report_df.to_dicts())
         except Exception as e:
@@ -944,13 +1001,19 @@ class ProxyLabelingEngine:
         long_win = self.label_counts_long.get(1, 0)
         short_win = self.label_counts_short.get(1, 0)
 
+        long_loss = total_samples - long_win
+        short_loss = total_samples - short_win
+
+        scale_pos_weight_long = long_loss / long_win if long_win > 0 else 1.0
+        scale_pos_weight_short = short_loss / short_win if short_win > 0 else 1.0
+
         summary = (
             "\n" + "=" * 60 + "\n"
             f"### V5 Dual-Directional Labeling COMPLETED ###\n"
             f"Output Dir: {self.config.output_dir}\n"
-            f"  - Total Labeled Samples: {total_samples}\n"
-            f"  - Long Win (1): {long_win} ({long_win / total_samples:.2%}) / Loss (0): {total_samples - long_win}\n"
-            f"  - Short Win (1): {short_win} ({short_win / total_samples:.2%}) / Loss (0): {total_samples - short_win}\n"
+            f"  - Total Labeled Triggers (is_trigger=1): {total_samples}\n"
+            f"  - Long Win (1): {long_win} / Loss (0): {long_loss}  => `scale_pos_weight_long`: {scale_pos_weight_long:.4f}\n"
+            f"  - Short Win (1): {short_win} / Loss (0): {short_loss} => `scale_pos_weight_short`: {scale_pos_weight_short:.4f}\n"
             + "="
             * 60
         )
@@ -971,6 +1034,12 @@ class ProxyLabelingEngine:
             l_win = df.filter(pl.col("label_long") == 1).height
             s_win = df.filter(pl.col("label_short") == 1).height
 
+            # --- [追加] Duration（決済までの時間）の統計を計算 ---
+            avg_duration_l = df["duration_long"].mean()
+            med_duration_l = df["duration_long"].median()
+            avg_duration_s = df["duration_short"].mean()
+            med_duration_s = df["duration_short"].median()
+
             daily_activity = (
                 df.group_by("date").len().sort("len", descending=True).limit(10)
             )
@@ -990,12 +1059,12 @@ class ProxyLabelingEngine:
 | **Long Rule** | `PT: {RULE_LONG["pt_mult"]}, SL: {RULE_LONG["sl_mult"]}, TD: {RULE_LONG["td"]}` |
 | **Short Rule** | `PT: {RULE_SHORT["pt_mult"]}, SL: {RULE_SHORT["sl_mult"]}, TD: {RULE_SHORT["td"]}` |
 
-### 2. Overall Performance
-| Metric | Count | Win Rate |
-|:---|---:|---:|
-| **Total Setups (M1 ATR shrink)** | `{total:,}` | - |
-| **Long Profit-Take (label_long=1)** | `{l_win:,}` | `{l_win / total:.2%}` |
-| **Short Profit-Take (label_short=1)** | `{s_win:,}` | `{s_win / total:.2%}` |
+### 2. Overall Performance & Event Duration
+| Metric | Count | Win Rate | Avg Duration | Median Duration |
+|:---|---:|---:|---:|---:|
+| **Total Setups (M1 ATR shrink)** | `{total:,}` | - | - | - |
+| **Long Profit-Take** | `{l_win:,}` | `{l_win / total:.2%}` | `{avg_duration_l:.1f} min` | `{med_duration_l:.1f} min` |
+| **Short Profit-Take** | `{s_win:,}` | `{s_win / total:.2%}` | `{avg_duration_s:.1f} min` | `{med_duration_s:.1f} min` |
 
 ### 3. Top 10 Busiest Days (Setups)
 {daily_table.strip()}
