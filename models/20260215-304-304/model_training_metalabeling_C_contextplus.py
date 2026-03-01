@@ -173,41 +173,8 @@ class FinalAssembler:
             f"Loading base feature list from {self.config.feature_list_path}..."
         )
         with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
-
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-            "meta_label",
-            "m1_pred_proba",  # B/C特有のメタデータも除外
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(f"   -> Loaded {len(features)} valid base features.")
+            features = [line.strip() for line in f if line.strip()]
+        logging.info(f"   -> Loaded {len(features)} base features.")
         return features
 
     # def _load_top_50_features(self) -> List[str]:

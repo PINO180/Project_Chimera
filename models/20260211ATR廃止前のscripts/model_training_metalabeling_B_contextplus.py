@@ -25,7 +25,6 @@ from blueprint import (
     S6_WEIGHTED_DATASET,
     S7_M1_OOF_PREDICTIONS,
     S7_META_LABELED_OOF_PARTITIONED,
-    S3_FEATURES_FOR_TRAINING,  # <--- 追加
 )
 
 logging.basicConfig(
@@ -46,9 +45,8 @@ class MetaLabelingConfig:
     m1_oof_path: Path = S7_M1_OOF_PREDICTIONS
     weighted_dataset_path: Path = S6_WEIGHTED_DATASET
     output_dir: Path = S7_META_LABELED_OOF_PARTITIONED
-    # [修正] JSONパスを廃止し、全特徴量リストのパスに変更
-    feature_list_path: Path = S3_FEATURES_FOR_TRAINING
-    top_n_per_day: int = 20
+    top_50_features_path: Path = project_root / "models" / "TOP_50_FEATURES.json"
+    top_n_per_day: int = 20  # 各日のM1予測確率上位N件をサンプリングする
     test: bool = False
 
 
@@ -56,8 +54,7 @@ class MetaLabelGenerator:
     def __init__(self, config: MetaLabelingConfig):
         self.config = config
         self.partitions = self._discover_partitions()
-        # [修正] 全特徴量をロード
-        self.features = self._load_features()
+        self.top_50_features = self._load_top_50_features()
 
         if self.config.test:
             logging.warning(
@@ -83,49 +80,19 @@ class MetaLabelGenerator:
         logging.info(f"  -> Discovered {len(dates)} daily partitions.")
         return dates
 
-    def _load_features(self) -> List[str]:
-        logging.info(f"Loading feature list from {self.config.feature_list_path}...")
-        if not self.config.feature_list_path.exists():
+    def _load_top_50_features(self) -> List[str]:
+        logging.info(
+            f"Loading Top 50 features list from {self.config.top_50_features_path}..."
+        )
+        if not self.config.top_50_features_path.exists():
             raise FileNotFoundError(
-                f"Feature list file not found at: {self.config.feature_list_path}"
+                f"Top 50 features file not found at: {self.config.top_50_features_path}"
             )
 
-        with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
+        with open(self.config.top_50_features_path, "r", encoding="utf-8") as f:
+            features = json.load(f)
 
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-            "meta_label",
-            "m1_pred_proba",  # B/C特有のメタデータも除外
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(f"  -> Loaded {len(features)} valid features.")
+        logging.info(f"  -> Loaded {len(features)} features.")
         return features
 
     # ==============================================================================
@@ -233,15 +200,17 @@ class MetaLabelGenerator:
             f"Processing {len(self.partitions)} partitions to generate and write meta-labels..."
         )
 
-        # [修正] self.top_50_features ではなく self.features (全特徴量) を使用
+        # 抽出するカラムの定義: 基本情報 + Top 50特徴量 + [必須] uniqueness, payoff_ratio
+        # ※ uniquenessはScript Cでの重み付けに必須
+        # ★★★ [修正] 横結合用に timeframe と atr_value を追加 ★★★
         columns_to_select = [
             "timestamp",
-            "timeframe",
-            "atr_value",
+            "timeframe",  # 必須
+            "atr_value",  # 必須 (コンテキスト用)
             "label",
             "uniqueness",
             "payoff_ratio",
-        ] + self.features
+        ] + self.top_50_features
 
         for partition_date in tqdm(self.partitions, desc="Generating Meta-Labels"):
             # ★★★ 修正: ワイルドカードをやめ、data.parquet を厳密に指定 ★★★

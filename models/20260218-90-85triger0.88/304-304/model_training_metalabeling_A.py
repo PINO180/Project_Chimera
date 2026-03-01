@@ -128,42 +128,9 @@ class M1CrossValidator:
             )
 
         with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
+            features = [line.strip() for line in f if line.strip()]
 
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            # 動的に生成されるトリガーフラグも除外
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(
-            f"   -> Loaded {len(features)} valid features (filtered out metadata)."
-        )
+        logging.info(f"   -> Loaded {len(features)} features.")
         return features
 
     def _discover_partitions(self) -> List[datetime.date]:

@@ -141,16 +141,13 @@ class FinalAssembler:
     def __init__(self, config: FinalTrainingConfig):
         self.config = config
 
-        # [修正] Top 50 (JSON) 読み込みを廃止し、既存の _load_features (txt) を使用する
-        self.all_features = self._load_features()
+        # ★★★ [実験①: All Top 50モード] ★★★
+        # M1用の特徴量 (Base) も Top 50 にする
+        self.top_50_features = self._load_top_50_features()
+        self.features_base: List[str] = self.top_50_features
 
-        # M1用の特徴量 (Base) -> 全特徴量を使用
-        self.features_base: List[str] = self.all_features
-
-        # M2用の特徴量 -> 全特徴量 + m1_pred_proba
-        self.features_m2: List[str] = ["m1_pred_proba"] + self.all_features
-
-        # ... (以下変更なし) ...
+        # M2用の特徴量も Top 50 (+ m1_pred_proba) にする
+        self.features_m2: List[str] = ["m1_pred_proba"] + self.top_50_features
         # -----------------------------------------------------------------------
 
         # M1 と M2 で使用するパーティションリストを個別に検出
@@ -173,57 +170,24 @@ class FinalAssembler:
             f"Loading base feature list from {self.config.feature_list_path}..."
         )
         with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
-
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-            "meta_label",
-            "m1_pred_proba",  # B/C特有のメタデータも除外
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(f"   -> Loaded {len(features)} valid base features.")
+            features = [line.strip() for line in f if line.strip()]
+        logging.info(f"   -> Loaded {len(features)} base features.")
         return features
 
-    # def _load_top_50_features(self) -> List[str]:
-    #     logging.info(
-    #         f"Loading Top 50 features list from {self.config.top_50_features_path}..."
-    #     )
-    #     if not self.config.top_50_features_path.exists():
-    #         raise FileNotFoundError(
-    #             f"Top 50 features file not found at: {self.config.top_50_features_path}"
-    #         )
+    def _load_top_50_features(self) -> List[str]:
+        logging.info(
+            f"Loading Top 50 features list from {self.config.top_50_features_path}..."
+        )
+        if not self.config.top_50_features_path.exists():
+            raise FileNotFoundError(
+                f"Top 50 features file not found at: {self.config.top_50_features_path}"
+            )
 
-    #     with open(self.config.top_50_features_path, "r", encoding="utf-8") as f:
-    #         features = json.load(f)
+        with open(self.config.top_50_features_path, "r", encoding="utf-8") as f:
+            features = json.load(f)
 
-    #     logging.info(f"   -> Loaded {len(features)} Top 50 features.")
-    #     return features
+        logging.info(f"   -> Loaded {len(features)} Top 50 features.")
+        return features
 
     def _discover_partitions(self) -> List[datetime.date]:
         # M2 の学習データ (S7_META_LABELED_OOF_PARTITIONED) からパーティションを見つける

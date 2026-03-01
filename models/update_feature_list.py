@@ -6,7 +6,7 @@ from pathlib import Path
 # 代表的なParquetファイル（どの日のものでもOK）
 # 実行中のプロセスが完了した後で、確実に存在するものを使用
 source_parquet_file = Path(
-    "/workspace/data/XAUUSD/stratum_6_training/1A_2B/labeled_dataset_partitioned_v2/year=2022/month=5/day=1/data.parquet"
+    "/workspace/data/XAUUSD/stratum_6_training/1A_2B/labeled_dataset_partitioned_v2/year=2022/month=5/day=2/data.parquet"
 )
 
 # 出力する新しい特徴量リストのパス

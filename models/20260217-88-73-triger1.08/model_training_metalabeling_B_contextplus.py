@@ -47,7 +47,8 @@ class MetaLabelingConfig:
     weighted_dataset_path: Path = S6_WEIGHTED_DATASET
     output_dir: Path = S7_META_LABELED_OOF_PARTITIONED
     # [修正] JSONパスを廃止し、全特徴量リストのパスに変更
-    feature_list_path: Path = S3_FEATURES_FOR_TRAINING
+    # [修正] 作成したM2用リストを指定
+    feature_list_path: Path = project_root / "models" / "selected_features_m2.txt"
     top_n_per_day: int = 20
     test: bool = False
 
@@ -56,7 +57,7 @@ class MetaLabelGenerator:
     def __init__(self, config: MetaLabelingConfig):
         self.config = config
         self.partitions = self._discover_partitions()
-        # [修正] 全特徴量をロード
+        # [修正] メソッド名を変更して呼び出し
         self.features = self._load_features()
 
         if self.config.test:
@@ -83,49 +84,18 @@ class MetaLabelGenerator:
         logging.info(f"  -> Discovered {len(dates)} daily partitions.")
         return dates
 
+    # [修正] テキストファイル読み込みに変更
     def _load_features(self) -> List[str]:
         logging.info(f"Loading feature list from {self.config.feature_list_path}...")
         if not self.config.feature_list_path.exists():
             raise FileNotFoundError(
-                f"Feature list file not found at: {self.config.feature_list_path}"
+                f"Feature list not found: {self.config.feature_list_path}"
             )
 
         with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
+            features = [line.strip() for line in f if line.strip()]
 
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-            "meta_label",
-            "m1_pred_proba",  # B/C特有のメタデータも除外
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(f"  -> Loaded {len(features)} valid features.")
+        logging.info(f"  -> Loaded {len(features)} features (Selected M2).")
         return features
 
     # ==============================================================================

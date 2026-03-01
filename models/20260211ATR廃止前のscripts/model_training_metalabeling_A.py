@@ -119,51 +119,17 @@ class M1CrossValidator:
         # --- ★★★ (維持) ここまで ★★★ ---
 
     def _load_features(self) -> List[str]:
-        # [修正] Top 50 (JSON) ではなく、Configで指定された全特徴量リスト (txt) を読み込む
-        logging.info(f"Loading features from {self.config.feature_list_path}...")
+        # ★★★ [実験①: Top 50モード] ★★★
+        top_50_path = project_root / "models" / "TOP_50_FEATURES.json"
+        logging.info(f"Loading Top 50 features from {top_50_path} for M1...")
 
-        if not self.config.feature_list_path.exists():
-            raise FileNotFoundError(
-                f"Feature list file not found: {self.config.feature_list_path}"
-            )
+        if not top_50_path.exists():
+            raise FileNotFoundError(f"Top 50 file not found: {top_50_path}")
 
-        with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
+        with open(top_50_path, "r", encoding="utf-8") as f:
+            features = json.load(f)
 
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            # 動的に生成されるトリガーフラグも除外
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(
-            f"   -> Loaded {len(features)} valid features (filtered out metadata)."
-        )
+        logging.info(f"   -> Loaded {len(features)} features (Top 50 only).")
         return features
 
     def _discover_partitions(self) -> List[datetime.date]:

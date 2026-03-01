@@ -83,6 +83,7 @@ class MetaLabelGenerator:
         logging.info(f"  -> Discovered {len(dates)} daily partitions.")
         return dates
 
+    # [修正] メソッド名とロジックを変更
     def _load_features(self) -> List[str]:
         logging.info(f"Loading feature list from {self.config.feature_list_path}...")
         if not self.config.feature_list_path.exists():
@@ -91,41 +92,9 @@ class MetaLabelGenerator:
             )
 
         with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
+            features = [line.strip() for line in f if line.strip()]
 
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-            "meta_label",
-            "m1_pred_proba",  # B/C特有のメタデータも除外
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(f"  -> Loaded {len(features)} valid features.")
+        logging.info(f"  -> Loaded {len(features)} features.")
         return features
 
     # ==============================================================================

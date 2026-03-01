@@ -63,8 +63,8 @@ class FinalTrainingConfig:
     weighted_dataset_path: Path = S6_WEIGHTED_DATASET
     meta_labeled_oof_path: Path = S7_META_LABELED_OOF_PARTITIONED
     m1_oof_path: Path = S7_M1_OOF_PREDICTIONS
-    feature_list_path: Path = S3_FEATURES_FOR_TRAINING
-    top_50_features_path: Path = project_root / "models" / "TOP_50_FEATURES.json"
+    feature_list_m1_path: Path = project_root / "models" / "selected_features_m1.txt"
+    feature_list_m2_path: Path = project_root / "models" / "selected_features_m2.txt"
     n_splits: int = 5
     purge_days: int = 3
     embargo_days: int = 2
@@ -141,14 +141,10 @@ class FinalAssembler:
     def __init__(self, config: FinalTrainingConfig):
         self.config = config
 
-        # [修正] Top 50 (JSON) 読み込みを廃止し、既存の _load_features (txt) を使用する
-        self.all_features = self._load_features()
-
-        # M1用の特徴量 (Base) -> 全特徴量を使用
-        self.features_base: List[str] = self.all_features
-
-        # M2用の特徴量 -> 全特徴量 + m1_pred_proba
-        self.features_m2: List[str] = ["m1_pred_proba"] + self.all_features
+        # [修正] M1とM2で別々のリストをロード
+        logging.info("Loading feature lists...")
+        self.features_base = self._load_features(self.config.feature_list_m1_path)
+        self.features_m2 = self._load_features(self.config.feature_list_m2_path)
 
         # ... (以下変更なし) ...
         # -----------------------------------------------------------------------
@@ -168,46 +164,12 @@ class FinalAssembler:
         self.config.lgbm_params_m2["scale_pos_weight"] = self.scale_pos_weight_m2
         logging.info(f"Using scale_pos_weight for M2: {self.scale_pos_weight_m2:.4f}")
 
-    def _load_features(self) -> List[str]:
-        logging.info(
-            f"Loading base feature list from {self.config.feature_list_path}..."
-        )
-        with open(self.config.feature_list_path, "r") as f:
-            raw_features = [line.strip() for line in f if line.strip()]
-
-        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
-        exclude_exact = {
-            "timestamp",
-            "timeframe",
-            "t1",
-            "label",
-            "uniqueness",
-            "payoff_ratio",
-            "pt_multiplier",
-            "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
-            "atr_value",
-            "calculated_body_ratio",
-            "fallback_vol",
-            "open",
-            "high",
-            "low",
-            "close",
-            "meta_label",
-            "m1_pred_proba",  # B/C特有のメタデータも除外
-        }
-
-        features = []
-        for col in raw_features:
-            if col in exclude_exact:
-                continue
-            if col.startswith("is_trigger_on"):
-                continue
-            features.append(col)
-
-        logging.info(f"   -> Loaded {len(features)} valid base features.")
+    # [修正] 引数でパスを受け取るように変更
+    def _load_features(self, path: Path) -> List[str]:
+        if not path.exists():
+            raise FileNotFoundError(f"Feature list not found at: {path}")
+        with open(path, "r") as f:
+            features = [line.strip() for line in f if line.strip()]
         return features
 
     # def _load_top_50_features(self) -> List[str]:

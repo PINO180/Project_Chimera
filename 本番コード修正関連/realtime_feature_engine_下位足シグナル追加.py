@@ -4136,31 +4136,23 @@ class RealtimeFeatureEngine:
         )
 
         # 3. 独立したデータバッファを初期化 (矛盾②)
-        # [V7.0 修正] 上位足参照用キャッシュの初期化
         self.data_buffers: Dict[str, Dict[str, Deque[float]]] = {}
         self.is_buffer_filled: Dict[str, bool] = {}
         self.last_bar_timestamps: Dict[str, Optional[pd.Timestamp]] = {}
-        self.latest_features_cache: Dict[
-            str, Dict[str, float]
-        ] = {}  # {tf: {feat_name: val}}
 
         for tf_name in self.ALL_TIMEFRAMES.keys():
             if self.ALL_TIMEFRAMES[tf_name] is None:
                 continue  # tick, M0.5 はスキップ
 
-            # [V7.1 修正] 名簿にない時間足（M1など）でもバッファを作成し、lookbacks_by_tf に登録する
-            # これを行わないと、fill_all_buffers で KeyError: 'M1' になる
+            # この時間足で計算すべき特徴量があるか？
             if tf_name not in self.lookbacks_by_tf:
-                self.lookbacks_by_tf[tf_name] = self.DEFAULT_LOOKBACK
                 self.logger.debug(
-                    f"  -> {tf_name} バッファ初期化 (Default: {self.DEFAULT_LOOKBACK}) [ATR計算/リサンプリング用]"
+                    f"時間足 {tf_name} は特徴量名簿にないためスキップします。"
                 )
-            else:
-                self.logger.info(
-                    f"  -> {tf_name} バッファ初期化 (Lookback: {self.lookbacks_by_tf[tf_name]})"
-                )
+                continue
 
             lookback = self.lookbacks_by_tf[tf_name]
+            self.logger.info(f"  -> {tf_name} バッファ初期化 (Lookback: {lookback})")
 
             # 各OHLCVカラムのDequeを作成
             self.data_buffers[tf_name] = {
@@ -4170,17 +4162,11 @@ class RealtimeFeatureEngine:
             self.is_buffer_filled[tf_name] = False
             # 最終タイムスタンプ (リサンプリングの基準)
             self.last_bar_timestamps[tf_name] = None
-            # キャッシュ初期化
-            self.latest_features_cache[tf_name] = {}
 
         # 4. M1データを保持するDeque (リサンプリング元)
         # (pd.concatによるメモリコピー地獄を回避するため)
         # MFDFA(5000) * D1(1440) + マージン
-        # lookbacks_by_tf が空の場合のエラー回避
-        max_lookback_val = (
-            max(self.lookbacks_by_tf.values()) if self.lookbacks_by_tf else 5000
-        )
-        max_m1_bars_needed = max_lookback_val * 1440 + 1000
+        max_m1_bars_needed = max(self.lookbacks_by_tf.values()) * 1440 + 1000
         self.m1_dataframe: Deque[Dict[str, Any]] = deque(maxlen=max_m1_bars_needed)
 
         # --- [V6.5 修正: 問題3 ボトルネック解決] ---
@@ -4199,9 +4185,7 @@ class RealtimeFeatureEngine:
         ]
 
         for tf_name in self.data_buffers.keys():
-            # [V7.0] バッファが存在する全時間足に対してOLS状態も初期化
-            lookback = self.data_buffers[tf_name]["close"].maxlen  # Dequeのmaxlenを取得
-
+            lookback = self.lookbacks_by_tf[tf_name]
             # [修正後] 'market_proxy' (x変数) のDequeも初期化する
             # 5a. Dequeを初期化 (y変数)
             self.proxy_feature_buffers[tf_name] = {
@@ -4734,9 +4718,12 @@ class RealtimeFeatureEngine:
         [I/F] main.py から M1 バーを受け取り、全バッファを更新し、
         シグナルをチェックして返す。
 
-        [V7.0 改修]
-        - リサンプリング確定時に特徴量を計算しキャッシュへ保存
-        - クロス参照（M1シグナル -> H1特徴量）に対応
+        Args:
+            m1_bar: MT5から取得した最新のM1バー (dict)
+            market_proxy_cache: [矛盾①解決] main.pyがロードしたM5市場プロキシDF
+
+        Returns:
+            シグナルオブジェクトのリスト
         """
         signal_list: List[Signal] = []
 
@@ -4769,40 +4756,15 @@ class RealtimeFeatureEngine:
             # M1もチェック対象に含める
             newly_closed_timeframes["M1"] = [m1_timestamp]
 
-            # 3. 新しくバーが確定した各時間足について処理
+            # 3. 新しくバーが確定した各時間足についてシグナルをチェック
             for tf_name, timestamps in newly_closed_timeframes.items():
                 for timestamp in timestamps:
-                    # --- [V7.0 追加] 特徴量キャッシュの更新 ---
-                    # 上位足（M1以外）またはTop 50に必要な足が確定したら特徴量を計算・保存
-                    # これにより、下位足シグナル時に上位足の最新値を参照できる
-                    if self.is_buffer_filled[tf_name]:
-                        try:
-                            # ベース計算
-                            data = {
-                                col: np.array(
-                                    self.data_buffers[tf_name][col], dtype=np.float64
-                                )
-                                for col in self.OHLCV_COLS
-                            }
-                            base_features = self._calculate_base_features(data, tf_name)
-                            # 純化
-                            neutralized = self._calculate_neutralized_features(
-                                base_features, tf_name, timestamp, market_proxy_cache
-                            )
-                            # キャッシュ更新
-                            self.latest_features_cache[tf_name] = neutralized
-                        except Exception as e:
-                            self.logger.warning(
-                                f"{tf_name} 特徴量キャッシュ更新失敗: {e}"
-                            )
-
-                    # --- シグナルチェック ---
                     # 3a. R4レジームフィルターをチェック
                     r4_check_result = self._check_for_signal(tf_name, timestamp)
 
                     if r4_check_result["is_r4"]:
                         # 3b. [矛盾①解決] R4の場合、純化済み特徴量ベクトルを計算
-                        # [V7.0] calculate_feature_vector 内でキャッシュを参照する
+                        # (純化には M5 プロキシキャッシュが必要)
                         feature_vector = self.calculate_feature_vector(
                             tf_name, timestamp, market_proxy_cache
                         )
@@ -4818,6 +4780,8 @@ class RealtimeFeatureEngine:
                             )
                             signal_list.append(signal)
 
+            # 4. メモリ管理: (V6.2) M1 Deque は maxlen で自動トリムされるため不要
+
             return signal_list
 
         except Exception as e:
@@ -4826,18 +4790,15 @@ class RealtimeFeatureEngine:
 
     def _check_for_signal(self, tf_name: str, timestamp: datetime) -> Dict[str, Any]:
         """
-        [Helper] (V4戦略 V7.0修正)
+        [Helper] (V4戦略)
         指定された時間足のバッファがR4レジーム (ATR比率条件) かを判定する。
         """
-        # [V7.0 修正] 許可リストに含まれる時間足以外は即座に除外
-        # Top 50に含まれる上位足(H12等)でも、シグナル発生（トレード判断）は下位足で行う
-        ALLOWED_TIMEFRAMES = ["M1", "M3", "M5", "M8", "M15", "H1"]
-        if tf_name not in ALLOWED_TIMEFRAMES:
-            return {"is_r4": False, "reason": "timeframe_not_allowed"}
-
-        # 管理対象外の時間足は除外
+        # [修正] 管理対象外の時間足（M1など）は即座に除外
         if tf_name not in self.data_buffers:
             return {"is_r4": False, "reason": "timeframe_not_managed"}
+
+        # if not self.is_buffer_filled[tf_name]:
+        #     return {"is_r4": False, "reason": "buffer_not_filled"}
 
         try:
             # R4判定用に、最新のATR(21)を計算
@@ -4859,7 +4820,7 @@ class RealtimeFeatureEngine:
             if np.isnan(atr_value):
                 return {"is_r4": False, "reason": "atr_is_nan"}
 
-            # [V7.0 修正] 変動ATRフィルター (価格の 0.15% 以上)
+            # [修正] 変動ATRフィルター (価格の 0.28% 以上)
             # ラベリングスクリプトの ATR_RATIO_THRESHOLD = 0.0015 と一致させる
             atr_threshold = current_price * 0.0015
 
@@ -5017,74 +4978,79 @@ class RealtimeFeatureEngine:
         self, tf_name: str, timestamp: datetime, market_proxy_cache: pd.DataFrame
     ) -> Optional[np.ndarray]:
         """
-        [修正 V7.0] (クロス参照対応)
-        指定されたシグナル時間足 (tf_name) に基づいてベクトルを構築する。
-        特徴量リストに含まれる時間足が tf_name と異なる場合、
-        キャッシュされている上位足の特徴量を参照する。
+        [修正] (矛盾①解決)
+        指定された時間足の現在のバッファから304個の全特徴量を計算し、
+        M5市場プロキシで「純化」する。
 
         Args:
-            tf_name: シグナル発生時間足 (例: "M1")
-            timestamp: シグナル発生時刻
-            market_proxy_cache: 市場プロキシDF
+            tf_name: 計算対象の時間足 (e.g., "M15")
+            timestamp: シグナル発生時刻 (純化のアライメント用)
+            market_proxy_cache: main.pyがロードしたM5市場プロキシDF
 
         Returns:
-            純化済み特徴量ベクトル (1, N)
+            純化済み特徴量ベクトル (Numpy配列)、またはエラーの場合は None
         """
         if not self.is_buffer_filled[tf_name]:
             self.logger.warning(f"特徴量計算スキップ ({tf_name}): バッファ未充填")
             return None
 
         try:
-            # 1. 自身の時間足の特徴量を計算 (まだキャッシュされていない最新M1など)
-            #    process_new_m1_bar でキャッシュ更新済みだが、念のため。
-            #    ただし、M1シグナルは「今」形成されたばかりのバーで判定するため、
-            #    latest_features_cache[tf_name] を正とする。
+            # 1. バッファをNumpy配列に変換
+            data = {
+                col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
+                for col in self.OHLCV_COLS
+            }
 
-            # 2. 名簿の順番通りにベクトルを構築
+            # 2. ベース特徴量の計算 (V5.1ロジック)
+            # (e.g., {'e1c_atr_21': 1.85, 'e1a_statistical_kurtosis_50': 3.2, ...})
+            base_features = self._calculate_base_features(data, tf_name)
+
+            # 3. アルファの純化 (Neutralization) [矛盾①解決]
+            #  (05_alpha_decay_analyzer.py のロジックを移植)
+            neutralized_features = self._calculate_neutralized_features(
+                base_features, tf_name, timestamp, market_proxy_cache
+            )
+
+            # 4. 名簿の順番通りにベクトルを構築
             feature_vector = []
 
-            # 時間足サフィックス抽出用の正規表現
-            # (e.g., "_M1", "_H1", "_D1", "_H12")
-            tf_pattern = re.compile(r"_(M[0-9\.]+|H[0-9]+|D[0-9]+|W[0-9]+|MN|tick)$")
-
+            # サフィックス付きの名簿 (e.g., "e1a_statistical_kurtosis_50_neutralized_D1")
             for feature_name_in_list in self.feature_list:
-                # 2a. 特徴量がどの時間足に属するか特定
-                tf_match = tf_pattern.search(feature_name_in_list)
-                target_tf = tf_match.group(1) if tf_match else None
+                # [修正] 該当する時間足かチェック
+                if feature_name_in_list.endswith(f"_{tf_name}"):
+                    # 該当する場合: 計算済みの値をセット
 
-                if not target_tf:
-                    # 時間足が付いていない異常な特徴量名 -> 0埋め
+                    # --- ▼▼▼ [V11.1 堅牢化] ベース名抽出ロジックの修正 ▼▼▼ ---
+                    if "_neutralized_" in feature_name_in_list:
+                        # 純化済み特徴量の場合: "feat_neutralized_M15" -> "feat"
+                        base_name = feature_name_in_list.split("_neutralized_")[0]
+                    else:
+                        # 生の特徴量の場合 (フォールバック): "feat_M15" -> "feat"
+                        # 右側から最初の "_" で分割してサフィックスを除去
+                        base_name = feature_name_in_list.rsplit("_", 1)[0]
+                    # --- ▲▲▲ 修正ここまで ▲▲▲ ---
+
+                    if base_name in neutralized_features:
+                        feature_vector.append(neutralized_features[base_name])
+                    else:
+                        # 計算マップになかった場合
+                        # self.logger.warning(f"特徴量 {base_name} が見つかりません。0.0 を使用します。")
+                        feature_vector.append(0.0)
+                else:
+                    # [修正] 該当しない時間足の場合:
+                    # AIの入力次元数を保つために 0.0 で埋める (Padding)
                     feature_vector.append(0.0)
-                    continue
 
-                # 2b. ベース特徴量名を抽出
-                # (例: "e1c_rsi_14_neutralized_H12" -> "e1c_rsi_14")
-                if "_neutralized_" in feature_name_in_list:
-                    base_name = feature_name_in_list.split("_neutralized_")[0]
-                else:
-                    # 生の特徴量の場合: サフィックスを除去
-                    base_name = feature_name_in_list.rsplit("_", 1)[0]
+            # ベクトルが空、または全て0の場合のチェックは必要だが、
+            # 304個埋めているので empty チェックは不要になる
 
-                # 2c. 値の取得 (クロス参照)
-                value = 0.0
-
-                # キャッシュから取得を試みる
-                # (H12などの上位足は process_new_m1_bar のリサンプリングループで既に計算され
-                #  latest_features_cache に格納されているはず)
-                if target_tf in self.latest_features_cache:
-                    features_dict = self.latest_features_cache[target_tf]
-                    value = features_dict.get(base_name, 0.0)
-                else:
-                    # キャッシュがない場合 (初期化直後など)
-                    value = 0.0
-
-                feature_vector.append(value)
-
-            # 3. 最終的なベクトルをNaNチェック (0で埋める)
+            # 5. 最終的なベクトルをNaNチェック (0で埋める)
             final_vector = np.nan_to_num(
                 np.array(feature_vector), nan=0.0, posinf=0.0, neginf=0.0
             )
 
+            # (1, N) の形状にして返す (Nは
+            # この時間足に属する特徴量の数)
             return np.array([final_vector])
 
         except Exception as e:
