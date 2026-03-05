@@ -2,15 +2,18 @@
 
 import sys
 import polars as pl
+import pyarrow.parquet as pq
 from pathlib import Path
 import logging
+import os
 import shutil
-from typing import List
+from typing import Dict
 
 # プロジェクトのルートディレクトリをPythonの検索パスに追加
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 # blueprintから一元管理された設定を読み込む
+# [MODIFIED] 月次ではなく、日次のパーティションデータを入力とする
 from blueprint import (
     S6_LABELED_DATASET,
     S6_WEIGHTED_DATASET,
@@ -28,22 +31,36 @@ logging.basicConfig(
 )
 
 
-def get_partitions(input_dir: Path) -> List[Path]:
-    """日次パーティションのファイルパス一覧を取得する。"""
-    logging.info("Step 1: Finding daily partitions...")
+def get_partition_info(input_dir: Path) -> Dict[Path, Dict[str, int]]:
+    """各パーティションファイルのオフセットと行数を計算する。"""
+    logging.info("Step 1: Calculating row counts and offsets for each partition...")
+    # [MODIFIED] 日次パーティションを探索するようにglobパターンを修正
     partitions = sorted(input_dir.glob("year=*/month=*/day=*/*.parquet"))
     if not partitions:
         raise FileNotFoundError(
             f"No daily parquet files found in the expected Hive structure within {input_dir}"
         )
 
-    logging.info(f"   -> Found {len(partitions)} daily partitions.")
-    return partitions
+    partition_info = {}
+    total_rows = 0
+    for path in partitions:
+        try:
+            row_count = pq.ParquetFile(path).metadata.num_rows
+            partition_info[path] = {"offset": total_rows, "rows": row_count}
+            total_rows += row_count
+        except Exception as e:
+            logging.error(f"Failed to read metadata from {path}: {e}")
+            raise
+
+    logging.info(
+        f"   -> Found {len(partitions)} daily partitions. Total rows: {total_rows}. Info calculated."
+    )
+    return partition_info
 
 
 def main():
-    """メインオーケストレーション関数（日次・逐次処理版・V5仕様）"""
-    logging.info("### Final Battle Stage 2: Daily Sequential Assembly (V5) ###")
+    """メインオーケストレーション関数（日次・逐次処理版）"""
+    logging.info("### Final Battle Stage 2: Daily Sequential Assembly ###")
 
     if not CONCURRENCY_RESULTS_PATH.exists():
         logging.error(
@@ -59,12 +76,13 @@ def main():
         shutil.rmtree(S6_WEIGHTED_DATASET)
     S6_WEIGHTED_DATASET.mkdir(parents=True)
 
-    # --- ステージ1: パーティション情報の取得 ---
-    partitions = get_partitions(S6_LABELED_DATASET)
+    # --- ステージ1: 各パーティションの情報を取得 ---
+    # [MODIFIED] 日次データセットのパスを使用
+    partition_info_map = get_partition_info(S6_LABELED_DATASET)
 
     # --- ステージ2: 逐次処理ループ ---
     logging.info(
-        f"Stage 2: Starting sequential processing of {len(partitions)} daily partitions."
+        f"Stage 2: Starting sequential processing of {len(partition_info_map)} daily partitions."
     )
 
     error_count = 0
@@ -73,44 +91,44 @@ def main():
     # concurrency_resultsを一度だけ遅延スキャンしておく
     concurrency_lf = pl.scan_parquet(CONCURRENCY_RESULTS_PATH)
 
-    for i, path in enumerate(partitions):
+    for i, (path, info) in enumerate(partition_info_map.items()):
         partition_name = f"{path.parent.parent.parent.name}/{path.parent.parent.name}/{path.parent.name}"
         logging.info(
-            f"Processing: [{i + 1}/{len(partitions)}] - Partition {partition_name}..."
+            f"Processing: [{i + 1}/{len(partition_info_map)}] - Partition {partition_name}..."
         )
 
         try:
-            # 日次パーティションを遅延スキャン
+            # このパーティションが担当するevent_idの範囲を計算
+            offset = info["offset"]
+            row_count = info["rows"]
+
+            # 行数が0のパーティションはスキップ
+            if row_count == 0:
+                logging.warning(f"Skipping empty partition: {partition_name}")
+                continue
+
+            start_id = offset + 1
+            end_id = offset + row_count
+
+            # 担当パーティションを遅延スキャン
             labeled_lf = pl.scan_parquet(path)
 
-            # timestampをキーにしてLeft Joinし、双方向のuniquenessを計算
-            final_lf = (
-                labeled_lf.join(concurrency_lf, on="timestamp", how="left")
-                .with_columns(
-                    [
-                        # concurrency_long が存在し、かつ0より大きい場合に uniqueness_long を計算
-                        pl.when(
-                            pl.col("concurrency_long").is_not_null()
-                            & (pl.col("concurrency_long") > 0)
-                        )
-                        .then(1.0 / pl.col("concurrency_long"))
-                        .otherwise(0.0)
-                        .alias("uniqueness_long"),
-                        # concurrency_short が存在し、かつ0より大きい場合に uniqueness_short を計算
-                        pl.when(
-                            pl.col("concurrency_short").is_not_null()
-                            & (pl.col("concurrency_short") > 0)
-                        )
-                        .then(1.0 / pl.col("concurrency_short"))
-                        .otherwise(0.0)
-                        .alias("uniqueness_short"),
-                    ]
-                )
-                # 中間カラムである concurrency を削除（必要に応じて残す場合は以下の行をコメントアウト）
-                .select(pl.all().exclude(["concurrency_long", "concurrency_short"]))
+            # concurrencyデータから必要な範囲だけをフィルタリング
+            concurrency_slice_lf = concurrency_lf.filter(
+                pl.col("event_id").is_between(start_id, end_id)
             )
 
-            # 日次パーティションのパスから年/月/日を抽出
+            # event_idを付与し、スライス済みのconcurrencyを結合
+            final_lf = (
+                labeled_lf.sort("timestamp", "t1")
+                .with_row_count(name="row_num", offset=offset)
+                .with_columns((pl.col("row_num") + 1).alias("event_id"))
+                .join(concurrency_slice_lf, on="event_id", how="left")
+                .with_columns((1.0 / pl.col("concurrency")).alias("uniqueness"))
+                .select(pl.all().exclude(["row_num", "concurrency"]))
+            )
+
+            # [MODIFIED] 日次パーティションのパスから年/月/日を抽出
             day_part = path.parent.name
             month_part = path.parent.parent.name
             year_part = path.parent.parent.parent.name
@@ -125,13 +143,6 @@ def main():
 
             # 計算を実行し、結果をファイルに書き出す
             result_df = final_lf.collect(streaming=True)
-
-            if len(result_df) == 0:
-                logging.warning(
-                    f"Empty dataframe after processing partition: {partition_name}"
-                )
-                continue
-
             result_df.write_parquet(output_path, compression="zstd")
             total_processed_rows += len(result_df)
 
@@ -145,7 +156,7 @@ def main():
     if error_count == 0:
         logging.info("### MISSION ACCOMPLISHED! All Stages COMPLETED! ###")
         logging.info(
-            f"Successfully processed {len(partitions)} partitions ({total_processed_rows} rows)."
+            f"Successfully processed {len(partition_info_map)} partitions ({total_processed_rows} rows)."
         )
         logging.info(f"The final weighted dataset is ready at: {S6_WEIGHTED_DATASET}")
     else:

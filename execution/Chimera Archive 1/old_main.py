@@ -42,10 +42,7 @@ from execution.state_manager import (
 
 # [V11.0] V3 (ハイブリッドZMQ/ゼロ・シリアライズ) をインポート
 from execution.mql5_bridge_publisher import MQL5BridgePublisherV3, BridgeConfig
-from execution.extreme_risk_engine import (
-    ExtremeRiskEngineV5,
-    MarketInfo,
-)  # [FIX-2] MarketInfo は extreme_risk_engine に定義済み
+from execution.extreme_risk_engine import ExtremeRiskEngineV5, MarketInfo
 from execution.realtime_feature_engine import RealtimeFeatureEngine
 
 # --- ログ設定 ---
@@ -97,10 +94,7 @@ g_market_proxy: Optional[pd.DataFrame] = (
 # ==================================================================
 # 🚨 Project Cimera (V5) 戦略パラメータ 🚨
 # ==================================================================
-risk_engine = ExtremeRiskEngineV5(config_path=str(config.CONFIG_RISK))
-M2_PROBA_THRESHOLD = risk_engine.config.get("m2_proba_threshold", 0.50)
-MAX_DRAWDOWN = risk_engine.config.get("max_drawdown", 0.50)
-MAX_POSITIONS = risk_engine.config.get("max_positions", 1000)
+M2_PROBA_THRESHOLD = 0.55  # Two-Brain推論のシグナル発火閾値
 
 # ==================================================================
 # 🚨 リアルタイムデータ取得 (ZMQ経由) 🚨
@@ -441,19 +435,23 @@ def main():
                                 }
                             )
 
-                            # [FIX-8] パブリック API apply_event_and_update を使用
+                            # イベントを発火させ、ローカル状態から削除
                             event_data = {
                                 "ticket": trade.ticket,
                                 "close_reason": "TO",
-                                "max_consecutive_sl": risk_engine.config.get(
-                                    "max_consecutive_sl", 2
-                                ),
-                                "cooldown_minutes_after_sl": risk_engine.config.get(
-                                    "cooldown_minutes_after_sl", 10
-                                ),
+                                "max_consecutive_sl": 2,  # バックテスト設定に準拠
+                                "cooldown_minutes_after_sl": 10,
                             }
-                            state_manager.apply_event_and_update(
+                            state_manager.append_event(
                                 EventType.POSITION_CLOSED, event_data
+                            )
+                            event_dict = {
+                                "event_type": EventType.POSITION_CLOSED.value,
+                                "data": event_data,
+                                "timestamp": current_time.isoformat(),
+                            }
+                            state_manager.current_state = state_manager._apply_event(
+                                state_manager.current_state, event_dict
                             )
 
                 # ==========================================================
@@ -479,15 +477,24 @@ def main():
                                 logger.warning(
                                     f"🔔 ブローカー側での決済を検知 (サイレントクローズ捕捉): Ticket={ticket}, Reason={reason}"
                                 )
-                                # [FIX-8] パブリック API apply_event_and_update を使用
                                 event_data = {
                                     "ticket": ticket,
                                     "close_reason": reason,  # "SL" または "PT"
                                     "max_consecutive_sl": 2,
                                     "cooldown_minutes_after_sl": 10,
                                 }
-                                state_manager.apply_event_and_update(
+                                state_manager.append_event(
                                     EventType.POSITION_CLOSED, event_data
+                                )
+                                event_dict = {
+                                    "event_type": EventType.POSITION_CLOSED.value,
+                                    "data": event_data,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                }
+                                state_manager.current_state = (
+                                    state_manager._apply_event(
+                                        state_manager.current_state, event_dict
+                                    )
                                 )
 
                 # 新しい足が確定したタイミングで、ブローカーと最終同期
@@ -525,19 +532,13 @@ def main():
                         return np.array([[f_dict.get(f, 0.0) for f in f_list]])
 
                     # --- Two-Brain 並列推論 (LightGBM Booster は predict_proba ではなく predict を使用) ---
-                    # [FIX-1] Long と Short で独立したキーを使用し、m1_pred_proba の上書きバグを修正
-
                     # 1. Long 側推論
                     X_long_m1 = extract_features(feature_lists["long_m1"], feature_dict)
                     p_long_m1 = models["long_m1"].predict(X_long_m1)[0]
 
-                    # Long M2 用の feature_dict コピーに Long の M1 確率をセット
-                    feature_dict_long = dict(feature_dict)
-                    feature_dict_long["m1_pred_proba"] = p_long_m1
+                    feature_dict["m1_pred_proba"] = p_long_m1
 
-                    X_long_m2 = extract_features(
-                        feature_lists["long_m2"], feature_dict_long
-                    )
+                    X_long_m2 = extract_features(feature_lists["long_m2"], feature_dict)
                     p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
 
                     # 2. Short 側推論
@@ -546,12 +547,10 @@ def main():
                     )
                     p_short_m1 = models["short_m1"].predict(X_short_m1)[0]
 
-                    # Short M2 用の feature_dict コピーに Short の M1 確率をセット
-                    feature_dict_short = dict(feature_dict)
-                    feature_dict_short["m1_pred_proba"] = p_short_m1
+                    feature_dict["m1_pred_proba"] = p_short_m1
 
                     X_short_m2 = extract_features(
-                        feature_lists["short_m2"], feature_dict_short
+                        feature_lists["short_m2"], feature_dict
                     )
                     p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
 
@@ -564,15 +563,13 @@ def main():
                     logger.info(
                         f"🧠 [M2 Calibrated] Long: {p_long_m2_calib:.4f} | Short: {p_short_m2_calib:.4f}"
                     )
-                    # [FIX-5] M2_PROBA_THRESHOLD 定数を参照 (ハードコード 0.50 を廃止)
-                    should_trade_long = p_long_m2_calib > M2_PROBA_THRESHOLD
-                    should_trade_short = p_short_m2_calib > M2_PROBA_THRESHOLD
+                    THRESHOLD = 0.50
+                    should_trade_long = p_long_m2_calib > THRESHOLD
+                    should_trade_short = p_short_m2_calib > THRESHOLD
 
                     # --- 1. 同時発注禁止 & 両建て防止 (prevent_simultaneous_orders) ---
                     # ※バックテストの default_config.prevent_simultaneous_orders = True に準拠
-                    prevent_simultaneous_orders = risk_engine.config.get(
-                        "prevent_simultaneous_orders", True
-                    )
+                    prevent_simultaneous_orders = True
 
                     if prevent_simultaneous_orders:
                         # ステップA: ノイズ検知（両方向のシグナルが同時に出た場合は問答無用で両方キャンセル）
@@ -616,25 +613,7 @@ def main():
                         )
                         should_trade_short = False
 
-                    # --- 3. ドローダウン上限チェック (防衛線3) ---
-                    current_dd = state_manager.current_state.current_drawdown
-                    if current_dd >= MAX_DRAWDOWN:
-                        logger.warning(
-                            f"🛑 【防衛線3】最大ドローダウン超過 ({current_dd:.1%} >= {MAX_DRAWDOWN:.1%})。全エントリーを停止します。"
-                        )
-                        should_trade_long = False
-                        should_trade_short = False
-
-                    # --- 4. 最大ポジション数チェック (防衛線4) ---
-                    current_pos_count = len(state_manager.current_state.trades)
-                    if current_pos_count >= MAX_POSITIONS:
-                        logger.warning(
-                            f"🛑 【防衛線4】最大ポジション数到達 ({current_pos_count}/{MAX_POSITIONS})。新規エントリーを停止します。"
-                        )
-                        should_trade_long = False
-                        should_trade_short = False
-
-                    # --- 5. 最終的な方向と確率の決定 ---  ← 番号を繰り下げ
+                    # --- 3. 最終的な方向と確率の決定 ---
                     direction = None
                     final_proba = 0.0
 
@@ -663,13 +642,16 @@ def main():
                         current_price=signal.market_info["current_price"],
                         atr=current_atr,
                         equity=state_manager.current_state.current_equity,
-                        sl_multiplier=risk_engine.config.get("sl_multiplier", 5.0),
-                        tp_multiplier=risk_engine.config.get("pt_multiplier", 1.0),
+                        sl_multiplier=risk_engine.config.get(
+                            "base_atr_sl_multiplier", 5.0
+                        ),
+                        tp_multiplier=risk_engine.config.get(
+                            "base_atr_tp_multiplier", 1.0
+                        ),
                     )
 
                     # V5エンジンは独立したため、ここでイベントログを記録する
-                    # [FIX-8] use_event_sourcing フラグは append_event 内でチェック済みのため直接呼ぶ
-                    if command["action"] != "HOLD":
+                    if command["action"] != "HOLD" and state_manager.use_event_sourcing:
                         state_manager.append_event(
                             EventType.TRADE_SIGNAL_SENT, {"command": command}
                         )

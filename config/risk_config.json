@@ -1,23 +1,18 @@
 {
-  "base_risk_percent": 0.02,
-  "max_drawdown": 0.5,
-  "drawdown_reduction_threshold": 1.0,
-  "base_confidence_threshold": 0.6,
-  "min_risk_reward_ratio": 0.1,
-  "base_atr_sl_multiplier": 5.0,
-  "base_atr_tp_multiplier": 1.0,
-  "kelly_fraction": 1.0,
-  "max_risk_per_trade": 0.01,
-  "max_positions": 10,
+  "base_capital": 1000.0,
+  "lot_per_base": 1.0,
+  "max_lot_absolute": 200.0,
   "contract_size": 100.0,
-  "pip_value_per_lot": 1.0,
-  "pip_multiplier": 100.0,
   "min_lot_size": 0.01,
   "base_leverage": 2000.0,
-  "time_filters": {
-    "blocked_hours_before_news": 0.5,
-    "blocked_hours_after_news": 0.5,
-    "blocked_hours_weekend_close": 4,
-    "blocked_hours_weekend_open": 2
-  }
+  "sl_multiplier": 5.0,
+  "pt_multiplier": 1.0,
+  "m2_proba_threshold": 0.50,
+  "max_consecutive_sl": 2,
+  "cooldown_minutes_after_sl": 10,
+  "spread_pips": 16.0,
+  "value_per_pip": 1.0,
+  "prevent_simultaneous_orders": true,
+  "max_drawdown": 0.50,
+  "max_positions": 1000
 }

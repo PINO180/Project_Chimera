@@ -1,4 +1,4 @@
-# /workspace/scripts/sample_uniqueness_weighting_calculate.py
+# /workspace/scripts/sample_uniqueness_weighting_calculate_v5.py
 
 import sys
 import duckdb
@@ -25,11 +25,12 @@ logging.basicConfig(
 
 def main():
     """
-    第一段階：ウィンドウ関数を駆使した高効率アルゴリズムで「並行数(concurrency)」の計算のみに特化し、
-    結果を小さな中間ファイルとして出力する。
+    V5仕様（Project Cimera）対応版：
+    ウィンドウ関数を用いた高効率アルゴリズムで、Long/Short双方の
+    「並行数(concurrency)」を計算し、中間ファイルとして出力する。
     """
     logging.info(
-        "### Final Battle Stage 1: Calculating Concurrency with Window Functions ###"
+        "### Final Battle Stage 1 (V5): Calculating Dual Concurrency with Window Functions ###"
     )
 
     input_path = str(S6_LABELED_DATASET_MONTHLY)
@@ -41,60 +42,92 @@ def main():
     logging.info(f"Temporary directory: {DUCKDB_TEMP_DIR_CONTAINER}")
     logging.info(f"Output path for results: {OUTPUT_PATH}")
 
-    # GeminiDeepResearchの最終報告書で推奨された、実運用レベルの最終SQLクエリ
+    # V5仕様に基づく双方向の並行数計算SQLクエリ
     query = f"""
-    -- 設定：これらの設定は安定性のために【極めて重要】
+    -- 設定：安定性のためのチューニング
     SET temp_directory = '{DUCKDB_TEMP_DIR_CONTAINER}';
     SET memory_limit = '20GB'; 
-    SET preserve_insertion_order = false; -- 最重要チューニング項目
-    SET enable_progress_bar = true; -- 進捗表示を有効化！
-    SET threads = 12; -- CPUコアをフル活用
+    SET preserve_insertion_order = false; 
+    SET enable_progress_bar = true; 
+    SET threads = 12; 
 
-    -- 最終結果を直接ファイルに書き出す
     COPY (
-        -- WITH句で処理を段階的に定義
-        WITH events_with_id AS (
-            -- ステップ0: event_idを付与
+        WITH base_events AS (
+            -- ステップ0: トリガー発生時点のみを抽出し、Long/Shortそれぞれの終了時刻を計算
+            -- ※ Float32の duration_long/short を分単位のインターバルとして加算
             SELECT
                 timestamp,
-                t1,
-                row_number() OVER (ORDER BY timestamp, t1) AS event_id
+                timestamp + interval '1 minute' * duration_long AS t1_long,
+                timestamp + interval '1 minute' * duration_short AS t1_short
             FROM read_parquet('{input_path}', hive_partitioning=true)
+            WHERE is_trigger = 1
         ),
-        event_stream AS (
-            -- ステップ1: イベント期間を「+1(開始)」と「-1(終了)」のポイントイベントに分解
-            SELECT event_id, timestamp AS event_time, 1 AS type FROM events_with_id
+        
+        -- ==========================================
+        -- Longサイドの並行数計算
+        -- ==========================================
+        event_stream_long AS (
+            SELECT timestamp, timestamp AS event_time, 1 AS type FROM base_events
             UNION ALL
-            SELECT event_id, t1 AS event_time, -1 AS type FROM events_with_id
+            SELECT timestamp, t1_long AS event_time, -1 AS type FROM base_events
         ),
-        concurrency_levels AS (
-            -- ステップ2: イベントを時間順に並べ、累積和で各時点の同時イベント数を計算
+        concurrency_levels_long AS (
             SELECT
                 event_time,
-                -- このウィンドウ関数がアルゴリズムの中核
                 SUM(type) OVER (ORDER BY event_time ASC, type DESC) AS active_intervals
-            FROM event_stream
+            FROM event_stream_long
         ),
-        final_concurrency AS (
-            -- ステップ3: 元のイベント開始時刻に、計算した同時イベント数を結合
+        final_concurrency_long AS (
             SELECT
-                e.event_id,
-                MAX(c.active_intervals) AS concurrency
-            FROM events_with_id AS e
-            JOIN concurrency_levels AS c ON e.timestamp = c.event_time
-            GROUP BY e.event_id
+                e.timestamp,
+                MAX(c.active_intervals) AS concurrency_long
+            FROM base_events AS e
+            JOIN concurrency_levels_long AS c ON e.timestamp = c.event_time
+            GROUP BY e.timestamp
+        ),
+        
+        -- ==========================================
+        -- Shortサイドの並行数計算
+        -- ==========================================
+        event_stream_short AS (
+            SELECT timestamp, timestamp AS event_time, 1 AS type FROM base_events
+            UNION ALL
+            SELECT timestamp, t1_short AS event_time, -1 AS type FROM base_events
+        ),
+        concurrency_levels_short AS (
+            SELECT
+                event_time,
+                SUM(type) OVER (ORDER BY event_time ASC, type DESC) AS active_intervals
+            FROM event_stream_short
+        ),
+        final_concurrency_short AS (
+            SELECT
+                e.timestamp,
+                MAX(c.active_intervals) AS concurrency_short
+            FROM base_events AS e
+            JOIN concurrency_levels_short AS c ON e.timestamp = c.event_time
+            GROUP BY e.timestamp
         )
-        -- 最終出力
-        SELECT * FROM final_concurrency
+        
+        -- ==========================================
+        -- 最終結果の結合
+        -- ==========================================
+        SELECT 
+            l.timestamp,
+            l.concurrency_long,
+            s.concurrency_short
+        FROM final_concurrency_long l
+        JOIN final_concurrency_short s ON l.timestamp = s.timestamp
+        ORDER BY l.timestamp
         
     ) TO '{OUTPUT_PATH}' (FORMAT PARQUET);
     """
 
     try:
         con = duckdb.connect()
-        logging.info("Executing the final, optimized query... The end is near.")
+        logging.info("Executing the V5 optimized query for dual concurrency...")
         con.execute(query)
-        logging.info("The final query executed successfully.")
+        logging.info("The V5 query executed successfully.")
     except Exception as e:
         logging.error(f"An error occurred during DuckDB execution: {e}", exc_info=True)
         raise
@@ -104,8 +137,8 @@ def main():
             logging.info("DuckDB connection closed.")
 
     logging.info("\n" + "=" * 60)
-    logging.info("### VICTORY! Stage 1 COMPLETED! ###")
-    logging.info(f"The 'engine block' is perfectly forged at: {OUTPUT_PATH}")
+    logging.info("### VICTORY! V5 Stage 1 COMPLETED! ###")
+    logging.info(f"The dual concurrency results are safely written to: {OUTPUT_PATH}")
     logging.info("=" * 60)
 
 

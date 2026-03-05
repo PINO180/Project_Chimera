@@ -8,13 +8,14 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-import json
 import re
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
+
+import blueprint as config
 
 # ==================================================================
 # 外部モジュール (Numba UDF群) のインポート
@@ -40,12 +41,6 @@ class Signal:
     market_info: Dict[str, Any]  # リスクエンジンに渡す市場文脈 (V4 R4ルール)
     atr_value: float  # 動的バリア計算用の定規(ATR)
     close_price: float  # 動的バリア計算用の起点(現在価格)
-    # [FIX-3] feature_dict を追加 — main.py で signal.feature_dict にアクセスするために必要
-    feature_dict: Dict[str, float] = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.feature_dict is None:
-            self.feature_dict = {}
 
 
 class RealtimeFeatureEngine:
@@ -96,8 +91,7 @@ class RealtimeFeatureEngine:
     def __init__(
         self,
         feature_list_path: str = str(
-            # [FIX-8] デフォルトを TOP_50_FEATURES.json に昇格 (main.py の明示指定と統一)
-            project_root / "models" / "TOP_50_FEATURES.json"
+            project_root / "models" / "final_feature_set_v3.txt"
         ),
     ):
         self.logger = logging.getLogger("ProjectCimera.FeatureEngine")
@@ -195,6 +189,8 @@ class RealtimeFeatureEngine:
             raise FileNotFoundError(f"Feature list not found: {path}")
 
         if p.suffix.lower() == ".json":
+            import json
+
             with open(p, "r", encoding="utf-8") as f:
                 features = json.load(f)
             return features
@@ -211,7 +207,6 @@ class RealtimeFeatureEngine:
             _ = engine_1A.rolling_skew_numba(dummy_data)
             _ = engine_1B.t分布_自由度_udf(dummy_data)
             _ = engine_1C.rolling_mean_numba(dummy_data, 10)
-            _ = engine_1C.calculate_schaff_trend_cycle_numba(dummy_data, 12, 26, 9)
             _ = engine_1D.hv_robust_udf(dummy_data)
             _ = engine_1E.spectral_centroid_udf(dummy_data)
             _ = engine_1F.rolling_linguistic_complexity_udf(dummy_data)
@@ -267,18 +262,17 @@ class RealtimeFeatureEngine:
         if last_ts is None:
             raise ValueError(f"バッファ {tf_name} のタイムスタンプがありません。")
 
-        # [FIX-INFO-2] Pandas 2.2以降の推奨エイリアスに更新 (T→min, H→h)
         freq_map = {
-            "M1": "1min",
-            "M3": "3min",
-            "M5": "5min",
-            "M8": "8min",
-            "M15": "15min",
-            "M30": "30min",
-            "H1": "1h",
-            "H4": "4h",
-            "H6": "6h",
-            "H12": "12h",
+            "M1": "1T",
+            "M3": "3T",
+            "M5": "5T",
+            "M8": "8T",
+            "M15": "15T",
+            "M30": "30T",
+            "H1": "1H",
+            "H4": "4H",
+            "H6": "6H",
+            "H12": "12H",
             "D1": "1D",
             "W1": "1W",
             "MN": "1MS",
@@ -521,19 +515,13 @@ class RealtimeFeatureEngine:
                 return []
 
             # 1. Dequeから必要なデータ「だけ」を抽出 (メモリコピー地獄を回避)
-            # [FIX-WARNING-5] off-by-one 修正: last_known_timestamp 以降のバーのみ収集し
-            # リサンプリングのオーバーラップ用に1本前のバーを追加する
             new_m1_bars_for_resampling = []
-            found_anchor = False
             for bar in reversed(self.m1_dataframe):
                 bar_ts = bar["timestamp"]
                 if bar_ts >= last_known_timestamp:
                     new_m1_bars_for_resampling.append(bar)
                 else:
-                    # 1本前のアンカーバーを追加してリサンプリングの境界を正確にする
-                    if not found_anchor:
-                        new_m1_bars_for_resampling.append(bar)
-                        found_anchor = True
+                    new_m1_bars_for_resampling.append(bar)
                     break
 
             new_m1_bars_for_resampling.reverse()
@@ -636,6 +624,7 @@ class RealtimeFeatureEngine:
                                 )
                                 for col in self.OHLCV_COLS
                             }
+                            # ※これらのメソッドは第4回で定義します
                             base_features = self._calculate_base_features(data, tf_name)
                             neutralized = self._calculate_neutralized_features(
                                 base_features, tf_name, timestamp, market_proxy_cache
@@ -655,10 +644,6 @@ class RealtimeFeatureEngine:
                         )
 
                         if feature_vector is not None:
-                            # [FIX-3] feature_dict を latest_features_cache から取得して Signal に詰める
-                            combined_features: Dict[str, float] = {}
-                            for _tf, _cache in self.latest_features_cache.items():
-                                combined_features.update(_cache)
                             signal = Signal(
                                 features=feature_vector,
                                 timestamp=timestamp,
@@ -670,7 +655,6 @@ class RealtimeFeatureEngine:
                                 close_price=r4_check_result["market_info"].get(
                                     "current_price", 0.0
                                 ),
-                                feature_dict=combined_features,
                             )
                             signal_list.append(signal)
 
@@ -843,18 +827,16 @@ class RealtimeFeatureEngine:
                     self.proxy_feature_buffers[tf_name]["market_proxy"].append(latest_x)
 
         except Exception as e:
-            feat_name_safe = locals().get("feat_name", "<unknown>")
             self.logger.warning(
-                f"[{tf_name}] 逐次OLSの更新に失敗 ({feat_name_safe}): {e}",
-                exc_info=False,
+                f"[{tf_name}] 逐次OLSの更新に失敗 ({feat_name}): {e}", exc_info=False
             )
 
     def _calculate_neutralized_features(
         self,
         base_features_dict: Dict[str, float],
         tf_name: str,
-        signal_timestamp: datetime,  # noqa: ARG002 – kept for API compatibility
-        market_proxy_cache_df: pd.DataFrame,  # noqa: ARG002 – kept for API compatibility
+        signal_timestamp: datetime,
+        market_proxy_cache_df: pd.DataFrame,
     ) -> Dict[str, float]:
         """
         逐次計算されたOLS状態を使って、瞬時に残差(純化済み特徴量)を計算する。
@@ -908,15 +890,16 @@ class RealtimeFeatureEngine:
         self, data: Dict[str, np.ndarray], tf_name: str
     ) -> Dict[str, float]:
         """
-        【特徴量ルーター：最適化版】
-        final_feature_set_v3.txt (304個) に必要な特徴量のみを計算。
-        不要なループやパラメータを排除し、外部モジュール(1A〜1C)へ委譲。
+        【特徴量ルーター】
+        304個の最終リスト(V3)に必要な特徴量のみを厳選し、
+        外部のNumbaモジュール(1A〜1F)へ委譲して計算する。
         """
         features = {}
 
-        # --- 高速化用内部ヘルパー ---
         def _window(arr: np.ndarray, window: int) -> np.ndarray:
-            return arr[-window:] if len(arr) >= window else arr
+            if window <= 0:
+                return np.array([], dtype=arr.dtype)
+            return arr[-window:] if window <= len(arr) else arr
 
         def _array(arr: np.ndarray) -> np.ndarray:
             return arr
@@ -941,10 +924,18 @@ class RealtimeFeatureEngine:
                 ema[i] = alpha * arr[i] + (1 - alpha) * ema[i - 1]
             return ema
 
+        def _rolling_mean(arr: np.ndarray, window: int) -> np.ndarray:
+            if len(arr) < window or window <= 0:
+                return np.full(len(arr), np.nan)
+            ret = np.cumsum(arr, dtype=float)
+            ret[window:] = ret[window:] - ret[:-window]
+            res = ret[window - 1 :] / window
+            return np.concatenate((np.full(window - 1, np.nan), res))
+
         close_pct = _pct(data["close"])
 
         # =======================================================
-        # Engine 1A: 統計特徴量 (V3リスト準拠)
+        # Engine 1A: 統計特徴量
         # =======================================================
         features["e1a_anderson_darling_statistic_30"] = (
             engine_1A.anderson_darling_numba(_window(data["close"], 30))
@@ -953,7 +944,6 @@ class RealtimeFeatureEngine:
             engine_1A.basic_stabilization_numba(_window(data["close"], 100))
         )
 
-        # 移動平均・標準偏差 (リストにある期間のみ)
         for w in [5, 10, 50]:
             features[f"e1a_fast_rolling_mean_{w}"] = np.mean(_window(data["close"], w))
         for w in [5, 10, 20, 100]:
@@ -965,7 +955,6 @@ class RealtimeFeatureEngine:
             engine_1A.jarque_bera_statistic_numba(_window(data["close"], 50))
         )
 
-        # ロバスト統計
         for w in [10, 20, 50]:
             q75, q25 = np.percentile(_window(data["close"], w), [75, 25])
             features[f"e1a_robust_iqr_{w}"] = q75 - q25
@@ -993,19 +982,27 @@ class RealtimeFeatureEngine:
                 _window(data["close"], w)
             )
 
-        # 高次モーメント
-        for m in [5, 6, 7, 8]:
-            for w in [20, 50]:
-                # リストにある組み合わせのみ抽出
-                if (
-                    (m == 5 and w in [20, 50])
-                    or (m == 6 and w in [20, 50])
-                    or (m == 7 and w in [20, 50])
-                    or (m == 8 and w == 50)
-                ):
-                    features[f"e1a_statistical_moment_{m}_{w}"] = (
-                        engine_1A.statistical_moment_numba(_window(data["close"], w), m)
-                    )
+        features["e1a_statistical_moment_5_20"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 20), 5
+        )
+        features["e1a_statistical_moment_5_50"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 50), 5
+        )
+        features["e1a_statistical_moment_6_20"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 20), 6
+        )
+        features["e1a_statistical_moment_6_50"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 50), 6
+        )
+        features["e1a_statistical_moment_7_20"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 20), 7
+        )
+        features["e1a_statistical_moment_7_50"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 50), 7
+        )
+        features["e1a_statistical_moment_8_50"] = engine_1A.statistical_moment_numba(
+            _window(data["close"], 50), 8
+        )
 
         features["e1a_statistical_variance_10"] = np.var(_window(data["close"], 10))
         features["e1a_von_neumann_ratio_30"] = engine_1A.von_neumann_ratio_numba(
@@ -1013,22 +1010,36 @@ class RealtimeFeatureEngine:
         )
 
         # =======================================================
-        # Engine 1B: 時系列モデル (V3リスト準拠)
+        # Engine 1B: 時系列モデル
         # =======================================================
+        features["e1b_adf_statistic_50"] = engine_1B.adf_統計量_udf(
+            _window(data["close"], 50)
+        )
+        features["e1b_adf_statistic_100"] = engine_1B.adf_統計量_udf(
+            _window(data["close"], 100)
+        )
+        features["e1b_arima_residual_var_50"] = engine_1B.arima_残差分散_udf(
+            _window(data["close"], 50)
+        )
+        features["e1b_arima_residual_var_100"] = engine_1B.arima_残差分散_udf(
+            _window(data["close"], 100)
+        )
+
+        m50, s50 = (
+            np.mean(_window(data["close"], 50)),
+            np.std(_window(data["close"], 50)),
+        )
+        features["e1b_bollinger_lower_50"] = m50 - 2 * s50
+        features["e1b_bollinger_upper_50"] = m50 + 2 * s50
+
         for w in [50, 100]:
-            features[f"e1b_adf_statistic_{w}"] = engine_1B.adf_統計量_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_arima_residual_var_{w}"] = engine_1B.arima_残差分散_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_kpss_statistic_{w}"] = engine_1B.kpss_統計量_udf(
-                _window(data["close"], w)
-            )
             features[f"e1b_holt_level_{w}"] = engine_1B.holt_winters_レベル_udf(
                 _window(data["close"], w)
             )
             features[f"e1b_holt_trend_{w}"] = engine_1B.holt_winters_トレンド_udf(
+                _window(data["close"], w)
+            )
+            features[f"e1b_kpss_statistic_{w}"] = engine_1B.kpss_統計量_udf(
                 _window(data["close"], w)
             )
             features[f"e1b_lowess_fitted_{w}"] = engine_1B.lowess_適合値_udf(
@@ -1038,23 +1049,19 @@ class RealtimeFeatureEngine:
                 _window(data["close"], w)
             )
 
-        m50, s50 = (
-            np.mean(_window(data["close"], 50)),
-            np.std(_window(data["close"], 50)),
-        )
-        features["e1b_bollinger_lower_50"] = m50 - 2 * s50
-        features["e1b_bollinger_upper_50"] = m50 + 2 * s50
         features["e1b_kalman_state_100"] = engine_1B.kalman_状態推定_udf(
             _window(data["close"], 100)
         )
         features["e1b_pp_statistic_100"] = engine_1B.phillips_perron_統計量_udf(
             _window(data["close"], 100)
         )
+
         features["e1b_price_change"] = _last(close_pct)
         features["e1b_price_range"] = data["high"][-1] - data["low"][-1]
         features["e1b_rolling_mean_100"] = np.mean(_window(data["close"], 100))
         features["e1b_rolling_median_50"] = np.median(_window(data["close"], 50))
         features["e1b_rolling_median_100"] = np.median(_window(data["close"], 100))
+
         features["e1b_t_dist_dof_50"] = engine_1B.t分布_自由度_udf(
             _window(close_pct, 50)
         )
@@ -1068,7 +1075,7 @@ class RealtimeFeatureEngine:
         features["e1b_zscore_50"] = (data["close"][-1] - m50) / (s50 + 1e-10)
 
         # =======================================================
-        # Engine 1C: テクニカル指標 (V3リスト準拠)
+        # Engine 1C: テクニカル指標
         # =======================================================
         features["e1c_adx_13"] = _last(
             engine_1C.calculate_adx_numba(
@@ -1085,54 +1092,61 @@ class RealtimeFeatureEngine:
             features["e1c_aroon_up_14"] - features["e1c_aroon_down_14"]
         )
 
-        # ATR系
+        atr_13 = _last(
+            engine_1C.calculate_atr_numba(
+                _array(data["high"]), _array(data["low"]), _array(data["close"]), 13
+            )
+        )
+        features["e1c_atr_13"] = atr_13
+        features["e1c_atr_lower_13_1.5"] = data["close"][-1] - (atr_13 * 1.5)
+        features["e1c_atr_lower_13_2.0"] = data["close"][-1] - (atr_13 * 2.0)
+        features["e1c_atr_upper_13_1.5"] = data["close"][-1] + (atr_13 * 1.5)
+        features["e1c_atr_upper_13_2.0"] = data["close"][-1] + (atr_13 * 2.0)
+        features["e1c_atr_upper_13_2.5"] = data["close"][-1] + (atr_13 * 2.5)
+        features["e1c_atr_pct_13"] = (atr_13 / data["close"][-1]) * 100
+
         atr_13_arr = engine_1C.calculate_atr_numba(
             _array(data["high"]), _array(data["low"]), _array(data["close"]), 13
         )
-        atr_13 = atr_13_arr[-1]
-        features["e1c_atr_13"] = atr_13
-        features["e1c_atr_pct_13"] = (atr_13 / data["close"][-1]) * 100
-        features["e1c_atr_trend_13"] = (
-            atr_13_arr[-1] - atr_13_arr[-2] if len(atr_13_arr) > 1 else 0.0
-        )
-        for m in [1.5, 2.0, 2.5]:
-            if m in [1.5, 2.0]:
-                features[f"e1c_atr_lower_13_{m}"] = data["close"][-1] - (atr_13 * m)
-            features[f"e1c_atr_upper_13_{m}"] = data["close"][-1] + (atr_13 * m)
+        features["e1c_atr_trend_13"] = atr_13_arr[-1] - atr_13_arr[-2]
+
         for w in [13, 21, 34, 55]:
             arr = engine_1C.calculate_atr_numba(
                 _array(data["high"]), _array(data["low"]), _array(data["close"]), w
             )
             features[f"e1c_atr_volatility_{w}"] = np.std(_window(arr, w))
 
-        # Bollinger Bands (リストにある組み合わせのみ)
         for p, s in [(20, 2.5), (30, 2.5), (50, 2.0), (50, 2.5), (50, 3.0)]:
-            m_p, s_p = (
-                np.mean(_window(data["close"], p)),
-                np.std(_window(data["close"], p)),
-            )
-            w_p = 2 * s * s_p
-            if s == 2.5:
-                features[f"e1c_bb_lower_{p}_{s}"] = m_p - s * s_p
-                # e1c_bb_upper_30_2.5 は最終リストに存在しないため p==30 を除外
-                if p != 30:
-                    features[f"e1c_bb_upper_{p}_{s}"] = m_p + s * s_p
-                if p == 30:
-                    features[f"e1c_bb_width_{p}_{s}"] = w_p
-                    features[f"e1c_bb_width_pct_{p}_{s}"] = (w_p / (m_p + 1e-10)) * 100
-                    features[f"e1c_bb_position_{p}_{s}"] = (data["close"][-1] - m_p) / (
-                        s_p + 1e-10
+            mean_p = np.mean(_window(data["close"], p))
+            std_p = np.std(_window(data["close"], p))
+            if std_p > 1e-10:
+                lower, upper, width = (
+                    mean_p - s * std_p,
+                    mean_p + s * std_p,
+                    (2 * s * std_p),
+                )
+                if s == 2.5 and p in [20, 30, 50]:
+                    features[f"e1c_bb_lower_{p}_{s}"] = lower
+                    features[f"e1c_bb_percent_{p}_{s}"] = (
+                        data["close"][-1] - lower
+                    ) / (width + 1e-10)
+                    if p in [20, 50]:
+                        features[f"e1c_bb_upper_{p}_{s}"] = upper
+                    if p == 30:
+                        features[f"e1c_bb_width_{p}_{s}"] = width
+                        features[f"e1c_bb_width_pct_{p}_{s}"] = (
+                            width / (mean_p + 1e-10)
+                        ) * 100
+                        features[f"e1c_bb_position_{p}_{s}"] = (
+                            data["close"][-1] - mean_p
+                        ) / std_p
+                if s == 2.0 and p == 50:
+                    features[f"e1c_bb_percent_{p}_2"] = (data["close"][-1] - lower) / (
+                        width + 1e-10
                     )
-                features[f"e1c_bb_percent_{p}_{s}"] = (
-                    data["close"][-1] - (m_p - s * s_p)
-                ) / (w_p + 1e-10)
-            elif s == 2.0 and p == 50:
-                features[f"e1c_bb_percent_{p}_2"] = (
-                    data["close"][-1] - (m_p - s * s_p)
-                ) / (w_p + 1e-10)
-            elif s == 3.0 and p == 50:
-                features[f"e1c_bb_lower_{p}_3"] = m_p - s * s_p
-                features[f"e1c_bb_upper_{p}_3"] = m_p + s * s_p
+                if s == 3.0 and p == 50:
+                    features[f"e1c_bb_lower_{p}_3"] = lower
+                    features[f"e1c_bb_upper_{p}_3"] = upper
 
         features["e1c_coppock_curve"] = (
             np.mean(_window(_pct(data["close"])[-24:] * 100, 10))
@@ -1155,34 +1169,34 @@ class RealtimeFeatureEngine:
             )
         )
 
-        # DPO / Deviation
         for p in [20, 30, 50]:
-            features[f"e1c_dpo_{p}"] = 0.0  # Lookahead回避
+            features[f"e1c_dpo_{p}"] = np.nan  # Lookahead防止のためNaN
+
         for p in [10, 20, 50, 100, 200]:
-            ev = _last(_ema(data["close"], p))
+            ema_val = _last(_ema(data["close"], p))
             features[f"e1c_ema_deviation_{p}"] = (
-                (data["close"][-1] - ev) / (ev + 1e-10) * 100
+                (data["close"][-1] - ema_val) / (ema_val + 1e-10) * 100
             )
             if p in [50, 100, 200]:
-                sv = np.mean(_window(data["close"], p))
+                sma_val = np.mean(_window(data["close"], p))
                 features[f"e1c_sma_deviation_{p}"] = (
-                    (data["close"][-1] - sv) / (sv + 1e-10) * 100
+                    (data["close"][-1] - sma_val) / (sma_val + 1e-10) * 100
                 )
                 if p == 100:
-                    features["e1c_sma_100"] = sv
+                    features["e1c_sma_100"] = sma_val
 
         features["e1c_hma_21"] = _last(
             engine_1C.calculate_hma_numba(_array(data["close"]), 21)
         )
-        # KST / MACD / Momentum (リスト準拠)
-        roc_10, roc_15, roc_20, roc_30 = (
-            _pct(_window(data["close"], 11))[-1],
-            _pct(_window(data["close"], 16))[-1],
-            _pct(_window(data["close"], 21))[-1],
-            _pct(_window(data["close"], 31))[-1],
-        )
-        kst = (roc_10 * 1 + roc_15 * 2 + roc_20 * 3 + roc_30 * 4) / 10 * 100
-        features["e1c_kst"], features["e1c_kst_signal"] = kst, kst
+
+        roc_10 = (data["close"][-1] - data["close"][-11]) / (data["close"][-11] + 1e-10)
+        roc_15 = (data["close"][-1] - data["close"][-16]) / (data["close"][-16] + 1e-10)
+        roc_20 = (data["close"][-1] - data["close"][-21]) / (data["close"][-21] + 1e-10)
+        roc_30 = (data["close"][-1] - data["close"][-31]) / (data["close"][-31] + 1e-10)
+        kst_val = (roc_10 * 1 + roc_15 * 2 + roc_20 * 3 + roc_30 * 4) / 10 * 100
+        features["e1c_kst"] = kst_val
+        features["e1c_kst_signal"] = kst_val
+
         features["e1c_macd_12_26"] = _last(
             _ema(data["close"], 12) - _ema(data["close"], 26)
         )
@@ -1203,58 +1217,79 @@ class RealtimeFeatureEngine:
             features[f"e1c_momentum_{p}"] = data["close"][-1] - data["close"][-1 - p]
             if p in [20, 50]:
                 features[f"e1c_rate_of_change_{p}"] = (
-                    features[f"e1c_momentum_{p}"] / (data["close"][-1 - p] + 1e-10)
-                ) * 100
+                    (data["close"][-1] - data["close"][-1 - p])
+                    / (data["close"][-1 - p] + 1e-10)
+                    * 100
+                )
 
-        # RSI / Stoch / Trend
-        rsi_14_arr, rsi_21_arr = (
-            engine_1C.calculate_rsi_numba(_array(data["close"]), 14),
-            engine_1C.calculate_rsi_numba(_array(data["close"]), 21),
-        )
-        features["e1c_rsi_14"] = rsi_14_arr[-1]
+        for p in [10, 14, 20]:
+            rvi_arr = _rolling_mean(data["close"] - data["open"], p) / (
+                _rolling_mean(data["high"] - data["low"], p) + 1e-10
+            )
+            features[f"e1c_relative_vigor_index_{p}"] = _last(rvi_arr)
+            features[f"e1c_rvi_signal_{p}"] = np.mean(_window(rvi_arr, 4))
+
+        rsi_14_arr = engine_1C.calculate_rsi_numba(_array(data["close"]), 14)
+        rsi_21_arr = engine_1C.calculate_rsi_numba(_array(data["close"]), 21)
+        features["e1c_rsi_14"] = _last(rsi_14_arr)
         features["e1c_rsi_divergence_14"] = (
             (data["close"][-1] - data["close"][-15]) / (data["close"][-15] + 1e-10)
         ) - ((rsi_14_arr[-1] - rsi_14_arr[-15]) / 50 - 1)
         features["e1c_rsi_divergence_21"] = (
             (data["close"][-1] - data["close"][-22]) / (data["close"][-22] + 1e-10)
         ) - ((rsi_21_arr[-1] - rsi_21_arr[-22]) / 50 - 1)
-        features["e1c_rsi_momentum_14"], features["e1c_rsi_momentum_21"] = (
-            rsi_14_arr[-1] - rsi_14_arr[-2],
-            rsi_21_arr[-1] - rsi_21_arr[-2],
-        )
+        features["e1c_rsi_momentum_14"] = rsi_14_arr[-1] - rsi_14_arr[-2]
+        features["e1c_rsi_momentum_21"] = rsi_21_arr[-1] - rsi_21_arr[-2]
 
-        stoch_k_14, stoch_k_21 = (
-            engine_1C.calculate_stochastic_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 14
-            ),
-            engine_1C.calculate_stochastic_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 21
-            ),
-        )
-        features["e1c_stoch_k_14"], features["e1c_stoch_d_14_3"] = (
-            stoch_k_14[-1],
-            np.mean(_window(stoch_k_14, 3)),
-        )
-        features["e1c_stoch_d_21_5"], features["e1c_stoch_slow_d_21_5_5"] = (
-            np.mean(_window(stoch_k_21, 5)),
-            np.mean(_window(_ema(stoch_k_21, 5), 5)),
-        )
-        features["e1c_stochastic_rsi_14"] = (
-            (rsi_14_arr[-1] - np.min(_window(rsi_14_arr, 14)))
+        features["e1c_schaff_trend_cycle_12_26_9"] = (
+            (
+                features["e1c_macd_12_26"]
+                - np.nanmin(
+                    _window(_ema(data["close"], 12) - _ema(data["close"], 26), 9)
+                )
+            )
             / (
-                np.max(_window(rsi_14_arr, 14))
-                - np.min(_window(rsi_14_arr, 14))
+                np.nanmax(_window(_ema(data["close"], 12) - _ema(data["close"], 26), 9))
+                - np.nanmin(
+                    _window(_ema(data["close"], 12) - _ema(data["close"], 26), 9)
+                )
                 + 1e-10
             )
             * 100
         )
-        features["e1c_stochastic_rsi_21"] = (
-            (rsi_21_arr[-1] - np.min(_window(rsi_21_arr, 21)))
+        stc_23_50 = _ema(data["close"], 23) - _ema(data["close"], 50)
+        features["e1c_schaff_trend_cycle_23_50_10"] = (
+            (_last(stc_23_50) - np.nanmin(_window(stc_23_50, 10)))
             / (
-                np.max(_window(rsi_21_arr, 21))
-                - np.min(_window(rsi_21_arr, 21))
+                np.nanmax(_window(stc_23_50, 10))
+                - np.nanmin(_window(stc_23_50, 10))
                 + 1e-10
             )
+            * 100
+        )
+
+        stoch_k_14 = engine_1C.calculate_stochastic_numba(
+            _array(data["high"]), _array(data["low"]), _array(data["close"]), 14
+        )
+        stoch_k_21 = engine_1C.calculate_stochastic_numba(
+            _array(data["high"]), _array(data["low"]), _array(data["close"]), 21
+        )
+        features["e1c_stoch_k_14"] = _last(stoch_k_14)
+        features["e1c_stoch_d_14_3"] = np.mean(_window(stoch_k_14, 3))
+        features["e1c_stoch_d_21_5"] = np.mean(_window(stoch_k_21, 5))
+        features["e1c_stoch_slow_d_21_5_5"] = np.mean(
+            _window(_rolling_mean(stoch_k_21, 5), 5)
+        )
+
+        rsi_14_w, rsi_21_w = _window(rsi_14_arr, 14), _window(rsi_21_arr, 21)
+        features["e1c_stochastic_rsi_14"] = (
+            (rsi_14_arr[-1] - np.nanmin(rsi_14_w))
+            / (np.nanmax(rsi_14_w) - np.nanmin(rsi_14_w) + 1e-10)
+            * 100
+        )
+        features["e1c_stochastic_rsi_21"] = (
+            (rsi_21_arr[-1] - np.nanmin(rsi_21_w))
+            / (np.nanmax(rsi_21_w) - np.nanmin(rsi_21_w) + 1e-10)
             * 100
         )
 
@@ -1292,27 +1327,8 @@ class RealtimeFeatureEngine:
             _window(data["close"], 200), 200
         )
 
-        # RVI (V3リストにあるものに限定)
-        for p in [10, 14, 20]:
-            rvi_arr = _last(_ema(data["close"] - data["open"], p)) / (
-                _last(_ema(data["high"] - data["low"], p)) + 1e-10
-            )
-            features[f"e1c_relative_vigor_index_{p}"] = rvi_arr
-            features[f"e1c_rvi_signal_{p}"] = rvi_arr  # 簡易化
-
-        features["e1c_schaff_trend_cycle_12_26_9"] = _last(
-            engine_1C.calculate_schaff_trend_cycle_numba(
-                _array(data["close"]), 12, 26, 9
-            )
-        )
-        features["e1c_schaff_trend_cycle_23_50_10"] = _last(
-            engine_1C.calculate_schaff_trend_cycle_numba(
-                _array(data["close"]), 23, 50, 10
-            )
-        )
-
         # =======================================================
-        # Engine 1D: ボリューム・プライスアクション (V3リスト準拠)
+        # Engine 1D: ボリューム・プライスアクション
         # =======================================================
         features["e1d_accumulation_distribution"] = _last(
             engine_1D.accumulation_distribution_udf(
@@ -1356,14 +1372,13 @@ class RealtimeFeatureEngine:
         features["e1d_hv_robust_annual_252"] = engine_1D.hv_robust_udf(
             _window(close_pct, 252)
         ) * np.sqrt(252)
-
         for w in [10, 30, 50]:
             features[f"e1d_hv_standard_{w}"] = engine_1D.hv_standard_udf(
                 _window(close_pct, w)
             )
 
         features["e1d_hv_regime_50"] = (
-            1.0 if features["e1d_hv_robust_50"] > 0.005 else 0.0
+            1.0 if engine_1D.hv_robust_udf(_window(close_pct, 50)) > 0.005 else 0.0
         )
         features["e1d_intraday_return"] = (data["close"][-1] - data["open"][-1]) / (
             data["open"][-1] + 1e-10
@@ -1406,7 +1421,7 @@ class RealtimeFeatureEngine:
         )
 
         # =======================================================
-        # Engine 1E: 信号処理 (V3リスト準拠)
+        # Engine 1E: 信号処理
         # =======================================================
         for w in [128, 256]:
             features[f"e1e_acoustic_frequency_{w}"] = engine_1E.acoustic_frequency_udf(
@@ -1469,27 +1484,22 @@ class RealtimeFeatureEngine:
             features[f"e1e_wavelet_std_{w}"] = np.std(_window(close_pct, w))
 
         # =======================================================
-        # Engine 1F: 実験的特徴量 (V3リスト準拠)
+        # Engine 1F: 実験的・学際的特徴量
         # =======================================================
         for w in [21, 34, 55, 89]:
             features[f"e1f_aesthetic_balance_{w}"] = (
                 engine_1F.rolling_aesthetic_balance_udf(_window(data["close"], w))
             )
-            features[f"e1f_symmetry_measure_{w}"] = (
-                engine_1F.rolling_symmetry_measure_udf(_window(data["close"], w))
-            )
-        # e1f_golden_ratio_adherence_89 は最終リストに存在しないため w=21,34,55 のみ
-        for w in [21, 34, 55]:
-            features[f"e1f_golden_ratio_adherence_{w}"] = (
-                engine_1F.rolling_golden_ratio_adherence_udf(_window(data["close"], w))
-            )
-
         features["e1f_biomechanical_efficiency_20"] = (
             engine_1F.rolling_biomechanical_efficiency_udf(_window(data["close"], 20))
         )
         for w in [20, 40, 60]:
             features[f"e1f_energy_expenditure_{w}"] = (
                 engine_1F.rolling_energy_expenditure_udf(_window(data["close"], w))
+            )
+        for w in [21, 34, 55]:
+            features[f"e1f_golden_ratio_adherence_{w}"] = (
+                engine_1F.rolling_golden_ratio_adherence_udf(_window(data["close"], w))
             )
         for w in [48, 96]:
             features[f"e1f_harmony_{w}"] = engine_1F.rolling_harmony_udf(
@@ -1503,7 +1513,6 @@ class RealtimeFeatureEngine:
             features[f"e1f_linguistic_complexity_{w}"] = (
                 engine_1F.rolling_linguistic_complexity_udf(_window(data["close"], w))
             )
-
         features["e1f_muscle_force_20"] = engine_1F.rolling_muscle_force_udf(
             _window(data["close"], 20)
         )
@@ -1511,21 +1520,25 @@ class RealtimeFeatureEngine:
             features[f"e1f_musical_tension_{w}"] = (
                 engine_1F.rolling_musical_tension_udf(_window(data["close"], w))
             )
-            features[f"e1f_rhythm_pattern_{w}"] = engine_1F.rolling_rhythm_pattern_udf(
-                _window(data["close"], w)
-            )
-
         for w in [20, 30, 50, 100]:
             features[f"e1f_network_clustering_{w}"] = (
                 engine_1F.rolling_network_clustering_udf(_window(data["close"], w))
             )
+        for w in [20, 30, 50, 100]:
             features[f"e1f_network_density_{w}"] = (
                 engine_1F.rolling_network_density_udf(_window(data["close"], w))
             )
-
+        for w in [24, 48, 96]:
+            features[f"e1f_rhythm_pattern_{w}"] = engine_1F.rolling_rhythm_pattern_udf(
+                _window(data["close"], w)
+            )
         for w in [15, 25, 40]:
             features[f"e1f_semantic_flow_{w}"] = engine_1F.rolling_semantic_flow_udf(
                 _window(data["close"], w)
+            )
+        for w in [21, 34, 55, 89]:
+            features[f"e1f_symmetry_measure_{w}"] = (
+                engine_1F.rolling_symmetry_measure_udf(_window(data["close"], w))
             )
         for w in [12, 24, 48, 96]:
             features[f"e1f_tonality_{w}"] = engine_1F.rolling_tonality_udf(
@@ -1537,7 +1550,7 @@ class RealtimeFeatureEngine:
             )
 
         # -------------------------------------------------------
-        # 純化用プロキシ (必須)
+        # 純化処理で必要なプロキシ特徴量
         features["atr"] = atr_13
         features["log_return"] = np.log(
             (data["close"][-1] + 1e-10) / (data["close"][-2] + 1e-10)
@@ -1556,71 +1569,217 @@ class RealtimeFeatureEngine:
 
     def calculate_dynamic_context(self, hmm_model: Any) -> Dict[str, float]:
         """
-        [環境認識用] HMMレジームと主要統計量の計算。
+        [リスクエンジン・環境認識用コンテキスト]
+        不要となった e2a 系 (MFDFA, Kolmogorov) を完全にパージし、
+        HMMと基本統計量のみを計算する超軽量版。
         """
-        if "D1" not in self.data_buffers:
+        tf_name = "D1"
+        if (tf_name not in self.data_buffers) or ("M1" not in self.data_buffers):
             return {}
-        close_arr = np.array(self.data_buffers["D1"]["close"], dtype=np.float64)
+
+        buffer_m1 = self.data_buffers["M1"]
+        if not buffer_m1["close"]:
+            return {}
+
+        # 1. 基準時刻の決定
+        try:
+            last_m1_ts_raw = self.m1_dataframe[-1]["timestamp"]
+            last_m1_ts = pd.Timestamp(last_m1_ts_raw)
+            if last_m1_ts.tzinfo is None:
+                last_m1_ts = last_m1_ts.tz_localize("UTC")
+            else:
+                last_m1_ts = last_m1_ts.tz_convert("UTC")
+
+            start_of_day = last_m1_ts.floor("D")
+        except Exception as e:
+            self.logger.error(f"基準時刻の計算に失敗: {e}")
+            return {}
+
+        # 2. D1バッファの重複削除
+        buffer_d1 = self.data_buffers[tf_name]
+        if not buffer_d1["close"]:
+            return {}
+
+        d1_close = np.array(buffer_d1["close"], dtype=np.float64)
+        d1_high = np.array(buffer_d1["high"], dtype=np.float64)
+        d1_low = np.array(buffer_d1["low"], dtype=np.float64)
+
+        last_d1_ts_raw = self.last_bar_timestamps.get(tf_name)
+        if last_d1_ts_raw is not None:
+            ts_check = pd.Timestamp(last_d1_ts_raw)
+            if ts_check.tzinfo is None:
+                ts_check = ts_check.tz_localize("UTC")
+            else:
+                ts_check = ts_check.tz_convert("UTC")
+
+            if ts_check >= start_of_day:
+                d1_close = d1_close[:-1]
+                d1_high = d1_high[:-1]
+                d1_low = d1_low[:-1]
+
+        # 3. 当日データの収集 (順序不整合対策のフルスキャン)
+        intraday_bars = []
+        scan_limit = 5000
+        scanned_count = 0
+
+        for bar in reversed(self.m1_dataframe):
+            scanned_count += 1
+            if scanned_count > scan_limit:
+                break
+
+            try:
+                bar_ts = pd.Timestamp(bar["timestamp"])
+                if bar_ts.tzinfo is None:
+                    bar_ts = bar_ts.tz_localize("UTC")
+                else:
+                    bar_ts = bar_ts.tz_convert("UTC")
+            except:
+                continue
+
+            if bar_ts >= start_of_day:
+                intraday_bars.append(bar)
+
+        # 4. 合成と計算
+        if intraday_bars:
+            current_close = intraday_bars[0]["close"]
+            max_h = -1.0
+            min_l = 1.0e15
+            for b in intraday_bars:
+                if b["high"] > max_h:
+                    max_h = b["high"]
+                if b["low"] < min_l:
+                    min_l = b["low"]
+            current_high = max_h
+            current_low = min_l
+        else:
+            price = buffer_m1["close"][-1]
+            current_high = current_low = current_close = price
+
+        close_arr = np.append(d1_close, current_close)
+        high_arr = np.append(d1_high, current_high)
+        low_arr = np.append(d1_low, current_low)
+
         if len(close_arr) < 50:
             return {}
 
         context = {}
         try:
-            # HMMレジーム判定
-            if hmm_model is not None:
-                log_rets = np.diff(np.log(close_arr[-100:] + 1e-10)).reshape(-1, 1)
-                probs = hmm_model.predict_proba(log_rets)
-                context["hmm_prob_0"], context["hmm_prob_1"] = (
-                    probs[-1][0],
-                    probs[-1][1],
-                )
+            # ATR (外部エンジン呼出)
+            atr_arr = engine_1C.calculate_atr_numba(high_arr, low_arr, close_arr, 21)
+            context["atr"] = atr_arr[-1] if not np.isnan(atr_arr[-1]) else 0.0
 
+            is_flat = np.std(close_arr[-100:]) < 1e-9
+
+            # HMMレジーム判定
+            if not is_flat and hmm_model is not None:
+                full_log_ret = np.diff(np.log(close_arr + 1e-10))
+                calc_len = min(len(full_log_ret), 100)
+                recent_ret = full_log_ret[-calc_len:]
+                recent_atr = atr_arr[1:][-calc_len:]
+                min_len = min(len(recent_ret), len(recent_atr))
+
+                valid_idx = np.isfinite(recent_ret[-min_len:]) & np.isfinite(
+                    recent_atr[-min_len:]
+                )
+                if np.sum(valid_idx) > 10:
+                    X = np.column_stack(
+                        (
+                            recent_ret[-min_len:][valid_idx],
+                            recent_atr[-min_len:][valid_idx],
+                        )
+                    )
+                    try:
+                        probs = hmm_model.predict_proba(X)
+                        context["hmm_prob_0"] = probs[-1][0]
+                        context["hmm_prob_1"] = probs[-1][1]
+                    except:
+                        context["hmm_prob_0"] = 0.5
+                        context["hmm_prob_1"] = 0.5
+                else:
+                    context["hmm_prob_0"] = 0.5
+                    context["hmm_prob_1"] = 0.5
+            else:
+                context["hmm_prob_0"] = 0.5
+                context["hmm_prob_1"] = 0.5
+
+            # 基本統計量 (外部エンジン呼出)
             context["e1a_statistical_kurtosis_50"] = engine_1A.rolling_kurtosis_numba(
                 close_arr[-50:]
             )
-            adx_arr = engine_1C.calculate_adx_numba(
-                np.array(self.data_buffers["D1"]["high"]),
-                np.array(self.data_buffers["D1"]["low"]),
-                close_arr,
-                21,
-            )
-            context["e1c_adx_21"] = adx_arr[-1]
-            return {k: (v if np.isfinite(v) else 0.0) for k, v in context.items()}
-        except Exception:
+            adx_arr = engine_1C.calculate_adx_numba(high_arr, low_arr, close_arr, 21)
+            context["e1c_adx_21"] = adx_arr[-1] if not np.isnan(adx_arr[-1]) else 0.0
+
+            # NaNチェック
+            for k, v in context.items():
+                if np.isnan(v) or np.isinf(v):
+                    context[k] = 0.0
+
+            return context
+
+        except Exception as e:
+            self.logger.error(f"Context calc error: {e}")
             return {}
 
     def calculate_feature_vector(
         self, tf_name: str, timestamp: datetime, market_proxy_cache: pd.DataFrame
     ) -> Optional[np.ndarray]:
         """
-        [ベクトル生成] 304個の精鋭リストに厳密準拠したベクトルを構築。
+        [ベクトル生成]
+        最終リスト(304個)に厳密に準拠した特徴量ベクトルを構築する。
+        欠損値の補完や異常値のクリッピングもここで行い、推論器を保護する。
         """
         if not self.is_buffer_filled[tf_name]:
+            self.logger.warning(f"特徴量計算スキップ ({tf_name}): バッファ未充填")
             return None
 
         try:
-            vector = []
+            feature_vector = []
             tf_pattern = re.compile(r"_(M[0-9\.]+|H[0-9]+|D[0-9]+|W[0-9]+|MN|tick)$")
 
-            for feat_name in self.feature_list:
-                m = tf_pattern.search(feat_name)
-                target_tf = m.group(1) if m else None
-                if not target_tf or target_tf not in self.latest_features_cache:
-                    vector.append(0.0)
+            for feature_name_in_list in self.feature_list:
+                # 時間足サフィックスの特定
+                tf_match = tf_pattern.search(feature_name_in_list)
+                target_tf = tf_match.group(1) if tf_match else None
+
+                if not target_tf:
+                    feature_vector.append(0.0)
                     continue
 
-                base_name = (
-                    feat_name.split("_neutralized_")[0]
-                    if "_neutralized_" in feat_name
-                    else feat_name.rsplit("_", 1)[0]
-                )
-                val = self.latest_features_cache[target_tf].get(base_name, 0.0)
-                vector.append(val)
+                # ベース名(純化サフィックス除去)
+                if "_neutralized_" in feature_name_in_list:
+                    base_name = feature_name_in_list.split("_neutralized_")[0]
+                else:
+                    base_name = feature_name_in_list.rsplit("_", 1)[0]
 
-            final_vector = np.nan_to_num(
-                np.array(vector, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
-            )
-            return np.array([np.clip(final_vector, -1e5, 1e5)])
+                # キャッシュからのクロス参照
+                value = 0.0
+                if (
+                    target_tf in self.latest_features_cache
+                    and base_name in self.latest_features_cache[target_tf]
+                ):
+                    value = self.latest_features_cache[target_tf][base_name]
+                else:
+                    value = np.nan
+
+                feature_vector.append(value)
+
+            raw_vector = np.array(feature_vector, dtype=np.float64)
+
+            # 次元数の厳格な照合
+            if len(raw_vector) != len(self.feature_list):
+                self.logger.critical(
+                    f"特徴量次元数エラー: 期待値 {len(self.feature_list)}, 実際 {len(raw_vector)}"
+                )
+                return None
+
+            # NaN/Infを0.0に補完し、推論器を破壊する異常値をクリップ (-1e5 ~ 1e5)
+            safe_vector = np.nan_to_num(raw_vector, nan=0.0, posinf=0.0, neginf=0.0)
+            final_vector = np.clip(safe_vector, -1e5, 1e5)
+
+            return np.array([final_vector])
+
         except Exception as e:
-            self.logger.error(f"Vector calculation error: {e}")
+            self.logger.error(
+                f"特徴量ベクトル計算中にエラー ({tf_name}): {e}", exc_info=True
+            )
             return None

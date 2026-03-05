@@ -26,6 +26,7 @@ if str(project_root) not in sys.path:
 from blueprint import (
     S6_WEIGHTED_DATASET,
     S3_FEATURES_FOR_TRAINING,
+    S3_SELECTED_FEATURES_DIR,
     S7_M1_OOF_PREDICTIONS_LONG,
     S7_M1_OOF_PREDICTIONS_SHORT,
 )
@@ -105,7 +106,6 @@ class PartitionPurgedKFold(BaseCrossValidator):
 class M1CrossValidator:
     def __init__(self, config: TrainingConfig):
         self.config = config
-        self.features: List[str] = self._load_features()
         self.partitions = self._discover_partitions()
         if self.config.test_limit > 0:
             logging.warning(
@@ -113,15 +113,14 @@ class M1CrossValidator:
             )
             self.partitions = self.partitions[: self.config.test_limit]
 
-    def _load_features(self) -> List[str]:
-        logging.info(f"Loading features from {self.config.feature_list_path}...")
+    def _load_features(self, feature_path: Path) -> List[str]:
+        logging.info(f"Loading features from {feature_path}...")
 
-        if not self.config.feature_list_path.exists():
-            raise FileNotFoundError(
-                f"Feature list file not found: {self.config.feature_list_path}"
-            )
+        if not feature_path.exists():
+            raise FileNotFoundError(f"Feature list file not found: {feature_path}")
 
-        with open(self.config.feature_list_path, "r") as f:
+        # ※以下の with open(...) のパスも self.config... から feature_path に変更してください
+        with open(feature_path, "r") as f:
             raw_features = [line.strip() for line in f if line.strip()]
 
         # V5仕様のメタデータ・未来情報の完全除外
@@ -404,11 +403,19 @@ class M1CrossValidator:
             "short": S7_M1_OOF_PREDICTIONS_SHORT,
         }
 
+        # Blueprintで追加したディレクトリをインポート済みであることを確認 (from blueprint import S3_SELECTED_FEATURES_DIR)
+
         # 双方向のループ処理 (Two-Brain Training)
         for direction in directions:
             logging.info("\n" + "=" * 50)
             logging.info(f"=== Starting Pipeline for: {direction.upper()} ===")
             logging.info("=" * 50)
+
+            # --- パターンB: 専用特徴量リストを動的に読み込む ---
+            dedicated_feature_path = (
+                S3_SELECTED_FEATURES_DIR / f"m1_{direction}_features.txt"
+            )
+            self.features = self._load_features(dedicated_feature_path)
 
             # scale_pos_weightを方向ごとに動的計算
             scale_pos_weight = self._calculate_scale_pos_weight(direction)

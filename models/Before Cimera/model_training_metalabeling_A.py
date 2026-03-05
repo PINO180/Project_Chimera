@@ -1,21 +1,23 @@
-# /workspace/models/model_training_metalabeling_A_v5.py
-# [V5仕様: 双方向ラベリング (Two-Brain) 対応版]
+# /workspace/models/model_training_metalabeling_A.py
+# [修正版: n_estimators を合計として解釈し、パーティションごとに分配する]
 
 import sys
 from pathlib import Path
 import logging
 import argparse
+import json
+from dataclasses import dataclass, field
 import datetime
 import warnings
-import gc
+import gc  # --- ★ gc をインポート (維持) ---
 
 import polars as pl
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection._split import BaseCrossValidator
 from typing import List, Tuple, Dict, Any, Generator
-from tqdm import tqdm
-from collections import Counter
+from tqdm import tqdm  # --- ★ tqdm をインポート (維持) ---
+from collections import Counter  # --- ★ Counter をインポート (維持) ---
 
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
@@ -26,8 +28,7 @@ if str(project_root) not in sys.path:
 from blueprint import (
     S6_WEIGHTED_DATASET,
     S3_FEATURES_FOR_TRAINING,
-    S7_M1_OOF_PREDICTIONS_LONG,
-    S7_M1_OOF_PREDICTIONS_SHORT,
+    S7_M1_OOF_PREDICTIONS,
 )
 
 logging.basicConfig(
@@ -43,9 +44,6 @@ except ImportError:
     pass
 
 
-from dataclasses import dataclass, field
-
-
 @dataclass
 class TrainingConfig:
     input_dir: Path = S6_WEIGHTED_DATASET
@@ -58,7 +56,7 @@ class TrainingConfig:
             "objective": "binary",
             "metric": "auc",
             "boosting_type": "gbdt",
-            "n_estimators": 2000,
+            "n_estimators": 2000,  # ★★★ 修正: 1000 -> 10000 (1日あたりの学習量を確保) ★★★
             "learning_rate": 0.01,
             "num_leaves": 31,
             "max_depth": -1,
@@ -67,6 +65,7 @@ class TrainingConfig:
             "verbose": -1,
             "colsample_bytree": 0.8,
             "subsample": 0.8,
+            # 'scale_pos_weight' は後で動的に計算して追加
         }
     )
     test_limit: int = 0
@@ -113,7 +112,14 @@ class M1CrossValidator:
             )
             self.partitions = self.partitions[: self.config.test_limit]
 
+        # --- ★★★ (維持) scale_pos_weight を計算してLGBMパラメータに追加 ★★★ ---
+        self.scale_pos_weight = self._calculate_scale_pos_weight()
+        self.config.lgbm_params["scale_pos_weight"] = self.scale_pos_weight
+        logging.info(f"Using scale_pos_weight: {self.scale_pos_weight:.4f}")
+        # --- ★★★ (維持) ここまで ★★★ ---
+
     def _load_features(self) -> List[str]:
+        # [修正] Top 50 (JSON) ではなく、Configで指定された全特徴量リスト (txt) を読み込む
         logging.info(f"Loading features from {self.config.feature_list_path}...")
 
         if not self.config.feature_list_path.exists():
@@ -124,20 +130,10 @@ class M1CrossValidator:
         with open(self.config.feature_list_path, "r") as f:
             raw_features = [line.strip() for line in f if line.strip()]
 
-        # V5仕様のメタデータ・未来情報の完全除外
+        # ★追加: V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
         exclude_exact = {
             "timestamp",
             "timeframe",
-            "is_trigger",
-            "label_long",
-            "label_short",
-            "uniqueness_long",
-            "uniqueness_short",
-            "duration_long",
-            "duration_short",
-            "concurrency_long",
-            "concurrency_short",
-            # 念のため旧仕様のカラムも除外
             "t1",
             "label",
             "uniqueness",
@@ -160,12 +156,13 @@ class M1CrossValidator:
         for col in raw_features:
             if col in exclude_exact:
                 continue
+            # 動的に生成されるトリガーフラグも除外
             if col.startswith("is_trigger_on"):
                 continue
             features.append(col)
 
         logging.info(
-            f"   -> Loaded {len(features)} valid features (filtered out V5 metadata)."
+            f"   -> Loaded {len(features)} valid features (filtered out metadata)."
         )
         return features
 
@@ -187,53 +184,53 @@ class M1CrossValidator:
         logging.info(f"  -> Discovered and sorted {len(dates)} daily partitions.")
         return dates
 
-    def _calculate_scale_pos_weight(self, direction: str) -> float:
+    # --- ★★★ (維持) scale_pos_weight を計算する関数 ★★★ ---
+    def _calculate_scale_pos_weight(self) -> float:
         """
-        V5: 指定された方向 (long/short) のラベル比率を計算する
-        対象は is_trigger == 1 の行のみ。
+        全パーティションをスキャンして M1 の scale_pos_weight (勝ち=1 vs それ以外=0) を計算する。
+        [修正版: .item() の呼び出しをロバスト化]
         """
-        label_col = f"label_{direction}"
         logging.info(
-            f"Calculating scale_pos_weight for {direction.upper()} (is_trigger=1)..."
+            "Calculating scale_pos_weight for M1 (label == 1 vs label != 1)..."
         )
-        counts = Counter({0: 0, 1: 0})
+        counts = Counter({0: 0, 1: 0})  # 0: Negative/Timeout, 1: Positive
         total_samples = 0
 
+        partitions_to_scan = self.partitions
+
         for partition_date in tqdm(
-            self.partitions, desc=f"Scanning {direction} labels"
+            partitions_to_scan, desc="Scanning labels for scale_pos_weight"
         ):
             p_path_glob = str(
                 self.config.input_dir
                 / f"year={partition_date.year}/month={partition_date.month}/day={partition_date.day}/*.parquet"
             )
             try:
-                # is_triggerフラグと対象ラベルのみ読み込み
-                df_labels = pl.read_parquet(
-                    p_path_glob, columns=["is_trigger", label_col]
-                )
-                # is_trigger == 1 でフィルタリング
-                df_labels = df_labels.filter(pl.col("is_trigger") == 1)
-
+                df_labels = pl.read_parquet(p_path_glob, columns=["label"])
                 if df_labels.is_empty():
                     continue
 
                 binary_labels = df_labels.select(
-                    pl.when(pl.col(label_col) == 1)
+                    pl.when(pl.col("label") == 1)
                     .then(1)
                     .otherwise(0)
                     .alias("binary_label")
                 )
                 counts_in_partition = binary_labels["binary_label"].value_counts()
 
+                # --- ▼▼▼ [バグ修正] .item() の呼び出しを安全にする ▼▼▼ ---
+                # Positive Count
                 pos_count_df = counts_in_partition.filter(
                     pl.col("binary_label") == 1
                 ).select(pl.col("count"))
                 pos_count = pos_count_df.item() if not pos_count_df.is_empty() else 0
 
+                # Negative Count
                 neg_count_df = counts_in_partition.filter(
                     pl.col("binary_label") == 0
                 ).select(pl.col("count"))
                 neg_count = neg_count_df.item() if not neg_count_df.is_empty() else 0
+                # --- ▲▲▲ 修正ここまで ▲▲▲ ---
 
                 counts[1] += pos_count
                 counts[0] += neg_count
@@ -248,28 +245,54 @@ class M1CrossValidator:
 
         if count_pos == 0 or count_neg == 0:
             logging.warning(
-                f"One of the classes has zero samples for {direction}. Using scale_pos_weight = 1.0"
+                "One of the classes has zero samples. Using scale_pos_weight = 1.0"
             )
             return 1.0
 
         scale_pos_weight = count_neg / count_pos
-        logging.info(f"  -> Total samples (is_trigger=1): {total_samples}")
-        logging.info(
-            f"  -> Calculated scale_pos_weight ({direction}): {scale_pos_weight:.4f}"
-        )
+        logging.info(f"  -> Total samples scanned: {total_samples}")
+        logging.info(f"  -> Positive (label=1) count: {count_pos}")
+        logging.info(f"  -> Negative (label!=1) count: {count_neg}")
+        logging.info(f"  -> Calculated scale_pos_weight: {scale_pos_weight:.4f}")
         return scale_pos_weight
 
-    def _train_model_partition_based(self, direction: str) -> Dict[str, np.ndarray]:
-        logging.info(f"--- Starting BATCH Training for M1 ({direction.upper()}) ---")
+    # --- ★★★ (維持) ここまで ★★★ ---
+
+    def run(self) -> None:
+        logging.info("### Script 1/3: M1 Cross-Validation ###")
+        S7_M1_OOF_PREDICTIONS.parent.mkdir(parents=True, exist_ok=True)
+
+        m1_oof_results = self._train_model_partition_based()
+
+        logging.info("--- M1 Cross-Validation Process Completed ---")
+
+        if m1_oof_results["timestamp"].size > 0:
+            oof_df = pl.DataFrame(m1_oof_results).sort("timestamp")
+            oof_df.write_parquet(S7_M1_OOF_PREDICTIONS, compression="zstd")
+            logging.info(
+                f"Successfully saved M1 OOF predictions to: {S7_M1_OOF_PREDICTIONS}"
+            )
+            logging.info(f"  - Total predictions saved: {len(oof_df)}")
+        else:
+            logging.warning(
+                "No OOF predictions were generated. Output file was not created."
+            )
+
+        logging.info("\n" + "=" * 60)
+        logging.info("### Script 1/3 FINISHED! You can now run Script B. ###")
+        logging.info("=" * 60)
+
+    # ---
+    # --- ★★★ ここが根本的な修正箇所 ★★★
+    # ---
+    def _train_model_partition_based(self) -> Dict[str, np.ndarray]:
+        logging.info("--- Starting BATCH Training for M1 (Primary) ---")
         kfold = PartitionPurgedKFold(
             self.config.n_splits, self.config.purge_days, self.config.embargo_days
         )
-
-        label_col = f"label_{direction}"
-        weight_col = f"uniqueness_{direction}"
-
         oof_results = {
             "timestamp": [],
+            "timeframe": [],  # 修正済み: Timeframeを含める
             "prediction": [],
             "true_label": [],
             "uniqueness": [],
@@ -278,11 +301,12 @@ class M1CrossValidator:
         for i, (train_partitions, val_partitions) in enumerate(
             kfold.split(self.partitions)
         ):
-            logging.info(
-                f"  [{direction.upper()}] Fold {i + 1}/{self.config.n_splits}..."
-            )
+            logging.info(f"  [M1 (Primary)] Fold {i + 1}/{self.config.n_splits}...")
 
             if self.config.test_fold_limit > 0:
+                logging.warning(
+                    f"--- TEST FOLD MODE: Limiting partitions to {self.config.test_fold_limit} for train/predict. ---"
+                )
                 train_partitions = train_partitions[: self.config.test_fold_limit]
                 val_partitions = val_partitions[: self.config.test_fold_limit]
 
@@ -290,6 +314,9 @@ class M1CrossValidator:
             X_train_list, y_train_list, w_train_list = [], [], []
 
             if len(train_partitions) > 0:
+                logging.info(
+                    f"    -> Collecting training data from {len(train_partitions)} partitions..."
+                )
                 for partition_date in tqdm(
                     train_partitions, desc=f"  Loading Train Fold {i + 1}"
                 ):
@@ -299,55 +326,59 @@ class M1CrossValidator:
                     )
                     try:
                         df_chunk = pl.read_parquet(p_path_glob)
-                        # V5: トリガー箇所のみを学習対象にする
-                        if "is_trigger" in df_chunk.columns:
-                            df_chunk = df_chunk.filter(pl.col("is_trigger") == 1)
                     except Exception:
                         continue
-
                     if df_chunk.is_empty():
                         continue
 
                     X_train_list.append(df_chunk.select(self.features).to_numpy())
-                    y_train_list.append(np.where(df_chunk[label_col] == 1, 1, 0))
-                    w_train_list.append(df_chunk[weight_col].to_numpy())
+                    y_train_list.append(np.where(df_chunk["label"] == 1, 1, 0))
+                    w_train_list.append(df_chunk["uniqueness"].to_numpy())
 
             # --- バッチ学習実行 ---
             model: lgb.Booster = None
             if len(X_train_list) > 0:
                 try:
+                    # 全データを結合 (Batch化)
                     X_train = np.concatenate(X_train_list)
                     y_train = np.concatenate(y_train_list)
                     w_train = np.concatenate(w_train_list)
 
+                    # メモリ解放: リストは不要になったので消す
                     del X_train_list, y_train_list, w_train_list
                     gc.collect()
 
                     train_params = self.config.lgbm_params.copy()
                     n_estimators = train_params.pop("n_estimators", 1000)
 
+                    logging.info(
+                        f"    -> Training model on {len(X_train)} samples (n_estimators={n_estimators})..."
+                    )
+
+                    # 一括学習 (init_modelなし)
                     model = lgb.train(
                         train_params,
                         lgb.Dataset(X_train, label=y_train, weight=w_train),
                         num_boost_round=n_estimators,
                     )
 
+                    # 学習済みデータの解放
                     del X_train, y_train, w_train
                     gc.collect()
 
                 except Exception as fit_error:
                     logging.error(
-                        f"Error during batch training ({direction}): {fit_error}",
-                        exc_info=True,
+                        f"Error during batch training: {fit_error}", exc_info=True
                     )
                     model = None
             else:
-                logging.warning(
-                    f"    -> No training data found for this fold ({direction})."
-                )
+                logging.warning("    -> No training data found for this fold.")
 
             # --- 予測 (Validation) ---
             if model is not None:
+                logging.info(
+                    f"    -> Predicting on {len(val_partitions)} partitions..."
+                )
                 for partition_date in tqdm(
                     val_partitions, desc=f"  Predicting Fold {i + 1}"
                 ):
@@ -357,12 +388,8 @@ class M1CrossValidator:
                     )
                     try:
                         df_chunk = pl.read_parquet(p_path_glob)
-                        # Validationもトリガー箇所のみ
-                        if "is_trigger" in df_chunk.columns:
-                            df_chunk = df_chunk.filter(pl.col("is_trigger") == 1)
                     except Exception:
                         continue
-
                     if df_chunk.is_empty():
                         continue
 
@@ -370,20 +397,20 @@ class M1CrossValidator:
                     try:
                         predictions = model.predict(X_val)
                     except Exception as pred_error:
-                        logging.error(
-                            f"Error during prediction ({direction}): {pred_error}"
-                        )
+                        logging.error(f"Error during prediction: {pred_error}")
                         predictions = np.full(len(df_chunk), np.nan)
 
                     oof_results["timestamp"].append(df_chunk["timestamp"].to_numpy())
+                    oof_results["timeframe"].append(df_chunk["timeframe"].to_numpy())
                     oof_results["prediction"].append(predictions)
-                    oof_results["true_label"].append(df_chunk[label_col].to_numpy())
-                    oof_results["uniqueness"].append(df_chunk[weight_col].to_numpy())
+                    oof_results["true_label"].append(df_chunk["label"].to_numpy())
+                    oof_results["uniqueness"].append(df_chunk["uniqueness"].to_numpy())
 
+            # モデル破棄
             del model
             gc.collect()
 
-        logging.info(f"Concatenating OOF results for {direction}...")
+        logging.info("Concatenating OOF results...")
         for key in oof_results:
             if oof_results[key]:
                 try:
@@ -392,70 +419,27 @@ class M1CrossValidator:
                     oof_results[key] = np.array([])
             else:
                 oof_results[key] = np.array([])
+        logging.info("OOF results concatenated.")
 
         return oof_results
 
-    def run(self) -> None:
-        logging.info("### Script 1/3: M1 Two-Brain Cross-Validation (V5) ###")
-        S7_M1_OOF_PREDICTIONS_LONG.parent.mkdir(parents=True, exist_ok=True)
-        directions = ["long", "short"]
-        output_paths = {
-            "long": S7_M1_OOF_PREDICTIONS_LONG,
-            "short": S7_M1_OOF_PREDICTIONS_SHORT,
-        }
-
-        # 双方向のループ処理 (Two-Brain Training)
-        for direction in directions:
-            logging.info("\n" + "=" * 50)
-            logging.info(f"=== Starting Pipeline for: {direction.upper()} ===")
-            logging.info("=" * 50)
-
-            # scale_pos_weightを方向ごとに動的計算
-            scale_pos_weight = self._calculate_scale_pos_weight(direction)
-            self.config.lgbm_params["scale_pos_weight"] = scale_pos_weight
-
-            # 学習とOOF予測
-            oof_results = self._train_model_partition_based(direction)
-
-            # 結果の保存
-            if oof_results["timestamp"].size > 0:
-                oof_df = pl.DataFrame(
-                    {
-                        "timestamp": oof_results["timestamp"],
-                        "prediction": oof_results["prediction"],
-                        "true_label": oof_results["true_label"],
-                        "uniqueness": oof_results["uniqueness"],
-                    }
-                ).sort("timestamp")
-
-                out_path = output_paths[direction]
-                oof_df.write_parquet(out_path, compression="zstd")
-
-                logging.info(
-                    f"Successfully saved M1 {direction.upper()} OOF predictions to: {out_path}"
-                )
-                logging.info(f"  - Total predictions saved: {len(oof_df)}")
-            else:
-                logging.warning(f"No OOF predictions generated for {direction}.")
-
-        logging.info("\n" + "=" * 60)
-        logging.info("### V5 Two-Brain Training COMPLETED! ###")
-        logging.info("=" * 60)
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Script 1/3: M1 Two-Brain Cross-Validation (V5)"
-    )
+    parser = argparse.ArgumentParser(description="Script 1/3: M1 Cross-Validation")
+
     parser.add_argument(
         "--test-limit",
         type=int,
         default=0,
-        help="Limit total partitions discovered for a very small test.",
+        help="Limit total partitions discovered for a very small test. Default is 0 (no limit).",
     )
-    parser.add_argument("--test", action="store_true", help="Run in quick test mode.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run in quick test mode, limiting each fold to 5 partitions for training and prediction.",
+    )
 
+    args = parser.parse_args()
     fold_limit = 5 if args.test else 0
     config = TrainingConfig(test_limit=args.test_limit, test_fold_limit=fold_limit)
 

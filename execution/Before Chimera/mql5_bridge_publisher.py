@@ -62,26 +62,15 @@ class BridgeConfig:
 
 def clean_zmq_json(response_json: str) -> str:
     """ZMQ フレームから余分なバイトを削除し、JSONを抽出"""
-    # オブジェクト '{...}' または 配列 '[...]' を正しく抽出する
-    obj_start = response_json.find("{")
-    arr_start = response_json.find("[")
-
-    # どちらが先に出現するか（存在しない場合は -1 なので除外）
-    valid_starts = [i for i in (obj_start, arr_start) if i != -1]
-
-    if not valid_starts:
+    json_start = response_json.find("{")
+    json_end = response_json.rfind("}") + 1
+    if json_start == -1 or json_end <= json_start:
+        # 単純な文字列応答の場合（ACKなど）はそのまま返す
         if "ACK" in response_json or "NACK" in response_json:
             return response_json
+        # JSON構造がない場合はエラーとせず、生の文字列として扱う（V11.0対応）
         return response_json
-
-    start_idx = min(valid_starts)
-    end_char = "}" if response_json[start_idx] == "{" else "]"
-    end_idx = response_json.rfind(end_char) + 1
-
-    if end_idx <= start_idx:
-        return response_json
-
-    return response_json[start_idx:end_idx]
+    return response_json[json_start:json_end]
 
 
 def parse_response(response_bytes: bytes) -> Any:
@@ -214,8 +203,7 @@ class MQL5BridgePublisherV3:
             return None
 
         # 1. ハンドシェイク: 履歴リクエスト送信 (制御チャネル)
-        # [FIX-7] lookback_bars をリクエスト文字列に含め MQL5 側に取得本数を通知する
-        request_msg = f"REQ_HISTORY:{timeframe_name}:{lookback_bars}"
+        request_msg = f"REQ_HISTORY:{timeframe_name}"
 
         try:
             # REQUEST送信
@@ -408,15 +396,13 @@ class MQL5BridgePublisherV3:
             # logger.debug(f"Sending Trade Command: {json_str}")
             self.control_socket.send_string(json_str)
 
-            # 3. ACK待機
-            # [FIX-6] タイムアウトを 3000ms → 9000ms に延長
-            # XAUUSD 高ボラティリティ時や市場オープン時は MT5 の応答が遅れる場合があるため、
-            # タイムアウト後はソケットを再生成してデッドロックを防ぐ。
-            if self.control_socket.poll(9000) == 0:
-                logger.error(
-                    "Timeout waiting for trade ACK from MT5 (9000ms). Recreating socket."
-                )
-                self._recreate_control_socket()
+            # 3. ACK待機 (タイムアウト 3000ms)
+            # ネットワーク遅延やMT5の処理時間を考慮して少し長めに待つ
+            if self.control_socket.poll(3000) == 0:
+                logger.error("Timeout waiting for trade ACK from MT5 (3000ms).")
+                # REQソケットはタイムアウトすると使用不能になるため、再接続ロジックが必要だが
+                # ここでは簡易的にFalseを返して次のループで再接続を促す
+                # (本格実装では self._reconnect() を呼ぶのがベター)
                 return False
 
             reply = self.control_socket.recv_string()
@@ -479,34 +465,6 @@ class MQL5BridgePublisherV3:
 
         except Exception as e:
             logger.error(f"ブローカー状態リクエスト失敗: {e}")
-            self._recreate_control_socket()
-            return None
-
-    def request_recent_history(self) -> Optional[List[Dict[str, Any]]]:
-        """直近決済されたポジション履歴を取得 (サイレント・クローズ対策)"""
-        if not self.is_connected:
-            return None
-
-        try:
-            self.control_socket.send_string("REQUEST_RECENT_HISTORY")
-
-            poller = zmq.Poller()
-            poller.register(self.control_socket, zmq.POLLIN)
-
-            if poller.poll(self.config.request_timeout):
-                response_bytes = self.control_socket.recv()
-                history = parse_response(response_bytes)
-
-                if isinstance(history, list):
-                    return history
-                return None
-            else:
-                logger.warning("履歴リクエストがタイムアウトしました")
-                self._recreate_control_socket()
-                return None
-
-        except Exception as e:
-            logger.error(f"履歴リクエスト失敗: {e}")
             self._recreate_control_socket()
             return None
 

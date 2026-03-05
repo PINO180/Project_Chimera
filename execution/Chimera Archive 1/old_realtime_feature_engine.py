@@ -40,12 +40,6 @@ class Signal:
     market_info: Dict[str, Any]  # リスクエンジンに渡す市場文脈 (V4 R4ルール)
     atr_value: float  # 動的バリア計算用の定規(ATR)
     close_price: float  # 動的バリア計算用の起点(現在価格)
-    # [FIX-3] feature_dict を追加 — main.py で signal.feature_dict にアクセスするために必要
-    feature_dict: Dict[str, float] = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.feature_dict is None:
-            self.feature_dict = {}
 
 
 class RealtimeFeatureEngine:
@@ -96,8 +90,7 @@ class RealtimeFeatureEngine:
     def __init__(
         self,
         feature_list_path: str = str(
-            # [FIX-8] デフォルトを TOP_50_FEATURES.json に昇格 (main.py の明示指定と統一)
-            project_root / "models" / "TOP_50_FEATURES.json"
+            project_root / "models" / "final_feature_set_v3.txt"
         ),
     ):
         self.logger = logging.getLogger("ProjectCimera.FeatureEngine")
@@ -267,18 +260,17 @@ class RealtimeFeatureEngine:
         if last_ts is None:
             raise ValueError(f"バッファ {tf_name} のタイムスタンプがありません。")
 
-        # [FIX-INFO-2] Pandas 2.2以降の推奨エイリアスに更新 (T→min, H→h)
         freq_map = {
-            "M1": "1min",
-            "M3": "3min",
-            "M5": "5min",
-            "M8": "8min",
-            "M15": "15min",
-            "M30": "30min",
-            "H1": "1h",
-            "H4": "4h",
-            "H6": "6h",
-            "H12": "12h",
+            "M1": "1T",
+            "M3": "3T",
+            "M5": "5T",
+            "M8": "8T",
+            "M15": "15T",
+            "M30": "30T",
+            "H1": "1H",
+            "H4": "4H",
+            "H6": "6H",
+            "H12": "12H",
             "D1": "1D",
             "W1": "1W",
             "MN": "1MS",
@@ -521,19 +513,13 @@ class RealtimeFeatureEngine:
                 return []
 
             # 1. Dequeから必要なデータ「だけ」を抽出 (メモリコピー地獄を回避)
-            # [FIX-WARNING-5] off-by-one 修正: last_known_timestamp 以降のバーのみ収集し
-            # リサンプリングのオーバーラップ用に1本前のバーを追加する
             new_m1_bars_for_resampling = []
-            found_anchor = False
             for bar in reversed(self.m1_dataframe):
                 bar_ts = bar["timestamp"]
                 if bar_ts >= last_known_timestamp:
                     new_m1_bars_for_resampling.append(bar)
                 else:
-                    # 1本前のアンカーバーを追加してリサンプリングの境界を正確にする
-                    if not found_anchor:
-                        new_m1_bars_for_resampling.append(bar)
-                        found_anchor = True
+                    new_m1_bars_for_resampling.append(bar)
                     break
 
             new_m1_bars_for_resampling.reverse()
@@ -655,10 +641,6 @@ class RealtimeFeatureEngine:
                         )
 
                         if feature_vector is not None:
-                            # [FIX-3] feature_dict を latest_features_cache から取得して Signal に詰める
-                            combined_features: Dict[str, float] = {}
-                            for _tf, _cache in self.latest_features_cache.items():
-                                combined_features.update(_cache)
                             signal = Signal(
                                 features=feature_vector,
                                 timestamp=timestamp,
@@ -670,7 +652,6 @@ class RealtimeFeatureEngine:
                                 close_price=r4_check_result["market_info"].get(
                                     "current_price", 0.0
                                 ),
-                                feature_dict=combined_features,
                             )
                             signal_list.append(signal)
 

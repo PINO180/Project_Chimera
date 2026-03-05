@@ -61,7 +61,9 @@ S3_SELECTED_FEATURES_PURIFIED_DIR = (
     S3_ARTIFACTS / S3_RUN_ID / "selected_features_purified_v5"
 )
 
-# Stratum 4: マスターテーブル (廃止 — git history 参照)
+# # --- Stratum 4: マスターテーブル ---(現在凍結)
+# S4_MASTER = DATA_DIR / SYMBOL / "stratum_4_master" / FEATURE_SET_ID
+# S4_MASTER_TABLE_PARTITIONED = S4_MASTER / "master_table_partitioned"
 
 # --- Stratum 5: 純化アルファ ---
 S5_ALPHA = DATA_DIR / SYMBOL / "stratum_5_alpha" / FEATURE_SET_ID
@@ -75,7 +77,19 @@ S6_WEIGHTED_DATASET = S6_TRAINING / "weighted_dataset_partitioned_v2"
 
 # --- Stratum 7: AIモデル ---
 S7_MODELS = DATA_DIR / SYMBOL / "stratum_7_models" / FEATURE_SET_ID
-# [FIX-INFO-1] 旧仕様の単方向モデルパス定義は廃止 (git history 参照)
+# # Long or Short専用システム時のパス
+# # 旧仕様・凍結 (参考としてコメントアウト)
+# S7_M1_MODEL_PKL = S7_MODELS / "m1_model_v2.pkl"
+# S7_M2_MODEL_PKL = S7_MODELS / "m2_model_v2.pkl"
+# S7_M1_CALIBRATED = S7_MODELS / "m1_calibrated_v2.pkl"
+# S7_M2_CALIBRATED = S7_MODELS / "m2_calibrated_v2.pkl"
+# S7_MODEL_PERFORMANCE_REPORT = S7_MODELS / "model_performance_report_v2.json"
+# S7_M2_OOF_PREDICTIONS_TMP = S7_MODELS / "tmp_m2_oof_predictions_v2"
+# S7_M2_OOF_PREDICTIONS = S7_MODELS / "m2_oof_predictions_v2.parquet"
+# S7_M1_OOF_PREDICTIONS = S7_MODELS / "m1_oof_predictions_v2.parquet"
+# S7_META_LABELED_OOF_PARTITIONED = S7_MODELS / "meta_labeled_oof_partitioned_v2"
+# S7_REGIME_MODEL = S7_MODELS / "regime_detector_hmm_v2.pkl"
+# S7_CONTEXT_FEATURES = S7_MODELS / "context_features_v2.parquet"
 
 
 # =====================================================================

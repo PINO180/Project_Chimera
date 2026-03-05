@@ -1288,9 +1288,11 @@ class BacktestSimulator:
                         format_expressions.append(
                             pl.col(col_name)
                             .map_elements(
-                                lambda d: float(d)
-                                if d is not None and d.is_finite()
-                                else None,
+                                lambda d: (
+                                    float(d)
+                                    if d is not None and d.is_finite()
+                                    else None
+                                ),
                                 return_dtype=pl.Float64,
                             )
                             .round(digits)

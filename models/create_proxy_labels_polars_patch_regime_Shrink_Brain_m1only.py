@@ -327,10 +327,6 @@ class ProxyLabelingEngine:
                 continue
             timeframe = match.group(1)
 
-            # --- [重要] M1以外の特徴量は読み込まない ---
-            if timeframe != TARGET_TIMEFRAME:
-                continue
-
             timeframe_suffix = f"_{timeframe}"
             lf: Optional[pl.LazyFrame] = None
 
@@ -639,12 +635,19 @@ class ProxyLabelingEngine:
                     )
                     continue
 
-                daily_bets_hive_df = unified_hive_lf.filter(
-                    pl.col("timestamp").dt.date() == current_date
-                ).collect()
-                daily_bets_file_df = unified_file_lf.filter(
-                    pl.col("timestamp").dt.date() == current_date
-                ).collect()
+                if "timestamp" in unified_hive_lf.collect_schema().names():
+                    daily_bets_hive_df = unified_hive_lf.filter(
+                        pl.col("timestamp").dt.date() == current_date
+                    ).collect()
+                else:
+                    daily_bets_hive_df = pl.DataFrame()
+
+                if "timestamp" in unified_file_lf.collect_schema().names():
+                    daily_bets_file_df = unified_file_lf.filter(
+                        pl.col("timestamp").dt.date() == current_date
+                    ).collect()
+                else:
+                    daily_bets_file_df = pl.DataFrame()
 
                 # --- 行増殖バグ対策: concat後の GroupBy + First ---
                 daily_bets_df = (
@@ -885,7 +888,9 @@ class ProxyLabelingEngine:
                     .then(pl.col("pt_l_time"))
                     .when(pl.col("sl_l_time") > 0)
                     .then(pl.col("sl_l_time"))
-                    .otherwise(pl.col("t1_max_long")),
+                    .otherwise(
+                        pl.col("t1_max_long").cast(pl.Int64)
+                    ),  # ←変更: Int64にキャスト
                     # ショート用ラベルと「正確な決済時刻(マイクロ秒)」の特定
                     label_short=pl.when(
                         (pl.col("pt_s_time") > 0)
@@ -906,15 +911,21 @@ class ProxyLabelingEngine:
                     .then(pl.col("pt_s_time"))
                     .when(pl.col("sl_s_time") > 0)
                     .then(pl.col("sl_s_time"))
-                    .otherwise(pl.col("t1_max_short")),
+                    .otherwise(
+                        pl.col("t1_max_short").cast(pl.Int64)
+                    ),  # ←変更: Int64にキャスト
                 )
                 .with_columns(
                     # マイクロ秒の差分から「実経過時間（分）」を算出して Float32 で保持
                     duration_long=(
-                        (pl.col("end_l") - pl.col("t0")) / 1_000_000 / 60.0
+                        (pl.col("end_l") - pl.col("t0").cast(pl.Int64))
+                        / 1_000_000
+                        / 60.0  # ←変更: t0をInt64にキャスト
                     ).cast(pl.Float32),
                     duration_short=(
-                        (pl.col("end_s") - pl.col("t0")) / 1_000_000 / 60.0
+                        (pl.col("end_s") - pl.col("t0").cast(pl.Int64))
+                        / 1_000_000
+                        / 60.0  # ←変更: t0をInt64にキャスト
                     ).cast(pl.Float32),
                 )
                 .select(
@@ -935,9 +946,11 @@ class ProxyLabelingEngine:
                 .rename({"t0": "timestamp"})
             )
 
-            # 不要な計算用カラムをドロップ（atr_value等）してリストに追加
-            labeled_chunks.append(final_group_df.drop(["atr_value"]))
-
+            # atr_valueはシミュレーターで必須になるためドロップせずに保持する
+            # 【重要】シミュレーター用の close と atr_value は残しつつ、不要なゴミを捨てる
+            labeled_chunks.append(
+                final_group_df.drop(["open", "high", "low", "e1c_atr_13_M1"])
+            )
         if not labeled_chunks:
             return None
         return pl.concat(labeled_chunks).sort("timestamp")

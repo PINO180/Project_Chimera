@@ -1,0 +1,231 @@
+hephaestus-zero@xxxxx18x:/workspace$ /usr/local/bin/python /workspace/models/model_training_metalabeling_A.py
+2026-03-05 05:51:23,873 - INFO - Loading features from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v3.txt...
+2026-03-05 05:51:23,884 - INFO -    -> Loaded 304 valid features (filtered out V5 metadata).
+2026-03-05 05:51:23,884 - INFO - Discovering all physical partitions...
+2026-03-05 05:51:24,112 - INFO -   -> Discovered and sorted 1165 daily partitions.
+2026-03-05 05:51:24,112 - INFO - ### Script 1/3: M1 Two-Brain Cross-Validation (V5) ###
+2026-03-05 05:51:24,115 - INFO - 
+==================================================
+2026-03-05 05:51:24,115 - INFO - === Starting Pipeline for: LONG ===
+2026-03-05 05:51:24,115 - INFO - ==================================================
+2026-03-05 05:51:24,115 - INFO - Calculating scale_pos_weight for LONG (is_trigger=1)...
+Scanning long labels: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:19<00:00, 14.62it/s]
+2026-03-05 05:52:43,801 - INFO -   -> Total samples (is_trigger=1): 764729
+2026-03-05 05:52:43,801 - INFO -   -> Calculated scale_pos_weight (long): 0.4933
+2026-03-05 05:52:43,801 - INFO - --- Starting BATCH Training for M1 (LONG) ---
+2026-03-05 05:52:43,801 - INFO -   [LONG] Fold 1/5...
+  Loading Train Fold 1: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 930/930 [01:17<00:00, 11.97it/s]
+  Predicting Fold 1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:21<00:00, 10.82it/s]
+2026-03-05 05:57:43,564 - INFO -   [LONG] Fold 2/5...
+  Loading Train Fold 2: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:16<00:00, 12.11it/s]
+  Predicting Fold 2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:21<00:00, 10.90it/s]
+2026-03-05 06:02:42,346 - INFO -   [LONG] Fold 3/5...
+  Loading Train Fold 3: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:16<00:00, 12.15it/s]
+  Predicting Fold 3: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:20<00:00, 11.16it/s]
+2026-03-05 06:07:49,578 - INFO -   [LONG] Fold 4/5...
+  Loading Train Fold 4: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:16<00:00, 12.18it/s]
+  Predicting Fold 4: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:22<00:00, 10.29it/s]
+2026-03-05 06:12:16,161 - INFO -   [LONG] Fold 5/5...
+  Loading Train Fold 5: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:16<00:00, 12.19it/s]
+  Predicting Fold 5: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:23<00:00, 10.03it/s]
+2026-03-05 06:16:29,387 - INFO - Concatenating OOF results for long...
+2026-03-05 06:16:29,575 - INFO - Successfully saved M1 LONG OOF predictions to: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_long.parquet
+2026-03-05 06:16:29,575 - INFO -   - Total predictions saved: 764729
+2026-03-05 06:16:29,575 - INFO - 
+==================================================
+2026-03-05 06:16:29,575 - INFO - === Starting Pipeline for: SHORT ===
+2026-03-05 06:16:29,575 - INFO - ==================================================
+2026-03-05 06:16:29,576 - INFO - Calculating scale_pos_weight for SHORT (is_trigger=1)...
+Scanning short labels: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:19<00:00, 14.69it/s]
+2026-03-05 06:17:48,856 - INFO -   -> Total samples (is_trigger=1): 764729
+2026-03-05 06:17:48,856 - INFO -   -> Calculated scale_pos_weight (short): 1.1693
+2026-03-05 06:17:48,856 - INFO - --- Starting BATCH Training for M1 (SHORT) ---
+2026-03-05 06:17:48,856 - INFO -   [SHORT] Fold 1/5...
+  Loading Train Fold 1: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 930/930 [01:16<00:00, 12.18it/s]
+  Predicting Fold 1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:21<00:00, 10.99it/s]
+2026-03-05 06:23:06,012 - INFO -   [SHORT] Fold 2/5...
+  Loading Train Fold 2: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:15<00:00, 12.28it/s]
+  Predicting Fold 2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:21<00:00, 10.77it/s]
+2026-03-05 06:28:21,359 - INFO -   [SHORT] Fold 3/5...
+  Loading Train Fold 3: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:16<00:00, 12.17it/s]
+  Predicting Fold 3: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:20<00:00, 11.13it/s]
+2026-03-05 06:33:51,678 - INFO -   [SHORT] Fold 4/5...
+  Loading Train Fold 4: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:16<00:00, 12.20it/s]
+  Predicting Fold 4: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:23<00:00, 10.03it/s]
+2026-03-05 06:38:33,040 - INFO -   [SHORT] Fold 5/5...
+  Loading Train Fold 5: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:16<00:00, 12.15it/s]
+  Predicting Fold 5: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:23<00:00,  9.85it/s]
+2026-03-05 06:43:09,718 - INFO - Concatenating OOF results for short...
+2026-03-05 06:43:09,892 - INFO - Successfully saved M1 SHORT OOF predictions to: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_short.parquet
+2026-03-05 06:43:09,892 - INFO -   - Total predictions saved: 764729
+2026-03-05 06:43:09,892 - INFO - 
+============================================================
+2026-03-05 06:43:09,892 - INFO - ### V5 Two-Brain Training COMPLETED! ###
+2026-03-05 06:43:09,892 - INFO - ============================================================
+hephaestus-zero@xxxxx18x:/workspace$ /usr/local/bin/python /workspace/models/model_training_metalabeling_B_.py
+2026-03-05 06:43:23,011 - INFO - Discovering all physical partitions from the weighted dataset...
+2026-03-05 06:43:23,262 - INFO -   -> Discovered 1165 daily partitions.
+2026-03-05 06:43:23,262 - INFO - Loading feature list from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v3.txt...
+2026-03-05 06:43:23,269 - INFO -   -> Loaded 304 valid features.
+2026-03-05 06:43:23,269 - INFO - ### Script 2/3: Meta-Label Generation (V5 Bidirectional / Context Plus) ###
+2026-03-05 06:43:23,269 - INFO - Using dynamic sampling: Top 20 M1 predictions per day.
+2026-03-05 06:43:23,270 - INFO - 
+============================================================
+=== Starting Meta-Label Generation for LONG ===
+============================================================
+2026-03-05 06:43:23,276 - INFO - Loading LONG M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_long.parquet...
+Generating Long Meta-Labels: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:39<00:00, 11.67it/s]
+2026-03-05 06:45:03,248 - INFO - Finished LONG -> Total samples generated: 23205
+2026-03-05 06:45:03,248 - INFO - 
+============================================================
+=== Starting Meta-Label Generation for SHORT ===
+============================================================
+2026-03-05 06:45:03,256 - INFO - Loading SHORT M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_short.parquet...
+Generating Short Meta-Labels: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:40<00:00, 11.64it/s]
+2026-03-05 06:46:43,404 - INFO - Finished SHORT -> Total samples generated: 23205
+2026-03-05 06:46:43,404 - INFO - 
+============================================================
+2026-03-05 06:46:43,404 - INFO - ### Script 2/3 FINISHED! (V5 Bidirectional Context Plus) ###
+2026-03-05 06:46:43,404 - INFO - ============================================================
+hephaestus-zero@xxxxx18x:/workspace$ /usr/local/bin/python /workspace/models/model_training_metalabeling_C.py
+
+============================================================
+### PROJECT FORGE: STARTING PROCESSING FOR DIRECTION: LONG ###
+============================================================
+
+2026-03-05 06:55:44,450 - INFO - [LONG] Loading base feature list from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v3.txt...
+2026-03-05 06:55:44,455 - INFO -    -> Loaded 304 valid base features.
+[LONG] Scale weight (M1): 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:33<00:00, 12.43it/s]
+2026-03-05 06:57:26,457 - INFO - [LONG] Using scale_pos_weight for M1: 0.4933
+[LONG] Scale weight (M2): 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:24<00:00, 13.75it/s]
+2026-03-05 06:58:51,175 - INFO - [LONG] Using scale_pos_weight for M2: 0.0281
+2026-03-05 06:58:51,176 - INFO - [LONG] ### Script 3/3: M2 CV, Final Training, Calibration, and Reporting ###
+2026-03-05 06:58:51,184 - INFO - [LONG] --- Starting BATCH Training for M2 (Meta) CV ---
+2026-03-05 06:58:51,185 - INFO - [LONG]  [M2 (Meta)] Fold 1/5...
+[LONG]  Loading M2 Train Fold 1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 930/930 [01:20<00:00, 11.55it/s]
+2026-03-05 07:00:11,713 - INFO - [LONG]    -> Training M2 model on 18509 samples...
+[LONG]  Predicting M2 Fold 1: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.19it/s]
+2026-03-05 07:00:53,772 - INFO - [LONG]  [M2 (Meta)] Fold 2/5...
+[LONG]  Loading M2 Train Fold 2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:20<00:00, 11.56it/s]
+2026-03-05 07:02:14,146 - INFO - [LONG]    -> Training M2 model on 18515 samples...
+[LONG]  Predicting M2 Fold 2: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.29it/s]
+2026-03-05 07:02:53,295 - INFO - [LONG]  [M2 (Meta)] Fold 3/5...
+[LONG]  Loading M2 Train Fold 3: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:19<00:00, 11.59it/s]
+2026-03-05 07:04:13,298 - INFO - [LONG]    -> Training M2 model on 18482 samples...
+[LONG]  Predicting M2 Fold 3: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.25it/s]
+2026-03-05 07:04:55,912 - INFO - [LONG]  [M2 (Meta)] Fold 4/5...
+[LONG]  Loading M2 Train Fold 4: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:19<00:00, 11.62it/s]
+2026-03-05 07:06:15,721 - INFO - [LONG]    -> Training M2 model on 18464 samples...
+[LONG]  Predicting M2 Fold 4: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.29it/s]
+2026-03-05 07:06:55,032 - INFO - [LONG]  [M2 (Meta)] Fold 5/5...
+[LONG]  Loading M2 Train Fold 5: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:20<00:00, 11.58it/s]
+2026-03-05 07:08:15,305 - INFO - [LONG]    -> Training M2 model on 18490 samples...
+[LONG]  Predicting M2 Fold 5: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.23it/s]
+2026-03-05 07:08:54,477 - INFO - [LONG] --- Training and Calibrating Final Models ---
+2026-03-05 07:08:54,480 - INFO - [LONG]   - Training M1 (Final) on 1165 partitions (BATCH Mode)...
+[LONG]   Loading Data for M1 (Final): 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:48<00:00, 10.74it/s]
+2026-03-05 07:10:43,983 - INFO - [LONG]     -> fitting M1 (Final) on 764729 samples...
+2026-03-05 07:14:44,460 - INFO - [LONG]   -> M1 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_model_v2_long.pkl.
+2026-03-05 07:14:44,461 - INFO - [LONG]   - Training M2 (Final) on 1165 partitions (BATCH Mode)...
+[LONG]   Loading Data for M2 (Final): 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:40<00:00, 11.60it/s]
+2026-03-05 07:16:24,941 - INFO - [LONG]     -> fitting M2 (Final) on 23205 samples...
+2026-03-05 07:16:43,726 - INFO - [LONG]   -> M2 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_model_v2_long.pkl.
+2026-03-05 07:16:43,726 - INFO - [LONG]   - Calibrating models (Manual, Memory-Safe Mode)...
+2026-03-05 07:16:43,728 - INFO - [LONG]     -> Calibrating M1 model...
+[LONG]   Gathering M1 calib predictions: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.00it/s]
+2026-03-05 07:17:09,647 - INFO - [LONG]   -> Calibrated M1 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_calibrated_v2_long.pkl.
+2026-03-05 07:17:09,650 - INFO - [LONG]     -> Calibrating M2 model...
+[LONG]   Gathering M2 calib predictions: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:20<00:00, 11.43it/s]
+2026-03-05 07:17:30,035 - INFO - [LONG]   -> Calibrated M2 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_calibrated_v2_long.pkl.
+2026-03-05 07:17:30,040 - INFO - [LONG] Aggregating M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_long...
+2026-03-05 07:17:49,187 - INFO - [LONG] Successfully aggregated 23205 M2 OOF predictions into: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_long.parquet
+2026-03-05 07:17:49,191 - INFO - [LONG] --- Generating Final Performance Report ---
+2026-03-05 07:17:49,193 - INFO - [LONG]   -> Loading M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_long.parquet...
+2026-03-05 07:17:49,480 - INFO - [LONG]   -> M1 AUC calculated.
+2026-03-05 07:17:49,484 - INFO - [LONG]   -> Loading aggregated M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_long.parquet...
+2026-03-05 07:17:49,518 - INFO - [LONG]   -> M2 AUC calculated.
+2026-03-05 07:17:49,529 - INFO - [LONG] Performance report saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/model_performance_report_long.json
+
+[LONG] Performance Report:
+{
+    "m1_performance": {
+        "auc": 0.8092165785528705
+    },
+    "m2_performance": {
+        "auc": 0.8060583534441934
+    }
+}
+2026-03-05 07:17:49,533 - INFO - [LONG] Cleaning up temporary directory: /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_long
+
+============================================================
+### PROJECT FORGE: STARTING PROCESSING FOR DIRECTION: SHORT ###
+============================================================
+
+2026-03-05 07:17:53,752 - INFO - [SHORT] Loading base feature list from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v3.txt...
+2026-03-05 07:17:53,756 - INFO -    -> Loaded 304 valid base features.
+[SHORT] Scale weight (M1): 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:33<00:00, 12.46it/s]
+2026-03-05 07:19:35,308 - INFO - [SHORT] Using scale_pos_weight for M1: 1.1693
+[SHORT] Scale weight (M2): 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:24<00:00, 13.73it/s]
+2026-03-05 07:21:00,141 - INFO - [SHORT] Using scale_pos_weight for M2: 0.0841
+2026-03-05 07:21:00,141 - INFO - [SHORT] ### Script 3/3: M2 CV, Final Training, Calibration, and Reporting ###
+2026-03-05 07:21:00,148 - INFO - [SHORT] --- Starting BATCH Training for M2 (Meta) CV ---
+2026-03-05 07:21:00,149 - INFO - [SHORT]  [M2 (Meta)] Fold 1/5...
+[SHORT]  Loading M2 Train Fold 1: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 930/930 [01:20<00:00, 11.62it/s]
+2026-03-05 07:22:20,200 - INFO - [SHORT]    -> Training M2 model on 18509 samples...
+[SHORT]  Predicting M2 Fold 1: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.27it/s]
+2026-03-05 07:22:58,893 - INFO - [SHORT]  [M2 (Meta)] Fold 2/5...
+[SHORT]  Loading M2 Train Fold 2: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:20<00:00, 11.59it/s]
+2026-03-05 07:24:19,029 - INFO - [SHORT]    -> Training M2 model on 18515 samples...
+[SHORT]  Predicting M2 Fold 2: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.07it/s]
+2026-03-05 07:24:58,013 - INFO - [SHORT]  [M2 (Meta)] Fold 3/5...
+[SHORT]  Loading M2 Train Fold 3: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:19<00:00, 11.60it/s]
+2026-03-05 07:26:17,929 - INFO - [SHORT]    -> Training M2 model on 18482 samples...
+[SHORT]  Predicting M2 Fold 3: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.27it/s]
+2026-03-05 07:26:57,314 - INFO - [SHORT]  [M2 (Meta)] Fold 4/5...
+[SHORT]  Loading M2 Train Fold 4: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 927/927 [01:20<00:00, 11.58it/s]
+2026-03-05 07:28:17,359 - INFO - [SHORT]    -> Training M2 model on 18464 samples...
+[SHORT]  Predicting M2 Fold 4: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.31it/s]
+2026-03-05 07:28:58,472 - INFO - [SHORT]  [M2 (Meta)] Fold 5/5...
+[SHORT]  Loading M2 Train Fold 5: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 929/929 [01:20<00:00, 11.49it/s]
+2026-03-05 07:30:19,354 - INFO - [SHORT]    -> Training M2 model on 18490 samples...
+[SHORT]  Predicting M2 Fold 5: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:25<00:00,  9.22it/s]
+2026-03-05 07:30:59,531 - INFO - [SHORT] --- Training and Calibrating Final Models ---
+2026-03-05 07:30:59,534 - INFO - [SHORT]   - Training M1 (Final) on 1165 partitions (BATCH Mode)...
+[SHORT]   Loading Data for M1 (Final): 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:49<00:00, 10.61it/s]
+2026-03-05 07:32:50,371 - INFO - [SHORT]     -> fitting M1 (Final) on 764729 samples...
+2026-03-05 07:37:28,120 - INFO - [SHORT]   -> M1 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_model_v2_short.pkl.
+2026-03-05 07:37:28,122 - INFO - [SHORT]   - Training M2 (Final) on 1165 partitions (BATCH Mode)...
+[SHORT]   Loading Data for M2 (Final): 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1165/1165 [01:44<00:00, 11.16it/s]
+2026-03-05 07:39:12,547 - INFO - [SHORT]     -> fitting M2 (Final) on 23205 samples...
+2026-03-05 07:39:32,211 - INFO - [SHORT]   -> M2 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_model_v2_short.pkl.
+2026-03-05 07:39:32,211 - INFO - [SHORT]   - Calibrating models (Manual, Memory-Safe Mode)...
+2026-03-05 07:39:32,213 - INFO - [SHORT]     -> Calibrating M1 model...
+[SHORT]   Gathering M1 calib predictions: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:26<00:00,  8.63it/s]
+2026-03-05 07:39:59,244 - INFO - [SHORT]   -> Calibrated M1 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_calibrated_v2_short.pkl.
+2026-03-05 07:39:59,247 - INFO - [SHORT]     -> Calibrating M2 model...
+[SHORT]   Gathering M2 calib predictions: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 233/233 [00:21<00:00, 11.06it/s]
+2026-03-05 07:40:20,324 - INFO - [SHORT]   -> Calibrated M2 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_calibrated_v2_short.pkl.
+2026-03-05 07:40:20,332 - INFO - [SHORT] Aggregating M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_short...
+2026-03-05 07:40:39,702 - INFO - [SHORT] Successfully aggregated 23205 M2 OOF predictions into: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_short.parquet
+2026-03-05 07:40:39,706 - INFO - [SHORT] --- Generating Final Performance Report ---
+2026-03-05 07:40:39,709 - INFO - [SHORT]   -> Loading M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_short.parquet...
+2026-03-05 07:40:40,000 - INFO - [SHORT]   -> M1 AUC calculated.
+2026-03-05 07:40:40,004 - INFO - [SHORT]   -> Loading aggregated M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_short.parquet...
+2026-03-05 07:40:40,037 - INFO - [SHORT]   -> M2 AUC calculated.
+2026-03-05 07:40:40,046 - INFO - [SHORT] Performance report saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/model_performance_report_short.json
+
+[SHORT] Performance Report:
+{
+    "m1_performance": {
+        "auc": 0.7830975441365713
+    },
+    "m2_performance": {
+        "auc": 0.7972030580344628
+    }
+}
+2026-03-05 07:40:40,049 - INFO - [SHORT] Cleaning up temporary directory: /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_short
+2026-03-05 07:40:44,499 - INFO - 
+============================================================
+### PROJECT FORGE: ALL STAGES (LONG & SHORT) COMPLETED! ###
+============================================================
+hephaestus-zero@xxxxx18x:/workspace$ 
