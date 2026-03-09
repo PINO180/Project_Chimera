@@ -82,6 +82,26 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
                 continue
             feature_cols.append(col)
 
+        # =====================================================================
+        # 【緊急防壁】未来情報（データリーク）を含む汚染特徴量の強制除外
+        # =====================================================================
+        # startswithで一括判定するため、必ずタプル () で定義してください
+        LEAKED_PREFIXES = ("e1a_fast_basic_stabilization", "e1c_dpo", "e1d_hv_regime")
+
+        original_count = len(feature_cols)
+
+        # 指定したプレフィックスから始まるカラムをリストから一掃する
+        feature_cols = [
+            col for col in feature_cols if not col.startswith(LEAKED_PREFIXES)
+        ]
+
+        removed_count = original_count - len(feature_cols)
+        if removed_count > 0:
+            print(
+                f"🚨 SECURITY WARNING: Removed {removed_count} leaked features from the training list!"
+            )
+        # =====================================================================
+
         # 3. 辞書順でソートして一貫性を保つ
         feature_cols.sort()
 

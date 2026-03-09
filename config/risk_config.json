@@ -1,6 +1,6 @@
 {
   "base_capital": 1000.0,
-  "lot_per_base": 1.0,
+  "lot_per_base": 0.1,
   "max_lot_absolute": 200.0,
   "contract_size": 100.0,
   "min_lot_size": 0.01,
@@ -14,5 +14,9 @@
   "value_per_pip": 1.0,
   "prevent_simultaneous_orders": true,
   "max_drawdown": 0.50,
-  "max_positions": 1000
+  "max_positions": 1000,
+  "min_atr_threshold": 0.0,
+  "use_fixed_risk": true,
+  "fixed_risk_percent": 0.10,
+  "max_allowed_spread": 30.0
 }

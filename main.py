@@ -148,10 +148,12 @@ def load_static_data() -> bool:
             .drop_nulls()  # 計算不能な先頭のNaNを削除
         )
 
-        # TZ-Aware (UTC) に統一
-        g_market_proxy = (
-            g_market_proxy_pl.to_pandas().set_index("timestamp").tz_localize("UTC")
-        )
+        # TZ-Aware (UTC) に統一 [FIX-8: 既にTZがある場合のクラッシュ回避]
+        proxy_df = g_market_proxy_pl.to_pandas().set_index("timestamp")
+        if proxy_df.index.tz is None:
+            g_market_proxy = proxy_df.tz_localize("UTC")
+        else:
+            g_market_proxy = proxy_df.tz_convert("UTC")
 
         logger.info(
             f"✓ M5市場プロキシデータをPandas DFとしてキャッシュ ({len(g_market_proxy)}行)。"
@@ -272,6 +274,8 @@ def get_latest_m1_bar(bridge: MQL5BridgePublisherV3) -> Optional[Dict[str, Any]]
             "low": bar["low"],
             "close": bar["close"],
             "volume": float(bar["volume"]),
+            "tick_volume_mean_5": float(bar.get("tick_volume_mean_5", 0.0)),
+            "spread": float(bar.get("spread", 16.0)),  # ▼追加: MT5からスプレッドを取得
         }
     else:
         return None
@@ -357,8 +361,10 @@ def main():
                 "short_m2": joblib.load(config.S7_M2_MODEL_SHORT_PKL),
             }
 
-            # 2. 確率較正モデル (IsotonicRegression)
+            # 2. 確率較正モデル (IsotonicRegression) [FIX: M1較正器のロードを追加]
             calibrators = {
+                "long_m1": joblib.load(config.S7_M1_CALIBRATED_LONG),
+                "short_m1": joblib.load(config.S7_M1_CALIBRATED_SHORT),
                 "long_m2": joblib.load(config.S7_M2_CALIBRATED_LONG),
                 "short_m2": joblib.load(config.S7_M2_CALIBRATED_SHORT),
             }
@@ -374,16 +380,16 @@ def main():
 
             feature_lists = {
                 "long_m1": load_feature_list(
-                    config.S3_SELECTED_FEATURES_DIR / "m1_long_features.txt"
+                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m1_long_features.txt"
                 ),
                 "long_m2": load_feature_list(
-                    config.S3_SELECTED_FEATURES_DIR / "m2_long_features.txt"
+                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m2_long_features.txt"
                 ),
                 "short_m1": load_feature_list(
-                    config.S3_SELECTED_FEATURES_DIR / "m1_short_features.txt"
+                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m1_short_features.txt"
                 ),
                 "short_m2": load_feature_list(
-                    config.S3_SELECTED_FEATURES_DIR / "m2_short_features.txt"
+                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m2_short_features.txt"
                 ),
             }
 
@@ -398,9 +404,8 @@ def main():
             "--- 6. リアルタイム特徴量エンジンの初期化 (ゼロ・シリアライズ) ---"
         )
 
-        # [推奨修正] Top 50 JSON を明示的に指定
         feature_engine = RealtimeFeatureEngine(
-            feature_list_path=str(project_root / "models" / "TOP_50_FEATURES.json")
+            feature_list_path=str(config.S3_FEATURES_FOR_TRAINING_V5)
         )
         # ✨ V3 bridge と g_market_proxy を渡す
         if not initialize_data_buffer(feature_engine, bridge, g_market_proxy):
@@ -433,7 +438,8 @@ def main():
                                 f"⏱️ タイムアウト(TO)条件到達。強制決済を実行: Ticket={trade.ticket}, Direction={trade.direction}, Duration={duration_mins:.1f}分"
                             )
                             # ZMQで単一ポジションの決済コマンドを送信
-                            bridge.send_trade_command(
+                            # ▼▼▼ 修正: 幽霊ポジション・無限ループの防止 ▼▼▼
+                            success = bridge.send_trade_command(
                                 {
                                     "action": "CLOSE",
                                     "ticket": trade.ticket,
@@ -441,20 +447,26 @@ def main():
                                 }
                             )
 
-                            # [FIX-8] パブリック API apply_event_and_update を使用
-                            event_data = {
-                                "ticket": trade.ticket,
-                                "close_reason": "TO",
-                                "max_consecutive_sl": risk_engine.config.get(
-                                    "max_consecutive_sl", 2
-                                ),
-                                "cooldown_minutes_after_sl": risk_engine.config.get(
-                                    "cooldown_minutes_after_sl", 10
-                                ),
-                            }
-                            state_manager.apply_event_and_update(
-                                EventType.POSITION_CLOSED, event_data
-                            )
+                            if success:
+                                # 送信成功時のみローカル状態を更新
+                                event_data = {
+                                    "ticket": trade.ticket,
+                                    "close_reason": "TO",
+                                    "max_consecutive_sl": risk_engine.config.get(
+                                        "max_consecutive_sl", 2
+                                    ),
+                                    "cooldown_minutes_after_sl": risk_engine.config.get(
+                                        "cooldown_minutes_after_sl", 10
+                                    ),
+                                }
+                                state_manager.apply_event_and_update(
+                                    EventType.POSITION_CLOSED, event_data
+                                )
+                            else:
+                                logger.warning(
+                                    f"⚠️ タイムアウト決済コマンドの送信に失敗しました。次ループで再試行します: Ticket={trade.ticket}"
+                                )
+                            # ▲▲▲ ここまで修正 ▲▲▲
 
                 # ==========================================================
                 # 【シミュレーター完全同期 2】 サイレント・クローズ(SL/PT)の確実な捕捉
@@ -501,6 +513,23 @@ def main():
                     time.sleep(1.0)  # CPU負荷軽減
                     continue
 
+                # ▼▼▼ 修正: 市場プロキシ (g_market_proxy) の永久凍結防止 ▼▼▼
+                global g_market_proxy
+                if feature_engine and len(feature_engine.m1_dataframe) >= 25:
+                    current_close = new_m1_bar["close"]
+                    past_close = feature_engine.m1_dataframe[-25]["close"]
+                    if past_close > 0:
+                        new_proxy_val = (current_close - past_close) / past_close
+                        new_proxy_df = pd.DataFrame(
+                            {"market_proxy": [new_proxy_val]},
+                            index=[new_m1_bar["timestamp"]],
+                        )
+                        g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
+                        # メモリ溢れ保護
+                        if len(g_market_proxy) > 10000:
+                            g_market_proxy = g_market_proxy.iloc[-5000:]
+                # ▲▲▲ ここまで修正 ▲▲▲
+
                 # (B) M1バーをエンジンに渡し、シグナルを待つ
                 signal_list = feature_engine.process_new_m1_bar(
                     new_m1_bar, g_market_proxy
@@ -518,45 +547,56 @@ def main():
 
                     # 全特徴量を持つ辞書を作成 (リストの場合は feature_engine.feature_names と zip して辞書化する想定)
                     # 例: feature_dict = dict(zip(feature_engine.feature_names, signal.features))
-                    feature_dict = signal.feature_dict
+                    feature_dict = signal.feature_dict.copy()
 
-                    # --- ユーティリティ: 特徴量抽出 ---
-                    def extract_features(f_list, f_dict):
-                        return np.array([[f_dict.get(f, 0.0) for f in f_list]])
+                    # --------------------------------------------------
+                    # 【Long側】 Two-Brain 推論と Isotonic 較正
+                    # --------------------------------------------------
+                    # 1. M1モデル (生の予測値 → 較正)
+                    X_long_m1 = np.array(
+                        [[feature_dict.get(f, 0.0) for f in feature_lists["long_m1"]]]
+                    )
+                    p_long_m1_raw = models["long_m1"].predict(X_long_m1)[0]
+                    p_long_m1 = calibrators["long_m1"].predict([p_long_m1_raw])[0]
 
-                    # --- Two-Brain 並列推論 (LightGBM Booster は predict_proba ではなく predict を使用) ---
-                    # [FIX-1] Long と Short で独立したキーを使用し、m1_pred_proba の上書きバグを修正
-
-                    # 1. Long 側推論
-                    X_long_m1 = extract_features(feature_lists["long_m1"], feature_dict)
-                    p_long_m1 = models["long_m1"].predict(X_long_m1)[0]
-
-                    # Long M2 用の feature_dict コピーに Long の M1 確率をセット
-                    feature_dict_long = dict(feature_dict)
+                    # 2. M2モデル (M1の較正済み予測値を特徴量として追加 → 生予測 → 較正)
+                    feature_dict_long = feature_dict.copy()
                     feature_dict_long["m1_pred_proba"] = p_long_m1
 
-                    X_long_m2 = extract_features(
-                        feature_lists["long_m2"], feature_dict_long
+                    X_long_m2 = np.array(
+                        [
+                            [
+                                feature_dict_long.get(f, 0.0)
+                                for f in feature_lists["long_m2"]
+                            ]
+                        ]
                     )
                     p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
+                    p_long_m2_calib = calibrators["long_m2"].predict([p_long_m2_raw])[0]
 
-                    # 2. Short 側推論
-                    X_short_m1 = extract_features(
-                        feature_lists["short_m1"], feature_dict
+                    # --------------------------------------------------
+                    # 【Short側】 Two-Brain 推論と Isotonic 較正
+                    # --------------------------------------------------
+                    # 1. M1モデル (生の予測値 → 較正)
+                    X_short_m1 = np.array(
+                        [[feature_dict.get(f, 0.0) for f in feature_lists["short_m1"]]]
                     )
-                    p_short_m1 = models["short_m1"].predict(X_short_m1)[0]
+                    p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
+                    p_short_m1 = calibrators["short_m1"].predict([p_short_m1_raw])[0]
 
-                    # Short M2 用の feature_dict コピーに Short の M1 確率をセット
-                    feature_dict_short = dict(feature_dict)
+                    # 2. M2モデル (M1の較正済み予測値を特徴量として追加 → 生予測 → 較正)
+                    feature_dict_short = feature_dict.copy()
                     feature_dict_short["m1_pred_proba"] = p_short_m1
 
-                    X_short_m2 = extract_features(
-                        feature_lists["short_m2"], feature_dict_short
+                    X_short_m2 = np.array(
+                        [
+                            [
+                                feature_dict_short.get(f, 0.0)
+                                for f in feature_lists["short_m2"]
+                            ]
+                        ]
                     )
                     p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
-
-                    # 3. M2確率の較正 (Isotonic Regression)
-                    p_long_m2_calib = calibrators["long_m2"].predict([p_long_m2_raw])[0]
                     p_short_m2_calib = calibrators["short_m2"].predict(
                         [p_short_m2_raw]
                     )[0]
@@ -576,31 +616,13 @@ def main():
 
                     if prevent_simultaneous_orders:
                         # ステップA: ノイズ検知（両方向のシグナルが同時に出た場合は問答無用で両方キャンセル）
+                        # ※バックテスト同様、別タイミングでの両建て(ヘッジ)は許可するためステップBは削除
                         if should_trade_long and should_trade_short:
                             logger.warning(
                                 f"⚠️ 【防衛線1-A】相場混乱検知: Long/Shortの同時シグナルにつき強制キャンセル。"
                             )
                             should_trade_long = False
                             should_trade_short = False
-                        else:
-                            # ステップB: 逆行ポジションの確認（片方向のみシグナルが出ている場合）
-                            if (
-                                should_trade_long
-                                and state_manager.get_active_positions_count("SELL") > 0
-                            ):
-                                logger.info(
-                                    "⚠️ 【防衛線1-B】逆方向(SELL)のポジションを保有しているため、Longシグナルを見送ります（両建て防止）。"
-                                )
-                                should_trade_long = False
-
-                            if (
-                                should_trade_short
-                                and state_manager.get_active_positions_count("BUY") > 0
-                            ):
-                                logger.info(
-                                    "⚠️ 【防衛線1-B】逆方向(BUY)のポジションを保有しているため、Shortシグナルを見送ります（両建て防止）。"
-                                )
-                                should_trade_short = False
 
                     # --- 2. サーキットブレーカー（連続SL）のチェック ---
                     # ステップC: クールダウン中かどうかの最終確認
@@ -655,6 +677,8 @@ def main():
                     current_atr = signal.market_info.get(
                         "atr_value", signal.market_info.get("atr", 5.0)
                     )
+                    # ▼追加: M1バーから取得したリアルタイムスプレッド
+                    current_spread = new_m1_bar.get("spread", 16.0)
 
                     command = risk_engine.generate_trade_command(
                         action=direction,  # 'BUY' or 'SELL'
@@ -665,6 +689,7 @@ def main():
                         equity=state_manager.current_state.current_equity,
                         sl_multiplier=risk_engine.config.get("sl_multiplier", 5.0),
                         tp_multiplier=risk_engine.config.get("pt_multiplier", 1.0),
+                        current_spread_pips=current_spread,  # ▼追加
                     )
 
                     # V5エンジンは独立したため、ここでイベントログを記録する

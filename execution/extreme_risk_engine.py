@@ -76,8 +76,17 @@ class ExtremeRiskEngineV5:
                 "contract_size": 100.0,
                 "min_lot_size": 0.01,
                 "base_leverage": 2000.0,
+                "spread_pips": 16.0,
+                "value_per_pip": 1.0,
+                "min_atr_threshold": 0.0,
                 "sl_multiplier": 5.0,
                 "pt_multiplier": 1.0,
+                "m2_proba_threshold": 0.50,
+                "max_drawdown": 0.50,
+                "max_positions": 1000,
+                "prevent_simultaneous_orders": True,
+                "max_consecutive_sl": 2,
+                "cooldown_minutes_after_sl": 10,
             }
 
     def _get_exness_leverage(self, equity: Decimal) -> Decimal:
@@ -110,9 +119,12 @@ class ExtremeRiskEngineV5:
         base_capital: Optional[float] = None,
         lot_per_base: Optional[float] = None,
         effective_leverage_cap: Optional[float] = None,
+        atr_value: float = 0.0,
+        current_spread_pips: Optional[float] = None,  # ▼追加: 動的スプレッドを受け取る
     ) -> float:
         """
         資金比例固定ロット (Auto Lot) を計算し、レバレッジ上限で安全にキャップする
+        [V5改修] スプレッドとATRを加味した厳密なFixed Riskロジックを統合
         """
         eq_dec = Decimal(str(max(equity, 0.0)))
         price_dec = Decimal(str(current_price))
@@ -125,7 +137,47 @@ class ExtremeRiskEngineV5:
         if eq_dec <= 0 or price_dec <= 0 or b_cap_dec <= 0:
             return 0.0
 
-        base_lot = (eq_dec / b_cap_dec) * l_base_dec
+        # ▼▼▼ 修正: 固定比率(Fixed Risk)と固定複利(Auto Lot)の動的分岐 ▼▼▼
+        use_fixed_risk = self.config.get("use_fixed_risk", True)
+
+        if use_fixed_risk and atr_value > 0.0:
+            # --- 厳密な固定比率（Fixed Risk）---
+            fixed_risk_percent = Decimal(
+                str(self.config.get("fixed_risk_percent", 0.02))
+            )
+            sl_mult = Decimal(str(self.config.get("sl_multiplier", 5.0)))
+
+            # ▼修正: 動的スプレッドがあればそれを優先し、なければconfig値を使用
+            spread_val = (
+                current_spread_pips
+                if current_spread_pips is not None
+                else self.config.get("spread_pips", 16.0)
+            )
+            spread_pips = Decimal(str(spread_val))
+
+            val_per_pip = Decimal(str(self.config.get("value_per_pip", 1.0)))
+
+            # 1. 最大許容損失額 = 現在の口座残高 × fixed_risk_percent
+            max_loss_amount = eq_dec * fixed_risk_percent
+
+            # 2. 1ロットあたりの値幅損失額 = ATR × SL_Multiplier × ContractSize
+            sl_loss_per_lot = Decimal(str(atr_value)) * sl_mult * contract_dec
+
+            # 3. 1ロットあたりのスプレッドコスト = Spread_pips × Value_per_pip
+            spread_cost_per_lot = spread_pips * val_per_pip
+
+            # 4. 1ロットあたりのトータル最大損失額 = 値幅損失額 ＋ スプレッドコスト
+            total_risk_per_lot = sl_loss_per_lot + spread_cost_per_lot
+
+            # 5. base_lot = 最大許容損失額 / トータル最大損失額
+            if total_risk_per_lot > Decimal("0"):
+                base_lot = max_loss_amount / total_risk_per_lot
+            else:
+                base_lot = Decimal("0")
+        else:
+            # --- 従来の固定複利（Auto Lot）---
+            base_lot = (eq_dec / b_cap_dec) * l_base_dec
+        # ▲▲▲ ここまで修正 ▲▲▲
 
         if effective_leverage_cap is not None:
             leverage_dec = Decimal(str(effective_leverage_cap))
@@ -136,8 +188,11 @@ class ExtremeRiskEngineV5:
         final_lot = min(base_lot, max_lot_margin, max_lot_abs)
         final_lot_quantized = float((final_lot // min_lot_dec) * min_lot_dec)
 
+        # ▼▼▼ 新規追加: ニート化防止パッチ (最低ロットの強制保証) ▼▼▼
+        final_lot_quantized = max(final_lot_quantized, float(min_lot_dec))
+
         logger.debug(
-            f"Auto Lot計算: 基本={base_lot:.2f}, 証拠金上限({leverage_dec}倍)={max_lot_margin:.2f} -> 最終={final_lot_quantized:.2f}"
+            f"Lot計算(FixedRisk={use_fixed_risk}): 基本={base_lot:.2f}, 証拠金上限({leverage_dec}倍)={max_lot_margin:.2f} -> 最終={final_lot_quantized:.2f}"
         )
         return final_lot_quantized
 
@@ -171,14 +226,51 @@ class ExtremeRiskEngineV5:
         current_price: float,
         atr: float,
         equity: float,
-        sl_multiplier: float,
-        tp_multiplier: float,
+        sl_multiplier: Optional[float] = None,
+        tp_multiplier: Optional[float] = None,
         base_capital: Optional[float] = None,
         lot_per_base: Optional[float] = None,
+        current_spread_pips: Optional[float] = None,  # ▼追加
     ) -> Dict[str, Any]:
         """外部(司令塔)から受け取った確率とパラメータに基づき、最終的な執行コマンドを生成する"""
+        # 仕様書との不整合を吸収するため、未指定時はconfigから取得
+        sl_mult = (
+            sl_multiplier
+            if sl_multiplier is not None
+            else self.config.get("sl_multiplier", 5.0)
+        )
+        tp_mult = (
+            tp_multiplier
+            if tp_multiplier is not None
+            else self.config.get("pt_multiplier", 1.0)
+        )
+
         if action == "HOLD":
             return self._generate_hold_command("司令塔からのHOLD指示", p_long, p_short)
+
+        # 追加: ATR最小閾値フィルター (ボラティリティ枯渇時の発注スキップ)
+        min_atr = self.config.get("min_atr_threshold", 0.0)
+        if atr <= min_atr:
+            return self._generate_hold_command(
+                f"ATR({atr:.3f})が最小閾値({min_atr})以下のためスキップ",
+                p_long,
+                p_short,
+            )
+
+        # ▼▼▼ 追加: リアルタイム・スプレッドフィルター (サーキットブレーカー) ▼▼▼
+        spread_val = (
+            current_spread_pips
+            if current_spread_pips is not None
+            else self.config.get("spread_pips", 16.0)
+        )
+        max_spread = self.config.get("max_allowed_spread", 30.0)
+        if spread_val > max_spread:
+            return self._generate_hold_command(
+                f"スプレッド({spread_val:.1f}pips)が許容上限({max_spread:.1f}pips)を超過したため発注をブロック",
+                p_long,
+                p_short,
+            )
+        # ▲▲▲ ここまで追加 ▲▲▲
 
         direction = 1 if action == "BUY" else -1
 
@@ -187,12 +279,11 @@ class ExtremeRiskEngineV5:
             current_price=current_price,
             base_capital=base_capital,
             lot_per_base=lot_per_base,
+            atr_value=atr,
+            current_spread_pips=spread_val,  # ▼追加: 動的スプレッドを渡す
         )
 
-        if lots < self.config["min_lot_size"]:
-            return self._generate_hold_command(
-                "資金不足による最小ロット未達", p_long, p_short
-            )
+        # ▼▼▼ 削除: ニート化防止のため、資金不足によるHOLD処理を撤廃 ▼▼▼
 
         sl_tp = self.calculate_sl_tp(
             entry_price=current_price,

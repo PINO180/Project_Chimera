@@ -63,8 +63,8 @@ def analyze_and_export(
     # --- ログ出力の復元 ---
     print(f"✨ Purified features (Gain > 0): {len(df_active)} / {len(feature_names)}")
     print(f"{'Rank':<5} {'Feature Name':<50} {'Gain':>15}")
-    print("-" * 75)
-    for i, row in enumerate(df_active.head(50).itertuples()):
+    print("-" * 500)
+    for i, row in enumerate(df_active.head(500).itertuples()):
         print(f"{i + 1:<5} {str(row.feature):<50} {row.gain:>15.2f}")
 
     out_path = S3_SELECTED_FEATURES_PURIFIED_DIR / output_filename  #

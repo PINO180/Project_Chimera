@@ -90,7 +90,15 @@ class Trade:
         """
         [V5追加] エントリーからの経過時間を分単位で算出
         """
-        delta = close_time - self.entry_time
+        safe_close_time = close_time
+        if safe_close_time.tzinfo is None:
+            safe_close_time = safe_close_time.replace(tzinfo=timezone.utc)
+
+        safe_entry_time = self.entry_time
+        if safe_entry_time.tzinfo is None:
+            safe_entry_time = safe_entry_time.replace(tzinfo=timezone.utc)
+
+        delta = safe_close_time - safe_entry_time
         return delta.total_seconds() / 60.0
 
 
@@ -104,6 +112,7 @@ class SystemState:
     current_margin: float
     free_margin: float
     current_drawdown: float
+    high_water_mark: float = 0.0  # [V3.3 修正] HWMの永続化
     trades: List[Trade]
 
     m1_rolling_precision: List[float] = None
@@ -131,6 +140,7 @@ class SystemState:
             "current_margin": self.current_margin,
             "free_margin": self.free_margin,
             "current_drawdown": self.current_drawdown,
+            "high_water_mark": self.high_water_mark,
             "recent_trades_count": self.recent_trades_count,
             # --- V5 追加分 ---
             "consecutive_sl_long": self.consecutive_sl_long,
@@ -189,6 +199,9 @@ class SystemState:
             current_margin=data.get("current_margin", 0.0),
             free_margin=data.get("free_margin", 0.0),
             current_drawdown=data.get("current_drawdown", 0.0),
+            high_water_mark=data.get(
+                "high_water_mark", data.get("current_equity", 0.0)
+            ),
             trades=trades,
             recent_trades_count=data.get("recent_trades_count", 0),
             consecutive_sl_long=data.get("consecutive_sl_long", 0),
@@ -713,6 +726,16 @@ class StateManager:
                     "balance", 0.0
                 )  # ★ここを追加
 
+            # HWM と Drawdown の自動更新を毎回の整合性検証時に実行
+            self.current_state.high_water_mark = max(
+                self.current_state.high_water_mark, self.current_state.current_equity
+            )
+            if self.current_state.high_water_mark > 0:
+                self.current_state.current_drawdown = (
+                    self.current_state.high_water_mark
+                    - self.current_state.current_equity
+                ) / self.current_state.high_water_mark
+
             # ✨ [V3.2 修正] positions キーが存在するかチェック
             broker_positions = broker_state.get("positions", [])
 
@@ -764,6 +787,10 @@ class StateManager:
                             else:
                                 # ISO形式の場合のフォールバック
                                 entry_time_dt = datetime.fromisoformat(entry_time_str)
+                                if entry_time_dt.tzinfo is None:
+                                    entry_time_dt = entry_time_dt.replace(
+                                        tzinfo=timezone.utc
+                                    )
 
                             # Tradeオブジェクトを作成して追加
                             new_trade = Trade(
@@ -875,9 +902,9 @@ class StateManager:
                 current_margin=margin,
                 free_margin=free_margin,
                 current_drawdown=0.0,  # [V3.3 追加] 初期化時は0.0
+                high_water_mark=equity,  # [V3.3 修正] HWM初期化
                 trades=trades,
             )
-
             # チェックポイント保存
             self.save_checkpoint(self.current_state)
 

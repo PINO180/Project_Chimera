@@ -14,8 +14,9 @@ import shutil
 
 # blueprintから一元管理された設定を読み込む
 from blueprint import (
+    S2_FEATURES_FIXED,  # ← これを追加
     S2_FEATURES_AFTER_AV,
-    S3_FEATURES_FOR_ALPHA_DECAY,
+    S3_ARTIFACTS,
     S5_ALPHA,
     S5_NEUTRALIZED_ALPHA_SET,
 )
@@ -49,7 +50,10 @@ def find_features_by_file(final_features: list[str]) -> dict[Path, list[str]]:
     print("Mapping final features to their source files with high precision...")
     features_by_file = {}
     all_sources_with_schema = {}
-    all_sources = list(S2_FEATURES_AFTER_AV.rglob("*"))
+    # ★ 修正: FIXED と AFTER_AV の両方からファイルを探す
+    all_sources = list(S2_FEATURES_AFTER_AV.rglob("*")) + list(
+        S2_FEATURES_FIXED.rglob("*")
+    )
     for source_path in tqdm(all_sources, desc="Caching all source schemas"):
         try:
             schema = set()
@@ -97,7 +101,12 @@ def find_features_by_file(final_features: list[str]) -> dict[Path, list[str]]:
 
 
 def get_output_path(input_path: Path) -> Path:
-    relative_path = input_path.relative_to(S2_FEATURES_AFTER_AV)
+    # ★ 修正: どちらのフォルダから来ても相対パスを正しく計算する
+    try:
+        relative_path = input_path.relative_to(S2_FEATURES_AFTER_AV)
+    except ValueError:
+        relative_path = input_path.relative_to(S2_FEATURES_FIXED)
+
     output_name = (
         input_path.name.replace(".parquet", "_neutralized.parquet")
         if input_path.is_file()
@@ -158,14 +167,22 @@ def main(test_mode: bool):
         shutil.rmtree(S5_NEUTRALIZED_ALPHA_SET)
     S5_NEUTRALIZED_ALPHA_SET.mkdir(parents=True, exist_ok=True)
 
-    with open(S3_FEATURES_FOR_ALPHA_DECAY, "r") as f:
+    # --- ★ 修正: Fast Track用のリストを直接読み込む ---
+    FAST_TRACK_FEATURES = S3_ARTIFACTS / "fast_track_filtered_features.txt"
+    if not FAST_TRACK_FEATURES.exists():
+        raise FileNotFoundError(
+            f"Fast Track feature list not found: {FAST_TRACK_FEATURES}"
+        )
+
+    with open(FAST_TRACK_FEATURES, "r") as f:
         final_features = [line.strip() for line in f if line.strip()]
+    # --- ★ 修正ここまで ---
 
     features_by_source_file = find_features_by_file(final_features)
 
     print(f"\nPreparing market proxy using {MARKET_PROXY_TIMEFRAME} data...")
     proxy_source_path = (
-        S2_FEATURES_AFTER_AV
+        S2_FEATURES_FIXED  # ★ 修正: 生データがあるFIXEDからプロキシを読み込む
         / "feature_value_a_vast_universeA"
         / f"features_e1a_{MARKET_PROXY_TIMEFRAME}.parquet"
     )

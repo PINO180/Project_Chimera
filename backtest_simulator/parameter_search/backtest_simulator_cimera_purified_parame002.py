@@ -26,7 +26,7 @@ from decimal import Decimal, getcontext, ROUND_HALF_UP
 getcontext().prec = 5000
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
-project_root = Path(__file__).resolve().parents[1]
+project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
@@ -40,8 +40,14 @@ from blueprint import (
 )
 
 # --- 出力ファイルパス ---
-FINAL_REPORT_PATH = S7_MODELS / "final_backtest_report_v5.json"
-EQUITY_CURVE_PATH = S7_MODELS / "equity_curve_v5.png"
+# [一時的] 出力先をハードコード (001の部分をスクリプトごとに書き換える)
+OUTPUT_DIR = Path(
+    "/workspace/data/XAUUSD/stratum_7_models/1A_2B/Chimera -4- Reunion first stage 110/backtast data/002"
+)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # フォルダが存在しなければ自動作成
+
+FINAL_REPORT_PATH = OUTPUT_DIR / "final_backtest_report_v5.json"
+EQUITY_CURVE_PATH = OUTPUT_DIR / "equity_curve_v5.png"
 
 
 # --- ロギング設定 ---
@@ -63,7 +69,7 @@ CONTRACT_SIZE = Decimal("100")  # 1 lot = 100 oz
 class BacktestConfig:
     """シミュレーションの全パラメータを一元管理 (V5 Two-Brain Architecture)"""
 
-    initial_capital: float = 100.0
+    initial_capital: float = 1000.0
     simulation_data_path: Path = S6_WEIGHTED_DATASET
 
     # V5: Long/Short独立のOOF予測パス
@@ -75,7 +81,7 @@ class BacktestConfig:
 
     # --- V5 新規: 自動ロット調整と発火閾値 ---
     auto_lot_base_capital: float = 1000.0
-    auto_lot_size_per_base: float = 0.1
+    auto_lot_size_per_base: float = 1.0
     m2_proba_threshold: float = 0.50
     test_limit_partitions: int = 0
     oof_mode: bool = True

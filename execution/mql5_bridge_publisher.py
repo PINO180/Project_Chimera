@@ -55,6 +55,9 @@ class BridgeConfig:
     )
 
     request_timeout: int = 45000  # 45秒
+    heartbeat_timeout: int = config.ZMQ.get(
+        "heartbeat_timeout", 9000
+    )  # ハートビート用タイムアウト
     request_retries: int = 3
     heartbeat_interval: int = 10
     log_dir: str = str(config.LOGS_ZMQ_BRIDGE)
@@ -88,8 +91,8 @@ def parse_response(response_bytes: bytes) -> Any:
     """ZMQ レスポンスをパース"""
     try:
         response_str = response_bytes.decode("utf-8")
-        # JSON形式か単純テキストかを簡易判定
-        if response_str.strip().startswith("{"):
+        # JSON形式か単純テキストかを簡易判定 (オブジェクト '{' または 配列 '[' に対応)
+        if response_str.strip().startswith("{") or response_str.strip().startswith("["):
             clean_json = clean_zmq_json(response_str)
             return json.loads(clean_json)
         return response_str
@@ -168,10 +171,9 @@ class MQL5BridgePublisherV3:
             self.data_socket.set_hwm(10000)
             logger.info(f"  Data Endpoint: {self.config.data_endpoint}")
 
-            # 3. ハートビートチャネル (REQ)
-            self.heartbeat_socket = self.context.socket(zmq.REQ)
-            self.heartbeat_socket.connect(self.config.heartbeat_endpoint)
-            logger.info(f"  Heartbeat Endpoint: {self.config.heartbeat_endpoint}")
+            # ▼▼▼ 修正: ZMQソケットのマルチスレッド違反を解消 ▼▼▼
+            # 3. ハートビートチャネル (REQ) のソケット作成は _heartbeat_loop (別スレッド) 内部で行うためここでは作成しない
+            # ▲▲▲ ここまで修正 ▲▲▲
 
             self.is_connected = True
             self._start_heartbeat_thread()
@@ -190,11 +192,12 @@ class MQL5BridgePublisherV3:
             self.control_socket.close()
         if self.data_socket:
             self.data_socket.close()
-        if self.heartbeat_socket:
-            self.heartbeat_socket.close()
+        # ▼▼▼ 修正: heartbeat_socket のクローズはスレッド側で行うため削除 ▼▼▼
+        # if self.heartbeat_socket:
+        #     self.heartbeat_socket.close()
+        # ▲▲▲ ここまで修正 ▲▲▲
         if self.context:
             self.context.term()
-
         self.is_connected = False
         logger.info("ZeroMQ通信を切断しました。")
 
@@ -533,32 +536,44 @@ class MQL5BridgePublisherV3:
 
     def _heartbeat_loop(self):
         """ハートビートループ (Simple Text PING/PONG)"""
-        while self.heartbeat_running:
-            try:
-                if self.heartbeat_socket:
-                    # PING送信
-                    self.heartbeat_socket.send_string("PING")
-                    self.last_heartbeat_sent = datetime.now()
-                    self.heartbeats_sent += 1
+        # ▼▼▼ 修正: 別スレッド内で専用ソケットを作成 ▼▼▼
+        self.heartbeat_socket = self.context.socket(zmq.REQ)
+        self.heartbeat_socket.connect(self.config.heartbeat_endpoint)
+        logger.info(f"  Heartbeat Endpoint (Thread): {self.config.heartbeat_endpoint}")
 
-                    # PONG受信待機
-                    # [修正] 固定値ではなく config.request_timeout (9000) を使用
-                    if self.heartbeat_socket.poll(self.config.request_timeout):
-                        pong = self.heartbeat_socket.recv_string()
-                        if "PONG" in pong:
-                            self.last_heartbeat_received = datetime.now()
-                            self.heartbeats_received += 1
-                    else:
-                        logger.warning("Heartbeat timeout")
-                        # 必要ならソケット再作成
-                        self.heartbeat_socket.close(linger=0)
-                        self.heartbeat_socket = self.context.socket(zmq.REQ)
-                        self.heartbeat_socket.connect(self.config.heartbeat_endpoint)
+        try:
+            while self.heartbeat_running:
+                try:
+                    if self.heartbeat_socket:
+                        # PING送信
+                        self.heartbeat_socket.send_string("PING")
+                        self.last_heartbeat_sent = datetime.now()
+                        self.heartbeats_sent += 1
 
-                time.sleep(self.config.heartbeat_interval)
-            except Exception as e:
-                logger.error(f"Heartbeat loop error: {e}")
-                time.sleep(1)
+                        # PONG受信待機
+                        if self.heartbeat_socket.poll(self.config.heartbeat_timeout):
+                            pong = self.heartbeat_socket.recv_string()
+                            if "PONG" in pong:
+                                self.last_heartbeat_received = datetime.now()
+                                self.heartbeats_received += 1
+                        else:
+                            logger.warning("Heartbeat timeout")
+                            # ソケット再作成
+                            self.heartbeat_socket.close(linger=0)
+                            self.heartbeat_socket = self.context.socket(zmq.REQ)
+                            self.heartbeat_socket.connect(
+                                self.config.heartbeat_endpoint
+                            )
+
+                    time.sleep(self.config.heartbeat_interval)
+                except Exception as e:
+                    logger.error(f"Heartbeat loop error: {e}")
+                    time.sleep(1)
+        finally:
+            if self.heartbeat_socket:
+                self.heartbeat_socket.close(linger=0)
+                self.heartbeat_socket = None
+        # ▲▲▲ ここまで修正 ▲▲▲
 
     def _log_message(
         self, trade_command: Dict[str, Any], status: str, error: Optional[str] = None

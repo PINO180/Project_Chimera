@@ -53,7 +53,8 @@ S3_SURVIVED_HF_FEATURES = S3_ARTIFACTS / S3_RUN_ID / "survived_hf_features.txt"
 S3_FEATURES_FOR_ALPHA_DECAY = S3_ARTIFACTS / S3_RUN_ID / "final_feature_set.txt"
 # [ADDED] Chapter3のモデル学習スクリプトが使用する、サフィックス追加後の特徴量リスト
 S3_FEATURES_FOR_TRAINING = S3_ARTIFACTS / S3_RUN_ID / "final_feature_set_v3.txt"
-
+# ▼▼▼ 新規追加: S3_SELECTED_FEATURES_PURIFIED_DIRの中の４つのファイルテキストの和集合リスト ▼▼▼
+S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / S3_RUN_ID / "final_feature_set_v5.txt"
 # ▼▼▼ V5 双方向ラベリング用: 各モデル専用の厳選特徴量リスト保存ディレクトリ ▼▼▼
 S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / S3_RUN_ID / "selected_features_v5"
 # ▼▼▼ 新規追加: 2周目（純化後）のさらに厳選された特徴量リスト保存ディレクトリ ▼▼▼
@@ -146,4 +147,5 @@ ZMQ = {
     "control_endpoint": "tcp://host.docker.internal:5555",  # コマンド/ハンドシェイク
     "data_endpoint": "tcp://host.docker.internal:5556",  # バルクデータ転送 (PUSH/PULL)
     "heartbeat_endpoint": "tcp://host.docker.internal:5558",  # ハートビート
+    "heartbeat_timeout": 9000,  # ハートビートのタイムアウト(ms)
 }

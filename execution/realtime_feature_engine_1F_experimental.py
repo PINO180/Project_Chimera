@@ -1,25 +1,11 @@
-# ==============================================================================
 # Project Cimera V5 - Feature Engine Module: 1F Experimental
 # File: realtime_feature_engine_1F_experimental.py
 # Description: 複雑系・音楽・運動学特徴量 (Network, Linguistics, Physics, Harmony)
-# Note: 最終選考を通過した304特徴量に必要なUDFのみを厳選して収録 (God Object解体版)
-#
-# [QA修正履歴]
-# - 全UDF: @njit に parallel=True を復元 (元スクリプト完全一致)
-# - 全UDF: シグネチャを (prices, window_size) -> np.ndarray に復元
-#           (元スクリプト設計: ローリング配列返却型)
-# - 全UDF: 内部に nb.prange() ループを復元
-# - rolling_symmetry_measure_udf: 相関計算を元スクリプトの
-#           normalize_series -> pearson 方式に完全一致化
-# - rolling_harmony_udf: 3方向一致判定ロジックを set(signs) 方式に復元
-# - rolling_musical_tension_udf: direction_dissonance の分母を
-#           len(signs) に統一 (np.diff(signs) 方式を復元)
-# ==============================================================================
 
 import numpy as np
 import numba as nb
 from numba import float64, int64, boolean
-
+from typing import Dict
 
 # ==================================================================
 # 1. ネットワーク・言語系 UDF群 (Network & Linguistics)
@@ -28,9 +14,7 @@ from numba import float64, int64, boolean
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_network_density_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】ネットワーク密度計算 - 価格変動の相互関係度
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -68,9 +52,7 @@ def rolling_network_density_udf(prices: np.ndarray, window_size: int) -> np.ndar
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_network_clustering_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】ネットワーククラスタリング係数 - 局所的密集度
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -105,8 +87,8 @@ def rolling_network_clustering_udf(prices: np.ndarray, window_size: int) -> np.n
                 if adjacency[j, k]:
                     neighbors.append(k)
 
-            k_neighbors = len(neighbors)
-            if k_neighbors < 2:
+            k = len(neighbors)
+            if k < 2:
                 continue
 
             neighbor_connections = 0
@@ -116,7 +98,7 @@ def rolling_network_clustering_udf(prices: np.ndarray, window_size: int) -> np.n
                     if adjacency[n1, n2]:
                         neighbor_connections += 1
 
-            max_connections = k_neighbors * (k_neighbors - 1) / 2
+            max_connections = k * (k - 1) / 2
             if max_connections > 0:
                 clustering_j = neighbor_connections / max_connections
                 total_clustering += clustering_j
@@ -132,13 +114,16 @@ def rolling_network_clustering_udf(prices: np.ndarray, window_size: int) -> np.n
     return results
 
 
+# =============================================================================
+# 言語学: 語彙多様性・言語的複雑性・意味的流れ (並列化版)
+# =============================================================================
+
+
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_vocabulary_diversity_udf(
     prices: np.ndarray, window_size: int
 ) -> np.ndarray:
-    """
-    【並列化版】語彙多様性指標 - 価格「語彙」の豊富さ
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -188,74 +173,8 @@ def rolling_vocabulary_diversity_udf(
 
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
-def rolling_linguistic_complexity_udf(
-    prices: np.ndarray, window_size: int
-) -> np.ndarray:
-    """
-    【並列化版】言語的複雑性 - 統語構造の複雑さ
-    """
-    n = len(prices)
-    results = np.full(n, np.nan)
-
-    for i in nb.prange(window_size - 1, n):
-        window_prices = prices[i - window_size + 1 : i + 1]
-
-        if len(window_prices) < 20:
-            continue
-
-        finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 20:
-            continue
-
-        price_changes = np.diff(finite_prices)
-        threshold = np.std(price_changes) * 0.1
-
-        syntax_sequence = []
-        for change in price_changes:
-            if change > threshold:
-                syntax_sequence.append(1)
-            elif change < -threshold:
-                syntax_sequence.append(-1)
-            else:
-                syntax_sequence.append(0)
-
-        if len(syntax_sequence) < 3:
-            continue
-
-        bigrams = set()
-        for j in range(len(syntax_sequence) - 1):
-            bigram = (syntax_sequence[j], syntax_sequence[j + 1])
-            bigrams.add(bigram)
-
-        trigrams = set()
-        for j in range(len(syntax_sequence) - 2):
-            trigram = (
-                syntax_sequence[j],
-                syntax_sequence[j + 1],
-                syntax_sequence[j + 2],
-            )
-            trigrams.add(trigram)
-
-        max_bigrams = min(9, len(syntax_sequence) - 1)
-        max_trigrams = min(27, len(syntax_sequence) - 2)
-
-        if max_bigrams > 0 and max_trigrams > 0:
-            bigram_complexity = len(bigrams) / max_bigrams
-            trigram_complexity = len(trigrams) / max_trigrams
-            complexity = (bigram_complexity + trigram_complexity) / 2
-        else:
-            complexity = 0.0
-
-        results[i] = complexity
-
-    return results
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_semantic_flow_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】意味的流れ - 価格の「意味」の連続性
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -316,18 +235,16 @@ def rolling_semantic_flow_udf(prices: np.ndarray, window_size: int) -> np.ndarra
     return results
 
 
-# ==================================================================
-# 2. 幾何学・バランス系 UDF群 (Geometry & Balance)
-# ==================================================================
+# =============================================================================
+# 美学: 黄金比・対称性・美的バランス (並列化版)
+# =============================================================================
 
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_golden_ratio_adherence_udf(
     prices: np.ndarray, window_size: int
 ) -> np.ndarray:
-    """
-    【並列化版】黄金比固着度 - 価格変動の黄金比との適合性
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
     golden_ratio = (1 + np.sqrt(5)) / 2
@@ -364,9 +281,7 @@ def rolling_golden_ratio_adherence_udf(
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_symmetry_measure_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】対称性測定 - 価格パターンの鏡像対称性
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -397,31 +312,26 @@ def rolling_symmetry_measure_udf(prices: np.ndarray, window_size: int) -> np.nda
         left_normalized = left_half[-min_len:]
         right_normalized = right_half_reversed[:min_len]
 
-        # normalize_series インライン展開 (元スクリプト完全一致)
-        mean_left = np.mean(left_normalized)
-        std_left = np.std(left_normalized)
-        if std_left > 1e-10:
-            left_norm = (left_normalized - mean_left) / std_left
-        else:
-            left_norm = left_normalized - mean_left
+        def normalize_series(series):
+            mean_val = np.mean(series)
+            std_val = np.std(series)
+            if std_val > 1e-10:
+                return (series - mean_val) / std_val
+            else:
+                return series - mean_val
 
-        mean_right = np.mean(right_normalized)
-        std_right = np.std(right_normalized)
-        if std_right > 1e-10:
-            right_norm = (right_normalized - mean_right) / std_right
-        else:
-            right_norm = right_normalized - mean_right
+        left_norm = normalize_series(left_normalized)
+        right_norm = normalize_series(right_normalized)
 
         if len(left_norm) < 2:
             continue
 
-        # ピアソン相関係数 (元スクリプト Σ方式)
-        mean_ln = np.mean(left_norm)
-        mean_rn = np.mean(right_norm)
+        mean_left = np.mean(left_norm)
+        mean_right = np.mean(right_norm)
 
-        numerator = np.sum((left_norm - mean_ln) * (right_norm - mean_rn))
-        denom_left = np.sum((left_norm - mean_ln) ** 2)
-        denom_right = np.sum((right_norm - mean_rn) ** 2)
+        numerator = np.sum((left_norm - mean_left) * (right_norm - mean_right))
+        denom_left = np.sum((left_norm - mean_left) ** 2)
+        denom_right = np.sum((right_norm - mean_right) ** 2)
 
         if denom_left > 1e-10 and denom_right > 1e-10:
             correlation = numerator / np.sqrt(denom_left * denom_right)
@@ -436,9 +346,7 @@ def rolling_symmetry_measure_udf(prices: np.ndarray, window_size: int) -> np.nda
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_aesthetic_balance_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】美的バランス - 価格変動の視覚的調和
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -506,253 +414,19 @@ def rolling_aesthetic_balance_udf(prices: np.ndarray, window_size: int) -> np.nd
     return results
 
 
-# ==================================================================
-# 3. 音楽・運動学系 UDF群 (Music & Kinetics)
-# ==================================================================
+# =============================================================================
+# 音楽理論: 調性・リズムパターン・和声・音楽的緊張度 (並列化版)
+# =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def rolling_tonality_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】調性 - 価格の「調」的特性
-    """
-    n = len(prices)
-    results = np.full(n, np.nan)
-
-    for i in nb.prange(window_size - 1, n):
-        window_prices = prices[i - window_size + 1 : i + 1]
-
-        if len(window_prices) < 12:
-            continue
-
-        finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 12:
-            continue
-
-        price_changes = np.diff(finite_prices)
-
-        if len(price_changes) < 5:
-            continue
-
-        std_change = np.std(price_changes)
-        if std_change <= 1e-10:
-            results[i] = 0.5
-            continue
-
-        normalized_changes = price_changes / std_change
-
-        scale_degrees = np.zeros(12)
-
-        for change in normalized_changes:
-            degree_idx = int((change + 3) / 6 * 11)
-            degree_idx = max(0, min(degree_idx, 11))
-            scale_degrees[degree_idx] += 1
-
-        major_pattern = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-        minor_pattern = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-
-        if np.sum(scale_degrees) > 0:
-            scale_distribution = scale_degrees / np.sum(scale_degrees)
-
-            major_similarity = np.sum(scale_distribution * major_pattern)
-            minor_similarity = np.sum(scale_distribution * minor_pattern)
-
-            total_similarity = major_similarity + minor_similarity
-            if total_similarity > 0:
-                tonality_score = major_similarity / total_similarity
-            else:
-                tonality_score = 0.5
-        else:
-            tonality_score = 0.5
-
-        results[i] = tonality_score
-
-    return results
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def rolling_rhythm_pattern_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】リズムパターン - 価格変動のリズム的規則性
-    """
-    n = len(prices)
-    results = np.full(n, np.nan)
-
-    for i in nb.prange(window_size - 1, n):
-        window_prices = prices[i - window_size + 1 : i + 1]
-
-        if len(window_prices) < 20:
-            continue
-
-        finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 20:
-            continue
-
-        price_changes = np.diff(finite_prices)
-        abs_changes = np.abs(price_changes)
-
-        mean_change = np.mean(abs_changes)
-        strong_beats = abs_changes > mean_change
-
-        pattern_strengths = []
-
-        for period in range(2, min(8, len(strong_beats) // 3)):
-            pattern_score = 0.0
-            pattern_count = 0
-
-            for j in range(period, len(strong_beats)):
-                if strong_beats[j] == strong_beats[j - period]:
-                    pattern_score += 1.0
-                pattern_count += 1
-
-            if pattern_count > 0:
-                pattern_strength = pattern_score / pattern_count
-                pattern_strengths.append(pattern_strength)
-
-        if pattern_strengths:
-            rhythm_strength = np.max(np.array(pattern_strengths))
-        else:
-            rhythm_strength = 0.0
-
-        results[i] = rhythm_strength
-
-    return results
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def rolling_harmony_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】和声 - 複数価格レベルの協調性
-    """
-    n = len(prices)
-    results = np.full(n, np.nan)
-
-    for i in nb.prange(window_size - 1, n):
-        window_prices = prices[i - window_size + 1 : i + 1]
-
-        if len(window_prices) < 30:
-            continue
-
-        finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 30:
-            continue
-
-        window_n = len(finite_prices)
-
-        short_window = max(3, window_n // 15)
-        medium_window = max(5, window_n // 10)
-        long_window = max(8, window_n // 6)
-
-        if long_window >= window_n:
-            continue
-
-        short_ma = np.zeros(window_n - short_window + 1)
-        medium_ma = np.zeros(window_n - medium_window + 1)
-        long_ma = np.zeros(window_n - long_window + 1)
-
-        for j in range(len(short_ma)):
-            short_ma[j] = np.mean(finite_prices[j : j + short_window])
-
-        for j in range(len(medium_ma)):
-            medium_ma[j] = np.mean(finite_prices[j : j + medium_window])
-
-        for j in range(len(long_ma)):
-            long_ma[j] = np.mean(finite_prices[j : j + long_window])
-
-        min_len = min(len(short_ma), len(medium_ma), len(long_ma))
-        if min_len < 5:
-            continue
-
-        short_trend = np.diff(short_ma[-min_len:])
-        medium_trend = np.diff(medium_ma[-min_len:])
-        long_trend = np.diff(long_ma[-min_len:])
-
-        harmony_scores = []
-
-        for j in range(len(short_trend)):
-            # 元スクリプト完全一致: set(signs) による判定
-            signs = [
-                np.sign(short_trend[j]),
-                np.sign(medium_trend[j]),
-                np.sign(long_trend[j]),
-            ]
-
-            if len(set(signs)) == 1 and signs[0] != 0:
-                harmony_scores.append(1.0)
-            elif len(set(signs)) == 2:
-                harmony_scores.append(0.5)
-            else:
-                harmony_scores.append(0.0)
-
-        if harmony_scores:
-            results[i] = np.mean(np.array(harmony_scores))
-        else:
-            results[i] = 0.0
-
-    return results
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def rolling_musical_tension_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】音楽的緊張度 - 価格変動の「緊張と緩和」
-    """
-    n = len(prices)
-    results = np.full(n, np.nan)
-
-    for i in nb.prange(window_size - 1, n):
-        window_prices = prices[i - window_size + 1 : i + 1]
-
-        if len(window_prices) < 15:
-            continue
-
-        finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
-            continue
-
-        price_changes = np.diff(finite_prices)
-
-        if len(price_changes) < 5:
-            continue
-
-        local_window = min(5, len(price_changes) // 3)
-        tension_scores = []
-
-        for j in range(local_window, len(price_changes) - local_window):
-            local_changes = price_changes[j - local_window : j + local_window + 1]
-
-            # 元スクリプト完全一致: np.sign + np.diff 方式
-            signs = np.sign(local_changes)
-            sign_changes = np.sum(np.diff(signs) != 0)
-            direction_dissonance = sign_changes / len(signs) if len(signs) > 0 else 0
-
-            volatility = np.std(local_changes)
-            max_volatility = np.max(np.abs(local_changes))
-            intensity_dissonance = max_volatility / (
-                np.mean(np.abs(finite_prices)) + 1e-10
-            )
-
-            total_tension = (direction_dissonance + intensity_dissonance) / 2
-            tension_scores.append(min(total_tension, 1.0))
-
-        if tension_scores:
-            results[i] = np.mean(np.array(tension_scores))
-        else:
-            results[i] = 0.0
-
-    return results
-
-
-# ==================================================================
-# 4. 生体力学系 UDF群 (Biomechanics)
-# ==================================================================
+# =============================================================================
+# 生体力学: 運動エネルギー・筋力・生体力学効率・エネルギー消費量 (並列化版)
+# =============================================================================
 
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_kinetic_energy_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】運動エネルギー - 価格「粒子」の運動エネルギー
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -792,9 +466,7 @@ def rolling_kinetic_energy_udf(prices: np.ndarray, window_size: int) -> np.ndarr
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_muscle_force_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】筋力 - 価格変動を起こす「筋力」
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -864,9 +536,7 @@ def rolling_muscle_force_udf(prices: np.ndarray, window_size: int) -> np.ndarray
 def rolling_biomechanical_efficiency_udf(
     prices: np.ndarray, window_size: int
 ) -> np.ndarray:
-    """
-    【並列化版】生体力学効率 - エネルギー効率の良い価格変動
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -908,9 +578,7 @@ def rolling_biomechanical_efficiency_udf(
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def rolling_energy_expenditure_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    【並列化版】エネルギー消費量 - 価格変動に要するエネルギー総量
-    """
+
     n = len(prices)
     results = np.full(n, np.nan)
 
@@ -974,3 +642,139 @@ def rolling_energy_expenditure_udf(prices: np.ndarray, window_size: int) -> np.n
         results[i] = normalized_energy
 
     return results
+
+
+# ==================================================================
+# メイン計算モジュール
+# ==================================================================
+
+
+def _window(arr: np.ndarray, window: int) -> np.ndarray:
+
+    if window <= 0:
+        return np.array([], dtype=arr.dtype)
+    if window > len(arr):
+        return arr
+    return arr[-window:]
+
+
+# [QA修正] 配列から最新1Tick（スカラー値）を抽出する関数を追加
+def _last(arr: np.ndarray) -> float:
+
+    if len(arr) == 0:
+        return np.nan
+    return float(arr[-1])
+
+
+class FeatureModule1F:
+    @staticmethod
+    def calculate_features(data: Dict[str, np.ndarray]) -> Dict[str, float]:
+        features = {}
+
+        # 安全な参照用変数
+        close_arr = data["close"]
+
+        # ---------------------------------------------------------
+        # 1. 美的バランス系指標 (Aesthetic Balance)
+        # ---------------------------------------------------------
+        features["e1f_aesthetic_balance_21"] = _last(
+            rolling_aesthetic_balance_udf(_window(close_arr, 21), 21)
+        )
+        # 34, 55, 89 はリスト外のため削除
+
+        # ---------------------------------------------------------
+        # 2. バイオメカニクス系指標 (Biomechanics)
+        # ---------------------------------------------------------
+        features["e1f_biomechanical_efficiency_20"] = _last(
+            rolling_biomechanical_efficiency_udf(_window(close_arr, 20), 20)
+        )
+
+        features["e1f_energy_expenditure_20"] = _last(
+            rolling_energy_expenditure_udf(_window(close_arr, 20), 20)
+        )
+        features["e1f_energy_expenditure_60"] = _last(
+            rolling_energy_expenditure_udf(_window(close_arr, 60), 60)
+        )
+        # 40はリスト外のため削除
+
+        features["e1f_kinetic_energy_10"] = _last(
+            rolling_kinetic_energy_udf(_window(close_arr, 10), 10)
+        )
+        features["e1f_kinetic_energy_20"] = _last(
+            rolling_kinetic_energy_udf(_window(close_arr, 20), 20)
+        )
+        features["e1f_kinetic_energy_40"] = _last(
+            rolling_kinetic_energy_udf(_window(close_arr, 40), 40)
+        )
+
+        features["e1f_muscle_force_20"] = _last(
+            rolling_muscle_force_udf(_window(close_arr, 20), 20)
+        )
+
+        # ---------------------------------------------------------
+        # 3. 黄金比系指標 (Golden Ratio)
+        # ---------------------------------------------------------
+        features["e1f_golden_ratio_adherence_21"] = _last(
+            rolling_golden_ratio_adherence_udf(_window(close_arr, 21), 21)
+        )
+        features["e1f_golden_ratio_adherence_34"] = _last(
+            rolling_golden_ratio_adherence_udf(_window(close_arr, 34), 34)
+        )
+        features["e1f_golden_ratio_adherence_55"] = _last(
+            rolling_golden_ratio_adherence_udf(_window(close_arr, 55), 55)
+        )
+
+        # ---------------------------------------------------------
+        # 4. 対称性・調和系指標 (Symmetry / Harmony)
+        # ---------------------------------------------------------
+        features["e1f_symmetry_measure_21"] = _last(
+            rolling_symmetry_measure_udf(_window(close_arr, 21), 21)
+        )
+        features["e1f_symmetry_measure_34"] = _last(
+            rolling_symmetry_measure_udf(_window(close_arr, 34), 34)
+        )
+        features["e1f_symmetry_measure_55"] = _last(
+            rolling_symmetry_measure_udf(_window(close_arr, 55), 55)
+        )
+        features["e1f_symmetry_measure_89"] = _last(
+            rolling_symmetry_measure_udf(_window(close_arr, 89), 89)
+        )
+        # Harmony系はリスト外のため削除
+
+        # ---------------------------------------------------------
+        # 5. 音楽・リズム系指標 (Musical / Rhythm)
+        # ---------------------------------------------------------
+        # 音楽・リズム系は全てリスト外のため完全削除
+
+        # ---------------------------------------------------------
+        # 6. ネットワーク系指標 (Network)
+        # ---------------------------------------------------------
+        features["e1f_network_clustering_50"] = _last(
+            rolling_network_clustering_udf(_window(close_arr, 50), 50)
+        )
+        # 20, 30, 100 はリスト外のため削除
+
+        features["e1f_network_density_20"] = _last(
+            rolling_network_density_udf(_window(close_arr, 20), 20)
+        )
+        features["e1f_network_density_50"] = _last(
+            rolling_network_density_udf(_window(close_arr, 50), 50)
+        )
+        # 30, 100 はリスト外のため削除
+
+        # ---------------------------------------------------------
+        # 7. 言語・意味系指標 (Linguistic / Semantic)
+        # ---------------------------------------------------------
+        # Linguistic Complexity はリスト外のため削除
+
+        features["e1f_semantic_flow_25"] = _last(
+            rolling_semantic_flow_udf(_window(close_arr, 25), 25)
+        )
+        # 15, 40 はリスト外のため削除
+
+        features["e1f_vocabulary_diversity_15"] = _last(
+            rolling_vocabulary_diversity_udf(_window(close_arr, 15), 15)
+        )
+        # 25, 40, 80 はリスト外のため削除
+
+        return features

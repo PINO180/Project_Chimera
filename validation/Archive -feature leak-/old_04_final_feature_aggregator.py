@@ -8,7 +8,7 @@ from blueprint import (
     S3_FINAL_FEATURE_TEAM,
     S3_SURVIVED_HF_FEATURES,
     S3_FEATURES_FOR_ALPHA_DECAY,
-) 
+)
 
 
 def main():

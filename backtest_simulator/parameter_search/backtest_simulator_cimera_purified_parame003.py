@@ -26,7 +26,7 @@ from decimal import Decimal, getcontext, ROUND_HALF_UP
 getcontext().prec = 5000
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
-project_root = Path(__file__).resolve().parents[1]
+project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
@@ -40,8 +40,14 @@ from blueprint import (
 )
 
 # --- 出力ファイルパス ---
-FINAL_REPORT_PATH = S7_MODELS / "final_backtest_report_v5.json"
-EQUITY_CURVE_PATH = S7_MODELS / "equity_curve_v5.png"
+# [一時的] 出力先をハードコード (001の部分をスクリプトごとに書き換える)
+OUTPUT_DIR = Path(
+    "/workspace/data/XAUUSD/stratum_7_models/1A_2B/Chimera -4- Reunion first stage 110/backtast data/003"
+)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # フォルダが存在しなければ自動作成
+
+FINAL_REPORT_PATH = OUTPUT_DIR / "final_backtest_report_v5.json"
+EQUITY_CURVE_PATH = OUTPUT_DIR / "equity_curve_v5.png"
 
 
 # --- ロギング設定 ---
@@ -86,7 +92,7 @@ class BacktestConfig:
 
     # --- V5 新規: サーキットブレーカーと同時発注禁止 ---
     prevent_simultaneous_orders: bool = True
-    max_consecutive_sl: int = 2
+    max_consecutive_sl: int = 1
     cooldown_minutes_after_sl: int = 10
 
     base_leverage: float = 2000.0

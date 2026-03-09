@@ -178,20 +178,13 @@ def select_features_for_tier(
     print("Preparing sample data for analysis...")
     lf_with_target = lf_tier.join_asof(price_lf, on="timestamp", strategy="backward")
 
-    df_all = lf_with_target.collect(streaming=True).to_pandas()
-    df_all = df_all.sort_values("timestamp").reset_index(drop=True)
-    df_all.dropna(subset=["target"], inplace=True)
-    df_all[feature_cols] = df_all[feature_cols].fillna(0)
+    df_sample_pd = lf_with_target.collect(streaming=True).to_pandas()
 
-    # ★ 修正: ランダムサンプリングを廃止し、時系列前半のみをSHAP学習に使用する。
-    # 後半の将来ターゲット値が特徴量選択に影響するlookhead leakを排除。
-    split_idx = int(len(df_all) * 0.5)
-    df_sample_pd = df_all.iloc[:split_idx].copy()
+    df_sample_pd.dropna(subset=["target"], inplace=True)
+    df_sample_pd[feature_cols] = df_sample_pd[feature_cols].fillna(0)
 
     if df_sample_pd.shape[0] > SHAP_SAMPLE_SIZE:
-        # 時系列を保持したままサンプリング（末尾からではなく等間隔で間引く）
-        step = df_sample_pd.shape[0] // SHAP_SAMPLE_SIZE
-        df_sample_pd = df_sample_pd.iloc[::step].head(SHAP_SAMPLE_SIZE)
+        df_sample_pd = df_sample_pd.sample(n=SHAP_SAMPLE_SIZE, random_state=42)
 
     if df_sample_pd.empty:
         print("Sample is empty. Cannot perform analysis. Skipping.")
@@ -248,11 +241,12 @@ def main(test_mode: bool):
     classified_paths = classify_paths(S2_FEATURES_AFTER_AV, test_mode)
 
     print("\nPreparing a temporary target variable for screening...")
-    # 修正: lf_micro から hf へ変更し、_M5 を _M1 に変更
-    price_path = next((p for p in classified_paths["hf"] if "_M1" in p.name), None)
+    price_path = next(
+        (p for p in classified_paths["lf_micro"] if "_M5" in p.name), None
+    )
     if not price_path:
         raise FileNotFoundError(
-            "Could not find M1 price data to generate a target variable."
+            "Could not find M5 price data to generate a target variable."
         )
 
     print(f"Using {price_path.name} for target generation.")
@@ -260,7 +254,6 @@ def main(test_mode: bool):
         pl.scan_parquet(price_path)
         .select(["timestamp", "close"])
         .sort("timestamp")
-        # M1の shift(-5) なので「5分後の収益率」をターゲットとする
         .with_columns((pl.col("close").shift(-5) / pl.col("close") - 1).alias("target"))
         .select(["timestamp", "target"])
     )

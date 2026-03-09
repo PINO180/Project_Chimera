@@ -170,20 +170,18 @@ def main(test_mode: bool):
     feature_file_map = find_feature_files(elite_lf_features)
     virtual_lf = build_virtual_lf(elite_lf_features, feature_file_map)
 
-    # 修正: _M5.parquet を _M1.parquet に変更
     price_path = (
-        S2_FEATURES_AFTER_AV / "feature_value_a_vast_universeA/features_e1a_M1.parquet"
+        S2_FEATURES_AFTER_AV / "feature_value_a_vast_universeA/features_e1a_M5.parquet"
     )
     if not price_path.exists():
         raise FileNotFoundError(
-            f"M1 price data for target generation not found at {price_path}"
+            f"M5 price data for target generation not found at {price_path}"
         )
 
     target_lf = (
         pl.scan_parquet(price_path)
         .select(["timestamp", "close"])
         .sort("timestamp")
-        # M1の shift(-5) なので「5分後の収益率」をターゲットとする
         .with_columns((pl.col("close").shift(-5) / pl.col("close") - 1).alias("target"))
         .select(["timestamp", "target"])
     )
@@ -269,22 +267,19 @@ def main(test_mode: bool):
         return
 
     final_shap_scores = pd.concat(all_shap_scores)
+    avg_shap_scores = (
+        final_shap_scores.groupby("feature")["shap_value"]
+        .mean()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
 
-    # ★ 修正: 将来フォールドの情報を完全に遮断するための厳密なアプローチ
-    # 最も直近の学習データ（最後のFold）におけるSHAP値のみを基準に特徴量を選定する。
-    last_fold_idx = len(splits)
-    last_fold_shap = final_shap_scores[
-        final_shap_scores["fold"] == last_fold_idx
-    ].copy()
-    last_fold_shap = last_fold_shap.sort_values(by="shap_value", ascending=False)
-
-    # 最後のFoldでSHAP値がプラスだった特徴量を最終チームとして採用
-    final_feature_team = last_fold_shap[last_fold_shap["shap_value"] > 0][
+    final_feature_team = avg_shap_scores[avg_shap_scores["shap_value"] > 0][
         "feature"
     ].tolist()
 
     print(
-        f"Selected {len(final_feature_team)} features as the final team based on the LAST training fold."
+        f"Selected {len(final_feature_team)} features as the final team based on positive average SHAP values."
     )
 
     pd.Series(final_feature_team).to_csv(
@@ -292,13 +287,6 @@ def main(test_mode: bool):
     )
     print(f"Final feature team saved to: {S3_FINAL_FEATURE_TEAM}")
 
-    # 参考記録として全Foldの平均スコアは保存しておく
-    avg_shap_scores = (
-        final_shap_scores.groupby("feature")["shap_value"]
-        .mean()
-        .sort_values(ascending=False)
-        .reset_index()
-    )
     avg_shap_scores.to_csv(S3_SHAP_SCORES, index=False)
     print(f"Average SHAP scores saved to: {S3_SHAP_SCORES}")
 

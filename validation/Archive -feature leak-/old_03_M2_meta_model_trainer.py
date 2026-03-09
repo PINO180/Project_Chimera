@@ -11,7 +11,6 @@ import argparse
 from typing import List, Dict, Optional
 import re
 from tqdm import tqdm
-from sklearn.model_selection import cross_val_predict, TimeSeriesSplit
 
 # blueprint.pyをインポートするためにパスを追加
 sys.path.append("/workspace")
@@ -253,26 +252,6 @@ def main(test_mode: bool):
 
     print("Training M2 meta-model and performing SHAP analysis...")
     X, y = meta_model_data_df[hf_feature_cols], meta_model_data_df["meta_label"]
-
-    # ★ 修正: TimeSeriesSplitに「gap（パージ/エンバーゴ）」を追加
-    # トリプルバリアのルックアヘッド（約300分）による未来情報のリークを防ぐため、
-    # 学習データと検証データの中間に使わないデータの隙間（サンプル数）を空けます。
-    # ※ 300分の間に発生する最大シグナル数を想定してgapを設定してください（ここでは仮に100としています）。
-    base_model = lgb.LGBMClassifier(
-        random_state=42, verbosity=-1, n_jobs=-1, is_unbalance=True
-    )
-    cv = TimeSeriesSplit(n_splits=5, gap=100)
-
-    oof_predictions = cross_val_predict(
-        base_model, X, y, cv=cv, method="predict_proba", n_jobs=-1
-    )[:, 1]
-
-    from sklearn.metrics import roc_auc_score
-
-    oof_auc = roc_auc_score(y, oof_predictions)
-    print(f"★ M2 Meta-Model OOF AUC (True Performance, Purged): {oof_auc:.4f}")
-
-    # SHAP分析のために全データで再学習（特徴量重要度の推定用途のみ）
     model = lgb.LGBMClassifier(
         random_state=42, verbosity=-1, n_jobs=-1, is_unbalance=True
     )

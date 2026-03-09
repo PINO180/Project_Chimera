@@ -26,7 +26,7 @@ from decimal import Decimal, getcontext, ROUND_HALF_UP
 getcontext().prec = 5000
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
-project_root = Path(__file__).resolve().parents[1]
+project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
@@ -40,8 +40,14 @@ from blueprint import (
 )
 
 # --- 出力ファイルパス ---
-FINAL_REPORT_PATH = S7_MODELS / "final_backtest_report_v5.json"
-EQUITY_CURVE_PATH = S7_MODELS / "equity_curve_v5.png"
+# [一時的] 出力先をハードコード (001の部分をスクリプトごとに書き換える)
+OUTPUT_DIR = Path(
+    "/workspace/data/XAUUSD/stratum_7_models/1A_2B/Chimera -4- Reunion first stage 110/backtast data/012"
+)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # フォルダが存在しなければ自動作成
+
+FINAL_REPORT_PATH = OUTPUT_DIR / "final_backtest_report_v5.json"
+EQUITY_CURVE_PATH = OUTPUT_DIR / "equity_curve_v5.png"
 
 
 # --- ロギング設定 ---
@@ -75,7 +81,15 @@ class BacktestConfig:
 
     # --- V5 新規: 自動ロット調整と発火閾値 ---
     auto_lot_base_capital: float = 1000.0
-    auto_lot_size_per_base: float = 0.1
+    auto_lot_size_per_base: float = 1.0
+
+    # ▼▼▼ 追加: 固定比率資金管理のパラメータ ▼▼▼
+    use_fixed_risk: bool = True
+    fixed_risk_percent: float = (
+        0.20  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
+    )
+    # ▲▲▲ ここまで追加 ▲▲▲
+
     m2_proba_threshold: float = 0.50
     test_limit_partitions: int = 0
     oof_mode: bool = True
@@ -584,11 +598,35 @@ class BacktestSimulator:
 
                     # [FIX-4] Auto Lot 計算を extreme_risk_engine.calculate_auto_lot() と統一
                     # 旧: ハードコード乗数方式 (0.25倍/0.5倍) → 新: 証拠金上限数式
-                    base_capital_dec = Decimal(str(self.config.auto_lot_base_capital))
-                    size_per_base_dec = Decimal(str(self.config.auto_lot_size_per_base))
 
-                    # Step1: 複利ベースの基本ロット
-                    base_lot = (current_capital / base_capital_dec) * size_per_base_dec
+                    # ▼▼▼ 修正: 固定比率(Fixed Risk)と固定複利(Auto Lot)の分岐 ▼▼▼
+                    if self.config.use_fixed_risk:
+                        # --- 固定比率（Fixed Risk）---
+                        # Lot = (Balance * risk_pct) / (ATR * SL_Mult * ContractSize)
+                        risk_pct_dec = Decimal(str(self.config.fixed_risk_percent))
+                        max_loss_amount = current_capital * risk_pct_dec
+                        sl_price_distance = (
+                            Decimal(str(atr_value_float)) * DECIMAL_SL_MULT
+                        )
+
+                        if sl_price_distance > DECIMAL_ZERO:
+                            base_lot = max_loss_amount / (
+                                sl_price_distance * DECIMAL_CONTRACT_SIZE
+                            )
+                        else:
+                            base_lot = DECIMAL_ZERO
+                    else:
+                        # --- 従来の固定複利（Auto Lot）---
+                        base_capital_dec = Decimal(
+                            str(self.config.auto_lot_base_capital)
+                        )
+                        size_per_base_dec = Decimal(
+                            str(self.config.auto_lot_size_per_base)
+                        )
+                        base_lot = (
+                            current_capital / base_capital_dec
+                        ) * size_per_base_dec
+                    # ▲▲▲ ここまで修正 ▲▲▲
 
                     # Step2: レバレッジに基づく証拠金上限ロット
                     effective_leverage_decimal = self._get_effective_leverage(
@@ -994,9 +1032,18 @@ class BacktestSimulator:
             else:
                 profit_factor = 0.0
 
+        # ▼▼▼ 修正: レポートのStrategy名に資金管理方式を反映 ▼▼▼
+        strategy_str = "V5 Two-Brain "
+        if self.config.use_fixed_risk:
+            strategy_str += f"Fixed Risk ({self.config.fixed_risk_percent * 100:.1f}%)"
+        else:
+            strategy_str += f"Auto Lot (Base: {self.config.auto_lot_base_capital}, Size: {self.config.auto_lot_size_per_base})"
+        strategy_str += f", M2 Thresh: {self.config.m2_proba_threshold}, SL Mult: {self.config.sl_multiplier}, PT Mult: {self.config.pt_multiplier}"
+
         report_data = {
-            "strategy": f"V5 Two-Brain Auto Lot (Base: {self.config.auto_lot_base_capital}, Size: {self.config.auto_lot_size_per_base}, M2 Thresh: {self.config.m2_proba_threshold}, SL Mult: {self.config.sl_multiplier}, PT Mult: {self.config.pt_multiplier})",
+            "strategy": strategy_str,
             "initial_capital": float(initial_capital),
+            # ▲▲▲ ここまで修正 ▲▲▲
             "final_capital": float(final_capital),
             "total_return_pct": float(total_return * DECIMAL_HUNDRED),
             "sharpe_ratio_annual": sharpe_ratio if np.isfinite(sharpe_ratio) else None,
@@ -1401,6 +1448,20 @@ if __name__ == "__main__":
         dest="auto_lot_size_per_base",
         help=f"Lot size per base capital. Default: {default_config.auto_lot_size_per_base}",
     )
+    # ▼▼▼ 追加: 引数パーサー ▼▼▼
+    parser.add_argument(
+        "--use-fixed-risk",
+        action="store_true",
+        help="Use fixed risk % position sizing instead of auto lot.",
+    )
+    parser.add_argument(
+        "--fixed-risk-pct",
+        type=float,
+        default=default_config.fixed_risk_percent,
+        dest="fixed_risk_pct",
+        help=f"Risk percentage for fixed risk sizing (e.g., 0.02 for 2%%). Default: {default_config.fixed_risk_percent}",
+    )
+    # ▲▲▲ ここまで追加 ▲▲▲
     parser.add_argument(
         "--base-leverage",
         type=float,
@@ -1512,6 +1573,10 @@ if __name__ == "__main__":
     config = BacktestConfig(
         auto_lot_base_capital=args.auto_lot_base_capital,
         auto_lot_size_per_base=args.auto_lot_size_per_base,
+        # ▼▼▼ 修正: args ではなく、一番上の設定(default_config)を直接読み込ませる ▼▼▼
+        use_fixed_risk=default_config.use_fixed_risk,
+        fixed_risk_percent=default_config.fixed_risk_percent,
+        # ▲▲▲ ここまで修正 ▲▲▲
         base_leverage=args.base_leverage,
         m2_proba_threshold=args.m2_th,
         test_limit_partitions=args.test_limit_partitions,

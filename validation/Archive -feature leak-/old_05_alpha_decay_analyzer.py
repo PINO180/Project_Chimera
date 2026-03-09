@@ -107,41 +107,17 @@ def get_output_path(input_path: Path) -> Path:
 
 
 def neutralize_lazyframe(
-    lf: pl.LazyFrame,
-    feature_names: list[str],
-    market_proxy_col: str,
-    rolling_window: int = 2016,  # 約1週間分(M5×2016=約7日)
+    lf: pl.LazyFrame, feature_names: list[str], market_proxy_col: str
 ) -> pl.LazyFrame:
-    """ローリング共分散の数学的展開を用いた正しい純化処理"""
     neutralization_exprs = []
-
-    # プロキシ(X)の準備と、Xのローリング分散( E[X^2] - E[X]^2 )
-    x = pl.col(market_proxy_col).fill_null(0)
-    x_mean = x.rolling_mean(window_size=rolling_window, min_periods=30)
-    var_x = (x * x).rolling_mean(window_size=rolling_window, min_periods=30) - (
-        x_mean * x_mean
-    )
-
     for suffixed_feature in feature_names:
         _, base_name, _ = parse_suffixed_feature_name(suffixed_feature)
         y = pl.col(base_name).fill_null(0)
-        y_mean = y.rolling_mean(window_size=rolling_window, min_periods=30)
-
-        # XとYのローリング共分散( E[XY] - E[X]E[Y] )
-        cov_xy = (x * y).rolling_mean(window_size=rolling_window, min_periods=30) - (
-            x_mean * y_mean
-        )
-
-        # ベータとアルファ
-        rolling_beta = cov_xy / (var_x + 1e-10)
-        rolling_alpha = y_mean - rolling_beta * x_mean
-
-        # 残差計算
-        residual_expr = (
-            y - (rolling_beta.fill_null(0) * x + rolling_alpha.fill_null(0))
-        ).alias(f"{base_name}_neutralized")
+        x = pl.col(market_proxy_col).fill_null(0)
+        beta = pl.cov(x, y) / (x.var() + 1e-10)
+        alpha = y.mean() - beta * x.mean()
+        residual_expr = (y - (beta * x + alpha)).alias(f"{base_name}_neutralized")
         neutralization_exprs.append(residual_expr)
-
     return lf.with_columns(neutralization_exprs)
 
 
@@ -174,8 +150,7 @@ def main(test_mode: bool):
         .select(["timestamp", "close"])
         .sort("timestamp")
         .with_columns(
-            # 修正: shift(-5) を廃止し、過去への参照（正の数）に変更
-            (pl.col("close") / pl.col("close").shift(MARKET_PROXY_LOOKBACK) - 1).alias(
+            (pl.col("close").shift(-MARKET_PROXY_LOOKBACK) / pl.col("close") - 1).alias(
                 "market_proxy"
             )
         )

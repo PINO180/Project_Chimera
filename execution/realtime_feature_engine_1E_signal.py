@@ -1,22 +1,11 @@
 # realtime_feature_engine_1E_signal.py
 # Project Cimera V5: Feature Engine Module 1E (Signal / Spectral / Wavelet / Hilbert)
-# 【修正済み】engine_1_E_a_vast_universe_of_features.py との完全一致照合・修正版
-#
-# 修正内容サマリー:
-#   1. 全UDF: @nb.njit(fastmath=True, cache=True, parallel=True) に統一（parallel=True 追加）
-#   2. 全UDF: シグネチャを (signal, window_size) に変更 → ローリングウィンドウ計算（配列→配列）
-#   3. 全UDF: 動的並列化制御ロジック (num_iterations > 2000 ? prange : range) を復元
-#   4. spectral_flux_udf: 欠落していたため追加
-#   5. wavelet_energy_udf: 欠落していたため追加
-#   6. spectral_rolloff_udf: rolloff_ratio パラメータを復元
-#   7. acoustic_frequency_udf: sample_rate パラメータを復元
-#   8. wavelet_entropy_udf: window_data をそのまま使用（NaN含む元ロジックに一致）
-#   9. hilbert_phase_stability_udf: window_data に対してstdチェック（元ロジックに一致）
 
 import numpy as np
 import numba as nb
 from numba import njit
-from typing import Dict
+from typing import Dict, Any
+import polars as pl
 
 # ==================================================================
 # 1. 基盤関数 (Base Functions)
@@ -25,10 +14,7 @@ from typing import Dict
 
 @nb.njit(fastmath=True, cache=True)
 def numba_fft(x: np.ndarray) -> np.ndarray:
-    """
-    Numbaで実装された反復的Cooley-Tukey FFTアルゴリズム（安定版）。
-    再帰を排除し、メモリ効率と並列処理への耐性を向上。
-    """
+
     n = x.shape[0]
 
     # nが2のべき乗でない場合、ゼロパディングを行う
@@ -80,10 +66,7 @@ def numba_fft(x: np.ndarray) -> np.ndarray:
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def spectral_centroid_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトル重心計算（動的並列化制御版）
-    周波数スペクトルの重心（平均周波数）を計算
-    """
+
     n = len(signal)
     result = np.full(n, np.nan)
 
@@ -140,259 +123,13 @@ def spectral_centroid_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
             if total_magnitude > 0:
                 centroid = np.sum(freqs * magnitude_spectrum) / total_magnitude
                 result[i] = centroid
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def spectral_bandwidth_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトル帯域幅計算（動的並列化制御版）
-    スペクトル重心周りの分散を計算
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-
-    if n < window_size:
-        return result
-
-    num_iterations = n - (window_size - 1)
-
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # NumbaネイティブFFTによるスペクトル計算
-            fft_values = numba_fft(finite_data)
-            magnitude_spectrum = np.abs(fft_values[: len(finite_data) // 2])
-
-            if len(magnitude_spectrum) == 0:
-                continue
-
-            # 周波数ビンの作成
-            freqs = np.linspace(0, 0.5, len(magnitude_spectrum))
-
-            # スペクトル重心計算
-            total_magnitude = np.sum(magnitude_spectrum)
-            if total_magnitude > 0:
-                centroid = np.sum(freqs * magnitude_spectrum) / total_magnitude
-
-                # 帯域幅（重心周りの分散）計算
-                bandwidth = np.sqrt(
-                    np.sum(((freqs - centroid) ** 2) * magnitude_spectrum)
-                    / total_magnitude
-                )
-                result[i] = bandwidth
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # NumbaネイティブFFTによるスペクトル計算
-            fft_values = numba_fft(finite_data)
-            magnitude_spectrum = np.abs(fft_values[: len(finite_data) // 2])
-
-            if len(magnitude_spectrum) == 0:
-                continue
-
-            # 周波数ビンの作成
-            freqs = np.linspace(0, 0.5, len(magnitude_spectrum))
-
-            # スペクトル重心計算
-            total_magnitude = np.sum(magnitude_spectrum)
-            if total_magnitude > 0:
-                centroid = np.sum(freqs * magnitude_spectrum) / total_magnitude
-
-                # 帯域幅（重心周りの分散）計算
-                bandwidth = np.sqrt(
-                    np.sum(((freqs - centroid) ** 2) * magnitude_spectrum)
-                    / total_magnitude
-                )
-                result[i] = bandwidth
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def spectral_rolloff_udf(
-    signal: np.ndarray, window_size: int, rolloff_ratio: float = 0.85
-) -> np.ndarray:
-    """
-    スペクトルロールオフ計算（動的並列化制御版）
-    累積エネルギーが指定割合に達する周波数
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-
-    if n < window_size:
-        return result
-
-    num_iterations = n - (window_size - 1)
-
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # NumbaネイティブFFTによるスペクトル計算
-            fft_values = numba_fft(finite_data)
-            magnitude_spectrum = np.abs(fft_values[: len(finite_data) // 2])
-
-            if len(magnitude_spectrum) == 0:
-                continue
-
-            # パワースペクトルに変換
-            power_spectrum = magnitude_spectrum**2
-            total_power = np.sum(power_spectrum)
-
-            if total_power > 0:
-                # 累積パワースペクトル
-                cumulative_power = np.cumsum(power_spectrum)
-                threshold = rolloff_ratio * total_power
-
-                # ロールオフ周波数の特定
-                rolloff_idx = np.where(cumulative_power >= threshold)[0]
-                if len(rolloff_idx) > 0:
-                    rolloff_freq = rolloff_idx[0] / (2.0 * len(magnitude_spectrum))
-                    result[i] = rolloff_freq
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # NumbaネイティブFFTによるスペクトル計算
-            fft_values = numba_fft(finite_data)
-            magnitude_spectrum = np.abs(fft_values[: len(finite_data) // 2])
-
-            if len(magnitude_spectrum) == 0:
-                continue
-
-            # パワースペクトルに変換
-            power_spectrum = magnitude_spectrum**2
-            total_power = np.sum(power_spectrum)
-
-            if total_power > 0:
-                # 累積パワースペクトル
-                cumulative_power = np.cumsum(power_spectrum)
-                threshold = rolloff_ratio * total_power
-
-                # ロールオフ周波数の特定
-                rolloff_idx = np.where(cumulative_power >= threshold)[0]
-                if len(rolloff_idx) > 0:
-                    rolloff_freq = rolloff_idx[0] / (2.0 * len(magnitude_spectrum))
-                    result[i] = rolloff_freq
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def spectral_flux_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトルフラックス計算（動的並列化制御版）
-    連続するフレーム間のスペクトル変化量
-    【修正】元スクリプトに存在したが新モジュールに欠落していたため追加
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-
-    if n < window_size * 2:
-        return result
-
-    num_iterations = n - (window_size * 2 - 1)
-
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size * 2 - 1, n):
-            # 現在フレーム
-            current_data = signal[i - window_size + 1 : i + 1]
-            current_finite = current_data[np.isfinite(current_data)]
-
-            # 前フレーム
-            prev_data = signal[i - window_size * 2 + 1 : i - window_size + 1]
-            prev_finite = prev_data[np.isfinite(prev_data)]
-
-            if (
-                len(current_finite) < window_size // 2
-                or len(prev_finite) < window_size // 2
-            ):
-                continue
-
-            # 両フレームのスペクトル計算
-            current_fft = numba_fft(current_finite)
-            current_spectrum = np.abs(current_fft[: len(current_finite) // 2])
-
-            prev_fft = numba_fft(prev_finite)
-            prev_spectrum = np.abs(prev_fft[: len(prev_finite) // 2])
-
-            # サイズを揃える
-            min_size = min(len(current_spectrum), len(prev_spectrum))
-            if min_size > 0:
-                current_spectrum = current_spectrum[:min_size]
-                prev_spectrum = prev_spectrum[:min_size]
-
-                # スペクトルフラックス計算（L2ノルム）
-                flux = np.sqrt(np.sum((current_spectrum - prev_spectrum) ** 2))
-                result[i] = flux
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size * 2 - 1, n):
-            # 現在フレーム
-            current_data = signal[i - window_size + 1 : i + 1]
-            current_finite = current_data[np.isfinite(current_data)]
-
-            # 前フレーム
-            prev_data = signal[i - window_size * 2 + 1 : i - window_size + 1]
-            prev_finite = prev_data[np.isfinite(prev_data)]
-
-            if (
-                len(current_finite) < window_size // 2
-                or len(prev_finite) < window_size // 2
-            ):
-                continue
-
-            # 両フレームのスペクトル計算
-            current_fft = numba_fft(current_finite)
-            current_spectrum = np.abs(current_fft[: len(current_finite) // 2])
-
-            prev_fft = numba_fft(prev_finite)
-            prev_spectrum = np.abs(prev_fft[: len(prev_finite) // 2])
-
-            # サイズを揃える
-            min_size = min(len(current_spectrum), len(prev_spectrum))
-            if min_size > 0:
-                current_spectrum = current_spectrum[:min_size]
-                prev_spectrum = prev_spectrum[:min_size]
-
-                # スペクトルフラックス計算（L2ノルム）
-                flux = np.sqrt(np.sum((current_spectrum - prev_spectrum) ** 2))
-                result[i] = flux
 
     return result
 
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def spectral_flatness_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトル平坦度計算（動的並列化制御版）
-    幾何平均と算術平均の比（Tonality係数）
-    """
+
     n = len(signal)
     result = np.full(n, np.nan)
 
@@ -453,80 +190,6 @@ def spectral_flatness_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
             if arithmetic_mean > 0:
                 flatness = geometric_mean / arithmetic_mean
                 result[i] = flatness
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def spectral_entropy_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトルエントロピー計算（動的並列化制御版）
-    周波数分布の不確実性を測定
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-
-    if n < window_size:
-        return result
-
-    num_iterations = n - (window_size - 1)
-
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # NumbaネイティブFFTによるスペクトル計算
-            fft_values = numba_fft(finite_data)
-            power_spectrum = np.abs(fft_values[: len(finite_data) // 2]) ** 2
-
-            if len(power_spectrum) == 0:
-                continue
-
-            # 正規化して確率分布に変換
-            total_power = np.sum(power_spectrum)
-            if total_power > 0:
-                probability = power_spectrum / total_power
-
-                # エントロピー計算
-                entropy = 0.0
-                for p in probability:
-                    if p > 1e-10:
-                        entropy -= p * np.log2(p)
-
-                result[i] = entropy
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # NumbaネイティブFFTによるスペクトル計算
-            fft_values = numba_fft(finite_data)
-            power_spectrum = np.abs(fft_values[: len(finite_data) // 2]) ** 2
-
-            if len(power_spectrum) == 0:
-                continue
-
-            # 正規化して確率分布に変換
-            total_power = np.sum(power_spectrum)
-            if total_power > 0:
-                probability = power_spectrum / total_power
-
-                # エントロピー計算
-                entropy = 0.0
-                for p in probability:
-                    if p > 1e-10:
-                        entropy -= p * np.log2(p)
-
-                result[i] = entropy
 
     return result
 
@@ -537,95 +200,8 @@ def spectral_entropy_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
 
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
-def wavelet_energy_udf(
-    signal: np.ndarray, window_size: int, levels: int = 4
-) -> np.ndarray:
-    """
-    ウェーブレットエネルギー計算（動的並列化制御版）
-    各レベルでの近似エネルギー
-    【修正】元スクリプトに存在したが新モジュールに欠落していたため追加
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-
-    if n < window_size:
-        return result
-
-    num_iterations = n - (window_size - 1)
-
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # 簡易ウェーブレット変換（移動平均とディファレンス）
-            level_energy = 0.0
-            current_signal = finite_data.copy()
-
-            for level in range(min(levels, 4)):
-                if len(current_signal) < 4:
-                    break
-
-                # ローパスフィルタ（移動平均）
-                filtered = np.zeros(len(current_signal) // 2)
-                for j in range(len(filtered)):
-                    idx = j * 2
-                    if idx + 1 < len(current_signal):
-                        filtered[j] = (
-                            current_signal[idx] + current_signal[idx + 1]
-                        ) / 2.0
-
-                # エネルギー計算
-                level_energy += np.sum(filtered**2)
-                current_signal = filtered
-
-            result[i] = level_energy
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # 簡易ウェーブレット変換（移動平均とディファレンス）
-            level_energy = 0.0
-            current_signal = finite_data.copy()
-
-            for level in range(min(levels, 4)):
-                if len(current_signal) < 4:
-                    break
-
-                # ローパスフィルタ（移動平均）
-                filtered = np.zeros(len(current_signal) // 2)
-                for j in range(len(filtered)):
-                    idx = j * 2
-                    if idx + 1 < len(current_signal):
-                        filtered[j] = (
-                            current_signal[idx] + current_signal[idx + 1]
-                        ) / 2.0
-
-                # エネルギー計算
-                level_energy += np.sum(filtered**2)
-                current_signal = filtered
-
-            result[i] = level_energy
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
 def wavelet_entropy_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ウェーブレットエントロピー計算（動的並列化制御版）
-    信号の二乗値に基づくエントロピー計算
-    【修正】window_data をそのまま使用（元スクリプトに一致）
-    """
+
     n = len(signal)
     result = np.full(n, np.nan)
     num_iterations = n - (window_size - 1)
@@ -656,80 +232,8 @@ def wavelet_entropy_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
 
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
-def hilbert_amplitude_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ヒルベルト変換による振幅包絡線計算（動的並列化制御版）
-    FFTを使用した近似ヒルベルト変換を行い、その振幅の平均を返す
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-
-    if n < window_size:
-        return result
-
-    num_iterations = n - (window_size - 1)
-
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # 近似ヒルベルト変換（90度位相シフト）
-            # FFTを使用した近似実装
-            fft_signal = numba_fft(finite_data)
-            n_samples = len(finite_data)
-
-            # 90度位相シフト
-            hilbert_fft = fft_signal.copy()
-            for j in range(1, n_samples // 2):
-                hilbert_fft[j] *= -1j
-                hilbert_fft[n_samples - j] *= 1j
-
-            # IFFT相当の処理（簡易版）
-            hilbert_signal = np.real(hilbert_fft)[: len(finite_data)]
-
-            # 振幅包絡線
-            amplitude_envelope = np.sqrt(finite_data**2 + hilbert_signal**2)
-            result[i] = np.mean(amplitude_envelope)
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
-
-            if len(finite_data) < window_size // 2:
-                continue
-
-            # 近似ヒルベルト変換（90度位相シフト）
-            # FFTを使用した近似実装
-            fft_signal = numba_fft(finite_data)
-            n_samples = len(finite_data)
-
-            # 90度位相シフト
-            hilbert_fft = fft_signal.copy()
-            for j in range(1, n_samples // 2):
-                hilbert_fft[j] *= -1j
-                hilbert_fft[n_samples - j] *= 1j
-
-            # IFFT相当の処理（簡易版）
-            hilbert_signal = np.real(hilbert_fft)[: len(finite_data)]
-
-            # 振幅包絡線
-            amplitude_envelope = np.sqrt(finite_data**2 + hilbert_signal**2)
-            result[i] = np.mean(amplitude_envelope)
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
 def hilbert_phase_var_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ヒルベルト位相分散（動的並列化制御版）
-    """
+
     n = len(signal)
     result = np.full(n, np.nan)
     num_iterations = n - (window_size - 1)
@@ -751,10 +255,7 @@ def hilbert_phase_var_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def hilbert_phase_stability_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ヒルベルト位相安定性（動的並列化制御版）
-    【修正】window_data に対して std チェック（元スクリプトに一致）
-    """
+
     n = len(signal)
     result = np.full(n, np.nan)
     num_iterations = n - (window_size - 1)
@@ -781,58 +282,6 @@ def hilbert_phase_stability_udf(signal: np.ndarray, window_size: int) -> np.ndar
     return result
 
 
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def hilbert_freq_mean_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ヒルベルト瞬時周波数平均（動的並列化制御版）
-    np.unwrapはNumbaでサポートされていないため、単純な差分で近似
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    num_iterations = n - (window_size - 1)
-
-    loop_range = (
-        nb.prange(window_size - 1, n)
-        if num_iterations > 2000
-        else range(window_size - 1, n)
-    )
-    for i in loop_range:
-        window_data = signal[i - window_size + 1 : i + 1]
-        if len(window_data) > 2:
-            analytic_signal = window_data + 1j * np.roll(window_data, 1)
-            # np.unwrapはNumbaでサポートされていないため、単純な差分で近似
-            instant_freq = np.abs(np.diff(np.angle(analytic_signal)))
-            result[i] = np.mean(instant_freq)
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def hilbert_freq_std_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ヒルベルト瞬時周波数標準偏差（動的並列化制御版）
-    np.unwrapはNumbaでサポートされていないため、単純な差分で近似
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    num_iterations = n - (window_size - 1)
-
-    loop_range = (
-        nb.prange(window_size - 1, n)
-        if num_iterations > 2000
-        else range(window_size - 1, n)
-    )
-    for i in loop_range:
-        window_data = signal[i - window_size + 1 : i + 1]
-        if len(window_data) > 2:
-            analytic_signal = window_data + 1j * np.roll(window_data, 1)
-            # np.unwrapはNumbaでサポートされていないため、単純な差分で近似
-            instant_freq = np.abs(np.diff(np.angle(analytic_signal)))
-            result[i] = np.std(instant_freq)
-
-    return result
-
-
 # ==================================================================
 # 5. 音響系 JIT関数群
 # ==================================================================
@@ -840,10 +289,7 @@ def hilbert_freq_std_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
 
 @nb.njit(fastmath=True, cache=True, parallel=True)
 def acoustic_power_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    音響パワー計算（動的並列化制御版）
-    RMS（Root Mean Square）パワーの計算
-    """
+
     n = len(signal)
     result = np.full(n, np.nan)
 
@@ -880,59 +326,107 @@ def acoustic_power_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
     return result
 
 
-@nb.njit(fastmath=True, cache=True, parallel=True)
-def acoustic_frequency_udf(
-    signal: np.ndarray, window_size: int, sample_rate: float = 1.0
-) -> np.ndarray:
-    """
-    音響周波数計算（動的並列化制御版）
-    ゼロクロッシング率に基づく周波数推定
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
+# ==================================================================
+# メイン計算モジュール
+# ==================================================================
 
-    if n < window_size:
-        return result
 
-    num_iterations = n - (window_size - 1)
+def _window(arr: np.ndarray, window: int) -> np.ndarray:
 
-    # 仕事量が多い場合のみ、prangeで並列化する
-    if num_iterations > 2000:
-        for i in nb.prange(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
+    if window <= 0:
+        return np.array([], dtype=arr.dtype)
+    if window > len(arr):
+        return arr
+    return arr[-window:]
 
-            if len(finite_data) < window_size // 2:
-                continue
 
-            # ゼロクロッシング率計算
-            zero_crossings = 0
-            for j in range(1, len(finite_data)):
-                if finite_data[j - 1] * finite_data[j] < 0:
-                    zero_crossings += 1
+def _last(arr: np.ndarray) -> float:
 
-            # 周波数推定（ゼロクロッシング率 / 2）
-            if len(finite_data) > 1:
-                frequency = (zero_crossings / (2.0 * len(finite_data))) * sample_rate
-                result[i] = frequency
-    else:
-        # 仕事量が少ない場合は、オーバーヘッドのない通常のforループで処理
-        for i in range(window_size - 1, n):
-            window_data = signal[i - window_size + 1 : i + 1]
-            finite_data = window_data[np.isfinite(window_data)]
+    if len(arr) == 0:
+        return np.nan
+    return float(arr[-1])
 
-            if len(finite_data) < window_size // 2:
-                continue
 
-            # ゼロクロッシング率計算
-            zero_crossings = 0
-            for j in range(1, len(finite_data)):
-                if finite_data[j - 1] * finite_data[j] < 0:
-                    zero_crossings += 1
+def _pct_change(arr: np.ndarray) -> np.ndarray:
 
-            # 周波数推定（ゼロクロッシング率 / 2）
-            if len(finite_data) > 1:
-                frequency = (zero_crossings / (2.0 * len(finite_data))) * sample_rate
-                result[i] = frequency
+    n = len(arr)
+    pct = np.full(n, np.nan, dtype=np.float64)
+    if n < 2:
+        return pct
+    for i in range(1, n):
+        prev = arr[i - 1]
+        if prev != 0.0:
+            pct[i] = (arr[i] - prev) / prev
+        else:
+            pct[i] = 0.0
+    return pct
 
-    return result
+
+class FeatureModule1E:
+    @staticmethod
+    def calculate_features(data: Dict[str, np.ndarray]) -> Dict[str, float]:
+        features = {}
+
+        # 安全な参照用変数
+        close_arr = data["close"]
+
+        if len(close_arr) == 0:
+            return features
+
+        # pct_change (全特徴量の前処理)
+        close_pct = _pct_change(close_arr)
+
+        # ---------------------------------------------------------
+        # 1. 音響系指標 (Acoustic)
+        # ---------------------------------------------------------
+        features["e1e_acoustic_power_128"] = _last(
+            acoustic_power_udf(_window(close_pct, 128), 128)
+        )
+
+        # ---------------------------------------------------------
+        # 2. ヒルベルト系指標 (Hilbert)
+        # ---------------------------------------------------------
+        features["e1e_hilbert_phase_stability_50"] = _last(
+            hilbert_phase_stability_udf(_window(close_pct, 50), 50)
+        )
+        features["e1e_hilbert_phase_var_50"] = _last(
+            hilbert_phase_var_udf(_window(close_pct, 50), 50)
+        )
+
+        # ---------------------------------------------------------
+        # 3. 信号統計系指標 (Signal Stats)
+        # ---------------------------------------------------------
+        features["e1e_signal_peak_to_peak_100"] = np.max(
+            _window(close_arr, 100)
+        ) - np.min(_window(close_arr, 100))
+
+        features["e1e_signal_rms_50"] = np.sqrt(np.mean(_window(close_pct, 50) ** 2))
+
+        # ---------------------------------------------------------
+        # 4. スペクトル系指標 (Spectral)
+        # ---------------------------------------------------------
+        features["e1e_spectral_centroid_128"] = _last(
+            spectral_centroid_udf(_window(close_pct, 128), 128)
+        )
+        features["e1e_spectral_flatness_128"] = _last(
+            spectral_flatness_udf(_window(close_pct, 128), 128)
+        )
+        features["e1e_spectral_energy_64"] = np.sum(_window(close_pct, 64) ** 2)
+        features["e1e_spectral_energy_128"] = np.sum(_window(close_pct, 128) ** 2)
+        features["e1e_spectral_energy_512"] = np.sum(_window(close_pct, 512) ** 2)
+
+        # ---------------------------------------------------------
+        # 5. ウェーブレット系指標 (Wavelet)
+        # ---------------------------------------------------------
+        features["e1e_wavelet_entropy_64"] = _last(
+            wavelet_entropy_udf(_window(close_pct, 64), 64)
+        )
+        features["e1e_wavelet_mean_256"] = np.mean(_window(close_pct, 256))
+
+        # [QA確認済] Polars準拠の不偏標準偏差 (ddof=1)
+        features["e1e_wavelet_std_32"] = np.std(_window(close_pct, 32), ddof=1)
+        features["e1e_wavelet_std_64"] = np.std(_window(close_pct, 64), ddof=1)
+        features["e1e_wavelet_std_128"] = np.std(_window(close_pct, 128), ddof=1)
+        features["e1e_wavelet_std_256"] = np.std(_window(close_pct, 256), ddof=1)
+
+        return features
