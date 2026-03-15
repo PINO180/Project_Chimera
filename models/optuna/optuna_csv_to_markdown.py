@@ -4,8 +4,8 @@ from io import StringIO
 # ============================================================
 # パス設定（必要に応じて書き換えてください）
 # ============================================================
-INPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_topdata_pure_atr_results_short.csv"
-OUTPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_topdata_pure_atr_results_short.md"
+INPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_topdata_pure_atr_results_sp36.csv"
+OUTPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_topdata_pure_atr_results_sp36.md"
 
 # ============================================================
 # セクションタイトルとして扱う行を判定

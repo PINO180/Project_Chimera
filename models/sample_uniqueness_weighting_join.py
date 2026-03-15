@@ -83,9 +83,16 @@ def main():
             # 日次パーティションを遅延スキャン
             labeled_lf = pl.scan_parquet(path)
 
-            # timestampをキーにしてLeft Joinし、双方向のuniquenessを計算
+            # --- 修正前 ---
+            # final_lf = (
+            #     labeled_lf.join(concurrency_lf, on="timestamp", how="left")
+            #     .with_columns(
+
+            # --- 修正後 ---
             final_lf = (
-                labeled_lf.join(concurrency_lf, on="timestamp", how="left")
+                labeled_lf.join(
+                    concurrency_lf, on=["timestamp", "timeframe"], how="left"
+                )  # ★ timeframeを追加
                 .with_columns(
                     [
                         # concurrency_long が存在し、かつ0より大きい場合に uniqueness_long を計算

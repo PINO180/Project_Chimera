@@ -25,6 +25,7 @@ from typing import Optional, Dict, Any, List
 import polars as pl
 import pandas as pd
 import re
+import csv  # ★これを追加
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
 project_root = Path(__file__).resolve().parents[0]
@@ -109,60 +110,21 @@ MAX_POSITIONS = risk_engine.config.get("max_positions", 1000)
 
 def load_static_data() -> bool:
     """
-    [V11.0 修正]
-    静的データ（市場プロキシ）のみをロードする。
-    旧来の 'context_features_v2.parquet' (D1文脈) は
-    現在の Top 50 戦略では使用しないため廃止（ロード処理を削除）。
+    [V11.2 修正] 静的ファイルへの依存を完全に排除。
+    初期の市場プロキシはZMQから取得したM1履歴データから動的生成するため、
+    ここでは空のデータフレームをセットアップするのみとします。
     """
     global g_market_proxy
 
-    logger.info("--- 0. 静的データ (プロキシ) のロード ---")
+    logger.info("--- 0. 初期データ構造のセットアップ ---")
 
-    # 1. 市場プロキシ (M5) のロード (アルファ純化に必須)
-    # (blueprintに定義がない場合は既存のパスロジックを使用)
-    proxy_source_path = (
-        config.S2_FEATURES_AFTER_AV
-        / "feature_value_a_vast_universeA"
-        / f"features_e1a_M5.parquet"
+    # 空のDataFrameで初期化 (型とインデックスを定義)
+    g_market_proxy = pd.DataFrame(
+        columns=["market_proxy"], index=pd.DatetimeIndex([], tz="UTC", name="timestamp")
     )
 
-    if not proxy_source_path.exists():
-        logger.critical(f"市場プロキシファイルが見つかりません: {proxy_source_path}")
-        return False
-
-    try:
-        logger.info(f"市場プロキシ {proxy_source_path} をロード中...")
-
-        # Polarsで計算してPandasに変換
-        g_market_proxy_pl = (
-            pl.read_parquet(proxy_source_path)
-            .select(["timestamp", "close"])
-            .sort("timestamp")
-            .with_columns(
-                # (close[t] - close[t-5]) / close[t-5]
-                (pl.col("close").pct_change(MARKET_PROXY_LOOKBACK)).alias(
-                    "market_proxy"
-                )
-            )
-            .select(["timestamp", "market_proxy"])
-            .drop_nulls()  # 計算不能な先頭のNaNを削除
-        )
-
-        # TZ-Aware (UTC) に統一 [FIX-8: 既にTZがある場合のクラッシュ回避]
-        proxy_df = g_market_proxy_pl.to_pandas().set_index("timestamp")
-        if proxy_df.index.tz is None:
-            g_market_proxy = proxy_df.tz_localize("UTC")
-        else:
-            g_market_proxy = proxy_df.tz_convert("UTC")
-
-        logger.info(
-            f"✓ M5市場プロキシデータをPandas DFとしてキャッシュ ({len(g_market_proxy)}行)。"
-        )
-        return True
-
-    except Exception as e:
-        logger.critical(f"市場プロキシのロードに失敗: {e}", exc_info=True)
-        return False
+    logger.info("✓ プロキシ用DataFrameの初期化完了 (実データはZMQから動的生成します)")
+    return True
 
 
 def initialize_data_buffer(
@@ -204,8 +166,9 @@ def initialize_data_buffer(
         if total_m1_needed > max_m1_bars_needed:
             max_m1_bars_needed = total_m1_needed
 
-    # 最低ライン(5万本) と エンジン要求(計算値 + マージン5000本) の大きい方を採用
-    lookback = max(50000, max_m1_bars_needed + 5000)
+    # D1のOLS学習サンプルを十分確保するため最低ラインを200,000本に引き上げ
+    # D1: 200,000 / 1440 ≈ 138本 → OLS2016サンプルには届かないが実用上許容範囲
+    lookback = max(200000, max_m1_bars_needed + 5000)
 
     logger.info(
         f"  -> {tf_name} の履歴データを {lookback} 本取得中 (Engine要求: {max_m1_bars_needed} M1 bars)..."
@@ -224,13 +187,47 @@ def initialize_data_buffer(
         )
         return False
 
+    # ▼▼▼ 修正: M1履歴データから市場プロキシ(M5)を動的生成 ▼▼▼
+    global g_market_proxy
+    logger.info("  -> 取得したM1履歴データから初期の市場プロキシ(M5)を動的生成中...")
+    try:
+        temp_df = df_rates_m1[["timestamp", "close"]].copy()
+        temp_df.set_index("timestamp", inplace=True)
+
+        # M1をM5にリサンプリング(5分ごとの終値)し、リターンを計算
+        m5_close = (
+            temp_df["close"]
+            .resample("5min", label="right", closed="right")
+            .last()
+            .dropna()
+        )
+        proxy_df = (
+            m5_close.pct_change(MARKET_PROXY_LOOKBACK)
+            .to_frame(name="market_proxy")
+            .dropna()
+        )
+
+        # タイムゾーンの適応(UTC)
+        if proxy_df.index.tz is None:
+            g_market_proxy = proxy_df.tz_localize("UTC")
+        else:
+            g_market_proxy = proxy_df.tz_convert("UTC")
+
+        logger.info(f"  ✓ 動的市場プロキシ生成完了 ({len(g_market_proxy)}行)")
+    except Exception as e:
+        logger.warning(
+            f"  ⚠ 動的市場プロキシ生成に失敗しました（空のプロキシで続行）: {e}"
+        )
+    # ▲▲▲ ここまで修正 ▲▲▲
+
     # 3. history_data_map には M1 だけを格納
     history_data_map[tf_name] = df_rates_m1
 
     # (M3, M5, M8, H6, H12, D1, W1, MN のリクエストは一切行わない)
 
     # エンジンに全履歴データを一括で渡す
-    engine.fill_all_buffers(history_data_map, market_proxy_cache)
+    # [修正] market_proxy_cache ではなく、たった今動的生成した g_market_proxy を渡す
+    engine.fill_all_buffers(history_data_map, g_market_proxy)
 
     # M1ループの開始時刻をセット
     global g_last_processed_bar_time
@@ -289,9 +286,33 @@ def get_latest_m1_bar(bridge: MQL5BridgePublisherV3) -> Optional[Dict[str, Any]]
 
 
 def main():
+    global g_market_proxy
+
     logger.info("=" * 60)
     logger.info("🚀 Project Forge 統合実行システム V11.0 (ZMQハイブリッド版) 起動...")
     logger.info("=" * 60)
+
+    # ▼▼▼ 追加: 推論値ログ用CSVのセットアップ ▼▼▼
+    predictions_csv_path = config.LOGS_DIR / "m1_m2_predictions_log.csv"
+    if not predictions_csv_path.exists():
+        with open(predictions_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # Excelの1行目になるヘッダーを書き込む
+            writer.writerow(
+                [
+                    "Timestamp",
+                    "CurrentPrice",
+                    "Long_M1_Raw",
+                    "Long_M1_Calib",
+                    "Short_M1_Raw",
+                    "Short_M1_Calib",
+                    "Long_M2_Raw",
+                    "Long_M2_Calib",
+                    "Short_M2_Raw",
+                    "Short_M2_Calib",
+                ]
+            )
+    # ▲▲▲ ここまで追加 ▲▲▲
 
     state_manager: Optional[StateManager] = None
     bridge: Optional[MQL5BridgePublisherV3] = None
@@ -300,12 +321,14 @@ def main():
 
     try:
         # --- 0. 静的データ (プロキシ) のロード ---
+        logger.info("")  # ★空白行を追加
         logger.info("--- 0. 静的データ (プロキシ) のロード ---")
         if not load_static_data():
             raise RuntimeError("静的データのロードに失敗しました。")
         logger.info("✓ 静的データ（M5プロキシ）をキャッシュしました。")
 
         # --- 1. 状態管理 (StateManager) の初期化 ---
+        logger.info("")  # ★空白行を追加
         logger.info("--- 1. 状態管理 (StateManager) の初期化 ---")
         state_manager = StateManager(
             checkpoint_dir=str(config.STATE_CHECKPOINT_DIR),
@@ -320,6 +343,7 @@ def main():
             )
 
         # --- 2. 通信 (MQL5BridgeV3) の初期化 ---
+        logger.info("")  # ★空白行を追加
         logger.info("--- 2. 通信 (MQL5BridgeV3 - V11.0) の初期化 ---")
         # [V11.0] 3系統のエンドポイントを設定
         bridge_config = BridgeConfig(
@@ -335,6 +359,7 @@ def main():
         logger.info("✓ MQL5ブリッジ接続完了 (Control/Data/Heartbeat)。")
 
         # --- 3. ブローカー状態との整合性検証 ---
+        logger.info("")  # ★空白行を追加
         logger.info("--- 3. ブローカー状態との整合性検証 ---")
         broker_state = bridge.request_broker_state()
         if broker_state:
@@ -346,11 +371,13 @@ def main():
             )
 
         # --- 4. リスクエンジン (ExtremeRiskEngineV5) の初期化 ---
+        logger.info("")  # ★空白行を追加
         logger.info("--- 4. リスクエンジン (ExtremeRiskEngineV5) の初期化 ---")
         risk_engine = ExtremeRiskEngineV5(config_path=str(config.CONFIG_RISK))
         logger.info("✓ リスクエンジンを初期化しました（Base+Calibratorロード完了）。")
 
         # --- 5. AIモデル (Two-Brain) と特徴量リストのロード ---
+        logger.info("")  # ★空白行を追加
         logger.info("--- 5. AIモデルと専用特徴量リストのロード (V5仕様) ---")
         try:
             # 1. LightGBM Booster (M1/M2)
@@ -400,6 +427,7 @@ def main():
             raise RuntimeError(f"モデルまたは特徴量リストのロードに失敗しました: {e}")
 
         # --- 6. リアルタイム特徴量エンジン (マルチバッファ) の初期化 ---
+        logger.info("")  # ★空白行を追加
         logger.info(
             "--- 6. リアルタイム特徴量エンジンの初期化 (ゼロ・シリアライズ) ---"
         )
@@ -426,11 +454,15 @@ def main():
                     for trade in state_manager.current_state.trades:
                         duration_mins = trade.get_duration_minutes(current_time)
 
-                        # シミュレーター仕様: Longは15分、Shortは5分でタイムアウト(TO)
+                        # ▼▼▼ 修正: Optunaの最強パラメータ(Mixed)に準拠 ▼▼▼
                         is_timeout = False
-                        if trade.direction == "BUY" and duration_mins >= 15.0:
+                        if (
+                            trade.direction == "BUY" and duration_mins >= 120.0
+                        ):  # 15.0 から 120.0 に変更
                             is_timeout = True
-                        elif trade.direction == "SELL" and duration_mins >= 5.0:
+                        elif (
+                            trade.direction == "SELL" and duration_mins >= 60.0
+                        ):  # 5.0 から 60.0 に変更
                             is_timeout = True
 
                         if is_timeout:
@@ -514,7 +546,7 @@ def main():
                     continue
 
                 # ▼▼▼ 修正: 市場プロキシ (g_market_proxy) の永久凍結防止 ▼▼▼
-                global g_market_proxy
+                # global g_market_proxy  # ▲ 削除（関数の先頭に移動済みのため）
                 if feature_engine and len(feature_engine.m1_dataframe) >= 25:
                     current_close = new_m1_bar["close"]
                     past_close = feature_engine.m1_dataframe[-25]["close"]
@@ -522,7 +554,7 @@ def main():
                         new_proxy_val = (current_close - past_close) / past_close
                         new_proxy_df = pd.DataFrame(
                             {"market_proxy": [new_proxy_val]},
-                            index=[new_m1_bar["timestamp"]],
+                            index=pd.DatetimeIndex([new_m1_bar["timestamp"]], tz="UTC"),
                         )
                         g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
                         # メモリ溢れ保護
@@ -559,9 +591,11 @@ def main():
                     p_long_m1_raw = models["long_m1"].predict(X_long_m1)[0]
                     p_long_m1 = calibrators["long_m1"].predict([p_long_m1_raw])[0]
 
-                    # 2. M2モデル (M1の較正済み予測値を特徴量として追加 → 生予測 → 較正)
+                    # 2. M2モデル (M1の「生」の予測値を特徴量として追加 → 生予測 → 較正)
                     feature_dict_long = feature_dict.copy()
-                    feature_dict_long["m1_pred_proba"] = p_long_m1
+                    feature_dict_long["m1_pred_proba"] = (
+                        p_long_m1_raw  # ▼修正: 学習時と同じRaw確率を渡す
+                    )
 
                     X_long_m2 = np.array(
                         [
@@ -584,10 +618,11 @@ def main():
                     p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
                     p_short_m1 = calibrators["short_m1"].predict([p_short_m1_raw])[0]
 
-                    # 2. M2モデル (M1の較正済み予測値を特徴量として追加 → 生予測 → 較正)
+                    # 2. M2モデル (M1の「生」の予測値を特徴量として追加 → 生予測 → 較正)
                     feature_dict_short = feature_dict.copy()
-                    feature_dict_short["m1_pred_proba"] = p_short_m1
-
+                    feature_dict_short["m1_pred_proba"] = (
+                        p_short_m1_raw  # ▼修正: 学習時と同じRaw確率を渡す
+                    )
                     X_short_m2 = np.array(
                         [
                             [
@@ -602,11 +637,90 @@ def main():
                     )[0]
 
                     logger.info(
-                        f"🧠 [M2 Calibrated] Long: {p_long_m2_calib:.4f} | Short: {p_short_m2_calib:.4f}"
+                        f"🧠 [M1 Raw->Calib] Long: {p_long_m1_raw:.4f} -> {p_long_m1:.4f} | "
+                        f"Short: {p_short_m1_raw:.4f} -> {p_short_m1:.4f}"
                     )
+                    logger.info(
+                        f"🧠 [M2 Raw->Calib] Long: {p_long_m2_raw:.4f} -> {p_long_m2_calib:.4f} | "
+                        f"Short: {p_short_m2_raw:.4f} -> {p_short_m2_calib:.4f}"
+                    )
+
+                    # ▼▼▼ 追加: Excel用CSVに1行追記 ▼▼▼
+                    try:
+                        with open(
+                            predictions_csv_path, "a", newline="", encoding="utf-8"
+                        ) as f:
+                            writer = csv.writer(f)
+                            writer.writerow(
+                                [
+                                    signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                                    signal.market_info["current_price"],
+                                    round(p_long_m1_raw, 4),
+                                    round(p_long_m1, 4),
+                                    round(p_short_m1_raw, 4),
+                                    round(p_short_m1, 4),
+                                    round(p_long_m2_raw, 4),
+                                    round(p_long_m2_calib, 4),
+                                    round(p_short_m2_raw, 4),
+                                    round(p_short_m2_calib, 4),
+                                ]
+                            )
+                    except Exception as e:
+                        logger.warning(f"CSVへの書き込みに失敗しました: {e}")
+                    # ▲▲▲ ここまで追加 ▲▲▲
                     # [FIX-5] M2_PROBA_THRESHOLD 定数を参照 (ハードコード 0.50 を廃止)
                     should_trade_long = p_long_m2_calib > M2_PROBA_THRESHOLD
                     should_trade_short = p_short_m2_calib > M2_PROBA_THRESHOLD
+
+                    # ▼▼▼ 新規追加: 取引判定時の全特徴量(110個)をCSVに追記する ▼▼▼
+                    if should_trade_long or should_trade_short:
+                        try:
+                            dump_csv_path = (
+                                config.LOGS_DIR / "triggered_features_log.csv"
+                            )
+                            file_exists = dump_csv_path.exists()
+
+                            with open(
+                                dump_csv_path, "a", newline="", encoding="utf-8"
+                            ) as f:
+                                writer = csv.writer(f)
+
+                                # 辞書のキー(110個の特徴量名)を取得
+                                feature_keys = list(feature_dict.keys())
+
+                                # ファイルが新規作成された場合のみヘッダーを書き込む
+                                if not file_exists:
+                                    header = [
+                                        "Timestamp",
+                                        "Action",
+                                        "Price",
+                                        "P_Long_M2",
+                                        "P_Short_M2",
+                                    ] + feature_keys
+                                    writer.writerow(header)
+
+                                # 記録するデータの準備
+                                action_str = "BUY" if should_trade_long else "SELL"
+                                row_data = [
+                                    signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                                    action_str,
+                                    signal.market_info["current_price"],
+                                    round(p_long_m2_calib, 4),
+                                    round(p_short_m2_calib, 4),
+                                ]
+
+                                # 110個の特徴量の値をリストに追加
+                                row_data.extend([feature_dict[k] for k in feature_keys])
+
+                                # CSVに1行追記
+                                writer.writerow(row_data)
+
+                            logger.info(
+                                f"💾 エントリー時の全特徴量(110個)をCSVに記録しました: {dump_csv_path.name}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"特徴量CSVの保存に失敗: {e}")
+                    # ▲▲▲ ここまで追加 ▲▲▲
 
                     # --- 1. 同時発注禁止 & 両建て防止 (prevent_simultaneous_orders) ---
                     # ※バックテストの default_config.prevent_simultaneous_orders = True に準拠
@@ -656,7 +770,7 @@ def main():
                         should_trade_long = False
                         should_trade_short = False
 
-                    # --- 5. 最終的な方向と確率の決定 ---  ← 番号を繰り下げ
+                    # --- 5. 最終的な方向と確率の決定 ---
                     direction = None
                     final_proba = 0.0
 

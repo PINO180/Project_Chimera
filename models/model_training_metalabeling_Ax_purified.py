@@ -429,11 +429,21 @@ class M1CrossValidator:
                 oof_df = pl.DataFrame(
                     {
                         "timestamp": oof_results["timestamp"],
+                        "timeframe": oof_results["timeframe"],  # ★追加
                         "prediction": oof_results["prediction"],
                         "true_label": oof_results["true_label"],
                         "uniqueness": oof_results["uniqueness"],
                     }
-                ).sort("timestamp")
+                )
+
+                # ▼▼▼ 追加: 下流でのJoinエラーを防ぐため、Intを文字列に戻す ▼▼▼
+                reverse_map = {0: "M1", 1: "M3", 2: "M5", 3: "M8", 4: "M15"}
+                oof_df = oof_df.with_columns(
+                    pl.col("timeframe")
+                    .replace_strict(reverse_map, default=None)
+                    .cast(pl.Utf8)
+                ).sort(["timestamp", "timeframe"])
+                # ▲▲▲ 追加ここまで ▲▲▲
 
                 out_path = output_paths[direction]
                 oof_df.write_parquet(out_path, compression="zstd")

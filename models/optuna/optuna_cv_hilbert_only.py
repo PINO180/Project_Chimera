@@ -442,8 +442,14 @@ def create_objective(cv_folds, data_loader, target_tf):
                 bets_atr = np.ascontiguousarray(raw_atr[valid_indices])
 
                 bets_t1_max = bets_t0 + td_us
-                bets_pt = np.ascontiguousarray(bets_close + bets_atr * pt_mult)
-                bets_sl = np.ascontiguousarray(bets_close - bets_atr * sl_mult)
+
+                # ★修正: スプレッドの壁をバリアに組み込む（PTは遠く、SLは近くなる）
+                bets_pt = np.ascontiguousarray(
+                    bets_close + bets_atr * pt_mult + SPREAD_COST
+                )
+                bets_sl = np.ascontiguousarray(
+                    bets_close - bets_atr * sl_mult + SPREAD_COST
+                )
 
                 out_pt, out_sl = _numba_find_hits_fast(
                     bets_t0,

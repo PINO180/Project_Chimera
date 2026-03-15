@@ -485,13 +485,16 @@ def create_objective(cv_folds, data_loader, target_tf):
                 bets_t0 = np.ascontiguousarray(raw_t0[valid_indices])
                 bets_close = np.ascontiguousarray(raw_close[valid_indices])
                 bets_atr = np.ascontiguousarray(raw_atr[valid_indices])
-
                 bets_t1_max = bets_t0 + td_us
 
-                # 【変更点】ショート: PTは下方向、SLは上方向に計算
-                bets_pt = np.ascontiguousarray(bets_close - bets_atr * pt_mult)
-                bets_sl = np.ascontiguousarray(bets_close + bets_atr * sl_mult)
-
+                # 【修正要件1】 バリアの計算式をショート用に反転（スプレッドの壁を加味）
+                # ショートの利確はスプレッド分さらに下へ遠ざかり、損切は下へ近づく
+                bets_pt = np.ascontiguousarray(
+                    bets_close - bets_atr * pt_mult - SPREAD_COST
+                )
+                bets_sl = np.ascontiguousarray(
+                    bets_close + bets_atr * sl_mult - SPREAD_COST
+                )
                 out_pt, out_sl = _numba_find_hits_fast(
                     bets_t0,
                     bets_t1_max,

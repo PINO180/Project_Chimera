@@ -5,6 +5,14 @@ from collections import deque
 import numpy as np
 import pandas as pd
 import logging
+
+# ▼▼▼ 追加: Numpyの無害な計算警告をミュートしてログをクリーンに保つ ▼▼▼
+np.seterr(divide="ignore", invalid="ignore")
+import warnings
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
+# ▲▲▲ ここまで追加 ▲▲▲
+
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -18,15 +26,15 @@ if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 # ==================================================================
-# 外部モジュール (Numba UDF群) のインポート
-# モノリスファイルから切り出された計算エンジン群に処理を委譲します
+# 外部モジュール (完全カプセル化クラス群) のインポート
+# 各モジュールは calculate_features(data) メソッドで一括計算を行います
 # ==================================================================
-import realtime_feature_engine_1A_statistics as engine_1A
-import realtime_feature_engine_1B_timeseries as engine_1B
-import realtime_feature_engine_1C_technical as engine_1C
-import realtime_feature_engine_1D_volume as engine_1D
-import realtime_feature_engine_1E_signal as engine_1E
-import realtime_feature_engine_1F_experimental as engine_1F
+from execution.realtime_feature_engine_1A_statistics import FeatureModule1A
+from execution.realtime_feature_engine_1B_timeseries import FeatureModule1B
+from execution.realtime_feature_engine_1C_technical import FeatureModule1C
+from execution.realtime_feature_engine_1D_volume import FeatureModule1D
+from execution.realtime_feature_engine_1E_signal import FeatureModule1E
+from execution.realtime_feature_engine_1F_experimental import FeatureModule1F
 
 
 @dataclass
@@ -138,11 +146,11 @@ class RealtimeFeatureEngine:
             if tf_name not in self.lookbacks_by_tf:
                 self.lookbacks_by_tf[tf_name] = self.DEFAULT_LOOKBACK
                 self.logger.debug(
-                    f"  -> {tf_name} バッファ初期化 (Default: {self.DEFAULT_LOOKBACK})"
+                    f"  -> {tf_name:<3} バッファ初期化 (Default: {self.DEFAULT_LOOKBACK})"
                 )
             else:
                 self.logger.info(
-                    f"  -> {tf_name} バッファ初期化 (Lookback: {self.lookbacks_by_tf[tf_name]})"
+                    f"  -> {tf_name:<3} バッファ初期化 (Lookback: {self.lookbacks_by_tf[tf_name]})"
                 )
 
             lookback = self.lookbacks_by_tf[tf_name]
@@ -174,12 +182,11 @@ class RealtimeFeatureEngine:
         ]
 
         for tf_name in self.data_buffers.keys():
-            lookback = self.data_buffers[tf_name]["close"].maxlen
-
+            # ▼修正: OLS純化バッファは、どの時間足でもStage3と完全一致の「2016」で固定
             self.proxy_feature_buffers[tf_name] = {
-                feat: deque(maxlen=lookback) for feat in PROXY_FEATURES
+                feat: deque(maxlen=2016) for feat in PROXY_FEATURES
             }
-            self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(maxlen=lookback)
+            self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(maxlen=2016)
 
             self.ols_state[tf_name] = {}
             for feat in PROXY_FEATURES:
@@ -211,18 +218,27 @@ class RealtimeFeatureEngine:
                 return [line.strip() for line in f if line.strip()]
 
     def _warmup_jit(self):
-        """外部モジュールのJITコンパイルを起動時に済ませる"""
-        self.logger.info("外部NumbaモジュールのJITウォームアップを開始します...")
+        """各モジュールの完全カプセル化メソッドを呼び出し、JITコンパイルを済ませる"""
+        self.logger.info("外部モジュールのJITウォームアップを開始します...")
         try:
-            dummy_data = np.cumsum(np.random.randn(100)).astype(np.float64)
-            # 各エンジンの軽量な関数を叩いてコンパイルを誘発
-            _ = engine_1A.rolling_skew_numba(dummy_data)
-            _ = engine_1B.t分布_自由度_udf(dummy_data)
-            _ = engine_1C.rolling_mean_numba(dummy_data, 10)
-            _ = engine_1C.calculate_schaff_trend_cycle_numba(dummy_data, 12, 26, 9)
-            _ = engine_1D.hv_robust_udf(dummy_data)
-            _ = engine_1E.spectral_centroid_udf(dummy_data)
-            _ = engine_1F.rolling_linguistic_complexity_udf(dummy_data)
+            # OHLCVのダミーデータ（辞書）を作成
+            dummy_arr = np.cumsum(np.random.randn(300)).astype(np.float64) + 1000.0
+            dummy_data = {
+                "open": dummy_arr,
+                "high": dummy_arr + 10.0,
+                "low": dummy_arr - 10.0,
+                "close": dummy_arr + np.random.randn(300),
+                "volume": np.abs(np.random.randn(300) * 100),
+            }
+
+            # 各モジュールのメインメソッドにダミーデータを流し込む
+            _ = FeatureModule1A.calculate_features(dummy_data)
+            _ = FeatureModule1B.calculate_features(dummy_data)
+            _ = FeatureModule1C.calculate_features(dummy_data)
+            _ = FeatureModule1D.calculate_features(dummy_data)
+            _ = FeatureModule1E.calculate_features(dummy_data)
+            _ = FeatureModule1F.calculate_features(dummy_data)
+
             self.logger.info("✓ JITウォームアップ完了。")
         except Exception as e:
             self.logger.warning(f"JITウォームアップ中に警告: {e}")
@@ -243,14 +259,15 @@ class RealtimeFeatureEngine:
                 lookbacks[tf_name_parsed] = 0
 
         # MFDFA等の特大要求が消えたため、ベース特徴量計算用マージンのみ確保
-        SAFE_MIN_LOOKBACK = 1000
+        # ▼修正: 純化の2016期間を完全にカバーするため1000から2016に変更
+        SAFE_MIN_LOOKBACK = 2016
 
         final_lookbacks = {}
         for tf_name_parsed in lookbacks.keys():
             req_size = max(lookbacks[tf_name_parsed], SAFE_MIN_LOOKBACK)
             final_lookbacks[tf_name_parsed] = req_size + 100
             self.logger.info(
-                f"  -> {tf_name_parsed} 最大ルックバック: {final_lookbacks[tf_name_parsed]}"
+                f"  -> {tf_name_parsed:<3} 最大ルックバック: {final_lookbacks[tf_name_parsed]}"
             )
 
         return final_lookbacks
@@ -309,62 +326,163 @@ class RealtimeFeatureEngine:
     ) -> None:
         """
         DataFrameの過去データを使ってOHLCVバッファを充填しつつ、
-        リアルタイムと全く同じフローで1行ずつ時系列を進め、
-        全304特徴量のOLS状態(純化バッファ)を完璧にウォームアップする。
+        全特徴量のOLS状態(純化バッファ)をウォームアップする。
+
+        [V12.0 バグ修正: 成長スライス問題の解消]
+
+        【旧実装の致命的バグ】
+        旧実装ではウォームアップのステップ i で `arr[:i+1]` (成長スライス) を使って
+        特徴量を計算し、その値でOLSを学習していた。
+        しかしリアルタイム推論では常に deque の全データ (buffer_len 本の固定ウィンドウ)
+        で特徴量を計算する。
+
+        この不一致が `volume_price_trend` などの累積特徴量で破滅的な分布シフトを引き起こす:
+          - OLSが学習した mean_y  ≈ 成長スライス平均 ≈ VPT_full / 2（小さい値）
+          - 推論時の実際の特徴量値 ≈ VPT_full（2116本分の累積、はるかに大きい値）
+          - 残差 = VPT_full - (beta * proxy + alpha) → 内部クリップ値 ±100,000 に張り付く
+          - モデルが OOD 入力を受け取り → M2 が Long/Short 両方向で 1.0 を出力
+
+        【修正内容】
+        OLSウォームアップにおいて、特徴量を「成長スライス(arr[:i+1])」ではなく
+        「固定スライディングウィンドウ (arr[max(0, i+1-buffer_len) : i+1])」で計算する。
+        これによりウォームアップ時の特徴量分布がリアルタイム推論と完全に一致する。
+
+        さらに、渡された df の全行（最大 OLS_WINDOW + buffer_len 行）を使うことで、
+        OLS が十分な数のフルウィンドウ特徴量値で学習できるようにする。
+        （旧実装は df を buffer_len 行に先頭から切り捨てていたため、累積特徴量が
+          フルウィンドウに達する前の値でOLSが汚染されていた。）
         """
         if tf_name not in self.data_buffers:
             self.logger.warning(f"_replace_buffer: {tf_name} は管理対象外です。")
             return
 
+        OLS_WINDOW = 2016
         buffer_len = self.lookbacks_by_tf[tf_name]
-        df_slice = df.iloc[-buffer_len:]
+
+        # [修正] OLS を十分なフルウィンドウ特徴量値で学習するために必要な行数。
+        # - buffer_len 行: 1つのフルウィンドウを形成するために必要な最小データ
+        # - OLS_WINDOW 行: OLS が安定した分布を学習するために必要なサンプル数
+        # 合計が用意できない場合は利用可能な全行数を使う。
+        ols_total_needed = buffer_len + OLS_WINDOW
+        df_for_processing = df.iloc[-min(len(df), ols_total_needed) :]
+
+        # [旧実装との互換性確保] OHLCVバッファ充填のフォールバック用スライス
+        df_slice_for_no_proxy = df.iloc[-buffer_len:]
 
         # 1. OHLCVバッファを一旦完全にクリア
         for col in self.OHLCV_COLS:
             self.data_buffers[tf_name][col].clear()
 
-        # プロキシがない場合は単純充填のみ（通常はここには来ない想定）
+        # プロキシがない場合（通常はここには来ない）
         if market_proxy_cache is None or market_proxy_cache.empty:
             self.logger.warning(
-                f"  -> {tf_name} OLSバックフィルスキップ (プロキシ未提供)"
+                f"  -> {tf_name:<3} OLSバックフィルスキップ (プロキシ未提供)"
             )
             for col in self.OHLCV_COLS:
-                self.data_buffers[tf_name][col].extend(df_slice[col].values)
-            self.last_bar_timestamps[tf_name] = df_slice.index[-1]
-            if len(df_slice) > 0:
+                self.data_buffers[tf_name][col].extend(
+                    df_slice_for_no_proxy[col].values
+                )
+            self.last_bar_timestamps[tf_name] = df_slice_for_no_proxy.index[-1]
+            if len(df_slice_for_no_proxy) > 0:
                 self.is_buffer_filled[tf_name] = True
             return
 
+        n_rows = len(df_for_processing)
         self.logger.info(
-            f"  -> {tf_name} ウォームアップ開始 ({len(df_slice)}行の過去データで全OLS状態を構築中)..."
+            f"  -> {tf_name:<3} ウォームアップ開始 (固定ウィンドウ版: {n_rows}行 / "
+            f"必要: {ols_total_needed}行 / buffer={buffer_len} / OLS={OLS_WINDOW})..."
         )
-
-        # 2. 1行ずつ時系列を進めながら完全シミュレーション (O(N)で超高速)
-        # dequeの自動押し出し(maxlen)をそのまま利用するため、スライスによるメモリコピーが一切発生しません。
-        for timestamp, row in df_slice.iterrows():
-            # (1) OHLCVバッファに1行追加
-            for col in self.OHLCV_COLS:
-                self.data_buffers[tf_name][col].append(row[col])
-
-            self.last_bar_timestamps[tf_name] = timestamp
-
-            # (2) 蓄積されたバッファを使ってベース特徴量を計算
-            data = {
-                col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
-                for col in self.OHLCV_COLS
-            }
-            base_features = self._calculate_base_features(data, tf_name)
-
-            # (3) 動的OLSの更新 (全304特徴量がここで動的に登録・更新される)
-            self._update_incremental_ols(
-                tf_name, base_features, market_proxy_cache, timestamp
+        if n_rows < ols_total_needed:
+            self.logger.warning(
+                f"  -> {tf_name:<3} 利用可能データが不足 ({n_rows} < {ols_total_needed})。"
+                f" OLS精度が低下する可能性があります。"
+                f" 取得する M1 バー数を増やすことを検討してください。"
             )
 
-        if len(df_slice) > 0:
+        # --- Numpy配列として一括抽出 ---
+        arr_open = df_for_processing["open"].values.astype(np.float64)
+        arr_high = df_for_processing["high"].values.astype(np.float64)
+        arr_low = df_for_processing["low"].values.astype(np.float64)
+        arr_close = df_for_processing["close"].values.astype(np.float64)
+        arr_vol = df_for_processing["volume"].values.astype(np.float64)
+        timestamps = df_for_processing.index
+
+        base_features: dict = {}
+
+        for i in range(n_rows):
+            # (1) OHLCVバッファに1行追加 (deque の maxlen=buffer_len が古い行を自動で押し出す)
+            self.data_buffers[tf_name]["open"].append(arr_open[i])
+            self.data_buffers[tf_name]["high"].append(arr_high[i])
+            self.data_buffers[tf_name]["low"].append(arr_low[i])
+            self.data_buffers[tf_name]["close"].append(arr_close[i])
+            self.data_buffers[tf_name]["volume"].append(arr_vol[i])
+
+            ts = timestamps[i]
+            self.last_bar_timestamps[tf_name] = ts
+
+            # (2) [修正の核心] 固定スライディングウィンドウでデータを切り出す。
+            #
+            # 旧実装: arr[:i+1]  ← 成長スライス（バグの根本原因）
+            # 新実装: arr[window_start : i+1]  ← 固定ウィンドウ（リアルタイム推論と同一）
+            #
+            # 例 (buffer_len=2116):
+            #   i=   0 → arr[0:1]      (1本)    <- 起動直後は仕方なく短いが…
+            #   i=2115 → arr[0:2116]   (2116本) <- ここからフルウィンドウ
+            #   i=2116 → arr[1:2117]   (2116本) <- スライドして常に2116本 ✓
+            #   i=4131 → arr[2015:4132](2116本) <- 最終ステップ
+            #
+            # これにより VPT 等の累積特徴量が「フルウィンドウ分」のみ蓄積された
+            # 値となり、OLS が学習する分布がリアルタイム推論と完全に一致する。
+            window_start = max(0, i + 1 - buffer_len)
+            data = {
+                "open": arr_open[window_start : i + 1],
+                "high": arr_high[window_start : i + 1],
+                "low": arr_low[window_start : i + 1],
+                "close": arr_close[window_start : i + 1],
+                "volume": arr_vol[window_start : i + 1],
+            }
+
+            # 最低 30 本未満ではほぼすべての特徴量が NaN になるためスキップ
+            if (i + 1 - window_start) < 30:
+                continue
+
+            base_features = self._calculate_base_features(data, tf_name)
+
+            # ↓ 一時デバッグ用（M1のi=100のときだけ出力）
+            if tf_name == "M1" and i == 100:
+                self.logger.info(
+                    f"DEBUG: base_features keys count = {len(base_features)}"
+                )
+                self.logger.info(
+                    f"DEBUG: ols_state M1 keys = {list(self.ols_state.get('M1', {}).keys())[:5]}"
+                )
+
+            # (3) 固定ウィンドウ特徴量値で OLS 状態を更新
+            self._update_incremental_ols(tf_name, base_features, market_proxy_cache, ts)
+
+        if n_rows > 0:
             self.is_buffer_filled[tf_name] = True
 
+            # ウォームアップ終了時に最新値をキャッシュに保存する
+            try:
+                if base_features:
+                    neutralized = self._calculate_neutralized_features(
+                        base_features, tf_name, timestamps[-1], market_proxy_cache
+                    )
+                    self.latest_features_cache[tf_name] = neutralized
+            except Exception as e:
+                self.logger.warning(f"{tf_name} ウォームアップキャッシュ保存失敗: {e}")
+
+        # OLS の有効サンプル数を報告（十分な精度かを確認するため）
+        ols_n = 0
+        if tf_name in self.ols_state:
+            # いずれかの特徴量の count を代表値として取得
+            for feat_state in self.ols_state[tf_name].values():
+                ols_n = int(feat_state.get("count", 0))
+                break
         self.logger.info(
-            f"  -> {tf_name} ウォームアップ完了。純化基準がバックテストと100%同期しました。"
+            f"  -> {tf_name:<3} ウォームアップ完了 (固定ウィンドウ版)。"
+            f" OLS学習サンプル数: ~{ols_n} / {OLS_WINDOW}"
         )
 
     def fill_all_buffers(
@@ -394,15 +512,12 @@ class RealtimeFeatureEngine:
         m1_records = m1_history_pd.reset_index().to_dict("records")
         self.m1_dataframe.extend(m1_records)
 
-        self.logger.info(
-            "M1データから M3〜MN の全バッファをリサンプリングして充填中..."
-        )
         for tf_name, rule in self.TF_RESAMPLE_RULES.items():
             if tf_name not in self.data_buffers or tf_name == "M1":
                 continue
 
             try:
-                self.logger.info(f"  -> {tf_name} をM1からリサンプリング中...")
+                self.logger.info(f"  -> {tf_name:<3} をM1からリサンプリング中...")
                 resampled_df = (
                     m1_history_pd.resample(rule)
                     .agg(
@@ -641,10 +756,11 @@ class RealtimeFeatureEngine:
                         )
 
                         if feature_vector is not None:
-                            # [FIX-3] feature_dict を latest_features_cache から取得して Signal に詰める
-                            combined_features: Dict[str, float] = {}
-                            for _tf, _cache in self.latest_features_cache.items():
-                                combined_features.update(_cache)
+                            # 修正: 上書きを防ぎ、モデルが期待するサフィックス付きの完全な辞書を構築
+                            combined_features = dict(
+                                zip(self.feature_list, feature_vector[0])
+                            )
+
                             signal = Signal(
                                 features=feature_vector,
                                 timestamp=timestamp,
@@ -670,11 +786,10 @@ class RealtimeFeatureEngine:
         """
         指定された時間足のバッファがV5レジーム (ATR比率条件) かを判定する。
         """
-        # シグナル発生を許可する下位足に限定
-        ALLOWED_TIMEFRAMES = ["M1", "M3", "M5", "M8", "M15", "H1"]
+        # ▼▼▼ 修正: シグナル判定を Mixed (M1〜M15) に拡大 ▼▼▼
+        ALLOWED_TIMEFRAMES = ["M1", "M3", "M5", "M8", "M15"]
         if tf_name not in ALLOWED_TIMEFRAMES:
             return {"is_V5": False, "reason": "timeframe_not_allowed"}
-
         if tf_name not in self.data_buffers:
             return {"is_V5": False, "reason": "timeframe_not_managed"}
 
@@ -687,13 +802,24 @@ class RealtimeFeatureEngine:
                 ),
             }
 
-            # --- 外部エンジン(1C) への委譲 ---
-            atr_13_arr = engine_1C.calculate_atr_numba(
-                data["high"], data["low"], data["close"], self.ATR_CALC_PERIOD
-            )
-            atr_value = atr_13_arr[-1]
-            current_price = data["close"][-1]
+            # --- 外部エンジン依存を排除し、Numpyでローカル計算 ---
+            high, low, close = data["high"], data["low"], data["close"]
+            if len(close) > 1:
+                tr = np.maximum(
+                    high[1:] - low[1:],
+                    np.maximum(
+                        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
+                    ),
+                )
+                atr_value = (
+                    float(np.mean(tr[-self.ATR_CALC_PERIOD :]))
+                    if len(tr) >= self.ATR_CALC_PERIOD
+                    else float(np.mean(tr))
+                )
+            else:
+                atr_value = 0.0
 
+            current_price = data["close"][-1]
             if np.isnan(atr_value):
                 return {"is_V5": False, "reason": "atr_is_nan"}
 
@@ -725,62 +851,6 @@ class RealtimeFeatureEngine:
             self.logger.warning(f"_check_for_signal ({tf_name}) でエラー: {e}")
             return {"is_V5": False, "reason": "atr_calculation_error"}
 
-    def _calculate_proxy_features_incremental(
-        self, tf_name: str, ohlcv_df: pd.DataFrame
-    ) -> Dict[str, float]:
-        """
-        純化対象の5特徴量（プロキシ）の「最新値」のみを計算する。
-        """
-        if ohlcv_df.empty:
-            return {}
-
-        ohlcv_buffer = self.data_buffers[tf_name]
-
-        close_arr = np.array(ohlcv_buffer["close"], dtype=np.float64)
-        high_arr = np.array(ohlcv_buffer["high"], dtype=np.float64)
-        low_arr = np.array(ohlcv_buffer["low"], dtype=np.float64)
-        volume_arr = np.array(ohlcv_buffer["volume"], dtype=np.float64)
-
-        if len(close_arr) < 2:
-            return {}
-
-        latest_features = {}
-
-        # 1. atr (13)
-        # --- 外部エンジン(1C) への委譲 ---
-        atr_13_arr = engine_1C.calculate_atr_numba(high_arr, low_arr, close_arr, 13)
-        latest_features["atr"] = atr_13_arr[-1] if len(atr_13_arr) > 0 else np.nan
-
-        # 2. log_return
-        safe_close_prev = close_arr[-2]
-        if safe_close_prev == 0:
-            safe_close_prev = 1e-10
-        latest_features["log_return"] = np.log(close_arr[-1] / safe_close_prev)
-
-        # 3. price_momentum (10)
-        if len(close_arr) > 10:
-            latest_features["price_momentum"] = close_arr[-1] - close_arr[-11]
-        else:
-            latest_features["price_momentum"] = np.nan
-
-        # 4. rolling_volatility (20)
-        if len(close_arr) > 20:
-            safe_denominator_pct = close_arr[-21:-1]
-            safe_denominator_pct[safe_denominator_pct == 0] = 1e-10
-            pct_calc = np.diff(close_arr[-21:]) / safe_denominator_pct
-            latest_features["rolling_volatility"] = np.std(pct_calc)
-        else:
-            latest_features["rolling_volatility"] = np.nan
-
-        # 5. volume_ratio (20)
-        if len(volume_arr) > 20:
-            vol_mean_20 = np.mean(volume_arr[-20:])
-            latest_features["volume_ratio"] = volume_arr[-1] / (vol_mean_20 + 1e-10)
-        else:
-            latest_features["volume_ratio"] = np.nan
-
-        return latest_features
-
     def _update_incremental_ols(
         self,
         tf_name: str,
@@ -789,13 +859,13 @@ class RealtimeFeatureEngine:
         timestamp: datetime,
     ):
         """
-        純化対象の5特徴量について、OLS状態(sum_x, sum_y...)を逐次更新する。
+        【V5完全修正版】 脆弱なWelford状態変数(sum_x, sum_x_sq等)の維持を廃止し、
+        純粋にDeque（リングバッファ）へ最新値を追加するだけの処理に特化。
         """
         from datetime import timezone
+        import numpy as np
 
         try:
-            # 1. 最新の市場プロキシ値 (x) を取得 (Asofライク)
-            # [FIX-8] timestampのタイムゾーンをUTCに統一してインデクサーエラーを防ぐ
             search_ts = timestamp
             if search_ts.tzinfo is None:
                 search_ts = search_ts.replace(tzinfo=timezone.utc)
@@ -804,75 +874,43 @@ class RealtimeFeatureEngine:
 
             idx = market_proxy_cache.index.get_indexer([search_ts], method="ffill")[0]
 
-            # ▼▼▼ 修正: 未来データのリーク (Lookahead Bias) 防止 ▼▼▼
             if idx == -1:
                 latest_x = 0.0
             else:
-                latest_x = market_proxy_cache.iloc[idx]["market_proxy"]
+                latest_x = float(market_proxy_cache.iloc[idx]["market_proxy"])
 
-            if np.isnan(latest_x):
+            if not np.isfinite(latest_x):
                 latest_x = 0.0
-            # ▲▲▲ ここまで修正 ▲▲▲
 
-            # ★ 動的初期化 (Tickなど未登録のTimeframe用)
-            if tf_name not in self.ols_state:
-                self.ols_state[tf_name] = {}
+            # リングバッファの初期化チェック
+            if tf_name not in self.proxy_feature_buffers:
+                buf_len = self.lookbacks_by_tf.get(tf_name, 2016)
                 self.proxy_feature_buffers[tf_name] = {
-                    "market_proxy": deque(maxlen=2016)
+                    "market_proxy": deque(maxlen=buf_len)
                 }
-                self.lookbacks_by_tf[tf_name] = 2016
 
-            is_first_feature = True
+            x_deque = self.proxy_feature_buffers[tf_name]["market_proxy"]
+
+            # 各特徴量の最新値をバッファへ追加
             for feat_name, latest_y in latest_proxy_features.items():
-                if np.isnan(latest_y):
+                if not np.isfinite(latest_y):
                     latest_y = 0.0
 
-                # ★ 動的初期化 (304個の全特徴量対応)
-                if feat_name not in self.ols_state[tf_name]:
-                    self.ols_state[tf_name][feat_name] = {
-                        "sum_x": 0.0,
-                        "sum_y": 0.0,
-                        "sum_xy": 0.0,
-                        "sum_x_sq": 0.0,
-                        "sum_y_sq": 0.0,
-                        "count": 0.0,
-                    }
-                    self.proxy_feature_buffers[tf_name][feat_name] = deque(maxlen=2016)
+                if feat_name not in self.proxy_feature_buffers[tf_name]:
+                    buf_len = self.lookbacks_by_tf.get(tf_name, 2016)
+                    self.proxy_feature_buffers[tf_name][feat_name] = deque(
+                        maxlen=buf_len
+                    )
 
-                state = self.ols_state[tf_name][feat_name]
-                buffer_len = self.lookbacks_by_tf[tf_name]
-
-                # Welford's online algorithm (バッファ満杯なら古い値を抜く)
-                if state["count"] >= buffer_len:
-                    old_x_deque = self.proxy_feature_buffers[tf_name]["market_proxy"]
-                    old_y_deque = self.proxy_feature_buffers[tf_name][feat_name]
-                    if old_x_deque and old_y_deque:
-                        old_x = old_x_deque[0]
-                        old_y = old_y_deque[0]
-                        state["sum_x"] -= old_x
-                        state["sum_y"] -= old_y
-                        state["sum_xy"] -= old_x * old_y
-                        state["sum_x_sq"] -= old_x**2
-                        state["sum_y_sq"] -= old_y**2
-                        state["count"] -= 1.0
-
-                state["sum_x"] += latest_x
-                state["sum_y"] += latest_y
-                state["sum_xy"] += latest_x * latest_y
-                state["sum_x_sq"] += latest_x**2
-                state["sum_y_sq"] += latest_y**2
-                state["count"] += 1.0
-
-                # 最新値を保存
                 self.proxy_feature_buffers[tf_name][feat_name].append(latest_y)
-                if is_first_feature:
-                    self.proxy_feature_buffers[tf_name]["market_proxy"].append(latest_x)
-                    is_first_feature = False
+
+            # 市場プロキシの最新値をバッファへ追加
+            x_deque.append(latest_x)
 
         except Exception as e:
             feat_name_safe = locals().get("feat_name", "<unknown>")
             self.logger.warning(
-                f"[{tf_name}] 逐次OLSの更新に失敗 ({feat_name_safe}): {e}",
+                f"[{tf_name}] バッファの更新に失敗 ({feat_name_safe}): {e}",
                 exc_info=False,
             )
 
@@ -880,45 +918,57 @@ class RealtimeFeatureEngine:
         self,
         base_features_dict: Dict[str, float],
         tf_name: str,
-        signal_timestamp: datetime,  # noqa: ARG002 – kept for API compatibility
-        market_proxy_cache_df: pd.DataFrame,  # noqa: ARG002 – kept for API compatibility
+        signal_timestamp: datetime,
+        market_proxy_cache_df: pd.DataFrame,
     ) -> Dict[str, float]:
         """
-        逐次計算されたOLS状態を使って、瞬時に残差(純化済み特徴量)を計算する。
+        【V5完全修正版】 Welfordの逐次減算による情報落ち(Catastrophic Cancellation)を排除し、
+        毎ティックNumpyのC言語バックエンドで2016期間の分散・共分散をO(N)でフル計算する。
         """
+        import numpy as np
+
         neutralized_features: Dict[str, float] = {}
 
-        PROXY_FEATURES = [
-            "atr",
-            "log_return",
-            "price_momentum",
-            "rolling_volatility",
-            "volume_ratio",
-        ]
-
         try:
-            latest_x_deque = self.proxy_feature_buffers[tf_name]["market_proxy"]
-            latest_x = latest_x_deque[-1] if latest_x_deque else 0.0
+            latest_x_deque = self.proxy_feature_buffers.get(tf_name, {}).get(
+                "market_proxy"
+            )
+            if not latest_x_deque:
+                return base_features_dict
+
+            # 過去最大2016件を抽出 (Polarsの rolling_window=2016 に完全一致させる)
+            x_arr = np.array(latest_x_deque, dtype=np.float64)[-2016:]
+            n = len(x_arr)
+
+            # Polarsの min_periods=30 に準拠
+            if n < 30:
+                return base_features_dict
+
+            # Numpyベクトル演算で一括計算 (過去の蓄積値に依存しないためドリフトは物理的に発生しない)
+            mean_x = np.mean(x_arr)
+            # Polarsの var_x = mean(x^2) - mean(x)^2 と数学的に完全一致
+            var_x = np.maximum(0.0, np.mean(x_arr**2) - mean_x**2)
+            latest_x = x_arr[-1]
 
             for base_name, latest_y in base_features_dict.items():
-                # ★ 制限撤廃: 304個すべての特徴量に対して純化(残差計算)を適用
-                if base_name not in self.ols_state[tf_name]:
+                y_deque = self.proxy_feature_buffers[tf_name].get(base_name)
+                if not y_deque:
                     neutralized_features[base_name] = latest_y
                     continue
 
-                state = self.ols_state[tf_name][base_name]
-                n = state["count"]
-
-                if n < 20:
+                y_arr = np.array(y_deque, dtype=np.float64)[-2016:]
+                # XとYのデータ数が一致しない場合のフェイルセーフ
+                if len(y_arr) != n:
                     neutralized_features[base_name] = latest_y
                     continue
 
-                mean_x = state["sum_x"] / n
-                mean_y = state["sum_y"] / n
-                cov_xy = (state["sum_xy"] / n) - (mean_x * mean_y)
-                var_x = (state["sum_x_sq"] / n) - (mean_x**2)
+                mean_y = np.mean(y_arr)
 
-                beta = cov_xy / var_x if var_x >= 1e-10 else 0.0
+                # Polarsの cov_xy = mean(x*y) - mean(x)*mean(y) と数学的に完全一致
+                cov_xy = np.mean(x_arr * y_arr) - (mean_x * mean_y)
+
+                # 学習時と全く同じ純化式 (ゼロ除算防止の 1e-10 も同一)
+                beta = cov_xy / (var_x + 1e-10)
                 alpha = mean_y - beta * mean_x
 
                 latest_y_safe = latest_y if np.isfinite(latest_y) else 0.0
@@ -936,21 +986,30 @@ class RealtimeFeatureEngine:
         self, data: Dict[str, np.ndarray], tf_name: str
     ) -> Dict[str, float]:
         """
-        【特徴量ルーター：最適化版】
-        final_feature_set_v3.txt (304個) に必要な特徴量のみを計算。
-        不要なループやパラメータを排除し、外部モジュール(1A〜1C)へ委譲。
+        【特徴量ルーター：完全カプセル化対応版】
+        各モジュール（1A〜1F）のクラスメソッドにデータを渡し、
+        完成した特徴量辞書を一括で受け取ってマージする。
         """
         features = {}
 
-        # --- 高速化用内部ヘルパー ---
+        # 1. 各カテゴリのクラスにデータを渡し、完成した辞書を受け取って結合
+        try:
+            features.update(FeatureModule1A.calculate_features(data))
+            features.update(FeatureModule1B.calculate_features(data))
+            features.update(FeatureModule1C.calculate_features(data))
+            features.update(FeatureModule1D.calculate_features(data))
+            features.update(FeatureModule1E.calculate_features(data))
+            features.update(FeatureModule1F.calculate_features(data))
+        except Exception as e:
+            self.logger.error(
+                f"ベース特徴量の計算中にエラーが発生しました ({tf_name}): {e}",
+                exc_info=True,
+            )
+
+        # 2. 純化用プロキシ (必須) の計算
+        # 司令塔側で最低限必要なプロキシ値を計算して追加する
         def _window(arr: np.ndarray, window: int) -> np.ndarray:
             return arr[-window:] if len(arr) >= window else arr
-
-        def _array(arr: np.ndarray) -> np.ndarray:
-            return arr
-
-        def _last(arr: np.ndarray) -> float:
-            return arr[-1] if len(arr) > 0 else np.nan
 
         def _pct(arr: np.ndarray) -> np.ndarray:
             if len(arr) < 2:
@@ -959,663 +1018,46 @@ class RealtimeFeatureEngine:
             arr_safe[arr_safe == 0] = 1e-10
             return np.concatenate(([np.nan], np.diff(arr) / arr_safe))
 
-        def _ema(arr: np.ndarray, span: int) -> np.ndarray:
-            alpha = 2.0 / (span + 1.0)
-            ema = np.zeros_like(arr, dtype=np.float64)
-            if len(arr) == 0:
-                return ema
-            ema[0] = arr[0]
-            for i in range(1, len(arr)):
-                ema[i] = alpha * arr[i] + (1 - alpha) * ema[i - 1]
-            return ema
-
         close_pct = _pct(data["close"])
 
-        # =======================================================
-        # Engine 1A: 統計特徴量 (V3リスト準拠)
-        # =======================================================
-        features["e1a_anderson_darling_statistic_30"] = (
-            engine_1A.anderson_darling_numba(_window(data["close"], 30))
-        )
-        features["e1a_fast_basic_stabilization"] = _last(
-            engine_1A.basic_stabilization_numba(_window(data["close"], 100))
-        )
-
-        # 移動平均・標準偏差 (リストにある期間のみ)
-        for w in [5, 10, 50]:
-            features[f"e1a_fast_rolling_mean_{w}"] = np.mean(_window(data["close"], w))
-        for w in [5, 10, 20, 100]:
-            features[f"e1a_fast_rolling_std_{w}"] = np.std(_window(data["close"], w))
-        for w in [5, 10, 20, 50]:
-            features[f"e1a_fast_volume_mean_{w}"] = np.mean(_window(data["volume"], w))
-
-        features["e1a_jarque_bera_statistic_50"] = (
-            engine_1A.jarque_bera_statistic_numba(_window(data["close"], 50))
-        )
-
-        # ロバスト統計
-        for w in [10, 20, 50]:
-            q75, q25 = np.percentile(_window(data["close"], w), [75, 25])
-            features[f"e1a_robust_iqr_{w}"] = q75 - q25
-            if w == 50:
-                features["e1a_robust_q75_50"] = q75
-
-        features["e1a_robust_mad_20"] = engine_1A.mad_rolling_numba(
-            _window(data["close"], 20)
-        )
-        features["e1a_robust_median_50"] = np.median(_window(data["close"], 50))
-        features["e1a_runs_test_statistic_30"] = engine_1A.runs_test_numba(
-            _window(data["close"], 30)
-        )
-
-        for w in [10, 20, 50]:
-            features[f"e1a_statistical_cv_{w}"] = np.std(_window(data["close"], w)) / (
-                np.mean(_window(data["close"], w)) + 1e-10
-            )
-
-        for w in [20, 50]:
-            features[f"e1a_statistical_kurtosis_{w}"] = (
-                engine_1A.rolling_kurtosis_numba(_window(data["close"], w))
-            )
-            features[f"e1a_statistical_skewness_{w}"] = engine_1A.rolling_skew_numba(
-                _window(data["close"], w)
-            )
-
-        # 高次モーメント
-        for m in [5, 6, 7, 8]:
-            for w in [20, 50]:
-                # リストにある組み合わせのみ抽出
-                if (
-                    (m == 5 and w in [20, 50])
-                    or (m == 6 and w in [20, 50])
-                    or (m == 7 and w in [20, 50])
-                    or (m == 8 and w == 50)
-                ):
-                    features[f"e1a_statistical_moment_{m}_{w}"] = (
-                        engine_1A.statistical_moment_numba(_window(data["close"], w), m)
-                    )
-
-        features["e1a_statistical_variance_10"] = np.var(_window(data["close"], 10))
-        features["e1a_von_neumann_ratio_30"] = engine_1A.von_neumann_ratio_numba(
-            _window(data["close"], 30)
-        )
-
-        # =======================================================
-        # Engine 1B: 時系列モデル (V3リスト準拠)
-        # =======================================================
-        for w in [50, 100]:
-            features[f"e1b_adf_statistic_{w}"] = engine_1B.adf_統計量_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_arima_residual_var_{w}"] = engine_1B.arima_残差分散_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_kpss_statistic_{w}"] = engine_1B.kpss_統計量_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_holt_level_{w}"] = engine_1B.holt_winters_レベル_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_holt_trend_{w}"] = engine_1B.holt_winters_トレンド_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_lowess_fitted_{w}"] = engine_1B.lowess_適合値_udf(
-                _window(data["close"], w)
-            )
-            features[f"e1b_theil_sen_slope_{w}"] = engine_1B.theil_sen_傾き_udf(
-                _window(data["close"], w)
-            )
-
-        m50, s50 = (
-            np.mean(_window(data["close"], 50)),
-            np.std(_window(data["close"], 50)),
-        )
-        features["e1b_bollinger_lower_50"] = m50 - 2 * s50
-        features["e1b_bollinger_upper_50"] = m50 + 2 * s50
-        features["e1b_kalman_state_100"] = engine_1B.kalman_状態推定_udf(
-            _window(data["close"], 100)
-        )
-        features["e1b_pp_statistic_100"] = engine_1B.phillips_perron_統計量_udf(
-            _window(data["close"], 100)
-        )
-        features["e1b_price_change"] = _last(close_pct)
-        features["e1b_price_range"] = data["high"][-1] - data["low"][-1]
-        features["e1b_rolling_mean_100"] = np.mean(_window(data["close"], 100))
-        features["e1b_rolling_median_50"] = np.median(_window(data["close"], 50))
-        features["e1b_rolling_median_100"] = np.median(_window(data["close"], 100))
-        features["e1b_t_dist_dof_50"] = engine_1B.t分布_自由度_udf(
-            _window(close_pct, 50)
-        )
-        features["e1b_t_dist_scale_50"] = engine_1B.t分布_尺度_udf(
-            _window(close_pct, 50)
-        )
-        features["e1b_volatility_20"] = np.std(_window(close_pct, 20))
-        features["e1b_zscore_20"] = (
-            data["close"][-1] - np.mean(_window(data["close"], 20))
-        ) / (np.std(_window(data["close"], 20)) + 1e-10)
-        features["e1b_zscore_50"] = (data["close"][-1] - m50) / (s50 + 1e-10)
-
-        # =======================================================
-        # Engine 1C: テクニカル指標 (V3リスト準拠)
-        # =======================================================
-        features["e1c_adx_13"] = _last(
-            engine_1C.calculate_adx_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 13
-            )
-        )
-        features["e1c_aroon_down_14"] = _last(
-            engine_1C.calculate_aroon_down_numba(_array(data["low"]), 14)
-        )
-        features["e1c_aroon_up_14"] = _last(
-            engine_1C.calculate_aroon_up_numba(_array(data["high"]), 14)
-        )
-        features["e1c_aroon_oscillator_14"] = (
-            features["e1c_aroon_up_14"] - features["e1c_aroon_down_14"]
-        )
-
-        # ATR系
-        atr_13_arr = engine_1C.calculate_atr_numba(
-            _array(data["high"]), _array(data["low"]), _array(data["close"]), 13
-        )
-        atr_13 = atr_13_arr[-1]
-        features["e1c_atr_13"] = atr_13
-        features["e1c_atr_pct_13"] = (atr_13 / data["close"][-1]) * 100
-        features["e1c_atr_trend_13"] = (
-            atr_13_arr[-1] - atr_13_arr[-2] if len(atr_13_arr) > 1 else 0.0
-        )
-        for m in [1.5, 2.0, 2.5]:
-            if m in [1.5, 2.0]:
-                features[f"e1c_atr_lower_13_{m}"] = data["close"][-1] - (atr_13 * m)
-            features[f"e1c_atr_upper_13_{m}"] = data["close"][-1] + (atr_13 * m)
-        for w in [13, 21, 34, 55]:
-            arr = engine_1C.calculate_atr_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), w
-            )
-            features[f"e1c_atr_volatility_{w}"] = np.std(_window(arr, w))
-
-        # Bollinger Bands (リストにある組み合わせのみ)
-        for p, s in [(20, 2.5), (30, 2.5), (50, 2.0), (50, 2.5), (50, 3.0)]:
-            m_p, s_p = (
-                np.mean(_window(data["close"], p)),
-                np.std(_window(data["close"], p)),
-            )
-            w_p = 2 * s * s_p
-            if s == 2.5:
-                features[f"e1c_bb_lower_{p}_{s}"] = m_p - s * s_p
-                # e1c_bb_upper_30_2.5 は最終リストに存在しないため p==30 を除外
-                if p != 30:
-                    features[f"e1c_bb_upper_{p}_{s}"] = m_p + s * s_p
-                if p == 30:
-                    features[f"e1c_bb_width_{p}_{s}"] = w_p
-                    features[f"e1c_bb_width_pct_{p}_{s}"] = (w_p / (m_p + 1e-10)) * 100
-                    features[f"e1c_bb_position_{p}_{s}"] = (data["close"][-1] - m_p) / (
-                        s_p + 1e-10
-                    )
-                features[f"e1c_bb_percent_{p}_{s}"] = (
-                    data["close"][-1] - (m_p - s * s_p)
-                ) / (w_p + 1e-10)
-            elif s == 2.0 and p == 50:
-                features[f"e1c_bb_percent_{p}_2"] = (
-                    data["close"][-1] - (m_p - s * s_p)
-                ) / (w_p + 1e-10)
-            elif s == 3.0 and p == 50:
-                features[f"e1c_bb_lower_{p}_3"] = m_p - s * s_p
-                features[f"e1c_bb_upper_{p}_3"] = m_p + s * s_p
-
-        features["e1c_coppock_curve"] = (
-            np.mean(_window(_pct(data["close"])[-24:] * 100, 10))
-            if len(data["close"]) >= 24
-            else np.nan
-        )
-        features["e1c_di_minus_13"] = _last(
-            engine_1C.calculate_di_minus_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 13
-            )
-        )
-        features["e1c_di_plus_13"] = _last(
-            engine_1C.calculate_di_plus_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 13
-            )
-        )
-        features["e1c_di_plus_21"] = _last(
-            engine_1C.calculate_di_plus_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 21
-            )
-        )
-
-        # DPO / Deviation
-        for p in [20, 30, 50]:
-            features[f"e1c_dpo_{p}"] = 0.0  # Lookahead回避
-        for p in [10, 20, 50, 100, 200]:
-            ev = _last(_ema(data["close"], p))
-            features[f"e1c_ema_deviation_{p}"] = (
-                (data["close"][-1] - ev) / (ev + 1e-10) * 100
-            )
-            if p in [50, 100, 200]:
-                sv = np.mean(_window(data["close"], p))
-                features[f"e1c_sma_deviation_{p}"] = (
-                    (data["close"][-1] - sv) / (sv + 1e-10) * 100
+        # atr のフォールバック処理 (1Cモジュールから取得できている場合はそれを使用)
+        if "e1c_atr_13" in features:
+            features["atr"] = features["e1c_atr_13"]
+        else:
+            high, low, close = data["high"], data["low"], data["close"]
+            if len(close) > 1:
+                tr = np.maximum(
+                    high[1:] - low[1:],
+                    np.maximum(
+                        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
+                    ),
                 )
-                if p == 100:
-                    features["e1c_sma_100"] = sv
-
-        features["e1c_hma_21"] = _last(
-            engine_1C.calculate_hma_numba(_array(data["close"]), 21)
-        )
-        # KST / MACD / Momentum (リスト準拠)
-        roc_10, roc_15, roc_20, roc_30 = (
-            _pct(_window(data["close"], 11))[-1],
-            _pct(_window(data["close"], 16))[-1],
-            _pct(_window(data["close"], 21))[-1],
-            _pct(_window(data["close"], 31))[-1],
-        )
-        kst = (roc_10 * 1 + roc_15 * 2 + roc_20 * 3 + roc_30 * 4) / 10 * 100
-        features["e1c_kst"], features["e1c_kst_signal"] = kst, kst
-        features["e1c_macd_12_26"] = _last(
-            _ema(data["close"], 12) - _ema(data["close"], 26)
-        )
-        features["e1c_macd_19_39"] = _last(
-            _ema(data["close"], 19) - _ema(data["close"], 39)
-        )
-        features["e1c_macd_histogram_12_26_9"] = features["e1c_macd_12_26"] - _last(
-            _ema(_ema(data["close"], 12) - _ema(data["close"], 26), 9)
-        )
-        features["e1c_macd_histogram_19_39_9"] = features["e1c_macd_19_39"] - _last(
-            _ema(_ema(data["close"], 19) - _ema(data["close"], 39), 9)
-        )
-        features["e1c_macd_histogram_5_35_5"] = _last(
-            _ema(data["close"], 5) - _ema(data["close"], 35)
-        ) - _last(_ema(_ema(data["close"], 5) - _ema(data["close"], 35), 5))
-
-        for p in [10, 20, 30, 50]:
-            features[f"e1c_momentum_{p}"] = data["close"][-1] - data["close"][-1 - p]
-            if p in [20, 50]:
-                features[f"e1c_rate_of_change_{p}"] = (
-                    features[f"e1c_momentum_{p}"] / (data["close"][-1 - p] + 1e-10)
-                ) * 100
-
-        # RSI / Stoch / Trend
-        rsi_14_arr, rsi_21_arr = (
-            engine_1C.calculate_rsi_numba(_array(data["close"]), 14),
-            engine_1C.calculate_rsi_numba(_array(data["close"]), 21),
-        )
-        features["e1c_rsi_14"] = rsi_14_arr[-1]
-        features["e1c_rsi_divergence_14"] = (
-            (data["close"][-1] - data["close"][-15]) / (data["close"][-15] + 1e-10)
-        ) - ((rsi_14_arr[-1] - rsi_14_arr[-15]) / 50 - 1)
-        features["e1c_rsi_divergence_21"] = (
-            (data["close"][-1] - data["close"][-22]) / (data["close"][-22] + 1e-10)
-        ) - ((rsi_21_arr[-1] - rsi_21_arr[-22]) / 50 - 1)
-        features["e1c_rsi_momentum_14"], features["e1c_rsi_momentum_21"] = (
-            rsi_14_arr[-1] - rsi_14_arr[-2],
-            rsi_21_arr[-1] - rsi_21_arr[-2],
-        )
-
-        stoch_k_14, stoch_k_21 = (
-            engine_1C.calculate_stochastic_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 14
-            ),
-            engine_1C.calculate_stochastic_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 21
-            ),
-        )
-        features["e1c_stoch_k_14"], features["e1c_stoch_d_14_3"] = (
-            stoch_k_14[-1],
-            np.mean(_window(stoch_k_14, 3)),
-        )
-        features["e1c_stoch_d_21_5"], features["e1c_stoch_slow_d_21_5_5"] = (
-            np.mean(_window(stoch_k_21, 5)),
-            np.mean(_window(_ema(stoch_k_21, 5), 5)),
-        )
-        features["e1c_stochastic_rsi_14"] = (
-            (rsi_14_arr[-1] - np.min(_window(rsi_14_arr, 14)))
-            / (
-                np.max(_window(rsi_14_arr, 14))
-                - np.min(_window(rsi_14_arr, 14))
-                + 1e-10
-            )
-            * 100
-        )
-        features["e1c_stochastic_rsi_21"] = (
-            (rsi_21_arr[-1] - np.min(_window(rsi_21_arr, 21)))
-            / (
-                np.max(_window(rsi_21_arr, 21))
-                - np.min(_window(rsi_21_arr, 21))
-                + 1e-10
-            )
-            * 100
-        )
-
-        for p in [20, 50, 100]:
-            if p in [20, 50]:
-                features[f"e1c_trend_strength_{p}"] = 1.0 / (
-                    np.std(_window(data["close"], p)) + 1e-10
+                features["atr"] = (
+                    np.mean(_window(tr, 13)) if len(tr) >= 13 else np.mean(tr)
                 )
-            features[f"e1c_trend_consistency_{p}"] = (
-                engine_1C.rolling_trend_consistency_numba(
-                    _window(data["close"], p + 10), p
-                )
-            )
+            else:
+                features["atr"] = 0.0
 
-        features["e1c_trix_14"] = _last(
-            engine_1C.calculate_trix_numba(_array(data["close"]), 14)
-        )
-        features["e1c_tsi_13"] = _last(
-            engine_1C.calculate_tsi_numba(_array(data["close"]), 25, 13)
-        )
-        features["e1c_ultimate_oscillator"] = _last(
-            engine_1C.calculate_ultimate_oscillator_numba(
-                _array(data["high"]),
-                _array(data["low"]),
-                _array(data["close"]),
-                _array(data["volume"]),
-            )
-        )
-        features["e1c_williams_r_14"] = _last(
-            engine_1C.calculate_williams_r_numba(
-                _array(data["high"]), _array(data["low"]), _array(data["close"]), 14
-            )
-        )
-        features["e1c_wma_200"] = engine_1C.wma_rolling_numba(
-            _window(data["close"], 200), 200
-        )
-
-        # RVI (V3リストにあるものに限定)
-        for p in [10, 14, 20]:
-            rvi_arr = _last(_ema(data["close"] - data["open"], p)) / (
-                _last(_ema(data["high"] - data["low"], p)) + 1e-10
-            )
-            features[f"e1c_relative_vigor_index_{p}"] = rvi_arr
-            features[f"e1c_rvi_signal_{p}"] = rvi_arr  # 簡易化
-
-        features["e1c_schaff_trend_cycle_12_26_9"] = _last(
-            engine_1C.calculate_schaff_trend_cycle_numba(
-                _array(data["close"]), 12, 26, 9
-            )
-        )
-        features["e1c_schaff_trend_cycle_23_50_10"] = _last(
-            engine_1C.calculate_schaff_trend_cycle_numba(
-                _array(data["close"]), 23, 50, 10
-            )
-        )
-
-        # =======================================================
-        # Engine 1D: ボリューム・プライスアクション (V3リスト準拠)
-        # =======================================================
-        features["e1d_accumulation_distribution"] = _last(
-            engine_1D.accumulation_distribution_udf(
-                _array(data["high"]),
-                _array(data["low"]),
-                _array(data["close"]),
-                _array(data["volume"]),
-            )
-        )
-        features["e1d_body_size"] = abs(data["close"][-1] - data["open"][-1])
-        features["e1d_candlestick_pattern"] = _last(
-            engine_1D.candlestick_patterns_udf(
-                _array(data["open"]),
-                _array(data["high"]),
-                _array(data["low"]),
-                _array(data["close"]),
-            )
-        )
-        features["e1d_chaikin_volatility_10"] = _last(
-            engine_1D.chaikin_volatility_udf(
-                _array(data["high"]), _array(data["low"]), 10
-            )
-        )
-        features["e1d_cmf_13"] = _last(
-            engine_1D.cmf_udf(
-                _array(data["high"]),
-                _array(data["low"]),
-                _array(data["close"]),
-                _array(data["volume"]),
-                13,
-            )
-        )
-        features["e1d_force_index"] = _last(
-            engine_1D.force_index_udf(_array(data["close"]), _array(data["volume"]))
-        )
-
-        for w in [10, 20, 30, 50]:
-            features[f"e1d_hv_robust_{w}"] = engine_1D.hv_robust_udf(
-                _window(close_pct, w)
-            )
-        features["e1d_hv_robust_annual_252"] = engine_1D.hv_robust_udf(
-            _window(close_pct, 252)
-        ) * np.sqrt(252)
-
-        for w in [10, 30, 50]:
-            features[f"e1d_hv_standard_{w}"] = engine_1D.hv_standard_udf(
-                _window(close_pct, w)
-            )
-
-        features["e1d_hv_regime_50"] = (
-            1.0 if features["e1d_hv_robust_50"] > 0.005 else 0.0
-        )
-        features["e1d_intraday_return"] = (data["close"][-1] - data["open"][-1]) / (
-            data["open"][-1] + 1e-10
-        )
-        features["e1d_lower_wick_ratio"] = (
-            min(data["open"][-1], data["close"][-1]) - data["low"][-1]
-        ) / (data["high"][-1] - data["low"][-1] + 1e-10)
-        features["e1d_mass_index_20"] = _last(
-            engine_1D.mass_index_udf(_array(data["high"]), _array(data["low"]), 20)
-        )
-        features["e1d_mfi_13"] = _last(
-            engine_1D.mfi_udf(
-                _array(data["high"]),
-                _array(data["low"]),
-                _array(data["close"]),
-                _array(data["volume"]),
-                13,
-            )
-        )
-        features["e1d_obv"] = _last(
-            engine_1D.obv_udf(_array(data["close"]), _array(data["volume"]))
-        )
-        features["e1d_overnight_gap"] = (
-            (data["open"][-1] - data["close"][-2]) / (data["close"][-2] + 1e-10)
+        features["log_return"] = (
+            np.log((data["close"][-1] + 1e-10) / (data["close"][-2] + 1e-10))
             if len(data["close"]) > 1
             else 0.0
-        )
-        features["e1d_price_channel_upper_100"] = np.max(_window(data["high"], 100))
-        features["e1d_price_location_hl"] = (data["close"][-1] - data["low"][-1]) / (
-            data["high"][-1] - data["low"][-1] + 1e-10
-        )
-        features["e1d_upper_wick_ratio"] = (
-            data["high"][-1] - max(data["open"][-1], data["close"][-1])
-        ) / (data["high"][-1] - data["low"][-1] + 1e-10)
-        features["e1d_volume_price_trend"] = np.mean(
-            _window(data["close"] * data["volume"], 10)
-        )
-        features["e1d_volume_ratio"] = data["volume"][-1] / (
-            np.mean(_window(data["volume"], 20)) + 1e-10
-        )
-
-        # =======================================================
-        # Engine 1E: 信号処理 (V3リスト準拠)
-        # =======================================================
-        for w in [128, 256]:
-            features[f"e1e_acoustic_frequency_{w}"] = engine_1E.acoustic_frequency_udf(
-                _window(close_pct, w)
-            )
-        features["e1e_acoustic_power_128"] = engine_1E.acoustic_power_udf(
-            _window(close_pct, 128)
-        )
-        features["e1e_hilbert_amp_cv_100"] = np.std(_window(data["close"], 100)) / (
-            np.mean(_window(data["close"], 100)) + 1e-10
-        )
-        features["e1e_hilbert_amplitude_100"] = engine_1E.hilbert_amplitude_udf(
-            _window(close_pct, 100)
-        )
-        features["e1e_hilbert_freq_energy_ratio_100"] = np.sum(
-            _window(close_pct, 100) ** 2
-        ) / (np.sum(_window(data["close"], 100) ** 2) + 1e-10)
-        features["e1e_hilbert_freq_mean_100"] = engine_1E.hilbert_freq_mean_udf(
-            _window(close_pct, 100)
-        )
-        features["e1e_hilbert_freq_std_100"] = engine_1E.hilbert_freq_std_udf(
-            _window(close_pct, 100)
-        )
-        features["e1e_hilbert_phase_stability_50"] = (
-            engine_1E.hilbert_phase_stability_udf(_window(close_pct, 50))
-        )
-        features["e1e_hilbert_phase_var_50"] = engine_1E.hilbert_phase_var_udf(
-            _window(close_pct, 50)
-        )
-        features["e1e_signal_crest_factor_50"] = np.max(
-            np.abs(_window(data["close"], 50))
-        ) / (np.sqrt(np.mean(_window(data["close"], 50) ** 2)) + 1e-10)
-        features["e1e_signal_peak_to_peak_100"] = np.max(
-            _window(data["close"], 100)
-        ) - np.min(_window(data["close"], 100))
-        features["e1e_signal_rms_50"] = np.sqrt(np.mean(_window(close_pct, 50) ** 2))
-        features["e1e_spectral_bandwidth_128"] = engine_1E.spectral_bandwidth_udf(
-            _window(close_pct, 128)
-        )
-        features["e1e_spectral_centroid_128"] = engine_1E.spectral_centroid_udf(
-            _window(close_pct, 128)
-        )
-        for w in [64, 128, 256, 512]:
-            features[f"e1e_spectral_energy_{w}"] = np.sum(_window(close_pct, w) ** 2)
-        features["e1e_spectral_entropy_64"] = engine_1E.spectral_entropy_udf(
-            _window(close_pct, 64)
-        )
-        features["e1e_spectral_flatness_128"] = engine_1E.spectral_flatness_udf(
-            _window(close_pct, 128)
-        )
-        features["e1e_spectral_rolloff_128"] = engine_1E.spectral_rolloff_udf(
-            _window(close_pct, 128)
-        )
-        features["e1e_wavelet_entropy_64"] = engine_1E.wavelet_entropy_udf(
-            _window(close_pct, 64)
-        )
-        for w in [64, 128, 256]:
-            features[f"e1e_wavelet_mean_{w}"] = np.mean(_window(close_pct, w))
-        for w in [32, 64, 128, 256]:
-            features[f"e1e_wavelet_std_{w}"] = np.std(_window(close_pct, w))
-
-        # =======================================================
-        # Engine 1F: 実験的特徴量 (V3リスト準拠)
-        # =======================================================
-        for w in [21, 34, 55, 89]:
-            features[f"e1f_aesthetic_balance_{w}"] = (
-                engine_1F.rolling_aesthetic_balance_udf(_window(data["close"], w))
-            )
-            features[f"e1f_symmetry_measure_{w}"] = (
-                engine_1F.rolling_symmetry_measure_udf(_window(data["close"], w))
-            )
-        # e1f_golden_ratio_adherence_89 は最終リストに存在しないため w=21,34,55 のみ
-        for w in [21, 34, 55]:
-            features[f"e1f_golden_ratio_adherence_{w}"] = (
-                engine_1F.rolling_golden_ratio_adherence_udf(_window(data["close"], w))
-            )
-
-        features["e1f_biomechanical_efficiency_20"] = (
-            engine_1F.rolling_biomechanical_efficiency_udf(_window(data["close"], 20))
-        )
-        for w in [20, 40, 60]:
-            features[f"e1f_energy_expenditure_{w}"] = (
-                engine_1F.rolling_energy_expenditure_udf(_window(data["close"], w))
-            )
-        for w in [48, 96]:
-            features[f"e1f_harmony_{w}"] = engine_1F.rolling_harmony_udf(
-                _window(data["close"], w)
-            )
-        for w in [10, 20, 40]:
-            features[f"e1f_kinetic_energy_{w}"] = engine_1F.rolling_kinetic_energy_udf(
-                _window(data["close"], w)
-            )
-        for w in [25, 40]:
-            features[f"e1f_linguistic_complexity_{w}"] = (
-                engine_1F.rolling_linguistic_complexity_udf(_window(data["close"], w))
-            )
-
-        features["e1f_muscle_force_20"] = engine_1F.rolling_muscle_force_udf(
-            _window(data["close"], 20)
-        )
-        for w in [24, 48, 96]:
-            features[f"e1f_musical_tension_{w}"] = (
-                engine_1F.rolling_musical_tension_udf(_window(data["close"], w))
-            )
-            features[f"e1f_rhythm_pattern_{w}"] = engine_1F.rolling_rhythm_pattern_udf(
-                _window(data["close"], w)
-            )
-
-        for w in [20, 30, 50, 100]:
-            features[f"e1f_network_clustering_{w}"] = (
-                engine_1F.rolling_network_clustering_udf(_window(data["close"], w))
-            )
-            features[f"e1f_network_density_{w}"] = (
-                engine_1F.rolling_network_density_udf(_window(data["close"], w))
-            )
-
-        for w in [15, 25, 40]:
-            features[f"e1f_semantic_flow_{w}"] = engine_1F.rolling_semantic_flow_udf(
-                _window(data["close"], w)
-            )
-        for w in [12, 24, 48, 96]:
-            features[f"e1f_tonality_{w}"] = engine_1F.rolling_tonality_udf(
-                _window(data["close"], w)
-            )
-        for w in [15, 25, 40, 80]:
-            features[f"e1f_vocabulary_diversity_{w}"] = (
-                engine_1F.rolling_vocabulary_diversity_udf(_window(data["close"], w))
-            )
-
-        # -------------------------------------------------------
-        # 純化用プロキシ (必須)
-        features["atr"] = atr_13
-        features["log_return"] = np.log(
-            (data["close"][-1] + 1e-10) / (data["close"][-2] + 1e-10)
         )
         features["price_momentum"] = (
             data["close"][-1] - data["close"][-11]
             if len(data["close"]) > 10
             else np.nan
         )
-        features["rolling_volatility"] = np.std(_window(close_pct, 20))
-        features["volume_ratio"] = data["volume"][-1] / (
-            np.mean(_window(data["volume"], 20)) + 1e-10
+        features["rolling_volatility"] = (
+            np.std(_window(close_pct, 20)) if len(close_pct) >= 20 else np.nan
+        )
+        features["volume_ratio"] = (
+            data["volume"][-1] / (np.mean(_window(data["volume"], 20)) + 1e-10)
+            if len(data["volume"]) > 0
+            else np.nan
         )
 
         return features
-
-    def calculate_dynamic_context(self, hmm_model: Any) -> Dict[str, float]:
-        """
-        [環境認識用] HMMレジームと主要統計量の計算。
-        """
-        if "D1" not in self.data_buffers:
-            return {}
-        close_arr = np.array(self.data_buffers["D1"]["close"], dtype=np.float64)
-        if len(close_arr) < 50:
-            return {}
-
-        context = {}
-        try:
-            # HMMレジーム判定
-            if hmm_model is not None:
-                log_rets = np.diff(np.log(close_arr[-100:] + 1e-10)).reshape(-1, 1)
-                probs = hmm_model.predict_proba(log_rets)
-                context["hmm_prob_0"], context["hmm_prob_1"] = (
-                    probs[-1][0],
-                    probs[-1][1],
-                )
-
-            context["e1a_statistical_kurtosis_50"] = engine_1A.rolling_kurtosis_numba(
-                close_arr[-50:]
-            )
-            adx_arr = engine_1C.calculate_adx_numba(
-                np.array(self.data_buffers["D1"]["high"]),
-                np.array(self.data_buffers["D1"]["low"]),
-                close_arr,
-                21,
-            )
-            context["e1c_adx_21"] = adx_arr[-1]
-            return {k: (v if np.isfinite(v) else 0.0) for k, v in context.items()}
-        except Exception:
-            return {}
 
     def calculate_feature_vector(
         self, tf_name: str, timestamp: datetime, market_proxy_cache: pd.DataFrame
@@ -1648,7 +1090,8 @@ class RealtimeFeatureEngine:
             final_vector = np.nan_to_num(
                 np.array(vector, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
             )
-            return np.array([np.clip(final_vector, -1e5, 1e5)])
+            # ▼修正: 10万でのクリッピングを撤廃 (VPTなどの自然な巨大値が切り捨てられOODになるのを防ぐ)
+            return np.array([final_vector])
         except Exception as e:
             self.logger.error(f"Vector calculation error: {e}")
             return None

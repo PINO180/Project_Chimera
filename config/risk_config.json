@@ -7,16 +7,16 @@
   "base_leverage": 2000.0,
   "sl_multiplier": 5.0,
   "pt_multiplier": 1.0,
-  "m2_proba_threshold": 0.50,
+  "m2_proba_threshold": 0.90,
   "max_consecutive_sl": 2,
   "cooldown_minutes_after_sl": 10,
-  "spread_pips": 16.0,
+  "spread_pips": 36.0,
   "value_per_pip": 1.0,
   "prevent_simultaneous_orders": true,
   "max_drawdown": 0.50,
   "max_positions": 1000,
-  "min_atr_threshold": 0.0,
+  "min_atr_threshold": 2.0,
   "use_fixed_risk": true,
   "fixed_risk_percent": 0.10,
-  "max_allowed_spread": 30.0
+  "max_allowed_spread": 50.0
 }

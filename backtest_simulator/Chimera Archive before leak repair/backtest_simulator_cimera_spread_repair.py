@@ -63,7 +63,7 @@ CONTRACT_SIZE = Decimal("100")  # 1 lot = 100 oz
 class BacktestConfig:
     """シミュレーションの全パラメータを一元管理 (V5 Two-Brain Architecture)"""
 
-    initial_capital: float = 100.0
+    initial_capital: float = 200.0
     simulation_data_path: Path = S6_WEIGHTED_DATASET
 
     # V5: Long/Short独立のOOF予測パス
@@ -78,17 +78,18 @@ class BacktestConfig:
     auto_lot_size_per_base: float = 0.1
 
     # ▼▼▼ 追加: 固定比率資金管理のパラメータ ▼▼▼
-    use_fixed_risk: bool = False
+    use_fixed_risk: bool = True
     fixed_risk_percent: float = (
-        0.02  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
+        0.05  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
     )
     # ▲▲▲ ここまで追加 ▲▲▲
 
-    m2_proba_threshold: float = 0.50
-    test_limit_partitions: int = 0
+    m2_proba_threshold: float = 0.90
+    test_limit_partitions: int = 100
     oof_mode: bool = True
     min_capital_threshold: float = 1.0
     min_lot_size: float = 0.01
+    min_atr_threshold: float = 2.0  # ★V5: Mixed対応のATRフィルターを追加
 
     max_positions: int = 1000
 
@@ -335,25 +336,26 @@ class BacktestSimulator:
                 ]
             ).sort("ts_future")
 
+            # ▼▼▼ 15分→120分、5分→60分 に修正 ▼▼▼
             lf = lf.with_columns(
-                (pl.col("timestamp") + pl.duration(minutes=15)).alias("ts_plus_15m")
+                (pl.col("timestamp") + pl.duration(minutes=120)).alias("ts_plus_120m")
             )
             lf = lf.join_asof(
                 price_lf_long,
-                left_on="ts_plus_15m",
+                left_on="ts_plus_120m",
                 right_on="ts_future",
                 strategy="forward",
-            ).drop(["ts_plus_15m", "ts_future"])
+            ).drop(["ts_plus_120m", "ts_future"])
 
             lf = lf.with_columns(
-                (pl.col("timestamp") + pl.duration(minutes=5)).alias("ts_plus_5m")
+                (pl.col("timestamp") + pl.duration(minutes=60)).alias("ts_plus_60m")
             )
             lf = lf.join_asof(
                 price_lf_short,
-                left_on="ts_plus_5m",
+                left_on="ts_plus_60m",
                 right_on="ts_future",
                 strategy="forward",
-            ).drop(["ts_plus_5m", "ts_future"])
+            ).drop(["ts_plus_60m", "ts_future"])
 
             # Null埋め (予測がない場合は確率0として扱う)
             lf = lf.with_columns(
@@ -586,7 +588,8 @@ class BacktestSimulator:
                     if (
                         atr_value_float is None
                         or not np.isfinite(atr_value_float)
-                        or atr_value_float <= 0
+                        or atr_value_float
+                        < self.config.min_atr_threshold  # ★ 0 から 閾値(2.0) に変更
                     ):
                         continue
 
@@ -689,7 +692,9 @@ class BacktestSimulator:
                                 exit_price_decimal = current_price_decimal + (
                                     Decimal(str(atr_value_float)) * DECIMAL_PT_MULT
                                 )
-                            elif valid_label == 0 and duration_val < 15.0:
+                            elif (
+                                valid_label == 0 and duration_val < 120.0
+                            ):  # ★ 15.0 を 120.0 に変更
                                 exit_price_decimal = current_price_decimal - (
                                     Decimal(str(atr_value_float)) * DECIMAL_SL_MULT
                                 )
@@ -715,7 +720,9 @@ class BacktestSimulator:
                                 exit_price_decimal = current_price_decimal - (
                                     Decimal(str(atr_value_float)) * DECIMAL_PT_MULT
                                 )
-                            elif valid_label == 0 and duration_val < 5.0:
+                            elif (
+                                valid_label == 0 and duration_val < 60.0
+                            ):  # ★ 5.0 を 60.0 に変更
                                 exit_price_decimal = current_price_decimal + (
                                     Decimal(str(atr_value_float)) * DECIMAL_SL_MULT
                                 )
@@ -1297,12 +1304,15 @@ class BacktestSimulator:
                     trade_log.filter(
                         (pl.col("label") == 0)
                         & (
-                            ((pl.col("direction") == 1) & (pl.col("TD") >= 14.9))
-                            | ((pl.col("direction") == -1) & (pl.col("TD") >= 4.9))
+                            (
+                                (pl.col("direction") == 1) & (pl.col("TD") >= 119.9)
+                            )  # ★ 14.9 を 119.9 に変更
+                            | (
+                                (pl.col("direction") == -1) & (pl.col("TD") >= 59.9)
+                            )  # ★ 4.9 を 59.9 に変更
                         )
                     )
                 )
-
                 m2_lst = trade_log["m2_proba"].to_list()
                 m2_bins = {
                     "<= 0.5": sum(1 for x in m2_lst if x <= 0.5),
@@ -1478,6 +1488,14 @@ if __name__ == "__main__":
         dest="min_capital",
         help=f"Min capital threshold. Default: {default_config.min_capital_threshold}",
     )
+    # ★追加
+    parser.add_argument(
+        "--min-atr",
+        type=float,
+        default=default_config.min_atr_threshold,
+        dest="min_atr",
+        help=f"Minimum ATR threshold. Default: {default_config.min_atr_threshold}",
+    )
     parser.add_argument(
         "--value-per-pip",
         type=float,
@@ -1576,6 +1594,7 @@ if __name__ == "__main__":
         test_limit_partitions=args.test_limit_partitions,
         oof_mode=True,
         min_capital_threshold=args.min_capital,
+        min_atr_threshold=args.min_atr,  # ★追加
         value_per_pip=args.value_per_pip,
         spread_pips=args.spread_pips,
         max_positions=args.max_positions,

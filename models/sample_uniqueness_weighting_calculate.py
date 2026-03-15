@@ -54,9 +54,9 @@ def main():
     COPY (
         WITH base_events AS (
             -- ステップ0: トリガー発生時点のみを抽出し、Long/Shortそれぞれの終了時刻を計算
-            -- ※ Float32の duration_long/short を分単位のインターバルとして加算
             SELECT
                 timestamp,
+                timeframe, -- ★追加
                 timestamp + interval '1 minute' * duration_long AS t1_long,
                 timestamp + interval '1 minute' * duration_short AS t1_short
             FROM read_parquet('{input_path}', hive_partitioning=true)
@@ -67,9 +67,9 @@ def main():
         -- Longサイドの並行数計算
         -- ==========================================
         event_stream_long AS (
-            SELECT timestamp, timestamp AS event_time, 1 AS type FROM base_events
+            SELECT timestamp AS event_time, 1 AS type FROM base_events
             UNION ALL
-            SELECT timestamp, t1_long AS event_time, -1 AS type FROM base_events
+            SELECT t1_long AS event_time, -1 AS type FROM base_events
         ),
         concurrency_levels_long AS (
             SELECT
@@ -80,19 +80,20 @@ def main():
         final_concurrency_long AS (
             SELECT
                 e.timestamp,
+                e.timeframe, -- ★追加
                 MAX(c.active_intervals) AS concurrency_long
             FROM base_events AS e
             JOIN concurrency_levels_long AS c ON e.timestamp = c.event_time
-            GROUP BY e.timestamp
+            GROUP BY e.timestamp, e.timeframe -- ★追加
         ),
         
         -- ==========================================
         -- Shortサイドの並行数計算
         -- ==========================================
         event_stream_short AS (
-            SELECT timestamp, timestamp AS event_time, 1 AS type FROM base_events
+            SELECT timestamp AS event_time, 1 AS type FROM base_events
             UNION ALL
-            SELECT timestamp, t1_short AS event_time, -1 AS type FROM base_events
+            SELECT t1_short AS event_time, -1 AS type FROM base_events
         ),
         concurrency_levels_short AS (
             SELECT
@@ -103,10 +104,11 @@ def main():
         final_concurrency_short AS (
             SELECT
                 e.timestamp,
+                e.timeframe, -- ★追加
                 MAX(c.active_intervals) AS concurrency_short
             FROM base_events AS e
             JOIN concurrency_levels_short AS c ON e.timestamp = c.event_time
-            GROUP BY e.timestamp
+            GROUP BY e.timestamp, e.timeframe -- ★追加
         )
         
         -- ==========================================
@@ -114,11 +116,12 @@ def main():
         -- ==========================================
         SELECT 
             l.timestamp,
+            l.timeframe, -- ★追加
             l.concurrency_long,
             s.concurrency_short
         FROM final_concurrency_long l
-        JOIN final_concurrency_short s ON l.timestamp = s.timestamp
-        ORDER BY l.timestamp
+        JOIN final_concurrency_short s ON l.timestamp = s.timestamp AND l.timeframe = s.timeframe -- ★追加
+        ORDER BY l.timestamp, l.timeframe -- ★追加
         
     ) TO '{OUTPUT_PATH}' (FORMAT PARQUET);
     """

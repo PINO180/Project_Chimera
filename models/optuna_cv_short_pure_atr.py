@@ -1,4 +1,4 @@
-# /workspace/models/optuna_cv_pure_atr.py
+# /workspace/models/optuna_cv_pure_atr_short.py
 
 import sys
 import logging
@@ -39,12 +39,17 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-RESULTS_CSV_PATH = Path(
-    "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_top100_pure_atr_results.csv"
-)
-RESULTS_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+# 【修正要件4】 保存先ベースディレクトリを設定
+RESULTS_BASE_DIR = Path("/workspace/data/XAUUSD/stratum_7_models/1A_2B")
+RESULTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-SPREAD_COST = 0.16
+# ★テストしたいスプレッドをリストで複数指定
+SPREAD_COSTS = [
+    # 0.16,
+    0.36,
+    0.50,
+    0.80,
+]
 COOL_DOWN_MINUTES = 1
 
 # --- 探索空間 (Search Space) ---
@@ -54,11 +59,11 @@ TIMEFRAMES = [
     "M5",
     "M8",
     "M15",
-    "H1",
-    "H4",
-    "H6",
-    "H12",
-    "D1",
+    # "H1",
+    # "H4",
+    # "H6",
+    # "H12",
+    # "D1",
 ]
 
 # ピュアATR用の探索パラメータ
@@ -67,11 +72,36 @@ ATR_PERIODS = [
     #    , 21, 34
 ]
 # 低い時間足(M1~M15等)のために、小さい閾値も含めることを推奨します
-ATR_THRESHOLDS = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0]
+ATR_THRESHOLDS = [
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    # 8.0, 10.0, 15.0
+]
 
-PT_MULTS = [0.5, 1.0, 2.5, 5.0]
-SL_MULTS = [0.5, 1.0, 2.5, 5.0]
-TD_MINS = [5, 15, 30, 60, 120, 180, 360, 720, 1080, 1200]
+PT_MULTS = [
+    # 0.5,
+    1.0,
+    2.5,
+    5.0,
+]
+SL_MULTS = [
+    # 0.5,
+    1.0,
+    2.5,
+    5.0,
+]
+TD_MINS = [
+    5,
+    15,
+    30,
+    60,
+    120,
+    180,
+    # 360, 720, 1080, 1200
+]
 
 # --- CV・最適化設定 ---
 K_FOLDS = 5
@@ -84,7 +114,7 @@ SEARCH_TIMEFRAMES = TIMEFRAMES + ["mixed"]
 
 
 # ====================================================================
-# Numba JIT 高速トリプルバリア関数
+# Numba JIT 高速トリプルバリア関数 (ショート専用に修正)
 # ====================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _numba_find_hits_fast(
@@ -107,7 +137,11 @@ def _numba_find_hits_fast(
         pt = bets_pt_barrier[i]
         sl = bets_sl_barrier[i]
 
-        start_idx = np.searchsorted(ticks_ts, t0, side="left")
+        # --- 修正前 ---
+        # start_idx = np.searchsorted(ticks_ts, t0, side="left")
+
+        # --- 修正後 ---
+        start_idx = np.searchsorted(ticks_ts, t0, side="right")
         first_pt_found = np.int64(0)
         first_sl_found = np.int64(0)
 
@@ -118,9 +152,12 @@ def _numba_find_hits_fast(
             tick_high = ticks_high[j]
             tick_low = ticks_low[j]
 
-            if first_pt_found == 0 and tick_high >= pt:
+            # 【修正要件2】 Hit判定の反転
+            # ショート利確: LowがPT(目標価格)以下になったら
+            if first_pt_found == 0 and tick_low <= pt:
                 first_pt_found = tick_time
-            if first_sl_found == 0 and tick_low <= sl:
+            # ショート損切: HighがSL(撤退価格)以上になったら
+            if first_sl_found == 0 and tick_high >= sl:
                 first_sl_found = tick_time
 
             if first_pt_found != 0 and first_sl_found != 0:
@@ -161,7 +198,7 @@ class PartitionPurgedKFold:
 
 
 # ====================================================================
-# データローダークラス (メモリ不足対策のためキャッシュ構造を分離)
+# データローダークラス
 # ====================================================================
 class FoldDataLoader:
     def __init__(self, base_tick_dir: Path):
@@ -188,7 +225,6 @@ class FoldDataLoader:
         fold_key = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
         sig_key = f"{fold_key}_{tf}_{atr_p}"
 
-        # 1. 巨大なTickデータは Fold単位で1回だけロードして共有する (メモリ節約の要)
         if fold_key not in self.tick_np_cache:
             logging.info(
                 f"    [Cache Miss] Loading Raw Tick Data for Fold {fold_key}..."
@@ -227,7 +263,6 @@ class FoldDataLoader:
         if self.tick_np_cache[fold_key] is None:
             return None
 
-        # 2. シグナルデータのロード (S5 + ATR)
         if sig_key not in self.sig_cache:
             logging.info(
                 f"    [Cache Miss] Loading Signal Data for {tf}, ATR={atr_p}..."
@@ -291,11 +326,19 @@ class FoldDataLoader:
                 )
                 lf_sig = lf_sig.join_asof(lf_atr, on="timestamp", strategy="backward")
 
+                # --- 修正前 ---
+                # lf_sig = (
+                #     lf_sig.with_columns(
+                #         pl.col(f"atr_{atr_p}")
+                #         .fill_null(strategy="forward")
+                #         .fill_null(strategy="backward")
+                #     )
+                # ...
+
+                # --- 修正後 ---
                 lf_sig = (
                     lf_sig.with_columns(
-                        pl.col(f"atr_{atr_p}")
-                        .fill_null(strategy="forward")
-                        .fill_null(strategy="backward")
+                        pl.col(f"atr_{atr_p}").fill_null(strategy="forward")
                     )
                     .drop_nulls(subset=["close", f"atr_{atr_p}"])
                     .with_columns(
@@ -318,14 +361,13 @@ class FoldDataLoader:
         if self.sig_cache[sig_key] is None:
             return None
 
-        # シグナル配列(3つ) と Tick配列(3つ) を結合して返す
         return self.sig_cache[sig_key] + self.tick_np_cache[fold_key]
 
 
 # ====================================================================
 # Optuna Objective
 # ====================================================================
-def create_objective(cv_folds, data_loader, target_tf):
+def create_objective(cv_folds, data_loader, target_tf, spread_cost):
     def objective(trial):
         tf_choice = trial.suggest_categorical("timeframe", [target_tf])
         atr_p = trial.suggest_categorical("atr_period", ATR_PERIODS)
@@ -383,7 +425,7 @@ def create_objective(cv_folds, data_loader, target_tf):
                     fold_data
                 )
 
-            # フィルタリング: ATRが閾値以上かのみ判定
+            # 【修正要件3】 ボラティリティによるフィルタリング（方向性を持たないためそのまま維持）
             mask = sig_atr >= atr_threshold
             if not np.any(mask):
                 fold_scores.append(0.0)
@@ -404,10 +446,16 @@ def create_objective(cv_folds, data_loader, target_tf):
                 bets_t0 = np.ascontiguousarray(raw_t0[valid_indices])
                 bets_close = np.ascontiguousarray(raw_close[valid_indices])
                 bets_atr = np.ascontiguousarray(raw_atr[valid_indices])
-
                 bets_t1_max = bets_t0 + td_us
-                bets_pt = np.ascontiguousarray(bets_close + bets_atr * pt_mult)
-                bets_sl = np.ascontiguousarray(bets_close - bets_atr * sl_mult)
+
+                # 【修正要件1】 バリアの計算式をショート用に反転（スプレッドの壁を加味）
+                # ショートの利確はスプレッド分さらに下へ遠ざかり、損切は下へ近づく
+                bets_pt = np.ascontiguousarray(
+                    bets_close - bets_atr * pt_mult - spread_cost
+                )
+                bets_sl = np.ascontiguousarray(
+                    bets_close + bets_atr * sl_mult - spread_cost
+                )
 
                 out_pt, out_sl = _numba_find_hits_fast(
                     bets_t0,
@@ -419,6 +467,8 @@ def create_objective(cv_folds, data_loader, target_tf):
                     ticks_low,
                 )
 
+                # 勝敗判定と利益計算は到達タイミング（timestamp）に依存するため、
+                # Numba関数内の到達判定を反転させたことで既存のロジックがそのまま機能します
                 is_win = (out_pt > 0) & ((out_sl == 0) | (out_pt < out_sl))
                 is_loss = (out_sl > 0) & ((out_pt == 0) | (out_sl <= out_pt))
                 timeouts = int(np.sum(~(is_win | is_loss)))
@@ -431,7 +481,7 @@ def create_objective(cv_folds, data_loader, target_tf):
                 total_loss_base = float(
                     np.sum(bets_atr[is_loss].astype(np.float64)) * sl_mult
                 )
-                total_loss_adj = total_loss_base + (timeouts * SPREAD_COST)
+                total_loss_adj = total_loss_base + (timeouts * spread_cost)
 
                 adj_pf = (
                     total_profit / total_loss_adj
@@ -449,7 +499,7 @@ def create_objective(cv_folds, data_loader, target_tf):
                     total_profit - total_loss_adj
                 )  # 追加: 純利益を加算
                 total_timeout_np_all += -(
-                    timeouts * SPREAD_COST
+                    timeouts * spread_cost
                 )  # 追加: Timeout損失を加算
 
             current_mean_score = np.mean(fold_scores)
@@ -526,67 +576,86 @@ def run_optimization():
         "Adjusted_PF",
     ]
 
-    for target_tf in SEARCH_TIMEFRAMES:
-        # # ★ 追加：タイムフレーム移行時にRAMを解放
-        # data_loader.clear_all_caches()
-
+    # ★スプレッドのループを一番外側に追加
+    for current_spread in SPREAD_COSTS:
+        logging.info("\n" + "*" * 80)
         logging.info(
-            f"=== Starting Optuna Optimization for {target_tf} (Trials: {N_TRIALS}) ==="
+            f"★★★ STARTING SHORT OPTIMIZATION FOR SPREAD: {current_spread} ★★★"
         )
+        logging.info("*" * 80)
 
-        sampler = TPESampler(n_startup_trials=300, multivariate=True)
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=sampler,
-            pruner=MedianPruner(
-                n_startup_trials=20, n_warmup_steps=1, interval_steps=1
-            ),
-        )
+        final_df_list = []
+        # 保存するCSVの名前をショート＆スプレッドごとに分ける
+        csv_name = f"optuna_top100_pure_atr_results_short_spread_{current_spread}.csv"
+        current_csv_path = RESULTS_BASE_DIR / csv_name
 
-        study.optimize(
-            create_objective(cv_folds, data_loader, target_tf),
-            n_trials=N_TRIALS,
-            gc_after_trial=True,
-        )
+        for target_tf in SEARCH_TIMEFRAMES:
+            # # ★ 追加：タイムフレーム移行時にRAMを解放
+            # data_loader.clear_all_caches()
 
-        df = study.trials_dataframe(attrs=("value", "params", "user_attrs", "state"))
-        df = df[df["state"] == "COMPLETE"].copy()
+            logging.info(
+                f"=== Starting Optuna Optimization for {target_tf} [SHORT_ONLY] | Spread: {current_spread} (Trials: {N_TRIALS}) ==="
+            )
 
-        if len(df) == 0:
-            logging.warning(f"No completed trials for {target_tf}.")
-            continue
+            # (studyの作成)
+            sampler = TPESampler(n_startup_trials=300, multivariate=True)
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=sampler,
+                pruner=MedianPruner(
+                    n_startup_trials=20, n_warmup_steps=1, interval_steps=1
+                ),
+            )
 
-        rename_dict = {"value": "Adjusted_PF"}
-        param_cols = []
-        for col in df.columns:
-            if col.startswith("params_"):
-                cleaned_name = col.replace("params_", "")
-                rename_dict[col] = cleaned_name
-                param_cols.append(cleaned_name)
-            elif col.startswith("user_attrs_"):
-                rename_dict[col] = col.replace("user_attrs_", "")
-        df = df.rename(columns=rename_dict)
+            # (最適化実行に current_spread を渡す)
+            study.optimize(
+                create_objective(cv_folds, data_loader, target_tf, current_spread),
+                n_trials=N_TRIALS,
+                gc_after_trial=True,
+            )
 
-        df = df.sort_values("Adjusted_PF", ascending=False)
-        df = df.drop_duplicates(subset=param_cols, keep="first")
+            # (データフレーム処理はそのまま)
+            df = study.trials_dataframe(
+                attrs=("value", "params", "user_attrs", "state")
+            )
+            df = df[df["state"] == "COMPLETE"].copy()
 
-        top_100 = df.head(100)
-        final_df_list.append(top_100)
+            if len(df) == 0:
+                logging.warning(f"No completed trials for {target_tf}.")
+                continue
 
-        print("\n" + "=" * 90)
-        print(f"🏆 {target_tf} Top 10 Configurations 🏆")
-        print("=" * 90)
-        print(top_100.head(10)[cols_to_print].to_string(index=False))
+            rename_dict = {"value": "Adjusted_PF"}
+            param_cols = []
+            for col in df.columns:
+                if col.startswith("params_"):
+                    cleaned_name = col.replace("params_", "")
+                    rename_dict[col] = cleaned_name
+                    param_cols.append(cleaned_name)
+                elif col.startswith("user_attrs_"):
+                    rename_dict[col] = col.replace("user_attrs_", "")
+            df = df.rename(columns=rename_dict)
 
-    if final_df_list:
-        final_csv_df = pl.DataFrame(
-            pd.concat(final_df_list, ignore_index=True)[cols_to_print]
-        )
-        final_csv_df.write_csv(RESULTS_CSV_PATH)
-        print("\n" + "=" * 90)
-        logging.info(
-            f"Top 100 results for each timeframe successfully saved to: {RESULTS_CSV_PATH}"
-        )
+            df = df.sort_values("Adjusted_PF", ascending=False)
+            df = df.drop_duplicates(subset=param_cols, keep="first")
+
+            top_100 = df.head(100)
+            final_df_list.append(top_100)
+
+            print("\n" + "=" * 90)
+            print(f"🏆 {target_tf} Top 10 Configurations [SHORT ONLY] 🏆")
+            print("=" * 90)
+            print(top_100.head(10)[cols_to_print].to_string(index=False))
+
+        # スプレッドごとのループの最後でCSVを保存
+        if final_df_list:
+            final_csv_df = pl.DataFrame(
+                pd.concat(final_df_list, ignore_index=True)[cols_to_print]
+            )
+            final_csv_df.write_csv(current_csv_path)
+            print("\n" + "=" * 90)
+            logging.info(
+                f"Top 100 SHORT results for spread {current_spread} successfully saved to: {current_csv_path}"
+            )
 
 
 if __name__ == "__main__":

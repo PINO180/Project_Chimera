@@ -439,9 +439,14 @@ def create_objective(cv_folds, data_loader, target_tf):
 
                 bets_t1_max = bets_t0 + td_us
 
-                # 【修正要件1】ショート専用バリア計算: 下がPT(利確), 上がSL(損切)
-                bets_pt = np.ascontiguousarray(bets_close - bets_atr * pt_mult)
-                bets_sl = np.ascontiguousarray(bets_close + bets_atr * sl_mult)
+                # 修正後
+                # 【修正要件1】ショート専用バリア計算: スプレッドの壁を加味（PTもSLもさらに下へシフト）
+                bets_pt = np.ascontiguousarray(
+                    bets_close - bets_atr * pt_mult - SPREAD_COST
+                )
+                bets_sl = np.ascontiguousarray(
+                    bets_close + bets_atr * sl_mult - SPREAD_COST
+                )
 
                 out_pt, out_sl = _numba_find_hits_fast(
                     bets_t0,

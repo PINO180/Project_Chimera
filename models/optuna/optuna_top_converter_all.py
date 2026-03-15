@@ -3,8 +3,8 @@ import pandas as pd
 # ============================================================
 # パス設定（必要に応じて書き換えてください）
 # ============================================================
-INPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_top100_pure_atr_results_short.csv"
-OUTPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_topdata_pure_atr_results_short.csv"
+INPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_top100_pure_atr_results_short_sp36.csv"
+OUTPUT_PATH = "/workspace/data/XAUUSD/stratum_7_models/1A_2B/optuna_topdata_pure_atr_results_short_sp36.csv"
 
 # ============================================================
 # 時間足の順序定義
@@ -53,10 +53,27 @@ if "Adjusted_PF" not in df.columns:
     )
 
 # ============================================================
+# データクリーニング処理（最強版）
+# ============================================================
+# 数字(\d)、小数点(\.)、マイナス記号(\-) 以外のすべての文字を正規表現で削除する
+df["Total_Net_Profit"] = (
+    df["Total_Net_Profit"].astype(str).str.replace(r"[^\d\.\-]", "", regex=True)
+)
+if "Timeout_NP" in df.columns:
+    df["Timeout_NP"] = (
+        df["Timeout_NP"].astype(str).str.replace(r"[^\d\.\-]", "", regex=True)
+    )
+
+# その上で数値化（空文字になった\0などは NaN になるので 0.0 で埋める）
+df["Total_Net_Profit"] = pd.to_numeric(df["Total_Net_Profit"], errors="coerce").fillna(
+    0.0
+)
+if "Timeout_NP" in df.columns:
+    df["Timeout_NP"] = pd.to_numeric(df["Timeout_NP"], errors="coerce").fillna(0.0)
+
+# ============================================================
 # 以降は共通処理
 # ============================================================
-
-# D1など全行がTotal_Net_Profit=0のtimeframeを除外
 valid_tf = df.groupby("timeframe").filter(lambda x: x["Total_Net_Profit"].max() > 0)
 
 # 対象timeframeを順序通りに並べる

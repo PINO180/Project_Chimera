@@ -1,8 +1,5 @@
 # /workspace/models/create_proxy_labels_polars_patch_regime.py
 # [フェーズ3: 最終ラベリングスクリプト - V5 双方向ラベリング仕様]
-# - 対象: M1（1分足）限定
-# - ATRフィルター: ATR(13) <= 0.5 （極小収縮）
-# - ロング/ショート同時判定（Numba 1パス処理）
 
 import sys
 from pathlib import Path
@@ -55,22 +52,25 @@ except ImportError:
 # --- ▼▼▼ V5 双方向ラベリング ルール定義 ▼▼▼ ---
 
 # 対象タイムフレームとATRの指定
-TARGET_TIMEFRAME = "M1"
-TARGET_ATR_COLUMN = "e1c_atr_13_M1"  # ATR13を使用
-ATR_SHRINK_THRESHOLD = 0.0  # 閾値を0に設定
+TARGET_TIMEFRAMES = ["M1", "M3", "M5", "M8", "M15"]  # Mixed対応
+ATR_PERIOD = 13
+ATR_SHRINK_THRESHOLD = 2.0
+
+# ★スプレッドコストを定義
+SPREAD = 0.50
 
 # ロング用ルール
 RULE_LONG = {
     "pt_mult": 1.0,
     "sl_mult": 5.0,
-    "td": "15m",
+    "td": "60m",  # td_mins: 60
 }
 
 # ショート用ルール
 RULE_SHORT = {
-    "pt_mult": 1.0,  # 下落方向への利幅
-    "sl_mult": 5.0,  # 上昇方向への損切幅
-    "td": "5m",
+    "pt_mult": 1.0,
+    "sl_mult": 5.0,
+    "td": "60m",  # td_mins: 60
 }
 # --- ▲▲▲ 改造ここまで ▲▲▲ ---
 
@@ -156,7 +156,11 @@ def _numba_find_hits_dual(
         pt_s = bets_pt_short[i]
         sl_s = bets_sl_short[i]
 
-        start_idx = np.searchsorted(ticks_ts, t0, side="left")
+        # --- 修正前 ---
+        # start_idx = np.searchsorted(ticks_ts, t0, side="left")
+
+        # --- 修正後 ---
+        start_idx = np.searchsorted(ticks_ts, t0, side="right")
 
         # ヒットしたタイムスタンプを記録する変数
         pt_l_found = np.int64(0)
@@ -318,7 +322,7 @@ class ProxyLabelingEngine:
         cfg = self.config
 
         logging.info(
-            f"  -> Separating Hive/Files for S5 (Filtering strictly for {TARGET_TIMEFRAME})..."
+            f"  -> Separating Hive/Files for S5 (Filtering strictly for {TARGET_TIMEFRAMES})..."
         )
         for path in feature_paths:
             name_to_match = path.stem if path.is_file() else path.name
@@ -401,7 +405,7 @@ class ProxyLabelingEngine:
                 f"  -> Prepared S5 Hive LazyFrame ({len(all_lazy_frames_hive)} sources)."
             )
         else:
-            logging.warning(f"No S5 Hive data found for {TARGET_TIMEFRAME}.")
+            logging.warning(f"No S5 Hive data found for {TARGET_TIMEFRAMES}.")
 
         unified_file_lf = pl.LazyFrame()
         if all_lazy_frames_file:
@@ -410,7 +414,7 @@ class ProxyLabelingEngine:
                 f"  -> Prepared S5 non-tick LazyFrame ({len(all_lazy_frames_file)} sources)."
             )
         else:
-            logging.warning(f"No S5 non-tick data found for {TARGET_TIMEFRAME}.")
+            logging.warning(f"No S5 non-tick data found for {TARGET_TIMEFRAMES}.")
 
         return unified_hive_lf, unified_file_lf
 
@@ -454,8 +458,8 @@ class ProxyLabelingEngine:
         )
         all_atr_lfs = []
 
-        # --- [修正] ATR13 を指定 ---
-        SOURCE_ATR_COLUMN_NAME = "e1c_atr_13"
+        # --- [修正] ATRを指定 ---
+        SOURCE_ATR_COLUMN_NAME = f"e1c_atr_{ATR_PERIOD}"
 
         for f_path in atr_files:
             match = timeframe_pattern.search(f_path.name)
@@ -463,11 +467,11 @@ class ProxyLabelingEngine:
                 continue
             timeframe = match.group(1)
 
-            # --- [重要] M1のATRのみ読み込む ---
-            if timeframe != TARGET_TIMEFRAME:
+            # --- [重要] ターゲットのATRのみ読み込む ---
+            if timeframe not in TARGET_TIMEFRAMES:
                 continue
 
-            target_atr_name = f"e1c_atr_13_{timeframe}"  # M1なら e1c_atr_13_M1 になる
+            target_atr_name = f"e1c_atr_{ATR_PERIOD}_{timeframe}"
             lf_original = pl.scan_parquet(str(f_path))
             schema_names = lf_original.collect_schema().names()
 
@@ -490,7 +494,7 @@ class ProxyLabelingEngine:
 
         if not all_atr_lfs:
             raise ValueError(
-                f"FATAL: No valid {SOURCE_ATR_COLUMN_NAME} columns were extracted for {TARGET_TIMEFRAME}."
+                f"FATAL: No valid {SOURCE_ATR_COLUMN_NAME} columns were extracted for {TARGET_TIMEFRAMES}."
             )
 
         return {"base_lf": base_lf, "atr_lfs": all_atr_lfs}
@@ -542,9 +546,9 @@ class ProxyLabelingEngine:
     def run(self):
         logging.info(f"### Phase 3: Final Labeling (V5 Dual-Directional Labeling) ###")
         logging.info(f"Applying filter: {self.config.get_filter_description()}")
-        logging.info(f"Target Timeframe: {TARGET_TIMEFRAME}")
+        logging.info(f"Target Timeframes: {TARGET_TIMEFRAMES}")
         logging.info(
-            f"ATR Shrink Filter: {TARGET_ATR_COLUMN} > {ATR_SHRINK_THRESHOLD}"  # ←ここを > に修正
+            f"ATR Shrink Filter: ATR > {ATR_SHRINK_THRESHOLD} (Period: {ATR_PERIOD})"
         )
         logging.info(
             f"Long Rule : PT={RULE_LONG['pt_mult']}, SL={RULE_LONG['sl_mult']}, TD={RULE_LONG['td']}"
@@ -657,31 +661,29 @@ class ProxyLabelingEngine:
                 if raw_bets_df.is_empty():
                     continue
 
-                daily_bets_df = (
-                    raw_bets_df.with_columns(
-                        # M1（ターゲット）の行が存在するかどうかのフラグを作成
-                        pl.when(pl.col("timeframe") == TARGET_TIMEFRAME)
-                        .then(pl.lit(1))
-                        .otherwise(pl.lit(0))
-                        .alias("is_target")
-                    )
-                    .group_by("timestamp")
-                    .agg(
-                        # 同一タイムスタンプの特徴量を1行にマージ
-                        pl.col("is_target").max(),
-                        pl.exclude("timestamp", "timeframe", "is_target")
-                        .drop_nulls()
-                        .first(),
-                    )
-                    .sort("timestamp")
-                    # 上位足（H1など）の直近確定値を前方補完し、M1の足に伝播させる
-                    .with_columns(pl.exclude("timestamp", "is_target").forward_fill())
-                    # M1データが存在するタイムスタンプのみを抽出
-                    .filter(pl.col("is_target") == 1)
-                    # 下流の処理のために timeframe 列を TARGET_TIMEFRAME (M1) で復元
-                    .with_columns(pl.lit(TARGET_TIMEFRAME).alias("timeframe"))
-                    .drop("is_target")
+                # --- [修正] ユニバーサルモデル用の特徴量統合とターゲット抽出 ---
+
+                # 1. 各タイムスタンプで有効なターゲット時間足を抽出 (M1, M5などが同時に存在する場合に対応)
+                valid_targets_df = (
+                    raw_bets_df.filter(pl.col("timeframe").is_in(TARGET_TIMEFRAMES))
+                    .select(["timestamp", "timeframe"])
+                    .unique()
                 )
+
+                # 2. 全時間足の特徴量を時系列で一つに統合し、上位足の特徴量を下位足に伝播させる (Master Features)
+                master_features_df = (
+                    raw_bets_df.drop("timeframe")
+                    .group_by("timestamp")
+                    .agg(pl.all().drop_nulls().first())
+                    .sort("timestamp")
+                    # ここで全時間足の特徴量を前方補完し、最新の状態を常に維持する（完全食の完成）
+                    .with_columns(pl.exclude("timestamp").forward_fill())
+                )
+
+                # 3. 統合された完全な特徴量を、各ターゲット時間足のラベル計算用行に結合
+                daily_bets_df = valid_targets_df.join(
+                    master_features_df, on="timestamp", how="left"
+                ).sort(["timeframe", "timestamp"])
 
                 if daily_bets_df.is_empty():
                     continue
@@ -713,9 +715,13 @@ class ProxyLabelingEngine:
                             atr_df_small, on="timestamp"
                         )
 
-                price_window_df = price_window_df.fill_null(
-                    strategy="forward"
-                ).fill_null(strategy="backward")
+                # --- 修正前 ---
+                # price_window_df = price_window_df.fill_null(
+                #     strategy="forward"
+                # ).fill_null(strategy="backward")
+
+                # --- 修正後 ---
+                price_window_df = price_window_df.fill_null(strategy="forward")
 
                 # ラベル計算（第4回で定義）
                 daily_labeled_df = self._calculate_labels_for_batch(
@@ -775,10 +781,10 @@ class ProxyLabelingEngine:
             if timeframe is None or group_df.is_empty():
                 continue
 
-            # M1以外のデータが混入した場合は安全のためスキップ
-            if timeframe != TARGET_TIMEFRAME:
+            # 対象外のデータが混入した場合は安全のためスキップ
+            if timeframe not in TARGET_TIMEFRAMES:
                 logging.debug(
-                    f"Skipping timeframe {timeframe} (Target is {TARGET_TIMEFRAME} only)."
+                    f"Skipping timeframe {timeframe} (Targets are {TARGET_TIMEFRAMES})."
                 )
                 continue
 
@@ -793,7 +799,7 @@ class ProxyLabelingEngine:
                 minutes=td_short_minutes
             )
 
-            atr_col_name = TARGET_ATR_COLUMN
+            atr_col_name = f"e1c_atr_{ATR_PERIOD}_{timeframe}"
             if atr_col_name not in price_window_df.columns:
                 logging.warning(
                     f"Required ATR column '{atr_col_name}' not found. Skipping."
@@ -820,7 +826,8 @@ class ProxyLabelingEngine:
             # --- [変更] 全行を保持しつつ、エントリー起点に is_trigger=1 を付与 ---
             bets_df_all = bets_df_with_atr.with_columns(
                 pl.when(
-                    pl.col("atr_value") > ATR_SHRINK_THRESHOLD
+                    pl.col("atr_value")
+                    >= ATR_SHRINK_THRESHOLD  # ★ ここが「>」ではなく「>=」になっているか
                 )  # > 0 の時、すべて1（対象）にする
                 .then(1)
                 .otherwise(0)
@@ -836,21 +843,29 @@ class ProxyLabelingEngine:
             # バリアの一括計算 (ロングとショート両方)
             bets_df = bets_df_filtered.select(
                 pl.col("timestamp").alias("t0"),
-                # ロング用バリア
-                (pl.col("close") + pl.col("atr_value") * RULE_LONG["pt_mult"]).alias(
-                    "pt_long"
-                ),
-                (pl.col("close") - pl.col("atr_value") * RULE_LONG["sl_mult"]).alias(
-                    "sl_long"
-                ),
+                # ★修正: ロング用バリア（Askエントリー想定: PTは遠く、SLは近く）
+                (
+                    pl.col("close")
+                    + pl.col("atr_value") * RULE_LONG["pt_mult"]
+                    + SPREAD
+                ).alias("pt_long"),
+                (
+                    pl.col("close")
+                    - pl.col("atr_value") * RULE_LONG["sl_mult"]
+                    + SPREAD
+                ).alias("sl_long"),
                 t1_max_long_expr.alias("t1_max_long"),
-                # ショート用バリア
-                (pl.col("close") - pl.col("atr_value") * RULE_SHORT["pt_mult"]).alias(
-                    "pt_short"
-                ),
-                (pl.col("close") + pl.col("atr_value") * RULE_SHORT["sl_mult"]).alias(
-                    "sl_short"
-                ),
+                # ★修正: ショート用バリア（Bidエントリー/Ask決済想定: PTは遠く、SLは近く）
+                (
+                    pl.col("close")
+                    - pl.col("atr_value") * RULE_SHORT["pt_mult"]
+                    - SPREAD
+                ).alias("pt_short"),
+                (
+                    pl.col("close")
+                    + pl.col("atr_value") * RULE_SHORT["sl_mult"]
+                    - SPREAD
+                ).alias("sl_short"),
                 t1_max_short_expr.alias("t1_max_short"),
                 pl.col("atr_value"),
                 pl.col("close"),
@@ -901,7 +916,7 @@ class ProxyLabelingEngine:
                         (pl.col("pt_l_time") > 0)
                         & (
                             (pl.col("sl_l_time") == 0)
-                            | (pl.col("pt_l_time") <= pl.col("sl_l_time"))
+                            | (pl.col("pt_l_time") < pl.col("sl_l_time"))  # 🟢 修正
                         )
                     )
                     .then(pl.lit(1, dtype=pl.Int8))
@@ -910,7 +925,7 @@ class ProxyLabelingEngine:
                         (pl.col("pt_l_time") > 0)
                         & (
                             (pl.col("sl_l_time") == 0)
-                            | (pl.col("pt_l_time") <= pl.col("sl_l_time"))
+                            | (pl.col("pt_l_time") < pl.col("sl_l_time"))  # 🟢 修正
                         )
                     )
                     .then(pl.col("pt_l_time"))
@@ -924,7 +939,7 @@ class ProxyLabelingEngine:
                         (pl.col("pt_s_time") > 0)
                         & (
                             (pl.col("sl_s_time") == 0)
-                            | (pl.col("pt_s_time") <= pl.col("sl_s_time"))
+                            | (pl.col("pt_s_time") < pl.col("sl_s_time"))  # 🟢 修正
                         )
                     )
                     .then(pl.lit(1, dtype=pl.Int8))
@@ -933,7 +948,7 @@ class ProxyLabelingEngine:
                         (pl.col("pt_s_time") > 0)
                         & (
                             (pl.col("sl_s_time") == 0)
-                            | (pl.col("pt_s_time") <= pl.col("sl_s_time"))
+                            | (pl.col("pt_s_time") < pl.col("sl_s_time"))  # 🟢 修正
                         )
                     )
                     .then(pl.col("pt_s_time"))
@@ -978,7 +993,7 @@ class ProxyLabelingEngine:
             # 【重要】シミュレーター用の close と atr_value は残しつつ、不要なゴミを捨てる
 
             # 存在するカラムのみを削除対象にする（安全なdrop）
-            drop_candidates = ["open", "high", "low", "e1c_atr_13_M1"]
+            drop_candidates = ["open", "high", "low", atr_col_name]
             actual_drops = [c for c in drop_candidates if c in final_group_df.columns]
 
             labeled_chunks.append(final_group_df.drop(actual_drops))
@@ -1098,8 +1113,8 @@ class ProxyLabelingEngine:
 | Item | Value |
 |:---|:---|
 | **Filter Applied** | `{cfg.get_filter_description()}` |
-| **Target Timeframe** | `{TARGET_TIMEFRAME}` |
-| **ATR Filter** | `{TARGET_ATR_COLUMN} > {ATR_SHRINK_THRESHOLD}` | # ←ここを > に修正
+| **Target Timeframes** | `{TARGET_TIMEFRAMES}` |
+| **ATR Filter** | `ATR_{ATR_PERIOD} >= {ATR_SHRINK_THRESHOLD}` |
 | **Long Rule** | `PT: {RULE_LONG["pt_mult"]}, SL: {RULE_LONG["sl_mult"]}, TD: {RULE_LONG["td"]}` |
 | **Short Rule** | `PT: {RULE_SHORT["pt_mult"]}, SL: {RULE_SHORT["sl_mult"]}, TD: {RULE_SHORT["td"]}` |
 

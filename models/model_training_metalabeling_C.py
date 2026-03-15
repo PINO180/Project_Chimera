@@ -31,7 +31,8 @@ if str(project_root) not in sys.path:
 # --- 修正後のインポート文 ---
 from blueprint import (
     S6_WEIGHTED_DATASET,
-    S3_FEATURES_FOR_TRAINING,
+    # S3_FEATURES_FOR_TRAINING,  # ← 削除
+    S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加
     S7_M1_OOF_PREDICTIONS_LONG,
     S7_M1_OOF_PREDICTIONS_SHORT,
     S7_META_LABELED_OOF_LONG,
@@ -74,7 +75,8 @@ class FinalTrainingConfig:
     meta_labeled_oof_path: Path = field(default=None, init=False)
     m1_oof_path_directed: Path = field(default=None, init=False)
 
-    feature_list_path: Path = S3_FEATURES_FOR_TRAINING
+    # feature_list_path: Path = S3_FEATURES_FOR_TRAINING  # ← 削除
+    feature_list_path: Path = S3_FEATURES_FOR_TRAINING_V5  # ★ 追加
     n_splits: int = 5
     purge_days: int = 3
     embargo_days: int = 2
@@ -85,11 +87,14 @@ class FinalTrainingConfig:
             "boosting_type": "gbdt",
             "n_estimators": 2000,
             "learning_rate": 0.01,
-            "num_leaves": 31,
+            "num_leaves": 127,  # ★変更: 複数時間足に対応するため脳容量を拡大 (31 -> 127)
             "max_depth": -1,
+            "min_data_in_leaf": 100,  # ★追加: 過学習防止
+            "lambda_l1": 0.1,  # ★追加: 正則化 (L1)
+            "lambda_l2": 0.1,  # ★追加: 正則化 (L2)
             "seed": 42,
-            "n_jobs": -1,
-            "verbose": -1,
+            "n_jobs": 1,
+            "verbose": 1,
             "colsample_bytree": 0.8,
             "subsample": 0.8,
         }
@@ -101,11 +106,14 @@ class FinalTrainingConfig:
             "boosting_type": "gbdt",
             "n_estimators": 2000,
             "learning_rate": 0.01,
-            "num_leaves": 31,
+            "num_leaves": 127,  # ★変更: 複数時間足に対応するため脳容量を拡大 (31 -> 127)
             "max_depth": -1,
+            "min_data_in_leaf": 100,  # ★追加: 過学習防止
+            "lambda_l1": 0.1,  # ★追加: 正則化 (L1)
+            "lambda_l2": 0.1,  # ★追加: 正則化 (L2)
             "seed": 42,
-            "n_jobs": -1,
-            "verbose": -1,
+            "n_jobs": 1,
+            "verbose": 1,
             "colsample_bytree": 0.8,
             "subsample": 0.8,
         }
@@ -202,7 +210,7 @@ class FinalAssembler:
 
         exclude_exact = {
             "timestamp",
-            "timeframe",
+            # "timeframe",  # ★削除: 特徴量として使うため除外リストから外す
             "t1",
             "label",
             "uniqueness",
@@ -224,9 +232,13 @@ class FinalAssembler:
             "is_trigger",
         }
 
-        features = []
+        features = ["timeframe"]  # ★変更: timeframeを最重要カテゴリとして先頭に配置
         for col in raw_features:
-            if col in exclude_exact or col.startswith("is_trigger_on"):
+            if (
+                col in exclude_exact
+                or col == "timeframe"
+                or col.startswith("is_trigger_on")
+            ):
                 continue
             features.append(col)
 
@@ -271,6 +283,23 @@ class FinalAssembler:
         """V5仕様: M1学習時のみ、トリガー(is_trigger=1)発火行に絞り込む"""
         if is_m1 and "is_trigger" in df.columns:
             df = df.filter(pl.col("is_trigger") == 1)
+
+        if "timeframe" in df.columns:
+            # 文字列型の場合のみreplaceを実行し、それ以外はただInt32にキャストする
+            if df.schema["timeframe"] in [pl.Utf8, pl.String]:
+                df = df.with_columns(
+                    pl.col("timeframe")
+                    .replace({"M1": 0, "M3": 1, "M5": 2, "M8": 3, "M15": 4})
+                    .cast(pl.Int32)
+                )
+            else:
+                df = df.with_columns(pl.col("timeframe").cast(pl.Int32))
+
+            # 行増殖バグを最後の行で完全鎮圧
+            df = df.unique(
+                subset=["timestamp", "timeframe"], keep="last", maintain_order=True
+            )
+
         return df
 
     def _calculate_scale_pos_weight_m1(self) -> float:
@@ -454,6 +483,17 @@ class FinalAssembler:
                     if missing_features:
                         continue
 
+                    # --- 修正前 ---
+                    # X_train_list.append(
+                    #     df_chunk.select(features_to_use).fill_null(0).to_numpy()
+                    # )
+
+                    # --- 修正前 ---
+                    # X_train_list.append(
+                    #     df_chunk.select(features_to_use).fill_null(0)
+                    # )
+
+                    # --- 修正後 ---
                     X_train_list.append(
                         df_chunk.select(features_to_use).fill_null(0).to_numpy()
                     )
@@ -467,6 +507,9 @@ class FinalAssembler:
                     y_train = np.concatenate(y_train_list)
                     w_train = np.concatenate(w_train_list)
 
+                    del X_train_list, y_train_list, w_train_list
+                    gc.collect()
+
                     train_params = self.config.lgbm_params_m2.copy()
                     n_estimators = train_params.pop("n_estimators", 1000)
 
@@ -475,9 +518,19 @@ class FinalAssembler:
                     )
                     model = lgb.train(
                         train_params,
-                        lgb.Dataset(X_train, label=y_train, weight=w_train),
+                        lgb.Dataset(
+                            X_train,
+                            label=y_train,
+                            weight=w_train,
+                            feature_name=self.features_m2,  # ★追加: 特徴量リスト(M2用)
+                            # categorical_feature の指定は削除！
+                        ),
                         num_boost_round=n_estimators,
                     )
+
+                    del X_train, y_train, w_train
+                    gc.collect()
+
                 except Exception as fit_error:
                     logging.error(
                         f"[{self.direction.upper()}] Error fitting M2 model: {fit_error}"
@@ -509,22 +562,45 @@ class FinalAssembler:
 
                 features_to_use = self.features_m2
                 try:
+                    # ▼▼▼ ここを書き換え ▼▼▼
                     X_val = df_chunk.select(features_to_use).fill_null(0).to_numpy()
                     predictions = model.predict(X_val)
+                    # ▲▲▲ ここまで ▲▲▲
                 except Exception as pred_error:
                     logging.error(
                         f"[{self.direction.upper()}] Error predicting M2 model: {pred_error}"
                     )
                     predictions = np.full(len(df_chunk), np.nan)
 
+                # --- 修正前 ---
+                # oof_df = pl.DataFrame(
+                #     {
+                #         "timestamp": df_chunk["timestamp"],
+                #         "prediction": predictions,
+                #         "true_label": df_chunk["meta_label"],
+                #         "uniqueness": df_chunk["uniqueness"],
+                #     }
+                # )
+
+                # --- 修正後 ---
                 oof_df = pl.DataFrame(
                     {
                         "timestamp": df_chunk["timestamp"],
+                        "timeframe": df_chunk["timeframe"],  # ★ 追加
                         "prediction": predictions,
                         "true_label": df_chunk["meta_label"],
                         "uniqueness": df_chunk["uniqueness"],
                     }
                 )
+
+                # ▼▼▼ 追加: 下流のシミュレーター向けに Int -> String に復元 ▼▼▼
+                reverse_map = {0: "M1", 1: "M3", 2: "M5", 3: "M8", 4: "M15"}
+                oof_df = oof_df.with_columns(
+                    pl.col("timeframe")
+                    .replace_strict(reverse_map, default=None)
+                    .cast(pl.Utf8)
+                )
+                # ▲▲▲ 追加ここまで ▲▲▲
 
                 output_partition_dir = (
                     self.config.m2_oof_predictions_tmp
@@ -538,16 +614,26 @@ class FinalAssembler:
             del model
             gc.collect()
 
+    # 修正後
     def _train_and_calibrate_final_models(self):
         logging.info(
             f"[{self.direction.upper()}] --- Training and Calibrating Final Models ---"
         )
 
+        # データを時系列で80% (最終モデル学習用) と 20% (較正用) に厳密に分割
+        split_idx_m1 = int(len(self.partitions_m1_final) * 0.8)
+        train_partitions_m1 = self.partitions_m1_final[:split_idx_m1]
+        calib_partitions_m1 = self.partitions_m1_final[split_idx_m1:]
+
+        split_idx_m2 = int(len(self.partitions_m2) * 0.8)
+        train_partitions_m2 = self.partitions_m2[:split_idx_m2]
+        calib_partitions_m2 = self.partitions_m2[split_idx_m2:]
+
         m1_model = self._ensure_model_trained(
             "M1",
             self.config.m1_model_pkl,
             is_m2=False,
-            partitions_to_train=self.partitions_m1_final,
+            partitions_to_train=train_partitions_m1,
             lgbm_params=self.config.lgbm_params_m1,
         )
 
@@ -555,26 +641,37 @@ class FinalAssembler:
             "M2",
             self.config.m2_model_pkl,
             is_m2=True,
-            partitions_to_train=self.partitions_m2,
+            partitions_to_train=train_partitions_m2,
             lgbm_params=self.config.lgbm_params_m2,
         )
 
         logging.info(
             f"[{self.direction.upper()}]   - Calibrating models (Manual, Memory-Safe Mode)..."
         )
-        calib_dates = self.partitions_m2[
-            -len(self.partitions_m2) // self.config.n_splits :
-        ]
-        if calib_dates:
+        if calib_partitions_m1:
             self._manual_calibrate(
-                "M1", m1_model, self.config.m1_calibrated, calib_dates, is_m2=False
-            )
-            self._manual_calibrate(
-                "M2", m2_model, self.config.m2_calibrated, calib_dates, is_m2=True
+                "M1",
+                m1_model,
+                self.config.m1_calibrated,
+                calib_partitions_m1,
+                is_m2=False,
             )
         else:
             logging.warning(
-                f"[{self.direction.upper()}] No partitions available for calibration. Skipping calibration."
+                f"[{self.direction.upper()}] No partitions available for M1 calibration."
+            )
+
+        if calib_partitions_m2:
+            self._manual_calibrate(
+                "M2",
+                m2_model,
+                self.config.m2_calibrated,
+                calib_partitions_m2,
+                is_m2=True,
+            )
+        else:
+            logging.warning(
+                f"[{self.direction.upper()}] No partitions available for M2 calibration."
             )
 
     def _ensure_model_trained(
@@ -655,6 +752,15 @@ class FinalAssembler:
 
             weight_col = "uniqueness" if is_m2 else f"uniqueness_{self.direction}"
 
+            # --- 修正前 ---
+            # X_chunk = df_chunk.select(features_to_use).fill_null(0)
+            # (中略)
+            # try:
+            #     X_train_df = pl.concat(X_list, rechunk=True).to_pandas()
+            #     (中略)
+            #     model = lgb.train( ... )
+
+            # --- 修正後 ---
             X_chunk = df_chunk.select(features_to_use).fill_null(0).to_numpy()
             y_chunk = df_chunk[target_col].to_numpy()
             w_chunk = df_chunk[weight_col].to_numpy()
@@ -688,7 +794,13 @@ class FinalAssembler:
 
             model = lgb.train(
                 train_params,
-                lgb.Dataset(X_train, label=y_train, weight=w_train),
+                lgb.Dataset(
+                    X_train,
+                    label=y_train,
+                    weight=w_train,
+                    feature_name=features_to_use,  # ★追加: 特徴量リスト(M1/M2動的)
+                    # categorical_feature の指定は削除！
+                ),
                 num_boost_round=n_estimators,
             )
 
@@ -699,7 +811,6 @@ class FinalAssembler:
             raise RuntimeError(
                 f"[{self.direction.upper()}] Failed to train {model_name}: {fit_error}"
             )
-
         return model
 
     def _manual_calibrate(
@@ -796,10 +907,12 @@ class FinalAssembler:
                 )
                 continue
 
+            # ▼▼▼ ここを書き換え ▼▼▼
             X = df_chunk.select(features_to_use).fill_null(0).to_numpy()
 
             try:
                 predictions = model.predict(X)
+            # ▲▲▲ ここまで ▲▲▲
             except Exception as pred_error:
                 logging.error(
                     f"[{self.direction.upper()}] Error predicting for calibration ({model_name}, {p_date}): {pred_error}",
@@ -847,7 +960,15 @@ class FinalAssembler:
             m2_oof_df = pl.scan_parquet(
                 str(self.config.m2_oof_predictions_tmp / "**/*.parquet")
             ).collect(streaming=True)
-            m2_oof_df.sort("timestamp").write_parquet(
+            # --- 修正前 ---
+            # m2_oof_df.sort("timestamp").write_parquet(
+            #     self.config.m2_oof_predictions, compression="zstd"
+            # )
+
+            # --- 修正後 ---
+            m2_oof_df.sort(
+                ["timestamp", "timeframe"]
+            ).write_parquet(  # ★ timeframeを追加
                 self.config.m2_oof_predictions, compression="zstd"
             )
             logging.info(

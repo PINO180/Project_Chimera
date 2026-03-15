@@ -17,7 +17,8 @@ from blueprint import (
     S7_M1_MODEL_SHORT_PKL,  #
     S7_M2_MODEL_LONG_PKL,  #
     S7_M2_MODEL_SHORT_PKL,  #
-    S3_FEATURES_FOR_TRAINING,  #
+    # S3_FEATURES_FOR_TRAINING,  # ← 削除
+    S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加
     S3_SELECTED_FEATURES_DIR,  #
 )
 
@@ -29,15 +30,15 @@ logging.basicConfig(
 
 
 def get_base_features() -> list[str]:
-    if not S3_FEATURES_FOR_TRAINING.exists():
-        logging.error(f"Feature list not found: {S3_FEATURES_FOR_TRAINING}")
+    if not S3_FEATURES_FOR_TRAINING_V5.exists():
+        logging.error(f"Feature list not found: {S3_FEATURES_FOR_TRAINING_V5}")
         return []
-    with open(S3_FEATURES_FOR_TRAINING, "r") as f:
+    with open(S3_FEATURES_FOR_TRAINING_V5, "r") as f:
         raw_features = [line.strip() for line in f if line.strip()]
 
     exclude_exact = {
         "timestamp",
-        "timeframe",
+        # "timeframe",  # ★削除: 特徴量として使うため除外してはいけない
         "t1",
         "label",
         "label_long",
@@ -66,11 +67,19 @@ def get_base_features() -> list[str]:
         "concurrency_long",
         "concurrency_short",
     }
-    return [
-        col
-        for col in raw_features
-        if col not in exclude_exact and not col.startswith("is_trigger_on")
-    ]
+
+    # ★追加: Script A/C と完全に同じロジックで特徴量リストを構築する
+    features = ["timeframe"]
+    for col in raw_features:
+        if (
+            col in exclude_exact
+            or col == "timeframe"
+            or col.startswith("is_trigger_on")
+        ):
+            continue
+        features.append(col)
+
+    return features
 
 
 def analyze_and_export(

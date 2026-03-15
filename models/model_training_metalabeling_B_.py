@@ -26,7 +26,8 @@ from blueprint import (
     S7_M1_OOF_PREDICTIONS_SHORT,
     S7_META_LABELED_OOF_LONG,
     S7_META_LABELED_OOF_SHORT,
-    S3_FEATURES_FOR_TRAINING,
+    # S3_FEATURES_FOR_TRAINING,  # ← 削除
+    S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加
 )
 
 logging.basicConfig(
@@ -49,8 +50,8 @@ class MetaLabelingConfig:
     m1_short_oof_path: Path = S7_M1_OOF_PREDICTIONS_SHORT
     output_long_dir: Path = S7_META_LABELED_OOF_LONG
     output_short_dir: Path = S7_META_LABELED_OOF_SHORT
-    feature_list_path: Path = S3_FEATURES_FOR_TRAINING
-    top_n_per_day: int = 20
+    # feature_list_path: Path = S3_FEATURES_FOR_TRAINING  # ← 削除
+    feature_list_path: Path = S3_FEATURES_FOR_TRAINING_V5  # ★ 追加
     test: bool = False
 
 
@@ -97,7 +98,7 @@ class MetaLabelGenerator:
         # V5ラベリングエンジンが生成する全メタデータ・未来情報の完全除外
         exclude_exact = {
             "timestamp",
-            "timeframe",
+            # "timeframe",  # ★削除: 特徴量として次へ渡すため除外しない
             "t1",
             "label",
             "label_long",
@@ -124,9 +125,9 @@ class MetaLabelGenerator:
             "m1_pred_proba",
         }
 
-        features = []
+        features = ["timeframe"]  # ★変更: 特徴量リストの先頭に明示的にセット
         for col in raw_features:
-            if col in exclude_exact:
+            if col in exclude_exact or col == "timeframe":  # ★変更: 重複防止
                 continue
             if col.startswith("is_trigger_on"):
                 continue
@@ -135,13 +136,12 @@ class MetaLabelGenerator:
         logging.info(f"  -> Loaded {len(features)} valid features.")
         return features
 
+    # 修正後
     def run(self) -> None:
         logging.info(
             "### Script 2/3: Meta-Label Generation (V5 Bidirectional / Context Plus) ###"
         )
-        logging.info(
-            f"Using dynamic sampling: Top {self.config.top_n_per_day} M1 predictions per day."
-        )
+        logging.info("Using dynamic sampling: Top 50% of M1 predictions per day.")
 
         # 双方向（Long/Short）でループ処理
         for direction in ["long", "short"]:
@@ -182,8 +182,14 @@ class MetaLabelGenerator:
             )
             try:
                 m1_oof_df = pl.read_parquet(oof_path)
+                # --- 修正前 ---
+                # m1_oof_df = m1_oof_df.with_columns(
+                #     pl.col("timestamp").dt.replace_time_zone("UTC")
+                # )
+
+                # --- 修正後 ---
                 m1_oof_df = m1_oof_df.with_columns(
-                    pl.col("timestamp").dt.replace_time_zone("UTC")
+                    pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
                 )
                 if "prediction" in m1_oof_df.columns:
                     m1_oof_df = m1_oof_df.rename({"prediction": "m1_pred_proba"})
@@ -200,7 +206,7 @@ class MetaLabelGenerator:
             # --- 特徴量カラムの選定 ---
             columns_to_select = [
                 "timestamp",
-                "timeframe",
+                # "timeframe",  # ★削除: self.features の中に既に含まれているため外す
                 "atr_value",
                 label_col,
                 uniqueness_col,
@@ -220,10 +226,25 @@ class MetaLabelGenerator:
                     if not s6_partition_path.exists():
                         continue
                     df_chunk = pl.read_parquet(s6_partition_path)
-                except Exception:
-                    continue
 
-                if df_chunk.is_empty():
+                    # ▼▼▼ 修正: 以下の Int32 へのキャスト処理を完全に削除する ▼▼▼
+                    # if "timeframe" in df_chunk.columns:
+                    #     if df_chunk.schema["timeframe"] != pl.Int32:
+                    #         df_chunk = df_chunk.with_columns(
+                    #             pl.col("timeframe")
+                    #             .replace({"M1": 0, "M3": 1, "M5": 2, "M8": 3, "M15": 4})
+                    #             .cast(pl.Int32)
+                    #         )
+                    # ▲▲▲ 削除ここまで ▲▲▲
+
+                    # unique処理だけ残す
+                    if "timeframe" in df_chunk.columns:
+                        df_chunk = df_chunk.unique(
+                            subset=["timestamp", "timeframe"],
+                            keep="last",
+                            maintain_order=True,
+                        )
+                except Exception:
                     continue
 
                 # --- サンプリング・結合ロジック ---
@@ -233,20 +254,38 @@ class MetaLabelGenerator:
                     if daily_m1_oof.is_empty():
                         continue
 
-                    # 2. その日の予測確率上位N件のタイムスタンプを取得
-                    top_n_timestamps = (
-                        daily_m1_oof.sort("m1_pred_proba", descending=True)
-                        .head(self.config.top_n_per_day)
-                        .select("timestamp")
+                    # --- 修正前 ---
+                    # その日の上位50%を抽出する処理は機械学習トレードにおいて非常に危険な未来情報リーク（分布のシフト）を引き起こします
+                    # 2. その日の予測確率上位50%のタイムスタンプを取得
+                    # n_samples = max(1, len(daily_m1_oof) // 2)
+                    # top_n_keys = (
+                    #     daily_m1_oof.sort("m1_pred_proba", descending=True)
+                    #     .head(n_samples)
+                    #     .select(["timestamp", "timeframe"])
+                    #     .unique()
+                    # )
+
+                    # --- 修正後 ---
+                    # 2. 一定の確率（例：0.5以上）を超えた「自信のあるシグナル」だけをメタモデルに渡す
+                    THRESHOLD = (
+                        0.50  # ※ベースモデルの強さに応じて 0.55 等に調整してください
+                    )
+                    top_n_keys = (
+                        daily_m1_oof.filter(pl.col("m1_pred_proba") >= THRESHOLD)
+                        .select(["timestamp", "timeframe"])
                         .unique()
                     )
-                    if top_n_timestamps.is_empty():
+                    if top_n_keys.is_empty():
                         continue
 
                     # 3. S6データを上位N件でフィルタリング
                     sampled_chunk_lf = (
                         df_chunk.lazy()
-                        .join(top_n_timestamps.lazy(), on="timestamp", how="inner")
+                        .join(
+                            top_n_keys.lazy(),
+                            on=["timestamp", "timeframe"],
+                            how="inner",
+                        )  # ★timeframeを追加
                         .select(
                             [
                                 col
@@ -259,11 +298,19 @@ class MetaLabelGenerator:
                     # 5. M1予測確率 (m1_pred_proba) を結合
                     merged_chunk_lf = sampled_chunk_lf.join(
                         daily_m1_oof.lazy().select(
-                            ["timestamp", "m1_pred_proba"]  # timeframeを削除
+                            [
+                                "timestamp",
+                                "timeframe",
+                                "m1_pred_proba",
+                            ]  # ★timeframeを追加
                         ),
-                        on="timestamp",  # timeframeを削除
+                        on=["timestamp", "timeframe"],  # ★timeframeを追加
                         how="inner",
                     )
+
+                    #  結合処理（.join）のコメントに # timeframeを削除 と書いてありますが、
+                    #  これは「スクリプトAの出力（右側のテーブル）には timeframe が存在しないため、timestamp だけで結合する」という意味でコード自体は正しく書かれています。
+                    #  左側のテーブル（S6の元データ）からしっかりと timeframe を引っ張ってきているので、結合後の完成データにはちゃんと timeframe が刻み込まれます。
 
                     merged_chunk_df = merged_chunk_lf.collect()
                     if merged_chunk_df.is_empty():
@@ -312,15 +359,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Run in quick test mode, processing only the first 5 partitions.",
     )
-    parser.add_argument(
-        "--top-n",
-        type=int,
-        default=20,
-        help="Number of top M1 predictions per day to sample for M2 training.",
-    )
 
+    # 修正後
     args = parser.parse_args()
-    config = MetaLabelingConfig(test=args.test, top_n_per_day=args.top_n)
+    config = MetaLabelingConfig(test=args.test)
 
     generator = MetaLabelGenerator(config)
     generator.run()

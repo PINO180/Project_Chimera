@@ -25,7 +25,8 @@ if str(project_root) not in sys.path:
 
 from blueprint import (
     S6_WEIGHTED_DATASET,
-    S3_FEATURES_FOR_TRAINING,
+    # S3_FEATURES_FOR_TRAINING,  # ← 削除
+    S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加
     S7_M1_OOF_PREDICTIONS_LONG,
     S7_M1_OOF_PREDICTIONS_SHORT,
 )
@@ -49,7 +50,8 @@ from dataclasses import dataclass, field
 @dataclass
 class TrainingConfig:
     input_dir: Path = S6_WEIGHTED_DATASET
-    feature_list_path: Path = S3_FEATURES_FOR_TRAINING
+    # feature_list_path: Path = S3_FEATURES_FOR_TRAINING  # ← 削除
+    feature_list_path: Path = S3_FEATURES_FOR_TRAINING_V5  # ★ 追加
     n_splits: int = 5
     purge_days: int = 3
     embargo_days: int = 2
@@ -60,11 +62,14 @@ class TrainingConfig:
             "boosting_type": "gbdt",
             "n_estimators": 2000,
             "learning_rate": 0.01,
-            "num_leaves": 31,
+            "num_leaves": 127,  # ★変更: 複数時間足に対応するため脳容量を拡大 (31 -> 127)
             "max_depth": -1,
+            "min_data_in_leaf": 100,  # ★追加: 末端の葉のデータ数を制限し過学習を防ぐ
+            "lambda_l1": 0.1,  # ★追加: 無駄な特徴量の分岐を減らす正則化 (L1)
+            "lambda_l2": 0.1,  # ★追加: 特定の特徴量への過度な依存を防ぐ正則化 (L2)
             "seed": 42,
-            "n_jobs": -1,
-            "verbose": -1,
+            "n_jobs": 12,
+            "verbose": 1,
             "colsample_bytree": 0.8,
             "subsample": 0.8,
         }
@@ -127,7 +132,7 @@ class M1CrossValidator:
         # V5仕様のメタデータ・未来情報の完全除外
         exclude_exact = {
             "timestamp",
-            "timeframe",
+            # "timeframe",  # ★削除: 特徴量として使うため除外リストから外す
             "is_trigger",
             "label_long",
             "label_short",
@@ -154,11 +159,13 @@ class M1CrossValidator:
             "high",
             "low",
             "close",
+            "m1_pred_proba",  # ★追加: M1学習時には存在しないため除外
+            "meta_label",  # ★追加: M1学習時には存在しないため除外
         }
 
-        features = []
+        features = ["timeframe"]  # ★変更: timeframeを最重要カテゴリとして先頭に配置
         for col in raw_features:
-            if col in exclude_exact:
+            if col in exclude_exact or col == "timeframe":  # ★変更: 重複防止
                 continue
             if col.startswith("is_trigger_on"):
                 continue
@@ -273,6 +280,7 @@ class M1CrossValidator:
             "prediction": [],
             "true_label": [],
             "uniqueness": [],
+            "timeframe": [],  # ★追加
         }
 
         for i, (train_partitions, val_partitions) in enumerate(
@@ -302,13 +310,33 @@ class M1CrossValidator:
                         # V5: トリガー箇所のみを学習対象にする
                         if "is_trigger" in df_chunk.columns:
                             df_chunk = df_chunk.filter(pl.col("is_trigger") == 1)
+
+                        # ★追加: timeframeを整数カテゴリに変換し、行増殖バグを「最後の行」で完全鎮圧
+                        df_chunk = df_chunk.with_columns(
+                            pl.col("timeframe")
+                            .replace({"M1": 0, "M3": 1, "M5": 2, "M8": 3, "M15": 4})
+                            .cast(pl.Int32)
+                        ).unique(
+                            subset=["timestamp", "timeframe"],
+                            keep="last",
+                            maintain_order=True,
+                        )
                     except Exception:
                         continue
 
                     if df_chunk.is_empty():
                         continue
 
-                    X_train_list.append(df_chunk.select(self.features).to_numpy())
+                    # --- 修正前 ---
+                    # X_train_list.append(df_chunk.select(self.features).to_numpy())
+
+                    # --- 修正前 ---
+                    # X_train_list.append(df_chunk.select(self.features))
+
+                    # --- 修正後 ---
+                    X_train_list.append(
+                        df_chunk.select(self.features).fill_null(0).to_numpy()
+                    )
                     y_train_list.append(np.where(df_chunk[label_col] == 1, 1, 0))
                     w_train_list.append(df_chunk[weight_col].to_numpy())
 
@@ -316,6 +344,7 @@ class M1CrossValidator:
             model: lgb.Booster = None
             if len(X_train_list) > 0:
                 try:
+                    # Numpy配列として超高速に結合
                     X_train = np.concatenate(X_train_list)
                     y_train = np.concatenate(y_train_list)
                     w_train = np.concatenate(w_train_list)
@@ -326,9 +355,17 @@ class M1CrossValidator:
                     train_params = self.config.lgbm_params.copy()
                     n_estimators = train_params.pop("n_estimators", 1000)
 
+                    logging.info(f"    -> fitting model on {len(X_train)} samples...")
+
                     model = lgb.train(
                         train_params,
-                        lgb.Dataset(X_train, label=y_train, weight=w_train),
+                        lgb.Dataset(
+                            X_train,
+                            label=y_train,
+                            weight=w_train,
+                            feature_name=self.features,
+                            # ★ categorical_feature の指定は削除！順序データとして学習させる
+                        ),
                         num_boost_round=n_estimators,
                     )
 
@@ -360,13 +397,32 @@ class M1CrossValidator:
                         # Validationもトリガー箇所のみ
                         if "is_trigger" in df_chunk.columns:
                             df_chunk = df_chunk.filter(pl.col("is_trigger") == 1)
+
+                        # ★追加: timeframeをLightGBMが処理できる整数カテゴリに変換
+                        df_chunk = df_chunk.with_columns(
+                            pl.col("timeframe")
+                            .replace({"M1": 0, "M3": 1, "M5": 2, "M8": 3, "M15": 4})
+                            .cast(pl.Int32)
+                        )
                     except Exception:
                         continue
 
                     if df_chunk.is_empty():
                         continue
 
-                    X_val = df_chunk.select(self.features).to_numpy()
+                    # --- 修正前 ---
+                    # X_val = df_chunk.select(self.features).to_numpy()
+                    # try:
+                    #     predictions = model.predict(X_val)
+
+                    # --- 修正前 ---
+                    # X_val_df = df_chunk.select(self.features).to_pandas()
+                    # X_val_df["timeframe"] = X_val_df["timeframe"].astype("category")
+                    # try:
+                    #     predictions = model.predict(X_val_df)
+
+                    # --- 修正後 ---
+                    X_val = df_chunk.select(self.features).fill_null(0).to_numpy()
                     try:
                         predictions = model.predict(X_val)
                     except Exception as pred_error:
@@ -379,6 +435,9 @@ class M1CrossValidator:
                     oof_results["prediction"].append(predictions)
                     oof_results["true_label"].append(df_chunk[label_col].to_numpy())
                     oof_results["uniqueness"].append(df_chunk[weight_col].to_numpy())
+                    oof_results["timeframe"].append(
+                        df_chunk["timeframe"].to_numpy()
+                    )  # ★追加
 
             del model
             gc.collect()
@@ -422,11 +481,21 @@ class M1CrossValidator:
                 oof_df = pl.DataFrame(
                     {
                         "timestamp": oof_results["timestamp"],
+                        "timeframe": oof_results["timeframe"],  # ★追加
                         "prediction": oof_results["prediction"],
                         "true_label": oof_results["true_label"],
                         "uniqueness": oof_results["uniqueness"],
                     }
-                ).sort("timestamp")
+                )
+
+                # ▼▼▼ 追加: 下流でのJoinエラーを防ぐため、Intを文字列に戻す ▼▼▼
+                reverse_map = {0: "M1", 1: "M3", 2: "M5", 3: "M8", 4: "M15"}
+                oof_df = oof_df.with_columns(
+                    pl.col("timeframe")
+                    .replace_strict(reverse_map, default=None)
+                    .cast(pl.Utf8)
+                ).sort(["timestamp", "timeframe"])
+                # ▲▲▲ 追加ここまで ▲▲▲
 
                 out_path = output_paths[direction]
                 oof_df.write_parquet(out_path, compression="zstd")
