@@ -1,30 +1,0 @@
-nohup: ignoring input
-2026-03-14 09:31:41,890 - INFO - MainProcess - Using output directory: /workspace/data/XAUUSD/stratum_6_training/1A_2B/labeled_dataset_partitioned_v2
-2026-03-14 09:31:41,896 - INFO - MainProcess - Using output directory: /workspace/data/XAUUSD/stratum_6_training/1A_2B/labeled_dataset_partitioned_v2
-2026-03-14 09:31:41,902 - INFO - MainProcess - ### Phase 3: Final Labeling (V5 Dual-Directional Labeling) ###
-2026-03-14 09:31:41,902 - INFO - MainProcess - Applying filter: All Time
-2026-03-14 09:31:41,902 - INFO - MainProcess - Target Timeframes: ['M1', 'M3', 'M5', 'M8', 'M15']
-2026-03-14 09:31:41,905 - INFO - MainProcess - ATR Shrink Filter: ATR > 2.0 (Period: 13)
-2026-03-14 09:31:41,906 - INFO - MainProcess - Long Rule : PT=1.0, SL=5.0, TD=120m
-2026-03-14 09:31:41,906 - INFO - MainProcess - Short Rule: PT=1.0, SL=5.0, TD=60m
-2026-03-14 09:31:41,911 - INFO - MainProcess - Step 1: Discovering feature paths...
-2026-03-14 09:31:41,911 - INFO - MainProcess - Recursively searching for feature paths in /workspace/data/XAUUSD/stratum_5_alpha/1A_2B/neutralized_alpha_set_partitioned...
-2026-03-14 09:31:55,779 - INFO - MainProcess -   -> Found 39 feature paths.
-2026-03-14 09:31:55,779 - INFO - MainProcess - Step 2: Building unified bet/feature frames (Lazy)...
-2026-03-14 09:31:55,780 - INFO - MainProcess -   -> Separating Hive/Files for S5 (Filtering strictly for ['M1', 'M3', 'M5', 'M8', 'M15'])...
-2026-03-14 09:32:21,976 - INFO - MainProcess -   -> Prepared S5 Hive LazyFrame (1 sources).
-2026-03-14 09:32:21,977 - INFO - MainProcess -   -> Prepared S5 non-tick LazyFrame (38 sources).
-2026-03-14 09:32:21,981 - INFO - MainProcess - Step 3: Preparing price data blueprints...
-2026-03-14 09:32:21,985 - INFO - MainProcess -   -> Scanning '/workspace/data/XAUUSD/stratum_2_features_fixed/feature_value_a_vast_universeC/features_e1c_tick' as master price source (S2 Tick).
-2026-03-14 09:32:22,022 - INFO - MainProcess -   -> Prepared ATR blueprint: Loaded 'e1c_atr_13' -> 'e1c_atr_13_M1'
-2026-03-14 09:32:22,043 - INFO - MainProcess -   -> Prepared ATR blueprint: Loaded 'e1c_atr_13' -> 'e1c_atr_13_M15'
-2026-03-14 09:32:22,067 - INFO - MainProcess -   -> Prepared ATR blueprint: Loaded 'e1c_atr_13' -> 'e1c_atr_13_M3'
-2026-03-14 09:32:22,090 - INFO - MainProcess -   -> Prepared ATR blueprint: Loaded 'e1c_atr_13' -> 'e1c_atr_13_M5'
-2026-03-14 09:32:22,114 - INFO - MainProcess -   -> Prepared ATR blueprint: Loaded 'e1c_atr_13' -> 'e1c_atr_13_M8'
-2026-03-14 09:32:22,114 - INFO - MainProcess -    -> Pre-loading 5 ATR files into memory...
-2026-03-14 09:32:22,524 - INFO - MainProcess - Step 4: Discovering daily partitions for processing...
-2026-03-14 09:32:28,727 - INFO - MainProcess -    -> Found 1304 daily partitions.
-2026-03-14 09:32:28,727 - INFO - MainProcess - Step 5: Starting daily processing loop...
-
-Starting V5 Dual-Directional Labeling Engine...
-Processing Partitions:   0%|          | 0/1304 [00:00<?, ?it/s]Processing Partitions:   0%|          | 1/1304 [00:33<12:10:10, 33.62s/it]Processing Partitions:   0%|          | 2/1304 [00:46<7:51:03, 21.71s/it] Processing Partitions:   0%|          | 3/1304 [00:59<6:21:58, 17.62s/it]Processing Partitions:   0%|          | 4/1304 [01:13<5:45:41, 15.96s/it]Processing Partitions:   0%|          | 5/1304 [01:26<5:25:03, 15.01s/it]Processing Partitions:   0%|          | 6/1304 [01:39<5:09:49, 14.32s/it]Processing Partitions:   1%|          | 7/1304 [01:52<4:59:24, 13.85s/it]Processing Partitions:   1%|          | 8/1304 [02:05<4:57:21, 13.77s/it]Processing Partitions:   1%|          | 9/1304 [02:19<4:53:55, 13.62s/it]Processing Partitions:   1%|          | 10/1304 [02:32<4:51:11, 13.50s/it]Processing Partitions:   1%|          | 11/1304 [02:45<4:48:26, 13.38s/it]Processing Partitions:   1%|          | 12/1304 [02:58<4:45:24, 13.25s/it]Processing Partitions:   1%|          | 13/1304 [03:11<4:44:20, 13.21s/it]Processing Partitions:   1%|          | 14/1304 [03:25<4:48:00, 13.40s/it]Processing Partitions:   1%|          | 15/1304 [03:39<4:54:23, 13.70s/it]Processing Partitions:   1%|          | 16/1304 [03:53<4:51:07, 13.56s/it]Processing Partitions:   1%|▏         | 17/1304 [04:06<4:47:30, 13.40s/it]Processing Partitions:   1%|▏         | 18/1304 [04:18<4:42:19, 13.17s/it]Processing Partitions:   1%|▏         | 19/1304 [04:31<4:38:31, 13.01s/it]Processing Partitions:   2%|▏         | 20/1304 [04:43<4:35:27, 12.87s/it]Processing Partitions:   2%|▏         | 21/1304 [04:56<4:33:50, 12.81s/it]Processing Partitions:   2%|▏         | 22/1304 [05:09<4:33:11, 12.79s/it]Processing Partitions:   2%|▏         | 23/1304 [05:22<4:33:19, 12.80s/it]Processing Partitions:   2%|▏         | 24/1304 [05:35<4:38:31, 13.06s/it]Processing Partitions:   2%|▏         | 25/1304 [05:49<4:42:09, 13.24s/it]Processing Partitions:   2%|▏         | 26/1304 [06:02<4:42:50, 13.28s/it]Processing Partitions:   2%|▏         | 27/1304 [06:20<5:07:05, 14.43s/it]Processing Partitions:   2%|▏         | 28/1304 [06:34<5:05:57, 14.39s/it]Processing Partitions:   2%|▏         | 29/1304 [06:51<5:24:28, 15.27s/it]Processing Partitions:   2%|▏         | 30/1304 [07:06<5:19:11, 15.03s/it]Processing Partitions:   2%|▏         | 31/1304 [07:21<5:23:28, 15.25s/it]Processing Partitions:   2%|▏         | 32/1304 [07:36<5:16:20, 14.92s/it]Processing Partitions:   3%|▎         | 33/1304 [07:53<5:29:37, 15.56s/it]Processing Partitions:   3%|▎         | 34/1304 [08:08<5:25:55, 15.40s/it]Processing Partitions:   3%|▎         | 35/1304 [08:23<5:26:47, 15.45s/it]Processing Partitions:   3%|▎         | 36/1304 [08:38<5:25:31, 15.40s/it]Processing Partitions:   3%|▎         | 37/1304 [08:53<5:21:51, 15.24s/it]
