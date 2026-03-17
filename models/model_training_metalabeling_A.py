@@ -68,7 +68,7 @@ class TrainingConfig:
             "lambda_l1": 0.1,  # ★追加: 無駄な特徴量の分岐を減らす正則化 (L1)
             "lambda_l2": 0.1,  # ★追加: 特定の特徴量への過度な依存を防ぐ正則化 (L2)
             "seed": 42,
-            "n_jobs": 12,
+            "n_jobs": 1,
             "verbose": 1,
             "colsample_bytree": 0.8,
             "subsample": 0.8,

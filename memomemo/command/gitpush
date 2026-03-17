@@ -28,6 +28,6 @@ git reset --hard HEAD
 1.変更をステージングする
 git add .
 2.変更をコミットする
-git commit -m "update20260315"
+git commit -m "update20260317"
 3.リモートリポジトリにプッシュする
 git push origin main

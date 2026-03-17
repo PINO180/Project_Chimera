@@ -80,18 +80,18 @@ class BacktestConfig:
     # ▼▼▼ 追加: 固定比率資金管理のパラメータ ▼▼▼
     use_fixed_risk: bool = True
     fixed_risk_percent: float = (
-        0.05  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
+        0.01  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
     )
     # ▲▲▲ ここまで追加 ▲▲▲
 
     m2_proba_threshold: float = 0.50
-    test_limit_partitions: int = 100
+    test_limit_partitions: int = 0
     oof_mode: bool = True
     min_capital_threshold: float = 1.0
     min_lot_size: float = 0.01
     min_atr_threshold: float = 2.0  # ★V5: Mixed対応のATRフィルターを追加
 
-    max_positions: int = 1000
+    max_positions: int = 100
 
     # --- V5 新規: サーキットブレーカーと同時発注禁止 ---
     prevent_simultaneous_orders: bool = True
@@ -110,8 +110,16 @@ class BacktestConfig:
     sl_multiplier_short: float = 5.0
     pt_multiplier_short: float = 1.0
 
-    td_minutes_long: float = 120.0
-    td_minutes_short: float = 120.0
+    td_minutes_long: float = 60.0
+    td_minutes_short: float = 60.0
+
+    # ▼▼▼ ここから追加 ▼▼▼
+    # ==========================================
+    # V5 Optuna対応: 証拠金維持率とロスカット設定
+    # ==========================================
+    margin_call_percent: float = 100.0  # 証拠金維持率がこれを下回ると新規エントリー禁止
+    stop_out_percent: float = 20.0  # 証拠金維持率がこれを下回ると強制ロスカット
+    # ▲▲▲ ここまで追加 ▲▲▲
 
 
 class BacktestSimulator:
@@ -147,80 +155,101 @@ class BacktestSimulator:
             limit_leverage = Decimal("500")
         return base_leverage_dec.min(limit_leverage)
 
-    def run(self):
-        logging.info("### Project Forge V5 Backtest Simulator: START ###")
-        logging.info(
-            f"Strategy: Auto Lot (Base={self.config.auto_lot_base_capital}, Size={self.config.auto_lot_size_per_base}), "
-            f"Base Leverage = {self.config.base_leverage}, "
-            f"Spread = {self.config.spread_pips} pips"
-        )
-        logging.info(
-            f"Bankruptcy Threshold (Min Capital): {self.config.min_capital_threshold:,.2f}"
-        )
-        logging.info(
-            f"Lot Size Params: Value = {self.config.value_per_pip}/lot/pip, Contract Size = 100"
-        )
-
+    def preload_data(self) -> Tuple[Dict[dt.date, pl.DataFrame], pl.DataFrame]:
+        """
+        Optuna超高速化用: 全パーティションのデータを1回だけ読み込み、
+        メモリ上の辞書(Dict)にキャッシュして返す。
+        """
+        logging.info("Pre-loading all data into memory for ultra-fast simulation...")
         lf, partitions_df = self._prepare_data()
 
-        all_results_dfs = []
-        all_trade_logs = []
-
-        logging.info(f"Processing {len(partitions_df)} partitions sequentially...")
-
+        preloaded_dict = {}
         partitions_to_process = partitions_df
+
         if self.config.test_limit_partitions > 0:
-            logging.warning(
-                f"--- TEST MODE: Limiting to first {self.config.test_limit_partitions} partitions. ---"
-            )
             partitions_to_process = partitions_df.head(
                 self.config.test_limit_partitions
             )
 
+        # 全日数をループして、LazyFrame(lf) を DataFrame としてメモリに collect() する
+        for row in tqdm(
+            partitions_to_process.iter_rows(named=True),
+            total=len(partitions_to_process),
+            desc="Preloading Partitions to Memory",
+        ):
+            current_date = row["date"]
+            try:
+                df_chunk = lf.filter(
+                    pl.col("timestamp").dt.date() == current_date
+                ).collect()
+                if not df_chunk.is_empty():
+                    preloaded_dict[current_date] = df_chunk
+            except Exception as e:
+                logging.error(f"Error preloading partition {current_date}: {e}")
+
+        logging.info(
+            f"Successfully preloaded {len(preloaded_dict)} partitions into memory."
+        )
+        return preloaded_dict, partitions_to_process
+
+    # ▼▼▼ def run(self): を引数付きに変更 ▼▼▼
+    def run(
+        self, preloaded_data: Tuple[Dict[dt.date, pl.DataFrame], pl.DataFrame] = None
+    ):
+        logging.info("### Project Forge V5 Backtest Simulator: START ###")
+        logging.info(
+            f"Strategy: Fixed Risk ({self.config.fixed_risk_percent * 100:.1f}%), "
+            f"Base Leverage = {self.config.base_leverage}, "
+            f"Spread = {self.config.spread_pips} pips"
+        )
+
+        # =========================================================
+        # オンメモリデータの受け取り、または単独実行時の自動ロード
+        # =========================================================
+        if preloaded_data is not None:
+            preloaded_dict, partitions_to_process = preloaded_data
+            logging.info("Using PRELOADED data from memory (Ultra-fast mode).")
+        else:
+            # Optunaを使わず、このスクリプトを単独で実行した場合の処理
+            preloaded_dict, partitions_to_process = self.preload_data()
+
+        all_results_dfs = []
+        all_trade_logs = []
+
         self._current_capital = Decimal(str(self.config.initial_capital))
         DECIMAL_MIN_CAPITAL = Decimal(str(self.config.min_capital_threshold))
 
-        # ▼▼▼ 新規追加: サーキットブレーカーの統計と最高資金(HWM)の初期化 ▼▼▼
         self.cb_simultaneous_prevented = 0
         self.cb_cooldown_long = 0
         self.cb_cooldown_short = 0
         self.high_water_mark = self._current_capital
-        # ▲▲▲ ここまで追加 ▲▲▲
+        self.min_margin_level_pct = Decimal("inf")
+        self.stop_out_count = 0
+
+        # tqdmのプログレスバーはOptuna側で大量に出力されると邪魔なので、
+        # オンメモリ(preloaded_dataあり)の場合はバーを非表示(disable=True)にする
+        disable_tqdm = preloaded_data is not None
 
         for row in tqdm(
             partitions_to_process.iter_rows(named=True),
             total=len(partitions_to_process),
             desc="Simulating Partitions",
+            disable=disable_tqdm,  # ★追加: Optuna実行時は静かに回す
         ):
             current_date = row["date"]
 
-            logging.debug(f"Processing partition: {current_date}")
-            try:
-                # Polars LazyFrameを日付ごとにcollectしてメモリを節約
-                df_chunk = lf.filter(
-                    pl.col("timestamp").dt.date() == current_date
-                ).collect()
-                if df_chunk.is_empty():
-                    logging.debug(f"Skipping empty partition: {current_date}")
-                    continue
-                logging.debug(f"Collected {len(df_chunk)} rows for {current_date}")
+            # ▼▼▼ 激重だった collect() 処理を廃止し、メモリ(辞書)から一瞬で取り出す ▼▼▼
+            df_chunk = preloaded_dict.get(current_date)
 
-            except Exception as e:
-                logging.error(
-                    f"Error collecting data for partition {current_date}: {e}",
-                    exc_info=True,
-                )
+            if df_chunk is None or df_chunk.is_empty():
                 continue
 
             try:
                 if self._current_capital < DECIMAL_MIN_CAPITAL:
-                    logging.warning(
-                        f"Capital ({self._current_capital:,.2f}) fell below threshold ({DECIMAL_MIN_CAPITAL:,.2f}) "
-                        f"before processing {current_date}. Stopping simulation."
-                    )
+                    # 破産した場合はそれ以降の日付をスキップ
                     break
 
-                # V5仕様: OOFデータの事前結合が済んでいるため、AI推論をスキップして直接シミュレーションへ
+                # 取得したメモリ上のデータを使ってシミュレーションを実行
                 results_chunk_df, trade_log_chunk_df = self._run_simulation_loop(
                     df_chunk
                 )
@@ -262,17 +291,33 @@ class BacktestSimulator:
             )
             return
 
-        self._analyze_and_report(final_results_df, final_trade_log_df)
+        # ▼▼▼ 修正前 ▼▼▼
+        # self._analyze_and_report(final_results_df, final_trade_log_df)
+        # logging.info("### Project Forge V5 Backtest Simulator: FINISHED ###")
+
+        # ▼▼▼ 修正後 ▼▼▼
+        report_data = self._analyze_and_report(final_results_df, final_trade_log_df)
+
+        # レポートデータに最低証拠金維持率とストップアウト回数をねじ込む
+        report_data["min_margin_level_pct"] = (
+            float(self.min_margin_level_pct)
+            if self.min_margin_level_pct != Decimal("inf")
+            else 9999.0
+        )
+        report_data["stop_out_count"] = self.stop_out_count
+
         logging.info("### Project Forge V5 Backtest Simulator: FINISHED ###")
+        return report_data
 
     def _prepare_data(self) -> Tuple[pl.LazyFrame, pl.DataFrame]:
-        # V5仕様: S6から読み込む基本カラム (direction等は削除)
+        # V5仕様: timeframe を必須キーとして取得
         base_cols = [
             "timestamp",
+            "timeframe",  # ★追加: 行増殖バグを防ぐための必須キー
             "close",
             "atr_value",
-            "duration_long",  # V5追加: Long経過時間
-            "duration_short",  # V5追加: Short経過時間
+            "duration_long",
+            "duration_short",
         ]
 
         if not self.config.oof_mode:  # In-Sample Mode
@@ -290,7 +335,14 @@ class BacktestSimulator:
                 str(self.config.simulation_data_path / "**/*.parquet")
             ).select(base_cols)
 
-            oof_cols = ["timestamp", "prediction", "true_label", "uniqueness"]
+            # ★追加: timeframe を必須キーとして取得
+            oof_cols = [
+                "timestamp",
+                "timeframe",
+                "prediction",
+                "true_label",
+                "uniqueness",
+            ]
 
             # 2. Long OOF
             long_lf = (
@@ -319,47 +371,63 @@ class BacktestSimulator:
             )
 
             # 4. Merge (Two-Brain)
-            # base_lf を軸にして、timestampでLeft Join。両建てが発生する行は両方に確率が入る。
+            # ★修正: timestamp と timeframe の両方で完全一致結合 (NxM増殖を防ぐ)
             lf = (
-                base_lf.join(long_lf, on="timestamp", how="left")
-                .join(short_lf, on="timestamp", how="left")
-                .sort("timestamp")
+                base_lf.join(long_lf, on=["timestamp", "timeframe"], how="left")
+                .join(short_lf, on=["timestamp", "timeframe"], how="left")
+                .sort(["timestamp", "timeframe"])
             )
 
             # V5追加: タイムアウト決済用の未来価格を asof join (forward) で事前結合
-            price_lf_long = base_lf.select(
-                [
-                    pl.col("timestamp").alias("ts_future"),
-                    pl.col("close").alias("close_future_long"),
-                ]
-            ).sort("ts_future")
-            price_lf_short = base_lf.select(
-                [
-                    pl.col("timestamp").alias("ts_future"),
-                    pl.col("close").alias("close_future_short"),
-                ]
-            ).sort("ts_future")
+            # ★修正: 未来価格のルックアップテーブルは timestamp で一意にする
+            price_lf_long = (
+                base_lf.select(
+                    [
+                        pl.col("timestamp").alias("ts_future"),
+                        pl.col("close").alias("close_future_long"),
+                    ]
+                )
+                .unique(subset=["ts_future"], keep="last")
+                .sort("ts_future")
+            )
 
-            # ▼▼▼ 15分→120分、5分→60分 に修正 ▼▼▼
+            price_lf_short = (
+                base_lf.select(
+                    [
+                        pl.col("timestamp").alias("ts_future"),
+                        pl.col("close").alias("close_future_short"),
+                    ]
+                )
+                .unique(subset=["ts_future"], keep="last")
+                .sort("ts_future")
+            )
+
+            # ★TDのハードコード解除
             lf = lf.with_columns(
-                (pl.col("timestamp") + pl.duration(minutes=120)).alias("ts_plus_120m")
+                (
+                    pl.col("timestamp")
+                    + pl.duration(minutes=int(self.config.td_minutes_long))
+                ).alias("ts_plus_long")
             )
             lf = lf.join_asof(
                 price_lf_long,
-                left_on="ts_plus_120m",
+                left_on="ts_plus_long",
                 right_on="ts_future",
                 strategy="forward",
-            ).drop(["ts_plus_120m", "ts_future"])
+            ).drop(["ts_plus_long", "ts_future"])
 
             lf = lf.with_columns(
-                (pl.col("timestamp") + pl.duration(minutes=60)).alias("ts_plus_60m")
+                (
+                    pl.col("timestamp")
+                    + pl.duration(minutes=int(self.config.td_minutes_short))
+                ).alias("ts_plus_short")
             )
             lf = lf.join_asof(
                 price_lf_short,
-                left_on="ts_plus_60m",
+                left_on="ts_plus_short",
                 right_on="ts_future",
                 strategy="forward",
-            ).drop(["ts_plus_60m", "ts_future"])
+            ).drop(["ts_plus_short", "ts_future"])
 
             # Null埋め (予測がない場合は確率0として扱う)
             lf = lf.with_columns(
@@ -423,13 +491,19 @@ class BacktestSimulator:
         # ▼▼▼ 以下の2行を削除またはコメントアウト ▼▼▼
         # DECIMAL_SL_MULT = Decimal(str(self.config.sl_multiplier))
         # DECIMAL_PT_MULT = Decimal(str(self.config.pt_multiplier))
+        # ▼▼▼ 修正後 ▼▼▼
         # --- サーキットブレーカー用状態管理 ---
-        pending_exits = []  # [(exit_time_int, direction_int, is_sl)]
+        pending_exits = []  # [(exit_time_int, direction_int, is_sl, margin_used_decimal)] ★変更
         consecutive_sl_long = 0
         consecutive_sl_short = 0
         cooldown_until_long = 0
         cooldown_until_short = 0
 
+        # --- 証拠金トラッキング用 ---
+        total_used_margin = DECIMAL_ZERO
+        # ▼▼▼ 以下の2行を【削除】してください ▼▼▼
+        # min_margin_level_pct = Decimal("inf")
+        # stop_out_count = 0
         active_exit_times = []
         MAX_POSITIONS = self.config.max_positions
 
@@ -480,16 +554,22 @@ class BacktestSimulator:
                 continue
 
             # =========================================================
-            # 完了したポジションの精算（SLカウントとクールダウン管理）
+            # 完了したポジションの精算（SLカウントと証拠金の解放）
             # =========================================================
             finished_positions = [
                 p for p in pending_exits if p[0] <= current_timestamp_int
             ]
             pending_exits = [p for p in pending_exits if p[0] > current_timestamp_int]
 
-            for exit_time, direction, is_sl in sorted(
+            # ★ 引数に margin_used を追加
+            for exit_time, direction, is_sl, margin_used in sorted(
                 finished_positions, key=lambda x: x[0]
             ):
+                # 証拠金の解放
+                total_used_margin -= margin_used
+                if total_used_margin < DECIMAL_ZERO:
+                    total_used_margin = DECIMAL_ZERO
+
                 if direction == 1:
                     if is_sl:
                         consecutive_sl_long += 1
@@ -498,7 +578,7 @@ class BacktestSimulator:
                                 self.config.cooldown_minutes_after_sl * 60 * 1_000_000
                             )
                             consecutive_sl_long = 0
-                            self.cb_cooldown_long += 1  # ★追加
+                            self.cb_cooldown_long += 1
                     else:
                         consecutive_sl_long = 0
                 else:
@@ -509,7 +589,7 @@ class BacktestSimulator:
                                 self.config.cooldown_minutes_after_sl * 60 * 1_000_000
                             )
                             consecutive_sl_short = 0
-                            self.cb_cooldown_short += 1  # ★追加
+                            self.cb_cooldown_short += 1
                     else:
                         consecutive_sl_short = 0
 
@@ -517,6 +597,29 @@ class BacktestSimulator:
             active_exit_times = [
                 t for t in active_exit_times if t > current_timestamp_int
             ]
+
+            # =========================================================
+            # リアルタイム証拠金維持率のチェック & 強制ロスカット(Stop Out)
+            # =========================================================
+            current_margin_level = Decimal("inf")
+            if total_used_margin > DECIMAL_ZERO:
+                current_margin_level = (current_capital / total_used_margin) * Decimal(
+                    "100.0"
+                )
+                if current_margin_level < self.min_margin_level_pct:  # ★ self. をつける
+                    self.min_margin_level_pct = current_margin_level  # ★ self. をつける
+
+                # ストップアウト（強制ロスカット）発動
+                if current_margin_level <= Decimal(str(self.config.stop_out_percent)):
+                    self.stop_out_count += 1  # ★ self. をつける
+                    # 簡易処理: 証拠金の大部分を失い、全ポジションを強制決済する
+                    current_capital = total_used_margin * (
+                        Decimal(str(self.config.stop_out_percent)) / Decimal("100.0")
+                    )
+                    total_used_margin = DECIMAL_ZERO
+                    pending_exits.clear()
+                    active_exit_times.clear()
+                    continue
 
             # =========================================================
             # 同時発注禁止フィルター
@@ -674,8 +777,21 @@ class BacktestSimulator:
                         ):
                             continue
 
-                        capital_before_pnl = current_capital - spread_cost_decimal
+                        # ▼▼▼ 新規追加: マージンコール（証拠金維持率）チェック ▼▼▼
+                        new_total_margin = total_used_margin + margin_required_decimal
+                        new_margin_level = (
+                            current_capital / new_total_margin
+                        ) * Decimal("100.0")
 
+                        if new_margin_level < Decimal(
+                            str(self.config.margin_call_percent)
+                        ):
+                            continue  # 維持率100%を下回るような過剰なエントリーは拒否
+
+                        total_used_margin = new_total_margin
+                        # ▲▲▲ ここまで追加 ▲▲▲
+
+                        capital_before_pnl = current_capital - spread_cost_decimal
                         pnl = DECIMAL_ZERO
                         is_sl_hit = False  # V5: SL判定フラグ
                         valid_label = (
@@ -778,14 +894,25 @@ class BacktestSimulator:
                         )
                         # ▲▲▲ ここまで追加 ▲▲▲
 
-                        # V5修正: duration_float (分) をマイクロ秒に変換して終了時刻を計算
+                        # ▼▼▼ 修正前 ▼▼▼
+                        # if duration_float is not None and np.isfinite(duration_float):
+                        #     new_exit_time = current_timestamp_int + int(duration_float * 60 * 1_000_000)
+                        #     active_exit_times.append(new_exit_time)
+                        #     pending_exits.append((new_exit_time, direction_int, is_sl_hit))
+
+                        # ▼▼▼ 修正後 ▼▼▼
                         if duration_float is not None and np.isfinite(duration_float):
                             new_exit_time = current_timestamp_int + int(
                                 duration_float * 60 * 1_000_000
                             )
                             active_exit_times.append(new_exit_time)
                             pending_exits.append(
-                                (new_exit_time, direction_int, is_sl_hit)
+                                (
+                                    new_exit_time,
+                                    direction_int,
+                                    is_sl_hit,
+                                    margin_required_decimal,
+                                )
                             )
 
                         traded_in_this_step = True
@@ -1458,6 +1585,9 @@ class BacktestSimulator:
             logging.info(f"Text performance report saved successfully.")
         except Exception as e:
             logging.error(f"Failed to save text performance report: {e}", exc_info=True)
+
+        # ▼▼▼ この行を末尾に追加！ ▼▼▼
+        return report_data
 
 
 if __name__ == "__main__":

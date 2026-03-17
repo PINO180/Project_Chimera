@@ -456,13 +456,13 @@ def main():
 
                         # ▼▼▼ 修正: Optunaの最強パラメータ(Mixed)に準拠 ▼▼▼
                         is_timeout = False
-                        if (
-                            trade.direction == "BUY" and duration_mins >= 120.0
-                        ):  # 15.0 から 120.0 に変更
+                        # コンフィグから個別のTO時間を取得 (デフォルト60.0)
+                        td_long = risk_engine.config.get("td_minutes_long", 60.0)
+                        td_short = risk_engine.config.get("td_minutes_short", 60.0)
+
+                        if trade.direction == "BUY" and duration_mins >= td_long:
                             is_timeout = True
-                        elif (
-                            trade.direction == "SELL" and duration_mins >= 60.0
-                        ):  # 5.0 から 60.0 に変更
+                        elif trade.direction == "SELL" and duration_mins >= td_short:
                             is_timeout = True
 
                         if is_timeout:
@@ -527,8 +527,12 @@ def main():
                                 event_data = {
                                     "ticket": ticket,
                                     "close_reason": reason,  # "SL" または "PT"
-                                    "max_consecutive_sl": 2,
-                                    "cooldown_minutes_after_sl": 10,
+                                    "max_consecutive_sl": risk_engine.config.get(
+                                        "max_consecutive_sl", 2
+                                    ),
+                                    "cooldown_minutes_after_sl": risk_engine.config.get(
+                                        "cooldown_minutes_after_sl", 30
+                                    ),
                                 }
                                 state_manager.apply_event_and_update(
                                     EventType.POSITION_CLOSED, event_data
@@ -794,6 +798,22 @@ def main():
                     # ▼追加: M1バーから取得したリアルタイムスプレッド
                     current_spread = new_m1_bar.get("spread", 16.0)
 
+                    # ▼▼▼ 修正: Long/Shortで独立したSL/PT倍率をコンフィグから取得 ▼▼▼
+                    if direction == "BUY":
+                        current_sl_mult = risk_engine.config.get(
+                            "sl_multiplier_long", 5.0
+                        )
+                        current_tp_mult = risk_engine.config.get(
+                            "pt_multiplier_long", 1.0
+                        )
+                    else:
+                        current_sl_mult = risk_engine.config.get(
+                            "sl_multiplier_short", 5.0
+                        )
+                        current_tp_mult = risk_engine.config.get(
+                            "pt_multiplier_short", 1.0
+                        )
+
                     command = risk_engine.generate_trade_command(
                         action=direction,  # 'BUY' or 'SELL'
                         p_long=p_long_m2_calib,
@@ -801,9 +821,9 @@ def main():
                         current_price=signal.market_info["current_price"],
                         atr=current_atr,
                         equity=state_manager.current_state.current_equity,
-                        sl_multiplier=risk_engine.config.get("sl_multiplier", 5.0),
-                        tp_multiplier=risk_engine.config.get("pt_multiplier", 1.0),
-                        current_spread_pips=current_spread,  # ▼追加
+                        sl_multiplier=current_sl_mult,  # 修正反映
+                        tp_multiplier=current_tp_mult,  # 修正反映
+                        current_spread_pips=current_spread,
                     )
 
                     # V5エンジンは独立したため、ここでイベントログを記録する

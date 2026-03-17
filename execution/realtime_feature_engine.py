@@ -827,17 +827,25 @@ class RealtimeFeatureEngine:
             atr_threshold = self.risk_config.get("min_atr_threshold", 0.0)
 
             if atr_value > atr_threshold:
-                pt_mult = self.risk_config.get("pt_multiplier", 1.0)
-                sl_mult = self.risk_config.get("sl_multiplier", 5.0)
-
+                # ▼▼▼ 修正: 古い unified キーの取得と payoff_ratio を廃止し、Long/Short 分割キーを取得 ▼▼▼
                 market_info = {
                     "atr_value": atr_value,
                     "current_price": current_price,
-                    "pt_multiplier": pt_mult,
-                    "sl_multiplier": sl_mult,
-                    "payoff_ratio": pt_mult / sl_mult if sl_mult > 0 else 0.2,
+                    "sl_multiplier_long": self.risk_config.get(
+                        "sl_multiplier_long", 5.0
+                    ),
+                    "pt_multiplier_long": self.risk_config.get(
+                        "pt_multiplier_long", 1.0
+                    ),
+                    "sl_multiplier_short": self.risk_config.get(
+                        "sl_multiplier_short", 5.0
+                    ),
+                    "pt_multiplier_short": self.risk_config.get(
+                        "pt_multiplier_short", 1.0
+                    ),
                     "direction": None,  # Two-Brain推論前のため未確定とする
                 }
+                # ▲▲▲ ここまで修正 ▲▲▲
 
                 self.logger.info(
                     f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "

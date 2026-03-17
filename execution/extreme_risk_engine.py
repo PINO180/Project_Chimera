@@ -43,8 +43,11 @@ class MarketInfo(TypedDict, total=False):
 
     atr_value: float
     current_price: float
-    pt_multiplier: float
-    sl_multiplier: float
+    # ▼ 修正: 古い pt_multiplier / sl_multiplier を廃止し Long/Short 分割に変更
+    sl_multiplier_long: float
+    pt_multiplier_long: float
+    sl_multiplier_short: float
+    pt_multiplier_short: float
     payoff_ratio: float
     direction: int
 
@@ -63,7 +66,6 @@ class ExtremeRiskEngineV5:
         try:
             with open(config_path, "r") as f:
                 loaded_config = json.load(f)
-                # ▼ config_path を Path(config_path).name に変更してファイル名だけにする
                 logger.info(
                     f"設定ファイル '{Path(config_path).name}' を読み込みました。"
                 )
@@ -79,17 +81,21 @@ class ExtremeRiskEngineV5:
                 "contract_size": 100.0,
                 "min_lot_size": 0.01,
                 "base_leverage": 2000.0,
-                "spread_pips": 16.0,
+                "spread_pips": 36.0,  # 16.0 -> 36.0 (Trial 0同期)
                 "value_per_pip": 1.0,
-                "min_atr_threshold": 0.0,
-                "sl_multiplier": 5.0,
-                "pt_multiplier": 1.0,
+                "min_atr_threshold": 2.0,  # 0.0 -> 2.0 (Trial 0同期)
+                # ▼ 修正: デフォルト値も Long/Short 分割に変更
+                "sl_multiplier_long": 5.0,
+                "pt_multiplier_long": 1.0,
+                "sl_multiplier_short": 5.0,
+                "pt_multiplier_short": 1.0,
                 "m2_proba_threshold": 0.50,
                 "max_drawdown": 0.50,
-                "max_positions": 1000,
+                "max_positions": 100,  # 1000 -> 100 (Trial 0同期)
                 "prevent_simultaneous_orders": True,
                 "max_consecutive_sl": 2,
-                "cooldown_minutes_after_sl": 10,
+                "cooldown_minutes_after_sl": 30,  # 10 -> 30 (Trial 0同期)
+                "fixed_risk_percent": 0.05,  # 追加 (Trial 0同期)
             }
 
     def _get_exness_leverage(self, equity: Decimal) -> Decimal:
@@ -123,7 +129,8 @@ class ExtremeRiskEngineV5:
         lot_per_base: Optional[float] = None,
         effective_leverage_cap: Optional[float] = None,
         atr_value: float = 0.0,
-        current_spread_pips: Optional[float] = None,  # ▼追加: 動的スプレッドを受け取る
+        current_spread_pips: Optional[float] = None,
+        sl_multiplier: float = 5.0,  # ▼追加: 呼び出し元から必ずSL倍率を受け取る
     ) -> float:
         """
         資金比例固定ロット (Auto Lot) を計算し、レバレッジ上限で安全にキャップする
@@ -140,15 +147,17 @@ class ExtremeRiskEngineV5:
         if eq_dec <= 0 or price_dec <= 0 or b_cap_dec <= 0:
             return 0.0
 
-        # ▼▼▼ 修正: 固定比率(Fixed Risk)と固定複利(Auto Lot)の動的分岐 ▼▼▼
         use_fixed_risk = self.config.get("use_fixed_risk", True)
 
         if use_fixed_risk and atr_value > 0.0:
             # --- 厳密な固定比率（Fixed Risk）---
             fixed_risk_percent = Decimal(
-                str(self.config.get("fixed_risk_percent", 0.02))
+                str(
+                    self.config.get("fixed_risk_percent", 0.05)
+                )  # デフォルトを0.05に変更
             )
-            sl_mult = Decimal(str(self.config.get("sl_multiplier", 5.0)))
+            # ▼修正: コンフィグを直接見に行くのではなく、引数として受け取った正確な倍率を使用する
+            sl_mult = Decimal(str(sl_multiplier))
 
             # ▼修正: 動的スプレッドがあればそれを優先し、なければconfig値を使用
             spread_val = (
@@ -233,26 +242,30 @@ class ExtremeRiskEngineV5:
         tp_multiplier: Optional[float] = None,
         base_capital: Optional[float] = None,
         lot_per_base: Optional[float] = None,
-        current_spread_pips: Optional[float] = None,  # ▼追加
+        current_spread_pips: Optional[float] = None,
     ) -> Dict[str, Any]:
         """外部(司令塔)から受け取った確率とパラメータに基づき、最終的な執行コマンドを生成する"""
-        # 仕様書との不整合を吸収するため、未指定時はconfigから取得
-        sl_mult = (
-            sl_multiplier
-            if sl_multiplier is not None
-            else self.config.get("sl_multiplier", 5.0)
-        )
-        tp_mult = (
-            tp_multiplier
-            if tp_multiplier is not None
-            else self.config.get("pt_multiplier", 1.0)
-        )
+
+        # ▼修正: 未指定時は Long/Short の方向に応じて正しいコンフィグキーから取得
+        if sl_multiplier is None:
+            sl_mult = self.config.get(
+                "sl_multiplier_long" if action == "BUY" else "sl_multiplier_short", 5.0
+            )
+        else:
+            sl_mult = sl_multiplier
+
+        if tp_multiplier is None:
+            tp_mult = self.config.get(
+                "pt_multiplier_long" if action == "BUY" else "pt_multiplier_short", 1.0
+            )
+        else:
+            tp_mult = tp_multiplier
 
         if action == "HOLD":
             return self._generate_hold_command("司令塔からのHOLD指示", p_long, p_short)
 
         # 追加: ATR最小閾値フィルター (ボラティリティ枯渇時の発注スキップ)
-        min_atr = self.config.get("min_atr_threshold", 0.0)
+        min_atr = self.config.get("min_atr_threshold", 2.0)  # デフォルト0.0 -> 2.0
         if atr <= min_atr:
             return self._generate_hold_command(
                 f"ATR({atr:.3f})が最小閾値({min_atr})以下のためスキップ",
@@ -260,20 +273,20 @@ class ExtremeRiskEngineV5:
                 p_short,
             )
 
-        # ▼▼▼ 追加: リアルタイム・スプレッドフィルター (サーキットブレーカー) ▼▼▼
         spread_val = (
             current_spread_pips
             if current_spread_pips is not None
-            else self.config.get("spread_pips", 16.0)
+            else self.config.get("spread_pips", 36.0)  # デフォルト16.0 -> 36.0
         )
-        max_spread = self.config.get("max_allowed_spread", 30.0)
+        max_spread = self.config.get(
+            "max_allowed_spread", 50.0
+        )  # デフォルト30.0 -> 50.0
         if spread_val > max_spread:
             return self._generate_hold_command(
                 f"スプレッド({spread_val:.1f}pips)が許容上限({max_spread:.1f}pips)を超過したため発注をブロック",
                 p_long,
                 p_short,
             )
-        # ▲▲▲ ここまで追加 ▲▲▲
 
         direction = 1 if action == "BUY" else -1
 
@@ -283,17 +296,16 @@ class ExtremeRiskEngineV5:
             base_capital=base_capital,
             lot_per_base=lot_per_base,
             atr_value=atr,
-            current_spread_pips=spread_val,  # ▼追加: 動的スプレッドを渡す
+            current_spread_pips=spread_val,
+            sl_multiplier=sl_mult,  # ▼修正: 確定した SL 倍率をロット計算関数にパスする！
         )
-
-        # ▼▼▼ 削除: ニート化防止のため、資金不足によるHOLD処理を撤廃 ▼▼▼
 
         sl_tp = self.calculate_sl_tp(
             entry_price=current_price,
             atr=atr,
             direction=direction,
-            sl_multiplier=sl_multiplier,
-            tp_multiplier=tp_multiplier,
+            sl_multiplier=sl_mult,  # 修正反映
+            tp_multiplier=tp_mult,  # 修正反映
         )
 
         trade_command = {
