@@ -112,15 +112,27 @@ class FeatureModule1A:
         # 1. 統計的モーメント系 (Moments)
         # Polarsの rolling_var / rolling_std に完全準拠するため ddof=1 を明記
         # ---------------------------------------------------------
+        # ▼▼ 修正前: 要素数チェックがないため、配列長1以下の時にNumpy警告および予期せぬ挙動のリスク
         # 分散
-        features["e1a_statistical_variance_10"] = float(
-            np.var(_window(close_arr, 10), ddof=1)
-        )
+        # features["e1a_statistical_variance_10"] = float(
+        #     np.var(_window(close_arr, 10), ddof=1)
+        # )
+        #
+        # # 変動係数 (CV)
+        # mean_w10 = float(np.mean(_window(close_arr, 10)))
+        # std_w10 = float(np.std(_window(close_arr, 10), ddof=1))
+        # features["e1a_statistical_cv_10"] = std_w10 / (mean_w10 + 1e-10)
 
-        # 変動係数 (CV)
-        mean_w10 = float(np.mean(_window(close_arr, 10)))
-        std_w10 = float(np.std(_window(close_arr, 10), ddof=1))
-        features["e1a_statistical_cv_10"] = std_w10 / (mean_w10 + 1e-10)
+        # ▼▼ 修正後: ルール5（最低要素数チェック）とルール3（ゼロ除算保護）の完全適用
+        w10_arr = _window(close_arr, 10)
+        if len(w10_arr) >= 2:
+            features["e1a_statistical_variance_10"] = float(np.var(w10_arr, ddof=1))
+            mean_w10 = float(np.mean(w10_arr))
+            std_w10 = float(np.std(w10_arr, ddof=1))
+            features["e1a_statistical_cv_10"] = std_w10 / (mean_w10 + 1e-10)
+        else:
+            features["e1a_statistical_variance_10"] = np.nan
+            features["e1a_statistical_cv_10"] = np.nan
 
         # 高次モーメント
         _mom = FeatureModule1A._rolling_moment_np
@@ -132,15 +144,33 @@ class FeatureModule1A:
         # ---------------------------------------------------------
         # 2. 高速ローリング統計 (Fast Rolling Stats)
         # ---------------------------------------------------------
+        # ▼▼ 修正前: 同様に配列長チェックが不足
         # ローリング標準偏差
-        features["e1a_fast_rolling_std_10"] = float(
-            np.std(_window(close_arr, 10), ddof=1)
+        # features["e1a_fast_rolling_std_10"] = float(
+        #     np.std(_window(close_arr, 10), ddof=1)
+        # )
+        # features["e1a_fast_rolling_std_20"] = float(
+        #     np.std(_window(close_arr, 20), ddof=1)
+        # )
+        # features["e1a_fast_rolling_std_100"] = float(
+        #     np.std(_window(close_arr, 100), ddof=1)
+        # )
+
+        # ▼▼ 修正後: ルール5に基づく最低2本以上のバッファ要件を追加
+        # ローリング標準偏差
+        w10_fast = _window(close_arr, 10)
+        features["e1a_fast_rolling_std_10"] = (
+            float(np.std(w10_fast, ddof=1)) if len(w10_fast) >= 2 else np.nan
         )
-        features["e1a_fast_rolling_std_20"] = float(
-            np.std(_window(close_arr, 20), ddof=1)
+
+        w20_fast = _window(close_arr, 20)
+        features["e1a_fast_rolling_std_20"] = (
+            float(np.std(w20_fast, ddof=1)) if len(w20_fast) >= 2 else np.nan
         )
-        features["e1a_fast_rolling_std_100"] = float(
-            np.std(_window(close_arr, 100), ddof=1)
+
+        w100_fast = _window(close_arr, 100)
+        features["e1a_fast_rolling_std_100"] = (
+            float(np.std(w100_fast, ddof=1)) if len(w100_fast) >= 2 else np.nan
         )
 
         # 出来高ローリング平均

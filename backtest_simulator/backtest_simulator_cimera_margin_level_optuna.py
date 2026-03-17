@@ -80,7 +80,7 @@ class BacktestConfig:
     # ▼▼▼ 追加: 固定比率資金管理のパラメータ ▼▼▼
     use_fixed_risk: bool = True
     fixed_risk_percent: float = (
-        0.01  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
+        0.05  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
     )
     # ▲▲▲ ここまで追加 ▲▲▲
 
@@ -96,10 +96,10 @@ class BacktestConfig:
     # --- V5 新規: サーキットブレーカーと同時発注禁止 ---
     prevent_simultaneous_orders: bool = True
     max_consecutive_sl: int = 2
-    cooldown_minutes_after_sl: int = 10
+    cooldown_minutes_after_sl: int = 30
 
     base_leverage: float = 2000.0
-    spread_pips: float = 36.0
+    spread_pips: float = 80.0
     value_per_pip: float = 1.0
 
     # ==========================================

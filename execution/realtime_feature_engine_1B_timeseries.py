@@ -196,15 +196,16 @@ def _last(arr: np.ndarray) -> float:
     return float(arr[-1])
 
 
+# ▼▼ 修正前: Polars pct_change() 完全準拠版...
+# ▼▼ 修正後: Rule 3に基づき分母に + 1e-10 を追加し、ゼロ除算を根本から防ぐ
 def _pct_change(arr: np.ndarray) -> np.ndarray:
     """
-    Polars pct_change() 完全準拠版 (先頭にNaN)。
-    ゼロ除算時は inf を返す（Polars 準拠・後段の QA でクリップ）。
+    Polars pct_change() 準拠版 (先頭にNaN)。
+    ゼロ除算を防止するため分母に 1e-10 を追加 (Rule 3準拠)。
     """
     if len(arr) < 2:
         return np.full_like(arr, np.nan)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pct = np.diff(arr) / arr[:-1]
+    pct = np.diff(arr) / (arr[:-1] + 1e-10)
     return np.concatenate(([np.nan], pct))
 
 
@@ -254,7 +255,12 @@ class FeatureModule1B:
         # ---------------------------------------------------------
         # 3. ボラティリティ (Volatility)
         # ---------------------------------------------------------
-        # volatility_20: リターン系列の不偏標準偏差 (ddof=1, Polars 準拠)
-        features["e1b_volatility_20"] = float(np.std(_window(close_pct, 20), ddof=1))
+        # ▼▼ 修正前: features["e1b_volatility_20"] = float(np.std(_window(close_pct, 20), ddof=1))
+        # ▼▼ 修正後: Rule 5/3に基づき、有限値のフィルタリングと最低要素数(2本)のチェックを追加
+        pct_20 = _window(close_pct, 20)
+        valid_pct_20 = pct_20[np.isfinite(pct_20)]
+        features["e1b_volatility_20"] = (
+            float(np.std(valid_pct_20, ddof=1)) if len(valid_pct_20) >= 2 else np.nan
+        )
 
         return features

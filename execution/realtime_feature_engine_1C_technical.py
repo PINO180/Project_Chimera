@@ -521,14 +521,32 @@ class FeatureModule1C:
         features["e1c_atr_trend_13"] = (
             atr_13_arr[-1] - atr_13_arr[-2] if len(atr_13_arr) >= 2 else np.nan
         )
-        features["e1c_atr_volatility_13"] = float(
-            np.std(_window(atr_13_arr, 13), ddof=1)
+
+        # ▼▼ 修正前: 配列長チェックがない
+        # features["e1c_atr_volatility_13"] = float(
+        #     np.std(_window(atr_13_arr, 13), ddof=1)
+        # )
+        # features["e1c_atr_volatility_21"] = float(
+        #     np.std(_window(atr_21_arr, 21), ddof=1)
+        # )
+        # features["e1c_atr_volatility_55"] = float(
+        #     np.std(_window(atr_55_arr, 55), ddof=1)
+        # )
+
+        # ▼▼ 修正後: 配列長が2以上の時のみ標準偏差(ddof=1)を計算
+        w_atr_13 = _window(atr_13_arr, 13)
+        features["e1c_atr_volatility_13"] = (
+            float(np.std(w_atr_13, ddof=1)) if len(w_atr_13) >= 2 else np.nan
         )
-        features["e1c_atr_volatility_21"] = float(
-            np.std(_window(atr_21_arr, 21), ddof=1)
+
+        w_atr_21 = _window(atr_21_arr, 21)
+        features["e1c_atr_volatility_21"] = (
+            float(np.std(w_atr_21, ddof=1)) if len(w_atr_21) >= 2 else np.nan
         )
-        features["e1c_atr_volatility_55"] = float(
-            np.std(_window(atr_55_arr, 55), ddof=1)
+
+        w_atr_55 = _window(atr_55_arr, 55)
+        features["e1c_atr_volatility_55"] = (
+            float(np.std(w_atr_55, ddof=1)) if len(w_atr_55) >= 2 else np.nan
         )
 
         # ---------------------------------------------------------
@@ -546,14 +564,24 @@ class FeatureModule1C:
         # ---------------------------------------------------------
         # 3. ボリンジャーバンド系 (厳選3個)
         # ---------------------------------------------------------
-        bb_mean_30, bb_std_30 = (
-            np.mean(_window(close_arr, 30)),
-            np.std(_window(close_arr, 30), ddof=1),
-        )
-        bb_mean_50, bb_std_50 = (
-            np.mean(_window(close_arr, 50)),
-            np.std(_window(close_arr, 50), ddof=1),
-        )
+        # ▼▼ 修正前: 配列長が0または1の時に落ちるリスク
+        # bb_mean_30, bb_std_30 = (
+        #     np.mean(_window(close_arr, 30)),
+        #     np.std(_window(close_arr, 30), ddof=1),
+        # )
+        # bb_mean_50, bb_std_50 = (
+        #     np.mean(_window(close_arr, 50)),
+        #     np.std(_window(close_arr, 50), ddof=1),
+        # )
+
+        # ▼▼ 修正後: 平均は長1以上、標準偏差は長2以上の制約を明示
+        w_bb_30 = _window(close_arr, 30)
+        bb_mean_30 = float(np.mean(w_bb_30)) if len(w_bb_30) >= 1 else np.nan
+        bb_std_30 = float(np.std(w_bb_30, ddof=1)) if len(w_bb_30) >= 2 else np.nan
+
+        w_bb_50 = _window(close_arr, 50)
+        bb_mean_50 = float(np.mean(w_bb_50)) if len(w_bb_50) >= 1 else np.nan
+        bb_std_50 = float(np.std(w_bb_50, ddof=1)) if len(w_bb_50) >= 2 else np.nan
 
         # Period 30, 2.5
         bb_lower_30_25 = bb_mean_30 - 2.5 * bb_std_30
@@ -657,7 +685,13 @@ class FeatureModule1C:
             )
             features[f"e1c_relative_vigor_index_{p}"] = _last(rvi_arr)
             if p in [10, 20]:
-                features[f"e1c_rvi_signal_{p}"] = np.mean(_window(rvi_arr, 4))
+                # ▼▼ 修正前
+                # features[f"e1c_rvi_signal_{p}"] = np.mean(_window(rvi_arr, 4))
+                # ▼▼ 修正後 (Polarsのrolling_mean(4)の仕様に合わせ、長4未満はNaN)
+                w_rvi = _window(rvi_arr, 4)
+                features[f"e1c_rvi_signal_{p}"] = (
+                    float(np.mean(w_rvi)) if len(w_rvi) >= 4 else np.nan
+                )
 
         # KST
         if len(close_arr) >= 31:
@@ -678,8 +712,14 @@ class FeatureModule1C:
 
         # Trend Strength
         for p in [20, 50]:
-            features[f"e1c_trend_strength_{p}"] = 1.0 / (
-                np.std(_window(close_arr, p), ddof=1) + 1e-10
+            # ▼▼ 修正前
+            # features[f"e1c_trend_strength_{p}"] = 1.0 / (
+            #     np.std(_window(close_arr, p), ddof=1) + 1e-10
+            # )
+            # ▼▼ 修正後
+            w_trend = _window(close_arr, p)
+            features[f"e1c_trend_strength_{p}"] = (
+                1.0 / (np.std(w_trend, ddof=1) + 1e-10) if len(w_trend) >= 2 else np.nan
             )
 
         # Others

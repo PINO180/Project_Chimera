@@ -159,13 +159,9 @@ class ExtremeRiskEngineV5:
             # ▼修正: コンフィグを直接見に行くのではなく、引数として受け取った正確な倍率を使用する
             sl_mult = Decimal(str(sl_multiplier))
 
-            # ▼修正: 動的スプレッドがあればそれを優先し、なければconfig値を使用
-            spread_val = (
-                current_spread_pips
-                if current_spread_pips is not None
-                else self.config.get("spread_pips", 16.0)
-            )
-            spread_pips = Decimal(str(spread_val))
+            # ▼修正: リアルタイムスプレッドの甘い誘惑を無視し、常にコンフィグの最悪想定コスト（固定値）で計算する！
+            # これにより、損切り時のスプレッド拡大による予算（Risk%）のオーバーを完全に防ぎます。
+            spread_pips = Decimal(str(self.config.get("spread_pips", 36.0)))
 
             val_per_pip = Decimal(str(self.config.get("value_per_pip", 1.0)))
 

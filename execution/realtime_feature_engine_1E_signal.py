@@ -396,11 +396,25 @@ class FeatureModule1E:
         # ---------------------------------------------------------
         # 3. 信号統計系指標 (Signal Stats)
         # ---------------------------------------------------------
-        features["e1e_signal_peak_to_peak_100"] = np.max(
-            _window(close_arr, 100)
-        ) - np.min(_window(close_arr, 100))
+        # ▼▼ 修正前: 配列長チェックがないためエラーや警告のリスク
+        # features["e1e_signal_peak_to_peak_100"] = np.max(
+        #     _window(close_arr, 100)
+        # ) - np.min(_window(close_arr, 100))
+        #
+        # features["e1e_signal_rms_50"] = np.sqrt(np.mean(_window(close_pct, 50) ** 2))
 
-        features["e1e_signal_rms_50"] = np.sqrt(np.mean(_window(close_pct, 50) ** 2))
+        # ▼▼ 修正後: 最低要素数のチェックを追加
+        w_sig_100 = _window(close_arr, 100)
+        features["e1e_signal_peak_to_peak_100"] = (
+            float(np.max(w_sig_100) - np.min(w_sig_100))
+            if len(w_sig_100) >= 1
+            else np.nan
+        )
+
+        w_rms_50 = _window(close_pct, 50)
+        features["e1e_signal_rms_50"] = (
+            float(np.sqrt(np.mean(w_rms_50**2))) if len(w_rms_50) >= 1 else np.nan
+        )
 
         # ---------------------------------------------------------
         # 4. スペクトル系指標 (Spectral)
@@ -411,9 +425,26 @@ class FeatureModule1E:
         features["e1e_spectral_flatness_128"] = _last(
             spectral_flatness_udf(_window(close_pct, 128), 128)
         )
-        features["e1e_spectral_energy_64"] = np.sum(_window(close_pct, 64) ** 2)
-        features["e1e_spectral_energy_128"] = np.sum(_window(close_pct, 128) ** 2)
-        features["e1e_spectral_energy_512"] = np.sum(_window(close_pct, 512) ** 2)
+        # ▼▼ 修正前: 配列長チェックがない
+        # features["e1e_spectral_energy_64"] = np.sum(_window(close_pct, 64) ** 2)
+        # features["e1e_spectral_energy_128"] = np.sum(_window(close_pct, 128) ** 2)
+        # features["e1e_spectral_energy_512"] = np.sum(_window(close_pct, 512) ** 2)
+
+        # ▼▼ 修正後: 配列長チェックを追加
+        w_spec_64 = _window(close_pct, 64)
+        features["e1e_spectral_energy_64"] = (
+            float(np.sum(w_spec_64**2)) if len(w_spec_64) >= 1 else np.nan
+        )
+
+        w_spec_128 = _window(close_pct, 128)
+        features["e1e_spectral_energy_128"] = (
+            float(np.sum(w_spec_128**2)) if len(w_spec_128) >= 1 else np.nan
+        )
+
+        w_spec_512 = _window(close_pct, 512)
+        features["e1e_spectral_energy_512"] = (
+            float(np.sum(w_spec_512**2)) if len(w_spec_512) >= 1 else np.nan
+        )
 
         # ---------------------------------------------------------
         # 5. ウェーブレット系指標 (Wavelet)
@@ -421,12 +452,38 @@ class FeatureModule1E:
         features["e1e_wavelet_entropy_64"] = _last(
             wavelet_entropy_udf(_window(close_pct, 64), 64)
         )
-        features["e1e_wavelet_mean_256"] = np.mean(_window(close_pct, 256))
+        # ▼▼ 修正前: 配列長チェックがない
+        # features["e1e_wavelet_mean_256"] = np.mean(_window(close_pct, 256))
+        #
+        # # [QA確認済] Polars準拠の不偏標準偏差 (ddof=1)
+        # features["e1e_wavelet_std_32"] = np.std(_window(close_pct, 32), ddof=1)
+        # features["e1e_wavelet_std_64"] = np.std(_window(close_pct, 64), ddof=1)
+        # features["e1e_wavelet_std_128"] = np.std(_window(close_pct, 128), ddof=1)
+        # features["e1e_wavelet_std_256"] = np.std(_window(close_pct, 256), ddof=1)
 
-        # [QA確認済] Polars準拠の不偏標準偏差 (ddof=1)
-        features["e1e_wavelet_std_32"] = np.std(_window(close_pct, 32), ddof=1)
-        features["e1e_wavelet_std_64"] = np.std(_window(close_pct, 64), ddof=1)
-        features["e1e_wavelet_std_128"] = np.std(_window(close_pct, 128), ddof=1)
-        features["e1e_wavelet_std_256"] = np.std(_window(close_pct, 256), ddof=1)
+        # ▼▼ 修正後: 平均は長1以上、標準偏差は長2以上の制約を追加
+        w_wav_256 = _window(close_pct, 256)
+        features["e1e_wavelet_mean_256"] = (
+            float(np.mean(w_wav_256)) if len(w_wav_256) >= 1 else np.nan
+        )
+
+        w_wav_32 = _window(close_pct, 32)
+        features["e1e_wavelet_std_32"] = (
+            float(np.std(w_wav_32, ddof=1)) if len(w_wav_32) >= 2 else np.nan
+        )
+
+        w_wav_64 = _window(close_pct, 64)
+        features["e1e_wavelet_std_64"] = (
+            float(np.std(w_wav_64, ddof=1)) if len(w_wav_64) >= 2 else np.nan
+        )
+
+        w_wav_128 = _window(close_pct, 128)
+        features["e1e_wavelet_std_128"] = (
+            float(np.std(w_wav_128, ddof=1)) if len(w_wav_128) >= 2 else np.nan
+        )
+
+        features["e1e_wavelet_std_256"] = (
+            float(np.std(w_wav_256, ddof=1)) if len(w_wav_256) >= 2 else np.nan
+        )
 
         return features

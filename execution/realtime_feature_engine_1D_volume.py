@@ -20,12 +20,11 @@ def pct_change_numba(arr: np.ndarray) -> np.ndarray:
     if n < 2:
         return pct
 
+    # ▼▼ 修正前: ゼロチェックのif分岐
+    # ▼▼ 修正後: Rule 3に基づき分母に + 1e-10 を追加しシンプルかつ安全に
     for i in range(1, n):
         prev = arr[i - 1]
-        if prev != 0.0:
-            pct[i] = (arr[i] - prev) / prev
-        else:
-            pct[i] = 0.0
+        pct[i] = (arr[i] - prev) / (prev + 1e-10)
 
     return pct
 
@@ -251,6 +250,10 @@ class FeatureModule1D:
         open_arr = data["open"]
         volume_arr = data["volume"]
 
+        # ▼▼ 追加: Rule 5に基づき、空データ時のIndexError即死を回避
+        if len(close_arr) == 0:
+            return features
+
         # pct_change (ボラティリティ系指標の前処理)
         close_pct = pct_change_numba(close_arr)
 
@@ -273,11 +276,10 @@ class FeatureModule1D:
             _window(close_arr * volume_arr, 10)
         )
 
-        # Polars準拠: ゼロ除算時は np.inf を返す
+        # ▼▼ 修正前: Polars準拠: ゼロ除算時は np.inf を返す分岐
+        # ▼▼ 修正後: Rule 3に基づき分母に 1e-10 を追加し、infを完全に排除
         vol_ma20 = np.mean(_window(volume_arr, 20))
-        features["e1d_volume_ratio"] = (
-            data["volume"][-1] / vol_ma20 if vol_ma20 != 0.0 else np.inf
-        )
+        features["e1d_volume_ratio"] = float(volume_arr[-1] / (vol_ma20 + 1e-10))
 
         # ---------------------------------------------------------
         # 2. Volatility系指標 (HV)
@@ -302,32 +304,27 @@ class FeatureModule1D:
             )
         )
 
-        # Polars準拠: ゼロ除算時は np.inf を返す
-        features["e1d_intraday_return"] = (
-            (close_arr[-1] - open_arr[-1]) / open_arr[-1]
-            if open_arr[-1] != 0.0
-            else np.inf
+        # ▼▼ 修正前: ゼロ除算時は np.inf を返す if/else 分岐
+        # ▼▼ 修正後: 分母に 1e-10 を追加し inf を排除
+        features["e1d_intraday_return"] = float(
+            (close_arr[-1] - open_arr[-1]) / (open_arr[-1] + 1e-10)
         )
 
         hl_range = high_arr[-1] - low_arr[-1]
 
-        features["e1d_lower_wick_ratio"] = (
-            (min(open_arr[-1], close_arr[-1]) - low_arr[-1]) / hl_range
-            if hl_range != 0.0
-            else np.inf
+        features["e1d_lower_wick_ratio"] = float(
+            (min(open_arr[-1], close_arr[-1]) - low_arr[-1]) / (hl_range + 1e-10)
         )
 
         features["e1d_overnight_gap"] = 0.0
         if len(close_arr) > 1:
             prev_close = close_arr[-2]
-            features["e1d_overnight_gap"] = (
-                (open_arr[-1] - prev_close) / prev_close
-                if prev_close != 0.0
-                else np.inf
+            features["e1d_overnight_gap"] = float(
+                (open_arr[-1] - prev_close) / (prev_close + 1e-10)
             )
 
-        features["e1d_price_location_hl"] = (
-            (close_arr[-1] - low_arr[-1]) / hl_range if hl_range != 0.0 else np.inf
+        features["e1d_price_location_hl"] = float(
+            (close_arr[-1] - low_arr[-1]) / (hl_range + 1e-10)
         )
 
         return features
