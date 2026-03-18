@@ -34,6 +34,7 @@ if str(project_root) not in sys.path:
 
 # --- 必要なコンポーネントをインポート ---
 import blueprint as config
+import os  # ▼追加: Configのホットリロード用ファイルの更新日時取得
 from execution.state_manager import (
     StateManager,
     SystemState,
@@ -427,7 +428,7 @@ def main():
             raise RuntimeError(f"モデルまたは特徴量リストのロードに失敗しました: {e}")
 
         # --- 6. リアルタイム特徴量エンジン (マルチバッファ) の初期化 ---
-        logger.info("")  # ★空白行を追加
+        logger.info("")
         logger.info(
             "--- 6. リアルタイム特徴量エンジンの初期化 (ゼロ・シリアライズ) ---"
         )
@@ -435,17 +436,100 @@ def main():
         feature_engine = RealtimeFeatureEngine(
             feature_list_path=str(config.S3_FEATURES_FOR_TRAINING_V5)
         )
-        # ✨ V3 bridge と g_market_proxy を渡す
-        if not initialize_data_buffer(feature_engine, bridge, g_market_proxy):
-            raise RuntimeError("特徴量エンジンのマルチバッファ充填に失敗しました。")
+
+        # ▼▼▼ 修正: スナップショットからの爆速復帰と差分取得 ▼▼▼
+        state_file = config.STATE_CHECKPOINT_DIR / "feature_engine_state.pkl"
+        is_warmed_up = False
+
+        if state_file.exists() and feature_engine.load_state(str(state_file)):
+            logger.info("⚡ スナップショットからの爆速復帰に成功しました！")
+            if len(feature_engine.m1_dataframe) > 0:
+                global g_last_processed_bar_time
+                g_last_processed_bar_time = int(
+                    feature_engine.m1_dataframe[-1]["timestamp"].timestamp()
+                )
+
+                # 差分（ギャップ）の時間を計算
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                diff_minutes = int((now_ts - g_last_processed_bar_time) / 60)
+
+                if diff_minutes > 0:
+                    logger.info(
+                        f"  -> 停止していた {diff_minutes} 分の差分データをM1履歴から取得して穴埋めします..."
+                    )
+                    # 余裕を持たせて diff_minutes + 10 本を取得
+                    diff_df = bridge.request_historical_data(
+                        symbol=STRATEGY_SYMBOL,
+                        timeframe_name="M1",
+                        lookback_bars=diff_minutes + 10,
+                    )
+                    if diff_df is not None and len(diff_df) > 0:
+                        # まだ処理していない新しいバーだけを抽出してエンジンに流し込む
+                        new_bars = diff_df[
+                            diff_df["timestamp"]
+                            > datetime.fromtimestamp(
+                                g_last_processed_bar_time, timezone.utc
+                            )
+                        ]
+                        for _, row in new_bars.iterrows():
+                            bar_dict = {
+                                "timestamp": row["timestamp"],
+                                "open": row["open"],
+                                "high": row["high"],
+                                "low": row["low"],
+                                "close": row["close"],
+                                "volume": float(row["volume"]),
+                                "spread": 16.0,  # 過去の差分なので固定値で代用
+                            }
+                            # プロキシの更新
+                            past_close = feature_engine.m1_dataframe[-25]["close"]
+                            new_proxy_val = (
+                                bar_dict["close"] - past_close
+                            ) / past_close
+                            new_proxy_df = pd.DataFrame(
+                                {"market_proxy": [new_proxy_val]},
+                                index=pd.DatetimeIndex(
+                                    [bar_dict["timestamp"]], tz="UTC"
+                                ),
+                            )
+                            g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
+
+                            feature_engine.process_new_m1_bar(bar_dict, g_market_proxy)
+                            g_last_processed_bar_time = int(
+                                row["timestamp"].timestamp()
+                            )
+
+                        logger.info(
+                            f"✓ 差分 {len(new_bars)} 本の追いつき計算が完了しました！完全に同期しています。"
+                        )
+            is_warmed_up = True
+
+        # スナップショットが無い場合のみ、1時間半のフルウォームアップを行う
+        if not is_warmed_up:
+            if not initialize_data_buffer(feature_engine, bridge, g_market_proxy):
+                raise RuntimeError("特徴量エンジンのマルチバッファ充填に失敗しました。")
+        # ▲▲▲ ここまで修正 ▲▲▲
 
         # --- 7. リアルタイム取引ループ開始 (M1ループ) ---
         logger.info("=" * 60)
         logger.info(f"🚀 リアルタイム取引ループ開始 ")
         logger.info("=" * 60)
 
+        # ▼追加: ホットリロード用のタイムスタンプ監視
+        last_config_mtime = os.path.getmtime(config.CONFIG_RISK)
+
         while True:
             try:
+                # ▼追加: 毎ループ、設定ファイル(risk_config.json)の更新日時をチェック
+                current_mtime = os.path.getmtime(config.CONFIG_RISK)
+                if current_mtime > last_config_mtime:
+                    logger.info(
+                        "⚙️ risk_config.json の更新を検知しました。再起動なしで動的に反映します！"
+                    )
+                    risk_engine = ExtremeRiskEngineV5(
+                        config_path=str(config.CONFIG_RISK)
+                    )
+                    last_config_mtime = current_mtime
                 # ==========================================================
                 # 【シミュレーター完全同期 1】 タイムアウト(TO)決済の監視と実行
                 # ==========================================================
@@ -622,11 +706,9 @@ def main():
                     p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
                     p_short_m1 = calibrators["short_m1"].predict([p_short_m1_raw])[0]
 
-                    # 2. M2モデル (M1の「生」の予測値を特徴量として追加 → 生予測 → 較正)
+                    # 2. M2モデル
                     feature_dict_short = feature_dict.copy()
-                    feature_dict_short["m1_pred_proba"] = (
-                        p_short_m1_raw  # ▼修正: 学習時と同じRaw確率を渡す
-                    )
+                    feature_dict_short["m1_pred_proba"] = p_short_m1_raw
                     X_short_m2 = np.array(
                         [
                             [
@@ -672,11 +754,30 @@ def main():
                     except Exception as e:
                         logger.warning(f"CSVへの書き込みに失敗しました: {e}")
                     # ▲▲▲ ここまで追加 ▲▲▲
-                    # [FIX-5] M2_PROBA_THRESHOLD 定数を参照 (ハードコード 0.50 を廃止)
-                    should_trade_long = p_long_m2_calib > M2_PROBA_THRESHOLD
-                    should_trade_short = p_short_m2_calib > M2_PROBA_THRESHOLD
+                    # ▼▼▼ 修正: Delta (差分) フィルター & Raw確率による判定 ▼▼▼
+                    # risk_config.json から最新の閾値を取得 (デフォルト値は最強設定のTrial 9に準拠)
+                    current_m2_thresh = risk_engine.config.get(
+                        "m2_proba_threshold", 0.30
+                    )
+                    current_m2_delta = risk_engine.config.get(
+                        "m2_delta_threshold", 0.50
+                    )
 
-                    # ▼▼▼ 新規追加: 取引判定時の全特徴量(110個)をCSVに追記する ▼▼▼
+                    p_l = p_long_m2_raw
+                    p_s = p_short_m2_raw
+                    delta = abs(p_l - p_s)
+
+                    should_trade_long = False
+                    should_trade_short = False
+
+                    # 条件1: 差分(Delta)が閾値以上開いていること
+                    # 条件2: 勝つ方の絶対確率自体も最低限の閾値を超えていること
+                    if delta >= current_m2_delta:
+                        if p_l > p_s and p_l > current_m2_thresh:
+                            should_trade_long = True
+                        elif p_s > p_l and p_s > current_m2_thresh:
+                            should_trade_short = True
+                    # ▲▲▲ ここまで修正 ▲▲▲
                     if should_trade_long or should_trade_short:
                         try:
                             dump_csv_path = (
@@ -688,11 +789,8 @@ def main():
                                 dump_csv_path, "a", newline="", encoding="utf-8"
                             ) as f:
                                 writer = csv.writer(f)
-
-                                # 辞書のキー(110個の特徴量名)を取得
                                 feature_keys = list(feature_dict.keys())
 
-                                # ファイルが新規作成された場合のみヘッダーを書き込む
                                 if not file_exists:
                                     header = [
                                         "Timestamp",
@@ -703,21 +801,24 @@ def main():
                                     ] + feature_keys
                                     writer.writerow(header)
 
-                                # 記録するデータの準備
                                 action_str = "BUY" if should_trade_long else "SELL"
+
+                                # ▼▼▼ 修正: CSVに記録する確率もRawにし、m1_pred_proba が 0 にならないよう上書き ▼▼▼
+                                if should_trade_long:
+                                    feature_dict["m1_pred_proba"] = p_long_m1_raw
+                                else:
+                                    feature_dict["m1_pred_proba"] = p_short_m1_raw
+
                                 row_data = [
                                     signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                                     action_str,
                                     signal.market_info["current_price"],
-                                    round(p_long_m2_calib, 4),
-                                    round(p_short_m2_calib, 4),
+                                    round(p_long_m2_raw, 4),  # CalibからRawへ変更
+                                    round(p_short_m2_raw, 4),  # CalibからRawへ変更
                                 ]
-
-                                # 110個の特徴量の値をリストに追加
                                 row_data.extend([feature_dict[k] for k in feature_keys])
-
-                                # CSVに1行追記
                                 writer.writerow(row_data)
+                                # ▲▲▲ ここまで修正 ▲▲▲
 
                             logger.info(
                                 f"💾 エントリー時の全特徴量(110個)をCSVに記録しました: {dump_csv_path.name}"
@@ -874,6 +975,13 @@ def main():
         if state_manager and state_manager.current_state:
             state_manager.save_checkpoint(state_manager.current_state)
             logger.info("最終状態をチェックポイントに保存しました。")
+
+        # ▼▼▼ 追加: 終了時に特徴量エンジンのスナップショットを必ず保存する ▼▼▼
+        if feature_engine:
+            state_file = config.STATE_CHECKPOINT_DIR / "feature_engine_state.pkl"
+            feature_engine.save_state(str(state_file))
+        # ▲▲▲ ここまで追加 ▲▲▲
+
         logger.info("MetaTrader5との接続をシャットダウンしました。")
         logger.info("=" * 60)
         logger.info("👋 Project Forge 正常終了")

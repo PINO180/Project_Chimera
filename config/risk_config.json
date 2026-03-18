@@ -13,7 +13,8 @@
   "td_minutes_long": 60.0,
   "td_minutes_short": 60.0,
   
-  "m2_proba_threshold": 0.50,
+  "m2_proba_threshold": 0.30,
+  "m2_delta_threshold": 0.50,
   "max_consecutive_sl": 2,
   "cooldown_minutes_after_sl": 30,
   

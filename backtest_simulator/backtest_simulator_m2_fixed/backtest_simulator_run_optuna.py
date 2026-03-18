@@ -1,6 +1,5 @@
 # /workspace/backtest_simulator/backtest_simulator_run_optuna.py
 import sys
-import shutil  # ★追加: ファイルコピー用
 from pathlib import Path
 import logging
 import optuna
@@ -56,38 +55,20 @@ def objective(trial: optuna.Trial):
     m2_th = trial.suggest_categorical(
         "m2_th",
         [
-            # 0.00,
-            # 0.10,
+            0.00,
+            0.10,
             # 0.20,
-            0.30,
-            # 0.40,
-            # 0.50,
+            # 0.30,
+            0.40,
+            0.50,
             # 0.55,
-            # 0.60,
+            0.60,
             # 0.70,
             # 0.80,
             # 0.90,
             # 0.95,
         ],
     )
-
-    # ▼▼▼ 追加: 差分(Delta)の探索パラメータ ▼▼▼
-    m2_delta = trial.suggest_categorical(
-        "m2_delta",
-        [
-            0.00,  # 差分ゼロ（Trial 7 の完全同意モードを含む）
-            # 0.10,
-            # 0.20,
-            0.30,
-            # 0.40,
-            0.50,  # 圧倒的優勢モード
-            # 0.60,
-            # 0.70,
-            0.80,
-        ],
-    )
-    # ▲▲▲ ここまで追加 ▲▲▲
-
     max_pos = trial.suggest_categorical(
         "max_positions",
         [
@@ -100,7 +81,7 @@ def objective(trial: optuna.Trial):
         [
             # 1,
             2,
-            # 3,
+            3,
         ],
     )
     cooldown = trial.suggest_categorical(
@@ -119,12 +100,12 @@ def objective(trial: optuna.Trial):
         use_fixed_risk=True,
         fixed_risk_percent=fixed_risk_pct,
         m2_proba_threshold=m2_th,
-        m2_delta_threshold=m2_delta,  # ★追加
         max_positions=max_pos,
         max_consecutive_sl=max_cons_sl,
         cooldown_minutes_after_sl=cooldown,
         test_limit_partitions=OPTUNA_TEST_LIMIT,
         oof_mode=True,
+        # --- 既にエッジが証明された固定パラメータ ---
         min_atr_threshold=2.0,
         sl_multiplier_long=5.0,
         pt_multiplier_long=1.0,
@@ -132,21 +113,26 @@ def objective(trial: optuna.Trial):
         pt_multiplier_short=1.0,
         td_minutes_long=60.0,
         td_minutes_short=60.0,
+        # --- 実運用レベルの安全装置設定 ---
         margin_call_percent=100.0,
         stop_out_percent=20.0,
     )
 
     logging.info(f"--- Starting Trial {trial.number} ---")
     logging.info(
-        f"Params: Risk={fixed_risk_pct * 100:.0f}%, M2_th={m2_th}, Delta={m2_delta}, MaxSL={max_cons_sl}"
+        f"Params: Risk={fixed_risk_pct * 100:.1f}%, M2={m2_th}, MaxPos={max_pos}, MaxSL={max_cons_sl}, Cooldown={cooldown}m"
     )
 
+    # =========================================================
+    # 3. シミュレーターの実行と結果の取得（★オンメモリデータを使用）
+    # =========================================================
     logger = logging.getLogger()
     original_level = logger.level
     logger.setLevel(logging.WARNING)  # ループ中は余計なログを消す
 
     try:
         simulator = BacktestSimulator(config)
+        # ★ ここでグローバル変数にキャッシュしておいたデータを引数として渡す！
         report_data = simulator.run(preloaded_data=global_preloaded_data)
     except Exception as e:
         logger.setLevel(original_level)
@@ -154,30 +140,6 @@ def objective(trial: optuna.Trial):
         raise optuna.exceptions.TrialPruned()
 
     logger.setLevel(original_level)
-
-    # =========================================================
-    # ★追加: 出力された4つのファイルを専用フォルダに退避させる
-    # =========================================================
-    # シミュレーターがファイルを出力する元の場所
-    src_dir = Path("/workspace/data/XAUUSD/stratum_7_models/1A_2B")
-
-    # フォルダ名に m2_th と m2_delta も含めて分かりやすくする
-    folder_name = f"Trial_{trial.number}_Th{m2_th}_Delta{m2_delta}_Risk{fixed_risk_pct * 100:.0f}_SL{max_cons_sl}"
-    dst_dir = Path(f"/workspace/backtest_simulator/optuna_results/{folder_name}")
-    dst_dir.mkdir(parents=True, exist_ok=True)
-
-    files_to_copy = [
-        "final_backtest_report_v5.json",
-        "final_backtest_report_v5.txt",
-        "equity_curve_v5.png",
-        "detailed_trade_log_v5.csv",
-    ]
-
-    for fname in files_to_copy:
-        src_file = src_dir / fname
-        if src_file.exists():
-            shutil.copy2(src_file, dst_dir / fname)
-    # =========================================================
 
     # =========================================================
     # 4. 評価指標の抽出 ＆ CSV保存用の属性セット
@@ -202,7 +164,7 @@ def objective(trial: optuna.Trial):
     )
 
     # =========================================================
-    # 5. ペナルティ判定
+    # 5. ペナルティ判定（破産・危険水域・ドローダウン超過の排除）
     # =========================================================
     if trades < 50:
         raise optuna.exceptions.TrialPruned()
@@ -217,7 +179,11 @@ def objective(trial: optuna.Trial):
         penalty = (150.0 - min_margin) * 10
         sharpe -= penalty
 
+    # =========================================================
+    # 6. 最終スコアの計算
+    # =========================================================
     score = sharpe + (profit_factor * 0.1)
+
     return float(score)
 
 
@@ -277,9 +243,7 @@ if __name__ == "__main__":
     # Optuna 最適化セッションの開始
     # =========================================================
     db_path = "sqlite:///optuna_v5_tuning.db"
-
-    # ▼修正: 新しいパラメータ(Delta)専用のテーブル名にする
-    study_name = "v5_delta_filter_optimization"
+    study_name = "v5_money_management_optimization"
 
     study = optuna.create_study(
         study_name=study_name,
@@ -291,7 +255,7 @@ if __name__ == "__main__":
 
     logging.info(f"Starting Optuna optimization. Study: {study_name}")
 
-    n_trials = 5
+    n_trials = 200
 
     # ★ 修正ポイント：callbacks=[save_csv_callback] を追加！
     # これにより、1周（約2分）終わるごとに自動でCSVが更新されます

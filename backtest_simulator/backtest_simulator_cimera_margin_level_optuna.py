@@ -63,7 +63,7 @@ CONTRACT_SIZE = Decimal("100")  # 1 lot = 100 oz
 class BacktestConfig:
     """シミュレーションの全パラメータを一元管理 (V5 Two-Brain Architecture)"""
 
-    initial_capital: float = 200.0
+    initial_capital: float = 1000.0
     simulation_data_path: Path = S6_WEIGHTED_DATASET
 
     # V5: Long/Short独立のOOF予測パス
@@ -85,6 +85,8 @@ class BacktestConfig:
     # ▲▲▲ ここまで追加 ▲▲▲
 
     m2_proba_threshold: float = 0.50
+    m2_delta_threshold: float = 0.50  # ★追加: LongとShortの確率の差分(Delta)閾値
+
     test_limit_partitions: int = 0
     oof_mode: bool = True
     min_capital_threshold: float = 1.0
@@ -99,7 +101,7 @@ class BacktestConfig:
     cooldown_minutes_after_sl: int = 30
 
     base_leverage: float = 2000.0
-    spread_pips: float = 80.0
+    spread_pips: float = 36.0
     value_per_pip: float = 1.0
 
     # ==========================================
@@ -622,19 +624,28 @@ class BacktestSimulator:
                     continue
 
             # =========================================================
-            # 同時発注禁止フィルター
+            # V5改修: Delta (差分) フィルター & 同時発注禁止ロジック
             # =========================================================
-            should_trade_long = p_long_chunk[i] > self.config.m2_proba_threshold
-            should_trade_short = p_short_chunk[i] > self.config.m2_proba_threshold
+            p_l = p_long_chunk[i]
+            p_s = p_short_chunk[i]
 
-            if (
-                self.config.prevent_simultaneous_orders
-                and should_trade_long
-                and should_trade_short
-            ):
-                should_trade_long = False
-                should_trade_short = False
-                self.cb_simultaneous_prevented += 1  # ★追加
+            should_trade_long = False
+            should_trade_short = False
+
+            # LongとShortの確率の差分（Delta）を計算
+            delta = abs(p_l - p_s)
+
+            # 条件1: 差分(Delta)が閾値以上開いていること
+            # 条件2: 勝つ方の絶対確率自体も最低限の閾値(m2_proba_threshold)を超えていること
+            if delta >= self.config.m2_delta_threshold:
+                if p_l > p_s and p_l > self.config.m2_proba_threshold:
+                    should_trade_long = True
+                elif p_s > p_l and p_s > self.config.m2_proba_threshold:
+                    should_trade_short = True
+
+            # 両方Falseのまま（差分が足りない、または絶対確率が足りない）場合はブロックカウント
+            if not should_trade_long and not should_trade_short:
+                self.cb_simultaneous_prevented += 1
 
             # =========================================================
             # V5 両建て評価ロジック (Long -> Short の順で独立評価)
@@ -1640,6 +1651,15 @@ if __name__ == "__main__":
         dest="m2_th",
         help=f"Min M2 prob threshold. Default: {default_config.m2_proba_threshold}",
     )
+    # ▼▼▼ 追加: 差分(Delta)閾値用の引数 ▼▼▼
+    parser.add_argument(
+        "--m2-delta",
+        type=float,
+        default=default_config.m2_delta_threshold,
+        dest="m2_delta",
+        help=f"Min M2 probability delta (difference between L and S). Default: {default_config.m2_delta_threshold}",
+    )
+    # ▲▲▲ ここまで追加 ▲▲▲
     parser.add_argument(
         "--min-capital",
         type=float,
@@ -1765,6 +1785,7 @@ if __name__ == "__main__":
         fixed_risk_percent=default_config.fixed_risk_percent,
         base_leverage=args.base_leverage,
         m2_proba_threshold=args.m2_th,
+        m2_delta_threshold=args.m2_delta,  # ★これを追加！
         test_limit_partitions=args.test_limit_partitions,
         oof_mode=True,
         min_capital_threshold=args.min_capital,

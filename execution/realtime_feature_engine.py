@@ -18,6 +18,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import json
 import re
+import pickle  # ▼追加: スナップショット保存用
+import os  # ▼追加: ファイル存在確認用
 import blueprint as config
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
@@ -1103,3 +1105,57 @@ class RealtimeFeatureEngine:
         except Exception as e:
             self.logger.error(f"Vector calculation error: {e}")
             return None
+
+    # ▼▼▼ 追加: スナップショット（Pickle）保存とロード機能 ▼▼▼
+    def save_state(self, filepath: str) -> bool:
+        """現在の特徴量バッファとOLS状態を丸ごとファイルに保存する"""
+        try:
+            state_data = {
+                "data_buffers": self.data_buffers,
+                "is_buffer_filled": self.is_buffer_filled,
+                "last_bar_timestamps": self.last_bar_timestamps,
+                "latest_features_cache": self.latest_features_cache,
+                "m1_dataframe": self.m1_dataframe,
+                "proxy_feature_buffers": self.proxy_feature_buffers,
+                "ols_state": self.ols_state,
+            }
+            with open(filepath, "wb") as f:
+                pickle.dump(state_data, f)
+            self.logger.info(
+                f"✓ 特徴量エンジンの状態をスナップショット保存しました: {filepath}"
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"✗ 特徴量エンジンの状態保存に失敗: {e}", exc_info=True)
+            return False
+
+    def load_state(self, filepath: str) -> bool:
+        """保存されたファイルから特徴量バッファとOLS状態を瞬時に復元する"""
+        if not os.path.exists(filepath):
+            return False
+
+        try:
+            with open(filepath, "rb") as f:
+                state_data = pickle.load(f)
+
+            self.data_buffers = state_data["data_buffers"]
+            self.is_buffer_filled = state_data["is_buffer_filled"]
+            self.last_bar_timestamps = state_data["last_bar_timestamps"]
+            self.latest_features_cache = state_data["latest_features_cache"]
+            self.m1_dataframe = state_data["m1_dataframe"]
+
+            # 後方互換性のため get() を使用
+            self.proxy_feature_buffers = state_data.get(
+                "proxy_feature_buffers", self.proxy_feature_buffers
+            )
+            self.ols_state = state_data.get("ols_state", self.ols_state)
+
+            self.logger.info(
+                f"✓ 特徴量エンジンの状態をスナップショットから復元しました: {filepath}"
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"✗ 特徴量エンジンの状態復元に失敗: {e}", exc_info=True)
+            return False
+
+    # ▲▲▲ ここまで追加 ▲▲▲
