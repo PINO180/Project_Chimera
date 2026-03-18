@@ -858,19 +858,21 @@ def main():
                         should_trade_short = False
 
                     # --- 3. ドローダウン上限チェック (防衛線3) ---
+                    current_max_dd = risk_engine.config.get("max_drawdown", 1.0)
                     current_dd = state_manager.current_state.current_drawdown
-                    if current_dd >= MAX_DRAWDOWN:
+                    if current_dd >= current_max_dd:
                         logger.warning(
-                            f"🛑 【防衛線3】最大ドローダウン超過 ({current_dd:.1%} >= {MAX_DRAWDOWN:.1%})。全エントリーを停止します。"
+                            f"🛑 【防衛線3】最大ドローダウン超過 ({current_dd:.1%} >= {current_max_dd:.1%})。全エントリーを停止します。"
                         )
                         should_trade_long = False
                         should_trade_short = False
 
                     # --- 4. 最大ポジション数チェック (防衛線4) ---
+                    current_max_pos = risk_engine.config.get("max_positions", 100)
                     current_pos_count = len(state_manager.current_state.trades)
-                    if current_pos_count >= MAX_POSITIONS:
+                    if current_pos_count >= current_max_pos:
                         logger.warning(
-                            f"🛑 【防衛線4】最大ポジション数到達 ({current_pos_count}/{MAX_POSITIONS})。新規エントリーを停止します。"
+                            f"🛑 【防衛線4】最大ポジション数到達 ({current_pos_count}/{current_max_pos})。新規エントリーを停止します。"
                         )
                         should_trade_long = False
                         should_trade_short = False
