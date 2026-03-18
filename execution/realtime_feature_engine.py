@@ -855,6 +855,12 @@ class RealtimeFeatureEngine:
                 )
                 return {"is_V5": True, "market_info": market_info}
             else:
+                # ▼▼▼ 追加: ATR不足で見送った時のログ ▼▼▼
+                self.logger.info(
+                    f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
+                    f"FAILED ⛔ (ATR: {atr_value:.2f} <= {atr_threshold:.2f})"
+                )
+                # ▲▲▲ ここまで追加 ▲▲▲
                 return {"is_V5": False, "reason": "below_min_atr_threshold"}
 
         except Exception as e:

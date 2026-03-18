@@ -722,14 +722,12 @@ def main():
                         [p_short_m2_raw]
                     )[0]
 
+                    # ▼▼▼ 修正: 生(Raw)確率のみをスッキリ1行で表示 ▼▼▼
                     logger.info(
-                        f"🧠 [M1 Raw->Calib] Long: {p_long_m1_raw:.4f} -> {p_long_m1:.4f} | "
-                        f"Short: {p_short_m1_raw:.4f} -> {p_short_m1:.4f}"
+                        f"🧠 [Raw Proba] M1(L: {p_long_m1_raw:.4f}, S: {p_short_m1_raw:.4f}) -> "
+                        f"M2(L: {p_long_m2_raw:.4f}, S: {p_short_m2_raw:.4f})"
                     )
-                    logger.info(
-                        f"🧠 [M2 Raw->Calib] Long: {p_long_m2_raw:.4f} -> {p_long_m2_calib:.4f} | "
-                        f"Short: {p_short_m2_raw:.4f} -> {p_short_m2_calib:.4f}"
-                    )
+                    # ▲▲▲ ここまで修正 ▲▲▲
 
                     # ▼▼▼ 追加: Excel用CSVに1行追記 ▼▼▼
                     try:
@@ -754,8 +752,8 @@ def main():
                     except Exception as e:
                         logger.warning(f"CSVへの書き込みに失敗しました: {e}")
                     # ▲▲▲ ここまで追加 ▲▲▲
-                    # ▼▼▼ 修正: Delta (差分) フィルター & Raw確率による判定 ▼▼▼
-                    # risk_config.json から最新の閾値を取得 (デフォルト値は最強設定のTrial 9に準拠)
+
+                    # ▼▼▼ 修正: Delta (差分) フィルター & 判定理由の明記 ▼▼▼
                     current_m2_thresh = risk_engine.config.get(
                         "m2_proba_threshold", 0.30
                     )
@@ -770,13 +768,26 @@ def main():
                     should_trade_long = False
                     should_trade_short = False
 
-                    # 条件1: 差分(Delta)が閾値以上開いていること
-                    # 条件2: 勝つ方の絶対確率自体も最低限の閾値を超えていること
+                    # 条件分岐ごとに、弾いた理由（または通した理由）をログに出力
                     if delta >= current_m2_delta:
                         if p_l > p_s and p_l > current_m2_thresh:
                             should_trade_long = True
+                            logger.info(
+                                f"🎯 [Delta Filter: PASS] Delta {delta:.4f} >= {current_m2_delta} 尚且つ Long({p_l:.4f}) > {current_m2_thresh}"
+                            )
                         elif p_s > p_l and p_s > current_m2_thresh:
                             should_trade_short = True
+                            logger.info(
+                                f"🎯 [Delta Filter: PASS] Delta {delta:.4f} >= {current_m2_delta} 尚且つ Short({p_s:.4f}) > {current_m2_thresh}"
+                            )
+                        else:
+                            logger.info(
+                                f"🚧 [Delta Filter: SKIP] 確信度不足 (勝つ方の確率が閾値 {current_m2_thresh} 以下)"
+                            )
+                    else:
+                        logger.info(
+                            f"🚧 [Delta Filter: SKIP] 差分不足 (Delta {delta:.4f} < 閾値 {current_m2_delta})"
+                        )
                     # ▲▲▲ ここまで修正 ▲▲▲
                     if should_trade_long or should_trade_short:
                         try:
