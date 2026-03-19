@@ -389,15 +389,7 @@ def main():
                 "short_m2": joblib.load(config.S7_M2_MODEL_SHORT_PKL),
             }
 
-            # 2. 確率較正モデル (IsotonicRegression) [FIX: M1較正器のロードを追加]
-            calibrators = {
-                "long_m1": joblib.load(config.S7_M1_CALIBRATED_LONG),
-                "short_m1": joblib.load(config.S7_M1_CALIBRATED_SHORT),
-                "long_m2": joblib.load(config.S7_M2_CALIBRATED_LONG),
-                "short_m2": joblib.load(config.S7_M2_CALIBRATED_SHORT),
-            }
-
-            # 3. 専用特徴量リストの読み込み関数
+            # 2. 専用特徴量リストの読み込み関数
             def load_feature_list(filepath: Path) -> list:
                 with open(filepath, "r") as f:
                     return [
@@ -665,71 +657,83 @@ def main():
                         f"🔍 {signal.timeframe} R4 シグナル検知 @ {signal.market_info['current_price']:.3f}"
                     )
 
+                    # ▼▼▼ 追加: 現在の保有ポジション数の集計と表示 ▼▼▼
+                    current_longs = sum(
+                        1
+                        for t in state_manager.current_state.trades
+                        if t.direction == "BUY"
+                    )
+                    current_shorts = sum(
+                        1
+                        for t in state_manager.current_state.trades
+                        if t.direction == "SELL"
+                    )
+                    logger.info(
+                        f"📊 現在の保有ポジション: Long {current_longs} / Short {current_shorts} (Total {current_longs + current_shorts})"
+                    )
+                    # ▲▲▲ ここまで追加 ▲▲▲
+
                     # 全特徴量を持つ辞書を作成 (リストの場合は feature_engine.feature_names と zip して辞書化する想定)
                     # 例: feature_dict = dict(zip(feature_engine.feature_names, signal.features))
                     feature_dict = signal.feature_dict.copy()
 
                     # --------------------------------------------------
-                    # 【Long側】 Two-Brain 推論と Isotonic 較正
+                    # 【Long側】 Two-Brain 推論
                     # --------------------------------------------------
-                    # 1. M1モデル (生の予測値 → 較正)
+                    # 1. M1モデル (生の予測値のみ)
                     X_long_m1 = np.array(
                         [[feature_dict.get(f, 0.0) for f in feature_lists["long_m1"]]]
                     )
                     p_long_m1_raw = models["long_m1"].predict(X_long_m1)[0]
-                    p_long_m1 = calibrators["long_m1"].predict([p_long_m1_raw])[0]
 
-                    # 2. M2モデル (M1の「生」の予測値を特徴量として追加 → 生予測 → 較正)
-                    feature_dict_long = feature_dict.copy()
-                    feature_dict_long["m1_pred_proba"] = (
-                        p_long_m1_raw  # ▼修正: 学習時と同じRaw確率を渡す
-                    )
-
-                    X_long_m2 = np.array(
-                        [
+                    # 2. M2モデル (M1が0.50以上の場合のみ推論、それ以外は強制0.0)
+                    if p_long_m1_raw >= 0.50:
+                        feature_dict_long = feature_dict.copy()
+                        feature_dict_long["m1_pred_proba"] = p_long_m1_raw
+                        X_long_m2 = np.array(
                             [
-                                feature_dict_long.get(f, 0.0)
-                                for f in feature_lists["long_m2"]
+                                [
+                                    feature_dict_long.get(f, 0.0)
+                                    for f in feature_lists["long_m2"]
+                                ]
                             ]
-                        ]
-                    )
-                    p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
-                    p_long_m2_calib = calibrators["long_m2"].predict([p_long_m2_raw])[0]
+                        )
+                        p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
+                    else:
+                        p_long_m2_raw = 0.0
 
                     # --------------------------------------------------
-                    # 【Short側】 Two-Brain 推論と Isotonic 較正
+                    # 【Short側】 Two-Brain 推論
                     # --------------------------------------------------
-                    # 1. M1モデル (生の予測値 → 較正)
+                    # 1. M1モデル (生の予測値のみ)
                     X_short_m1 = np.array(
                         [[feature_dict.get(f, 0.0) for f in feature_lists["short_m1"]]]
                     )
                     p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
-                    p_short_m1 = calibrators["short_m1"].predict([p_short_m1_raw])[0]
 
-                    # 2. M2モデル
-                    feature_dict_short = feature_dict.copy()
-                    feature_dict_short["m1_pred_proba"] = p_short_m1_raw
-                    X_short_m2 = np.array(
-                        [
+                    # 2. M2モデル (M1が0.50以上の場合のみ推論、それ以外は強制0.0)
+                    if p_short_m1_raw >= 0.50:
+                        feature_dict_short = feature_dict.copy()
+                        feature_dict_short["m1_pred_proba"] = p_short_m1_raw
+                        X_short_m2 = np.array(
                             [
-                                feature_dict_short.get(f, 0.0)
-                                for f in feature_lists["short_m2"]
+                                [
+                                    feature_dict_short.get(f, 0.0)
+                                    for f in feature_lists["short_m2"]
+                                ]
                             ]
-                        ]
-                    )
-                    p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
-                    p_short_m2_calib = calibrators["short_m2"].predict(
-                        [p_short_m2_raw]
-                    )[0]
+                        )
+                        p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
+                    else:
+                        p_short_m2_raw = 0.0
 
-                    # ▼▼▼ 修正: 生(Raw)確率のみをスッキリ1行で表示 ▼▼▼
+                    # ▼▼▼ 生(Raw)確率のみをスッキリ1行で表示 ▼▼▼
                     logger.info(
                         f"🧠 [Raw Proba] M1(L: {p_long_m1_raw:.4f}, S: {p_short_m1_raw:.4f}) -> "
                         f"M2(L: {p_long_m2_raw:.4f}, S: {p_short_m2_raw:.4f})"
                     )
-                    # ▲▲▲ ここまで修正 ▲▲▲
 
-                    # ▼▼▼ 追加: Excel用CSVに1行追記 ▼▼▼
+                    # ▼▼▼ Excel用CSVに1行追記 ▼▼▼
                     try:
                         with open(
                             predictions_csv_path, "a", newline="", encoding="utf-8"
@@ -740,13 +744,13 @@ def main():
                                     signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                                     signal.market_info["current_price"],
                                     round(p_long_m1_raw, 4),
-                                    round(p_long_m1, 4),
+                                    0.0,  # 廃止(M1 Calib)
                                     round(p_short_m1_raw, 4),
-                                    round(p_short_m1, 4),
+                                    0.0,  # 廃止(M1 Calib)
                                     round(p_long_m2_raw, 4),
-                                    round(p_long_m2_calib, 4),
+                                    0.0,  # 廃止(M2 Calib)
                                     round(p_short_m2_raw, 4),
-                                    round(p_short_m2_calib, 4),
+                                    0.0,  # 廃止(M2 Calib)
                                 ]
                             )
                     except Exception as e:
@@ -894,10 +898,10 @@ def main():
 
                     if should_trade_long:
                         direction = "BUY"
-                        final_proba = p_long_m2_calib
+                        final_proba = p_long_m2_raw
                     elif should_trade_short:
                         direction = "SELL"
-                        final_proba = p_short_m2_calib
+                        final_proba = p_short_m2_raw
                     else:
                         continue  # どちらもFalseなら見送り (次のループへ)
                     logger.info(
@@ -930,8 +934,8 @@ def main():
 
                     command = risk_engine.generate_trade_command(
                         action=direction,  # 'BUY' or 'SELL'
-                        p_long=p_long_m2_calib,
-                        p_short=p_short_m2_calib,
+                        p_long=p_long_m2_raw,
+                        p_short=p_short_m2_raw,
                         current_price=signal.market_info["current_price"],
                         atr=current_atr,
                         equity=state_manager.current_state.current_equity,
