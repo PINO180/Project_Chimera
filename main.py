@@ -484,7 +484,14 @@ def main():
                                     [bar_dict["timestamp"]], tz="UTC"
                                 ),
                             )
-                            g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
+                            # ▼▼▼ FutureWarning対策: 空の場合はconcatせずに代入 ▼▼▼
+                            if g_market_proxy.empty:
+                                g_market_proxy = new_proxy_df
+                            else:
+                                g_market_proxy = pd.concat(
+                                    [g_market_proxy, new_proxy_df]
+                                )
+                            # ▲▲▲ ここまで修正 ▲▲▲
 
                             feature_engine.process_new_m1_bar(bar_dict, g_market_proxy)
                             g_last_processed_bar_time = int(
@@ -494,6 +501,14 @@ def main():
                         logger.info(
                             f"✓ 差分 {len(new_bars)} 本の追いつき計算が完了しました！完全に同期しています。"
                         )
+
+                    # ▼▼▼ 追加: 穴埋め完了直後に確実にセーブする ▼▼▼
+                    feature_engine.save_state(str(state_file))
+                    logger.info(
+                        "💾 追いつき後の最新状態をスナップショットに保存しました。"
+                    )
+                    # ▲▲▲ ここまで追加 ▲▲▲
+
             is_warmed_up = True
 
         # スナップショットが無い場合のみ、1時間半のフルウォームアップを行う
@@ -509,9 +524,25 @@ def main():
 
         # ▼追加: ホットリロード用のタイムスタンプ監視
         last_config_mtime = os.path.getmtime(config.CONFIG_RISK)
+        # ▼追加: 定期セーブ用のタイマー
+        last_snapshot_time = time.time()
 
         while True:
             try:
+                # ▼▼▼ 追加: 15分間隔でスナップショットを強制保存 ▼▼▼
+                current_time_sec = time.time()
+                if current_time_sec - last_snapshot_time > 900:  # 900秒 = 15分
+                    if feature_engine:
+                        state_file = (
+                            config.STATE_CHECKPOINT_DIR / "feature_engine_state.pkl"
+                        )
+                        feature_engine.save_state(str(state_file))
+                        logger.info(
+                            "💾 [定期保存] 特徴量エンジンの状態をスナップショットに保存しました。"
+                        )
+                    last_snapshot_time = current_time_sec
+                # ▲▲▲ ここまで追加 ▲▲▲
+
                 # ▼追加: 毎ループ、設定ファイル(risk_config.json)の更新日時をチェック
                 current_mtime = os.path.getmtime(config.CONFIG_RISK)
                 if current_mtime > last_config_mtime:
@@ -636,7 +667,12 @@ def main():
                             {"market_proxy": [new_proxy_val]},
                             index=pd.DatetimeIndex([new_m1_bar["timestamp"]], tz="UTC"),
                         )
-                        g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
+                        # ▼▼▼ FutureWarning対策: 空の場合はconcatせずに代入 ▼▼▼
+                        if g_market_proxy.empty:
+                            g_market_proxy = new_proxy_df
+                        else:
+                            g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
+                        # ▲▲▲ ここまで修正 ▲▲▲
                         # メモリ溢れ保護
                         if len(g_market_proxy) > 10000:
                             g_market_proxy = g_market_proxy.iloc[-5000:]

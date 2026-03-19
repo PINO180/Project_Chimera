@@ -7,6 +7,11 @@ import pandas as pd
 import logging
 
 # ▼▼▼ 追加: Numpyの無害な計算警告をミュートしてログをクリーンに保つ ▼▼▼
+# 【アーキテクチャ設計メモ】
+# Numpyのゼロ除算(RuntimeWarning)に関して、全ての割り算にif文等の安全装置をつけて
+# 「完全準拠」させると、C言語レベルのベクトル計算の恩恵が失われシステムが重くなる。
+# そのため、ここではあえて警告をミュートし、途中でinfやNaNが発生しても最高速で計算を回す。
+# 発生した異常値は、最終出口(calculate_feature_vector)で一括洗浄するのがクオンツとしての正解。
 np.seterr(divide="ignore", invalid="ignore")
 import warnings
 
@@ -1103,6 +1108,9 @@ class RealtimeFeatureEngine:
                 val = self.latest_features_cache[target_tf].get(base_name, 0.0)
                 vector.append(val)
 
+            # 【アーキテクチャ設計メモ: 最強の出口フィルター】
+            # ファイル冒頭でミュートしたNumpyのゼロ除算等による異常値(inf, NaN)は、
+            # AIモデル(LightGBM)に渡る直前のここで、一括して安全な 0.0 に浄化される。
             final_vector = np.nan_to_num(
                 np.array(vector, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
             )
