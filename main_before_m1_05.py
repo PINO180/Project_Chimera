@@ -260,7 +260,6 @@ def get_latest_m1_bar(bridge: MQL5BridgePublisherV3) -> Optional[Dict[str, Any]]
 
     # ✨ ZMQ リクエストを送信
     bar = bridge.request_latest_m1_bar(symbol=STRATEGY_SYMBOL)
-
     if bar is None:
         return None
 
@@ -748,21 +747,18 @@ def main():
                     )
                     p_long_m1_raw = models["long_m1"].predict(X_long_m1)[0]
 
-                    # 2. M2モデル (M1が0.50以上の場合のみ推論、それ以外は強制0.0)
-                    if p_long_m1_raw >= 0.50:
-                        feature_dict_long = feature_dict.copy()
-                        feature_dict_long["m1_pred_proba"] = p_long_m1_raw
-                        X_long_m2 = np.array(
+                    # 2. M2モデル (M1の確率をそのまま特徴量として推論)
+                    feature_dict_long = feature_dict.copy()
+                    feature_dict_long["m1_pred_proba"] = p_long_m1_raw
+                    X_long_m2 = np.array(
+                        [
                             [
-                                [
-                                    feature_dict_long.get(f, 0.0)
-                                    for f in feature_lists["long_m2"]
-                                ]
+                                feature_dict_long.get(f, 0.0)
+                                for f in feature_lists["long_m2"]
                             ]
-                        )
-                        p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
-                    else:
-                        p_long_m2_raw = 0.0
+                        ]
+                    )
+                    p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
 
                     # --------------------------------------------------
                     # 【Short側】 Two-Brain 推論
@@ -773,21 +769,18 @@ def main():
                     )
                     p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
 
-                    # 2. M2モデル (M1が0.50以上の場合のみ推論、それ以外は強制0.0)
-                    if p_short_m1_raw >= 0.50:
-                        feature_dict_short = feature_dict.copy()
-                        feature_dict_short["m1_pred_proba"] = p_short_m1_raw
-                        X_short_m2 = np.array(
+                    # 2. M2モデル (M1の確率をそのまま特徴量として推論)
+                    feature_dict_short = feature_dict.copy()
+                    feature_dict_short["m1_pred_proba"] = p_short_m1_raw
+                    X_short_m2 = np.array(
+                        [
                             [
-                                [
-                                    feature_dict_short.get(f, 0.0)
-                                    for f in feature_lists["short_m2"]
-                                ]
+                                feature_dict_short.get(f, 0.0)
+                                for f in feature_lists["short_m2"]
                             ]
-                        )
-                        p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
-                    else:
-                        p_short_m2_raw = 0.0
+                        ]
+                    )
+                    p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
 
                     # ▼▼▼ 生(Raw)確率のみをスッキリ1行で表示 ▼▼▼
                     logger.info(

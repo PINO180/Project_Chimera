@@ -1120,10 +1120,15 @@ class RealtimeFeatureEngine:
             self.logger.error(f"Vector calculation error: {e}")
             return None
 
-    # ▼▼▼ 追加: スナップショット（Pickle）保存とロード機能 ▼▼▼
     def save_state(self, filepath: str) -> bool:
-        """現在の特徴量バッファとOLS状態を丸ごとファイルに保存する"""
+        """
+        特徴量エンジンの内部状態をアトミックにPickle保存する。
+        Ctrl+Cなどの強制終了時でもファイルの破損を完全に防ぎます。
+        """
+        temp_filepath = f"{filepath}.tmp"
+
         try:
+            # ▼▼ 保存する中身はあなたの元のコードのまま維持 ▼▼
             state_data = {
                 "data_buffers": self.data_buffers,
                 "is_buffer_filled": self.is_buffer_filled,
@@ -1133,14 +1138,35 @@ class RealtimeFeatureEngine:
                 "proxy_feature_buffers": self.proxy_feature_buffers,
                 "ols_state": self.ols_state,
             }
-            with open(filepath, "wb") as f:
-                pickle.dump(state_data, f)
+
+            # 1. まず一時ファイル (.tmp) に書き込む
+            with open(temp_filepath, "wb") as f:
+                pickle.dump(state_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                # 2. OSのバッファをフラッシュし、物理ディスクへの書き込みを強制する (fsync)
+                f.flush()
+                import os  # 念のため関数内でインポートしておく
+
+                os.fsync(f.fileno())
+
+            # 3. 書き込みが完璧に完了したら、一瞬で本番ファイルとすり替える（アトミック操作）
+            os.replace(temp_filepath, filepath)
+
             self.logger.info(
-                f"✓ 特徴量エンジンの状態をスナップショット保存しました: {filepath}"
+                f"✓ 特徴量エンジンの状態をスナップショット保存しました (Atomic): {filepath}"
             )
             return True
+
         except Exception as e:
             self.logger.error(f"✗ 特徴量エンジンの状態保存に失敗: {e}", exc_info=True)
+            # エラーや強制終了が起きた場合は、書き込み途中のゴミ(.tmp)を削除して元ファイルを保護
+            import os
+
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
             return False
 
     def load_state(self, filepath: str) -> bool:

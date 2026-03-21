@@ -21,7 +21,7 @@
   "spread_pips": 36.0,
   "value_per_pip": 1.0,
   "prevent_simultaneous_orders": true,
-  "max_drawdown": 1.0,
+  "max_drawdown": 10.0,
   "max_positions": 100,
   "min_atr_threshold": 2.0,
   
