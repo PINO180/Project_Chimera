@@ -1,37 +1,42 @@
-# /workspace/config.py
-# Project Forge - Central Configuration Blueprint (v3 - Final)
+# Project Forge - Central Configuration Blueprint (v4)
 from pathlib import Path
 
-# --- プロジェクトの基本設定 ---
+# =================================================================
+# プロジェクト基盤設定
+# =================================================================
 BASE_DIR = Path("/workspace")
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 CONFIG_DIR = BASE_DIR / "config"
-SYMBOL = "XAUUSD"
 
-# --- データリネージュ識別子 ---
-# どの特徴量セットを使った分析パイプラインかを定義
-FEATURE_SET_ID = "1A_2B"  # 例: Engine 1Aから2Bまでの特徴量を使用した場合
+# 処理対象シンボル（マルチシンボル対応: ここを切り替えるだけ）
+SYMBOL = "XAUUSD"  # 例: "USDJPY", "EURUSD" など
+
+# データリネージュ識別子（どのエンジンセットを使ったか）
+FEATURE_SET_ID = "1A_2B"
+
+# シンボルルートを1箇所で定義（以下の全Stratumがここに依存）
+_SYM = DATA_DIR / SYMBOL
 
 # =================================================================
-# データディレクトリ構造定義 (STRATUM BLUEPRINT)
+# STRATUM BLUEPRINT
 # =================================================================
+
+# --- Stratum 0: 生データ（取り込み前・ブローカー提供ファイル）---
+S0_RAW = _SYM / "stratum_0_raw"
+S0_RAW_CSV = S0_RAW / "tick_raw_data.csv"  # ブローカーCSV置き場
 
 # --- Stratum 1: 基礎データ ---
-S1_BASE = DATA_DIR / SYMBOL / "stratum_1_base"
-S1_RAW_TICK_PARQUET = S1_BASE / "master_tick_exness_raw.parquet"
-S1_RAW_TICK_PARTITIONED = S1_BASE / "master_tick_partitioned"
-S1_BASE_MULTITIMEFRAME = S1_BASE / "master_from_tick"
+S1_BASE = _SYM / "stratum_1_base"
+S1_RAW_TICK_PARQUET = S1_BASE / "master_tick_raw.parquet"  # 単一parquet
+S1_RAW_TICK_PARTITIONED = S1_BASE / "master_tick_partitioned"  # 年月日Hive
+S1_MULTITIMEFRAME = S1_BASE / "master_multitimeframe"  # 15時間足OHLCV
+S1_PROCESSED = S1_BASE / "master_processed"  # 特徴量付加・型統一済み
 
-# --- Stratum 2: 特徴量 ---
-S2_FEATURES = DATA_DIR / SYMBOL / "stratum_2_features"
-S2_FEATURES_FIXED = DATA_DIR / SYMBOL / "stratum_2_features_fixed"
-
-# KS検定後の安定特徴量セット
-S2_FEATURES_AFTER_KS = DATA_DIR / SYMBOL / "stratum_2_features_after_ks"
-
-# AV後の安定特徴量セット
-S2_FEATURES_AFTER_AV = DATA_DIR / SYMBOL / "stratum_2_features_after_av"
+# --- Stratum 2: 特徴量（エンジン出力・検証後）---
+S2_FEATURES = _SYM / "stratum_2_features"
+S2_FEATURES_AFTER_KS = _SYM / "stratum_2_features_after_ks"
+S2_FEATURES_AFTER_AV = _SYM / "stratum_2_features_after_av"
 
 # --- Stratum 3: 検証成果物 ---
 S3_ARTIFACTS = DATA_DIR / SYMBOL / "stratum_3_artifacts" / FEATURE_SET_ID

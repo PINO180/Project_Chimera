@@ -1,0 +1,34 @@
+{
+  "base_capital": 1000.0,
+  "lot_per_base": 0.1,
+  "max_lot_absolute": 200.0,
+  "contract_size": 100.0,
+  "min_lot_size": 0.01,
+  "base_leverage": 2000.0,
+  
+  "sl_multiplier_long": 5.0,
+  "pt_multiplier_long": 1.0,
+  "sl_multiplier_short": 5.0,
+  "pt_multiplier_short": 1.0,
+  "td_minutes_long": 60.0,
+  "td_minutes_short": 60.0,
+  
+  "m2_proba_threshold": 0.30,
+  "m2_delta_threshold": 0.30,
+  "max_consecutive_sl": 2,
+  "cooldown_minutes_after_sl": 30,
+  
+  "spread_pips": 36.0,
+  "value_per_pip": 1.0,
+  "prevent_simultaneous_orders": true,
+  "max_drawdown": 10.0,
+  "max_positions": 100,
+  "min_atr_threshold": 2.0,
+  
+  "use_fixed_risk": true,
+  "fixed_risk_percent": 0.05,
+  
+  "max_allowed_spread": 50.0,
+  "margin_call_percent": 100.0,
+  "stop_out_percent": 20.0
+}

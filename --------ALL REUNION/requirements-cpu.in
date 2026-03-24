@@ -1,0 +1,59 @@
+# requirements-cpu.in - 最終安定版 v4 (lightgbm公式連携対応)
+
+# =================================================================
+# 核心的な互換性の基盤 (Core Compatibility Foundation)
+# =================================================================
+dask[distributed]>=2023.5.0
+numpy<2.0
+
+# =================================================================
+# データ処理・コアサイエンス (Data Processing & Core Science)
+# =================================================================
+memory-profiler
+pathos
+polars
+psutil
+pyarrow
+scipy
+sympy
+tqdm
+duckdb
+
+# =================================================================
+# 機械学習・統計 (Machine Learning & Statistics)
+# =================================================================
+arch
+# dask-lightgbm は削除し、lightgbm 本体を直接指定
+lightgbm
+dask-ml
+hmmlearn
+scikit-learn
+scikit-optimize
+shap
+statsmodels
+tensorflow
+torch
+torchvision
+tslearn
+xgboost
+
+# =================================================================
+# 特殊解析 (Specialized Analysis)
+# =================================================================
+PyCausality
+PyWavelets
+dcor
+emd
+EMD-signal
+entropy
+MFDFA
+nolds
+pmdarima
+seaborn
+optuna
+
+# =================================================================
+# インフラ・開発 (Infrastructure & Development)
+# =================================================================
+jupyterlab>=4.0,<5.0
+pyzmq

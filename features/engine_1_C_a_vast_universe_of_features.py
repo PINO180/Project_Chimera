@@ -106,9 +106,33 @@ class ProcessingConfig:
     """処理設定"""
 
     # データパス - config.pyから読み込む
-    input_base_path: str = str(config.S1_BASE_MULTITIMEFRAME)
+    input_base_path: str = str(config.S1_PROCESSED)
     partitioned_tick_path: str = str(config.S1_RAW_TICK_PARTITIONED)
-    output_base_path: str = str(config.S2_FEATURES)
+    # ▼▼ 修正前: output_base_path: str = str(config.S2_FEATURES / "feature_value_c_vast_universeC")
+    # ▼▼ 修正後: 正しいディレクトリ名に修正
+    output_base_path: str = str(config.S2_FEATURES / "feature_value_a_vast_universeC")
+
+    # 各時間足の1日あたりのバー数定義
+    timeframe_bars_per_day: Dict[str, int] = field(
+        default_factory=lambda: {
+            "tick": 1440,
+            "M0.5": 2880,
+            "M1": 1440,
+            "M3": 480,
+            "M5": 288,
+            "M8": 180,
+            "M15": 96,
+            "M30": 48,
+            "H1": 24,
+            "H4": 6,
+            "H6": 4,
+            "H12": 2,
+            "D1": 1,
+            "W1": 1,
+            "MN": 1,
+        }
+    )
+    # ▲▲ 追加ここまで
 
     # エンジン識別
     engine_id: str = "e1c"
@@ -181,81 +205,6 @@ class MemoryMonitor:
 
 
 # ========================================
-# 品質保証システム
-# ========================================
-
-
-class QualityAssurance:
-    """品質保証システム"""
-
-    @staticmethod
-    def calculate_quality_score(values: np.ndarray) -> float:
-        """品質スコア算出：0.0（使用不可）～ 1.0（完璧）"""
-        # 1. NaN/Inf率の計算（最重要指標）
-        nan_inf_ratio = (np.isnan(values).sum() + np.isinf(values).sum()) / len(values)
-
-        # 2. 多様性指標（定数値や崩壊した出力の検出）
-        unique_ratio = len(np.unique(values)) / len(values)
-        unique_ratio_norm = min(unique_ratio, 0.1) / 0.1  # 10%を上限として正規化
-
-        # 3. 範囲指標（理論範囲からの逸脱度）
-        finite_values = values[np.isfinite(values)]
-        if len(finite_values) == 0:
-            range_norm = 0.0
-        else:
-            # 99%パーセンタイル範囲での正規化
-            p1, p99 = np.percentile(finite_values, [1, 99])
-            range_span = p99 - p1
-            range_norm = 1.0 if range_span > 0 else 0.0
-
-        # 総合スコア計算
-        score = (1 - nan_inf_ratio) * (0.5 * unique_ratio_norm + 0.5 * range_norm)
-
-        return np.clip(score, 0.0, 1.0)
-
-    @staticmethod
-    def basic_stabilization(values: np.ndarray) -> np.ndarray:
-        """第1段階：基本対処（品質スコア > 0.6）"""
-        # 軽量で高速な処理
-        cleaned = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-
-        finite_values = cleaned[np.isfinite(cleaned)]
-        if len(finite_values) == 0:
-            return np.zeros_like(values)
-
-        p1, p99 = np.percentile(finite_values, [1, 99])
-        result = np.clip(cleaned, p1, p99)  # 上下1%除去
-
-        return result
-
-    @staticmethod
-    def robust_stabilization(values: np.ndarray) -> np.ndarray:
-        """第2段階：フォールバック（品質スコア ≤ 0.6）"""
-        finite_values = values[np.isfinite(values)]
-
-        if len(finite_values) == 0:
-            return np.zeros_like(values)
-
-        # ロバスト統計による処理
-        from scipy.stats import median_abs_deviation
-
-        median_val = np.median(finite_values)
-        mad_val = median_abs_deviation(finite_values)
-
-        if mad_val == 0:
-            mad_val = 1.0
-
-        # MADベースの外れ値除去と正規化
-        robust_bounds = (median_val - 3 * mad_val, median_val + 3 * mad_val)
-        result = np.clip(values, *robust_bounds)
-
-        # NaN処理
-        result = np.nan_to_num(result, nan=median_val)
-
-        return result
-
-
-# ========================================
 # Numba UDF関数（モジュールレベル）
 # ========================================
 
@@ -267,6 +216,13 @@ def calculate_rsi_numba(prices, period, out):
     """RSI計算 (Numba最適化版)"""
     n = len(prices)
 
+    # ▼▼ 追加: ルール7（バッファ不足時の安全な保護処理）
+    if n < period:
+        for i in range(n):
+            out[i] = np.nan
+        return
+    # ▲▲ 追加ここまで
+
     for i in range(n):
         if i < period:
             out[i] = np.nan
@@ -277,12 +233,16 @@ def calculate_rsi_numba(prices, period, out):
             # 初期期間の計算
             for j in range(i - period + 1, i + 1):
                 diff = prices[j] - prices[j - 1]
-                if diff > 0:
+                # ▼▼ 修正前: if diff > 0: ...
+                # ▼▼ 修正後: ルール8（型の厳格化）に基づき、0.0 と明記
+                if diff > 0.0:
                     gains += diff
                 else:
                     losses += abs(diff)
 
-            if gains + losses == 0:
+            # ▼▼ 修正前: if gains + losses == 0: ...
+            # ▼▼ 修正後: 型の厳格化
+            if gains + losses == 0.0:
                 out[i] = 50.0
             else:
                 avg_gain = gains / period
@@ -513,13 +473,52 @@ def calculate_di_minus_numba(high, low, close, period, out):
                 out[i] = 0.0
 
 
-# ===== ブロック1完了 =====
-
-# ===== ブロック2開始 =====
-
 # ========================================
 # Numba UDF関数（続き）
 # ========================================
+
+
+# ▼▼ 追加: 真のWMA（加重移動平均）を計算するNumba UDF
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_wma_numba(prices, period, out):
+    """WMA (Weighted Moving Average) 計算 (完全版)"""
+    n = len(prices)
+    if n < period:
+        for i in range(n):
+            out[i] = np.nan
+        return
+
+    weight_sum = period * (period + 1) / 2.0
+    for i in range(n):
+        if i < period - 1:
+            out[i] = np.nan
+        else:
+            val_sum = 0.0
+            for j in range(period):
+                weight = period - j
+                val_sum += prices[i - j] * weight
+            out[i] = val_sum / weight_sum
+
+
+# ▲▲ 追加ここまで
+
+
+# 修正後
+@nb.njit(cache=True)
+def _wma_helper(data, start, length):
+    if start + length > len(data):
+        return np.nan
+    weight_sum = 0.0
+    value_sum = 0.0
+    for i in range(length):
+        weight = length - i
+        value_sum += data[start + i] * weight
+        weight_sum += weight
+    if weight_sum > 0:
+        return value_sum / weight_sum
+    return np.nan
 
 
 @nb.guvectorize(
@@ -531,18 +530,6 @@ def calculate_hma_numba(prices, period, out):
     half_period = period // 2
     sqrt_period = int(np.sqrt(period))
 
-    # WMA計算用の関数
-    def wma(data, start, length):
-        if start + length > len(data):
-            return np.nan
-        weight_sum = 0.0
-        value_sum = 0.0
-        for i in range(length):
-            weight = length - i
-            value_sum += data[start + i] * weight
-            weight_sum += weight
-        return value_sum / weight_sum if weight_sum > 0 else np.nan
-
     # 中間配列
     wma_half = np.zeros(n)
     wma_full = np.zeros(n)
@@ -551,12 +538,12 @@ def calculate_hma_numba(prices, period, out):
     # 計算
     for i in range(n):
         if i >= half_period - 1:
-            wma_half[i] = wma(prices, i - half_period + 1, half_period)
+            wma_half[i] = _wma_helper(prices, i - half_period + 1, half_period)
         else:
             wma_half[i] = np.nan
 
         if i >= period - 1:
-            wma_full[i] = wma(prices, i - period + 1, period)
+            wma_full[i] = _wma_helper(prices, i - period + 1, period)
         else:
             wma_full[i] = np.nan
 
@@ -568,7 +555,7 @@ def calculate_hma_numba(prices, period, out):
     # 最終HMA計算
     for i in range(n):
         if i >= sqrt_period - 1:
-            out[i] = wma(raw_hma, i - sqrt_period + 1, sqrt_period)
+            out[i] = _wma_helper(raw_hma, i - sqrt_period + 1, sqrt_period)
         else:
             out[i] = np.nan
 
@@ -647,12 +634,21 @@ def calculate_stochastic_numba(high, low, close, k_period, d_period, slow_period
             out[i] = np.nan
         else:
             sum_k = 0.0
-            count = 0
+            # ▼▼ 修正前: count = 0
+            # ▼▼ 修正後: ルール8（型の厳格化）に基づき、float の 0.0 で初期化
+            count = 0.0
             for j in range(i - d_period + 1, i + 1):
                 if not np.isnan(k_values[j]):
                     sum_k += k_values[j]
-                    count += 1
-            if count > 0:
+                    # ▼▼ 修正前: count += 1
+                    # ▼▼ 修正後: 型の厳格化
+                    count += 1.0
+
+            # ▼▼ 修正前: if count > 0:
+            # ▼▼ 修正前:     out[i] = sum_k / count
+            # ▼▼ 修正後: 型の厳格化（0.0）と、ルール5（ゼロ除算の鉄壁防衛）のための + 1e-10 の追加
+            # 修正後
+            if count > 0.0:
                 out[i] = sum_k / count
             else:
                 out[i] = np.nan
@@ -741,8 +737,14 @@ def calculate_trix_numba(prices, period, out):
 def calculate_ultimate_oscillator_numba(high, low, close, volume, out):
     """Ultimate Oscillator計算 (Numba最適化版)"""
     n = len(high)
-    periods = [7, 14, 28]
-    weights = [4.0, 2.0, 1.0]
+    period_7 = 7
+    period_14 = 14
+    period_28 = 28
+    weight_0 = 4.0
+    weight_1 = 2.0
+    weight_2 = 1.0
+    weight_total = 7.0
+    max_period = 28
 
     # Buying Pressure and True Range計算
     bp = np.zeros(n)
@@ -753,7 +755,8 @@ def calculate_ultimate_oscillator_numba(high, low, close, volume, out):
             bp[i] = close[i] - low[i]
             tr[i] = high[i] - low[i]
         else:
-            bp[i] = close[i] - min(low[i], close[i - 1])
+            lc = close[i - 1]
+            bp[i] = close[i] - (low[i] if low[i] < lc else lc)
             h_l = high[i] - low[i]
             h_pc = abs(high[i] - close[i - 1])
             l_pc = abs(low[i] - close[i - 1])
@@ -761,13 +764,21 @@ def calculate_ultimate_oscillator_numba(high, low, close, volume, out):
 
     # Ultimate Oscillator計算
     for i in range(n):
-        if i < max(periods):
+        if i < max_period:
             out[i] = np.nan
         else:
             weighted_sum = 0.0
-            weight_total = sum(weights)
 
-            for j, period in enumerate(periods):
+            for j in range(3):
+                if j == 0:
+                    period = period_7
+                    w = weight_0
+                elif j == 1:
+                    period = period_14
+                    w = weight_1
+                else:
+                    period = period_28
+                    w = weight_2
                 bp_sum = 0.0
                 tr_sum = 0.0
 
@@ -780,7 +791,8 @@ def calculate_ultimate_oscillator_numba(high, low, close, volume, out):
                 else:
                     avg = 0.0
 
-                weighted_sum += avg * weights[j]
+                # 修正後
+                weighted_sum += avg * w
 
             out[i] = 100 * weighted_sum / weight_total
 
@@ -1041,6 +1053,34 @@ class OutputEngine:
         start_time = time.time()
 
         try:
+            # blueprint.py v4 に準拠した型キャスト処理を内包（後処理スクリプトへの依存排除）
+            cast_exprs = [
+                pl.col("timestamp").cast(pl.Datetime("us")),
+                pl.col("timeframe").cast(pl.Utf8),
+            ]
+
+            # tick時間足などでyear, month, dayが存在する場合のみint32にキャスト
+            schema_names = lazy_frame.collect_schema().names()
+            for c in ["year", "month", "day"]:
+                if c in schema_names:
+                    cast_exprs.append(pl.col(c).cast(pl.Int32))
+
+            lazy_frame = lazy_frame.with_columns(cast_exprs)
+
+            # ▼▼ 修正前: Categorical型をすべてUtf8へ一括キャスト（重複エラーの危険あり）
+            # ▼▼ 修正前: lazy_frame = lazy_frame.with_columns(pl.col(pl.Categorical).cast(pl.Utf8))
+            # ▼▼ 修正後: timeframe等の重複を避けるため、スキーマから明示的に除外してキャスト
+            categorical_cols = [
+                col
+                for col, dtype in lazy_frame.collect_schema().items()
+                if dtype == pl.Categorical and col != "timeframe"
+            ]
+            if categorical_cols:
+                lazy_frame = lazy_frame.with_columns(
+                    [pl.col(c).cast(pl.Utf8) for c in categorical_cols]
+                )
+            # ▲▲ 修正ここまで
+
             # ストリーミング出力
             lazy_frame.sink_parquet(str(output_path), compression="snappy")
 
@@ -1083,7 +1123,8 @@ class OutputEngine:
                 col
                 for col, dtype in schema.items()
                 if dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]
-                and col not in ["timestamp", "timeframe"]
+                # 修正後
+                and col not in ["timestamp", "timeframe", "sample_weight"]
             ]
 
             # NaN埋め処理
@@ -1201,9 +1242,16 @@ class CalculationEngine:
     def __init__(self, config: ProcessingConfig):
         """初期化"""
         self.config = config
-        self.qa = QualityAssurance()
         self.memory_monitor = MemoryMonitor(config.memory_limit_gb)
         self.prefix = "e1c_"  # エンジン識別子
+
+        # ▼▼ 追加: 一時ディレクトリの作成
+        import tempfile
+        from pathlib import Path
+
+        self.temp_dir = Path(tempfile.mkdtemp(prefix=f"features_{config.engine_id}_"))
+        logger.info(f"一時ディレクトリ作成: {self.temp_dir}")
+        # ▲▲ 追加ここまで
 
         logger.info(f"CalculationEngine初期化: {self.prefix}")
 
@@ -1318,7 +1366,10 @@ class CalculationEngine:
             ],
         }
 
-    def calculate_all_features(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    # ▼ 引数に timeframe を追加
+    def calculate_all_features(
+        self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
+    ) -> pl.LazyFrame:
         """全特徴量計算（6段階処理）"""
         logger.info(f"=== カテゴリ1B: 全特徴量計算開始 ===")
 
@@ -1345,7 +1396,8 @@ class CalculationEngine:
             result = self.create_basic_processing_features(result)
 
             # 6. 品質保証システム適用
-            result = self.apply_quality_assurance(result)
+            # ▼ timeframe を渡す
+            result = self.apply_quality_assurance(result, timeframe=timeframe)
 
             logger.info(f"=== カテゴリ1B: 全特徴量計算完了 ===")
             return result
@@ -1361,36 +1413,32 @@ class CalculationEngine:
         exprs = []
 
         # 標準RSI（Polars Expression）
-        for period in self.config.window_sizes["rsi"]:  # [14, 21, 30, 50]
-            # RSI計算（Numba版使用）
+        for period in self.config.window_sizes["rsi"]:
             exprs.append(
                 pl.col("close")
                 .map_batches(
-                    lambda s: calculate_rsi_numba(s.to_numpy(), period),
+                    lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}rsi_{period}")
             )
 
-            # RSIモメンタム（RSIの変化率）
             exprs.append(
                 pl.col("close")
                 .map_batches(
-                    lambda s: calculate_rsi_numba(s.to_numpy(), period),
+                    lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .diff()
                 .alias(f"{self.prefix}rsi_momentum_{period}")
             )
 
-        # Stochastic RSI（複合計算）
         for period in [14, 21]:
             rsi_col = pl.col("close").map_batches(
-                lambda s: calculate_rsi_numba(s.to_numpy(), period),
+                lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
 
-            # Stochastic RSI = (RSI - RSI_min) / (RSI_max - RSI_min) * 100
             exprs.append(
                 (
                     (rsi_col - rsi_col.rolling_min(period))
@@ -1403,16 +1451,15 @@ class CalculationEngine:
                 ).alias(f"{self.prefix}stochastic_rsi_{period}")
             )
 
-        # RSIダイバージェンス（価格とRSIの乖離）
         for period in [14, 21]:
             price_change = (pl.col("close") - pl.col("close").shift(period)) / pl.col(
                 "close"
             ).shift(period)
             rsi_col = pl.col("close").map_batches(
-                lambda s: calculate_rsi_numba(s.to_numpy(), period),
+                lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
-            rsi_change = (rsi_col - rsi_col.shift(period)) / 50 - 1  # 正規化
+            rsi_change = (rsi_col - rsi_col.shift(period)) / 50 - 1
 
             exprs.append(
                 (price_change - rsi_change).alias(
@@ -1437,25 +1484,42 @@ class CalculationEngine:
             (19, 39, 9),  # 長期
         ]
 
+        # 内部正規化用のATR13ベース
+        atr_13_base = pl.struct(["high", "low", "close"]).map_batches(
+            lambda s: calculate_atr_numba(
+                s.struct.field("high").to_numpy(),
+                s.struct.field("low").to_numpy(),
+                s.struct.field("close").to_numpy(),
+                13,
+            ),
+            return_dtype=pl.Float64,
+        )
+
         for fast, slow, signal in macd_configs:
             # EMA計算（Polars内蔵）
             ema_fast = pl.col("close").ewm_mean(span=fast, adjust=False)
             ema_slow = pl.col("close").ewm_mean(span=slow, adjust=False)
 
-            # MACDライン
-            macd_line = (ema_fast - ema_slow).alias(f"{self.prefix}macd_{fast}_{slow}")
+            # 生MACDライン（エイリアスなし・内部計算用）
+            macd_raw = ema_fast - ema_slow
+
+            # MACDライン（ATR13で割りスケール不変化）
+            macd_line = (macd_raw / (atr_13_base + 1e-10)).alias(
+                f"{self.prefix}macd_{fast}_{slow}"
+            )
             exprs.append(macd_line)
 
-            # シグナルライン
-            signal_line = macd_line.ewm_mean(span=signal, adjust=False).alias(
+            # 生シグナルライン（エイリアスなし・内部計算用）
+            signal_raw = macd_raw.ewm_mean(span=signal, adjust=False)
+
+            # シグナルライン（ATR13で割りスケール不変化）
+            signal_line = (signal_raw / (atr_13_base + 1e-10)).alias(
                 f"{self.prefix}macd_signal_{fast}_{slow}_{signal}"
             )
             exprs.append(signal_line)
 
-            # ヒストグラム (修正箇所)
-            # 修正前: (macd_line - signal_line.ewm_mean(span=signal, adjust=False))
-            # 修正後: (macd_line - signal_line)
-            histogram = (macd_line - signal_line).alias(
+            # ヒストグラム（ATR13で割りスケール不変化）
+            histogram = ((macd_raw - signal_raw) / (atr_13_base + 1e-10)).alias(
                 f"{self.prefix}macd_histogram_{fast}_{slow}_{signal}"
             )
             exprs.append(histogram)
@@ -1470,6 +1534,17 @@ class CalculationEngine:
 
         exprs = []
 
+        # ▼▼ 追加: 内部計算用のATR13（スケール不変性用）
+        atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
+            lambda s: calculate_atr_numba(
+                s.struct.field("high").to_numpy(),
+                s.struct.field("low").to_numpy(),
+                s.struct.field("close").to_numpy(),
+                13,
+            ),
+            return_dtype=pl.Float64,
+        )
+
         # ボリンジャーバンド設定
         bb_periods = [20, 30, 50]
         bb_stdevs = [2, 2.5, 3]
@@ -1477,33 +1552,44 @@ class CalculationEngine:
         for period in bb_periods:
             for num_std in bb_stdevs:
                 # 移動平均と標準偏差
+                # ▼▼ 修正前: std = pl.col("close").rolling_std(period)
+                # ▼▼ 修正後: 分散の罠を回避（ddof=1を明記）
                 sma = pl.col("close").rolling_mean(period)
-                std = pl.col("close").rolling_std(period)
+                std = pl.col("close").rolling_std(period, ddof=1)
 
                 # 上限・下限バンド
-                upper = (sma + num_std * std).alias(
+                # ▼▼ 修正前: 絶対値でのバンド算出
+                # ▼▼ 修正後: 生価格で計算後、ATR割りによるスケール不変表現へ変換
+                upper_raw = sma + num_std * std
+                lower_raw = sma - num_std * std
+
+                upper = ((upper_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
                     f"{self.prefix}bb_upper_{period}_{num_std}"
                 )
-                lower = (sma - num_std * std).alias(
+                lower = ((pl.col("close") - lower_raw) / (atr_13_expr + 1e-10)).alias(
                     f"{self.prefix}bb_lower_{period}_{num_std}"
                 )
 
                 exprs.extend([upper, lower])
 
-                # BB内の位置（%B）
-                percent_b = ((pl.col("close") - lower) / (upper - lower + 1e-10)).alias(
-                    f"{self.prefix}bb_percent_{period}_{num_std}"
-                )
+                # BB内の位置（%B）※これは既に比率なのでraw値を使用
+                percent_b = (
+                    (pl.col("close") - lower_raw) / (upper_raw - lower_raw + 1e-10)
+                ).alias(f"{self.prefix}bb_percent_{period}_{num_std}")
                 exprs.append(percent_b)
 
                 # BB幅
-                width = (upper - lower).alias(
+                # ▼▼ 修正前: width = (upper - lower).alias(...)
+                # ▼▼ 修正後: バンド幅もATRで正規化
+                width = ((upper_raw - lower_raw) / (atr_13_expr + 1e-10)).alias(
                     f"{self.prefix}bb_width_{period}_{num_std}"
                 )
                 exprs.append(width)
 
                 # BB幅のパーセンタイル
-                width_pct = (width / sma * 100).alias(
+                # ▼▼ 修正前: width_pct = (width / sma * 100).alias(...)
+                # ▼▼ 修正後: 生価格同士で計算し、純粋なパーセント（無次元）へ正常化
+                width_pct = ((upper_raw - lower_raw) / (sma + 1e-10) * 100).alias(
                     f"{self.prefix}bb_width_pct_{period}_{num_std}"
                 )
                 exprs.append(width_pct)
@@ -1527,49 +1613,59 @@ class CalculationEngine:
         # ATR期間
         atr_periods = self.config.window_sizes["atr"]  # [13, 21, 34, 55]
 
+        # 内部正規化用のATR13ベース（スケール不変化の基準）
+        atr_13_base = pl.struct(["high", "low", "close"]).map_batches(
+            lambda s: calculate_atr_numba(
+                s.struct.field("high").to_numpy(),
+                s.struct.field("low").to_numpy(),
+                s.struct.field("close").to_numpy(),
+                13,
+            ),
+            return_dtype=pl.Float64,
+        )
+
         for period in atr_periods:
-            # 基本ATR（Numba版）
-            atr = (
-                pl.struct(["high", "low", "close"])
-                .map_batches(
-                    lambda s: calculate_atr_numba(
-                        s.struct.field("high").to_numpy(),
-                        s.struct.field("low").to_numpy(),
-                        s.struct.field("close").to_numpy(),
-                        period,
-                    ),
-                    return_dtype=pl.Float64,
-                )
-                .alias(f"{self.prefix}atr_{period}")
+            # 生ATR計算（エイリアスなし・内部計算用）
+            atr_raw = pl.struct(["high", "low", "close"]).map_batches(
+                lambda s, p=period: calculate_atr_numba(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                    p,
+                ),
+                return_dtype=pl.Float64,
             )
-            exprs.append(atr)
 
-            # ATRパーセンテージ（価格に対する比率）
-            atr_pct = (atr / pl.col("close") * 100).alias(
-                f"{self.prefix}atr_pct_{period}"
+            # ATR比率（ATR13で割ったスケール不変値）
+            exprs.append(
+                (atr_raw / (atr_13_base + 1e-10)).alias(f"{self.prefix}atr_{period}")
             )
-            exprs.append(atr_pct)
 
-            # ATRトレンド（ATRの変化率）
-            atr_trend = atr.diff().alias(f"{self.prefix}atr_trend_{period}")
-            exprs.append(atr_trend)
-
-            # ATRボラティリティ（ATR自体の標準偏差）
-            atr_volatility = atr.rolling_std(period).alias(
-                f"{self.prefix}atr_volatility_{period}"
+            # ATRパーセンテージ（closeに対する比率）はすでにスケール不変
+            exprs.append(
+                (atr_raw / (pl.col("close") + 1e-10) * 100).alias(
+                    f"{self.prefix}atr_pct_{period}"
+                )
             )
-            exprs.append(atr_volatility)
 
-            # ATRベースのバンド
-            atr_multipliers = [1.5, 2.0, 2.5]
-            for mult in atr_multipliers:
-                upper_band = (pl.col("close") + atr * mult).alias(
-                    f"{self.prefix}atr_upper_{period}_{mult}"
+            # ATRトレンド（ATRの変化分をATR13で割りスケール不変化）
+            exprs.append(
+                (atr_raw.diff() / (atr_13_base + 1e-10)).alias(
+                    f"{self.prefix}atr_trend_{period}"
                 )
-                lower_band = (pl.col("close") - atr * mult).alias(
-                    f"{self.prefix}atr_lower_{period}_{mult}"
+            )
+
+            # ATRボラティリティ（ATR自体の標準偏差をATR13で割りスケール不変化）
+            exprs.append(
+                (atr_raw.rolling_std(period, ddof=1) / (atr_13_base + 1e-10)).alias(
+                    f"{self.prefix}atr_volatility_{period}"
                 )
-                exprs.extend([upper_band, lower_band])
+            )
+
+            # ▼▼ 削除: ATRベースの絶対値バンド（atr_upper / atr_lower）のループ処理を丸ごと削除
+            #        atr_multipliers = [1.5, 2.0, 2.5]
+            #        for mult in atr_multipliers: ...
+            # ▲▲ 削除ここまで
 
         result = lazy_frame.with_columns(exprs)
         logger.info(f"ATR特徴量計算完了: {len(exprs)}個")
@@ -1590,14 +1686,17 @@ class CalculationEngine:
         for k_period, d_period, slow_period in stoch_periods:
             stoch_k = (
                 pl.struct(["high", "low", "close"])
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_stochastic_numba(
-                        s.struct.field("high").to_numpy(),
-                        s.struct.field("low").to_numpy(),
-                        s.struct.field("close").to_numpy(),
-                        k_period,
-                        d_period,
-                        slow_period,
+                    lambda s, kp=k_period, dp=d_period, sp=slow_period: (
+                        calculate_stochastic_numba(
+                            s.struct.field("high").to_numpy(),
+                            s.struct.field("low").to_numpy(),
+                            s.struct.field("close").to_numpy(),
+                            kp,
+                            dp,
+                            sp,
+                        )
                     ),
                     return_dtype=pl.Float64,
                 )
@@ -1622,12 +1721,13 @@ class CalculationEngine:
             # ADX
             adx = (
                 pl.struct(["high", "low", "close"])
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_adx_numba(
+                    lambda s, p=period: calculate_adx_numba(
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
-                        period,
+                        p,
                     ),
                     return_dtype=pl.Float64,
                 )
@@ -1638,12 +1738,13 @@ class CalculationEngine:
             # DI+
             di_plus = (
                 pl.struct(["high", "low", "close"])
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_di_plus_numba(
+                    lambda s, p=period: calculate_di_plus_numba(
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
-                        period,
+                        p,
                     ),
                     return_dtype=pl.Float64,
                 )
@@ -1654,12 +1755,13 @@ class CalculationEngine:
             # DI-
             di_minus = (
                 pl.struct(["high", "low", "close"])
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_di_minus_numba(
+                    lambda s, p=period: calculate_di_minus_numba(
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
-                        period,
+                        p,
                     ),
                     return_dtype=pl.Float64,
                 )
@@ -1673,8 +1775,9 @@ class CalculationEngine:
             # Aroon Up
             aroon_up = (
                 pl.col("high")
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_aroon_up_numba(s.to_numpy(), period),
+                    lambda s, p=period: calculate_aroon_up_numba(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}aroon_up_{period}")
@@ -1684,8 +1787,9 @@ class CalculationEngine:
             # Aroon Down
             aroon_down = (
                 pl.col("low")
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_aroon_down_numba(s.to_numpy(), period),
+                    lambda s, p=period: calculate_aroon_down_numba(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}aroon_down_{period}")
@@ -1726,12 +1830,26 @@ class CalculationEngine:
 
         exprs = []
 
+        # ▼▼ 追加: 内部計算用のATR13
+        atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
+            lambda s: calculate_atr_numba(
+                s.struct.field("high").to_numpy(),
+                s.struct.field("low").to_numpy(),
+                s.struct.field("close").to_numpy(),
+                13,
+            ),
+            return_dtype=pl.Float64,
+        )
+
         # Detrended Price Oscillator (DPO)
         dpo_periods = [20, 30, 50]
         for period in dpo_periods:
-            lookback = period // 2 + 1
-            sma = pl.col("close").rolling_mean(period).shift(-lookback)
-            dpo = (pl.col("close") - sma).alias(f"{self.prefix}dpo_{period}")
+            sma = pl.col("close").rolling_mean(period)
+            # ▼▼ 修正前: dpo = (pl.col("close") - sma).alias(...)
+            # ▼▼ 修正後: ATR割り
+            dpo = ((pl.col("close") - sma) / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}dpo_{period}"
+            )
             exprs.append(dpo)
 
         # TRIX (Numba版)
@@ -1739,8 +1857,9 @@ class CalculationEngine:
         for period in trix_periods:
             trix = (
                 pl.col("close")
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_trix_numba(s.to_numpy(), period),
+                    lambda s, p=period: calculate_trix_numba(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}trix_{period}")
@@ -1768,8 +1887,9 @@ class CalculationEngine:
         for period in tsi_periods:
             tsi = (
                 pl.col("close")
+                # 修正後
                 .map_batches(
-                    lambda s: calculate_tsi_numba(s.to_numpy(), period),
+                    lambda s, p=period: calculate_tsi_numba(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}tsi_{period}")
@@ -1789,9 +1909,12 @@ class CalculationEngine:
         # Momentum
         momentum_periods = [10, 20, 30, 50]
         for period in momentum_periods:
-            momentum = (pl.col("close") - pl.col("close").shift(period)).alias(
-                f"{self.prefix}momentum_{period}"
-            )
+            # ▼▼ 修正前: momentum = (pl.col("close") - pl.col("close").shift(period)).alias(...)
+            # ▼▼ 修正後: ATR割り
+            momentum = (
+                (pl.col("close") - pl.col("close").shift(period))
+                / (atr_13_expr + 1e-10)
+            ).alias(f"{self.prefix}momentum_{period}")
             exprs.append(momentum)
 
         result = lazy_frame.with_columns(exprs)
@@ -1843,18 +1966,34 @@ class CalculationEngine:
             rvi_signal = rvi.rolling_mean(4).alias(f"{self.prefix}rvi_signal_{period}")
             exprs.append(rvi_signal)
 
-        # Schaff Trend Cycle (STC) - 簡略版
+        # Schaff Trend Cycle (STC) - 簡略版からの完全純化
         stc_periods = [(23, 50, 10), (12, 26, 9)]
         for fast_period, slow_period, cycle_period in stc_periods:
             # MACDベース
-            fast_ma = pl.col("close").ewm_mean(span=fast_period, adjust=False)
-            slow_ma = pl.col("close").ewm_mean(span=slow_period, adjust=False)
+            fast_ma = pl.col("close").ewm_mean(half_life=fast_period, adjust=False)
+            slow_ma = pl.col("close").ewm_mean(half_life=slow_period, adjust=False)
             macd = fast_ma - slow_ma
 
-            # Stochastic of MACD
-            macd_min = macd.rolling_min(cycle_period)
-            macd_max = macd.rolling_max(cycle_period)
-            stc = ((macd - macd_min) / (macd_max - macd_min + 1e-10) * 100).alias(
+            # 1st Stochastic (%K of MACD)
+            macd_min1 = macd.rolling_min(cycle_period)
+            macd_max1 = macd.rolling_max(cycle_period)
+            stoch_macd = ((macd - macd_min1) / (macd_max1 - macd_min1 + 1e-10)) * 100
+
+            # ▼▼ 修正前: smooth_period = max(2, cycle_period // 2)
+            # ▼▼ 修正前: stoch_macd_smoothed = stoch_macd.ewm_mean(half_life=smooth_period, adjust=False)
+            # ▼▼ 修正後: 原論文（Doug Schaff）およびStochasticの伝統的コンセンサスに忠実な固定値(span=3)を採用
+            smooth_period = 3
+            stoch_macd_smoothed = stoch_macd.ewm_mean(span=smooth_period, adjust=False)
+
+            # 2nd Stochastic (%K of Smoothed %D)
+            stoch_min2 = stoch_macd_smoothed.rolling_min(cycle_period)
+            stoch_max2 = stoch_macd_smoothed.rolling_max(cycle_period)
+            stoch_stoch = (
+                (stoch_macd_smoothed - stoch_min2) / (stoch_max2 - stoch_min2 + 1e-10)
+            ) * 100
+
+            # Final Smoothing (True STC)
+            stc = stoch_stoch.ewm_mean(span=smooth_period, adjust=False).alias(
                 f"{self.prefix}schaff_trend_cycle_{fast_period}_{slow_period}_{cycle_period}"
             )
             exprs.append(stc)
@@ -1895,87 +2034,113 @@ class CalculationEngine:
         logger.info("移動平均線特徴量計算開始")
 
         exprs = []
+        # 内部計算用のATR13
+        atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
+            lambda s: calculate_atr_numba(
+                s.struct.field("high").to_numpy(),
+                s.struct.field("low").to_numpy(),
+                s.struct.field("close").to_numpy(),
+                13,
+            ),
+            return_dtype=pl.Float64,
+        )
 
         # 基本移動平均
         ma_periods = [10, 20, 50, 100, 200]
 
         for period in ma_periods:
             # SMA
-            sma = (
-                pl.col("close").rolling_mean(period).alias(f"{self.prefix}sma_{period}")
+            sma_raw = pl.col("close").rolling_mean(period)
+            sma = ((sma_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}sma_{period}"
             )
             exprs.append(sma)
 
-            # SMA乖離率
-            sma_deviation = ((pl.col("close") - sma) / sma * 100).alias(
-                f"{self.prefix}sma_deviation_{period}"
-            )
+            # SMA乖離率 (生価格ベースでの乖離比率を維持)
+            sma_deviation = (
+                (pl.col("close") - sma_raw) / (sma_raw + 1e-10) * 100
+            ).alias(f"{self.prefix}sma_deviation_{period}")
             exprs.append(sma_deviation)
 
             # EMA
-            ema = (
-                pl.col("close")
-                .ewm_mean(span=period, adjust=False)
-                .alias(f"{self.prefix}ema_{period}")
+            ema_raw = pl.col("close").ewm_mean(span=period, adjust=False)
+            ema = ((ema_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}ema_{period}"
             )
             exprs.append(ema)
 
             # EMA乖離率
-            ema_deviation = ((pl.col("close") - ema) / ema * 100).alias(
-                f"{self.prefix}ema_deviation_{period}"
-            )
+            ema_deviation = (
+                (pl.col("close") - ema_raw) / (ema_raw + 1e-10) * 100
+            ).alias(f"{self.prefix}ema_deviation_{period}")
             exprs.append(ema_deviation)
 
-            # WMA (Weighted Moving Average)
-            weights = list(range(1, period + 1))
-            weight_sum = sum(weights)
-
-            # WMAは複雑なので簡略版
-            wma = (
-                pl.col("close").rolling_mean(period).alias(f"{self.prefix}wma_{period}")
+            # ▼▼ 修正前: WMA (簡略版: 既存ロジック準拠)
+            # ▼▼ 修正前: wma_raw = pl.col("close").rolling_mean(period)
+            # ▼▼ 修正後: 先ほど新設したNumba UDFを用いた真のWMAへ置換
+            # 修正後
+            wma_raw = pl.col("close").map_batches(
+                lambda s, p=period: calculate_wma_numba(s.to_numpy(), p),
+                return_dtype=pl.Float64,
+            )
+            wma = ((wma_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}wma_{period}"
             )
             exprs.append(wma)
 
         # HMA (Hull Moving Average) - Numba版
         for period in self.config.window_sizes["hma"]:  # [21, 34, 55]
-            hma = (
-                pl.col("close")
-                .map_batches(
-                    lambda s: calculate_hma_numba(s.to_numpy(), period),
-                    return_dtype=pl.Float64,
-                )
-                .alias(f"{self.prefix}hma_{period}")
+            # 修正後
+            hma_raw = pl.col("close").map_batches(
+                lambda s, p=period: calculate_hma_numba(s.to_numpy(), p),
+                return_dtype=pl.Float64,
+            )
+            hma = ((hma_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}hma_{period}"
             )
             exprs.append(hma)
 
         # KAMA (Kaufman Adaptive Moving Average) - Numba版
         for period in self.config.window_sizes["kama"]:  # [21, 34]
-            kama = (
-                pl.col("close")
-                .map_batches(
-                    lambda s: calculate_kama_numba(s.to_numpy(), period),
-                    return_dtype=pl.Float64,
-                )
-                .alias(f"{self.prefix}kama_{period}")
+            # 修正後
+            kama_raw = pl.col("close").map_batches(
+                lambda s, p=period: calculate_kama_numba(s.to_numpy(), p),
+                return_dtype=pl.Float64,
+            )
+            kama = ((kama_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}kama_{period}"
             )
             exprs.append(kama)
 
         # トレンド分析
         trend_periods = [20, 50, 100]
         for period in trend_periods:
-            # トレンド傾き（線形回帰の傾き）
-            x = pl.arange(0, period).cast(pl.Float64)
-            y = pl.col("close").rolling_map(lambda s: s, window_size=period)
+            # ▼▼ 修正前: トレンド傾き（簡略版：価格変化率で代用）
+            # ▼▼ 修正前: trend_slope = ((pl.col("close") - pl.col("close").shift(period)) / (atr_13_expr * period + 1e-10)).alias(...)
+            # ▼▼ 修正後: 真の線形回帰(OLS)の傾きを WMA と SMA の恒等式から計算し、ATR割り
+            sma_for_slope = pl.col("close").rolling_mean(period)
+            # 修正後
+            wma_for_slope = pl.col("close").map_batches(
+                lambda s, p=period: calculate_wma_numba(s.to_numpy(), p),
+                return_dtype=pl.Float64,
+            )
+            true_ols_slope = 6.0 * (wma_for_slope - sma_for_slope) / (period - 1.0)
 
-            # 簡略版：価格変化率で代用
-            trend_slope = (
-                (pl.col("close") - pl.col("close").shift(period)) / period
-            ).alias(f"{self.prefix}trend_slope_{period}")
+            trend_slope = (true_ols_slope / (atr_13_expr + 1e-10)).alias(
+                f"{self.prefix}trend_slope_{period}"
+            )
             exprs.append(trend_slope)
 
             # トレンド強度（R²の代用として標準偏差の逆数）
-            trend_strength = (1 / (pl.col("close").rolling_std(period) + 1e-10)).alias(
-                f"{self.prefix}trend_strength_{period}"
+            # ▼▼ 修正前: trend_strength = (1 / (pl.col("close").rolling_std(period) + 1e-10)).alias(...)
+            # ▼▼ 修正後: 案Aを採用（無次元化した上で上限100.0でクリップ）
+            normalized_std = pl.col("close").rolling_std(period, ddof=1) / (
+                atr_13_expr + 1e-10
+            )
+            trend_strength = (
+                (1.0 / (normalized_std + 1e-10))
+                .clip(upper_bound=100.0)
+                .alias(f"{self.prefix}trend_strength_{period}")
             )
             exprs.append(trend_strength)
 
@@ -2002,18 +2167,53 @@ class CalculationEngine:
         result = self.create_advanced_features(result)
         result = self.create_moving_average_features(result)
 
+        # ▼▼ 追加: スケール不変のZスコアを用いた自動重み付け（sample_weight）
+        atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
+            lambda s: calculate_atr_numba(
+                s.struct.field("high").to_numpy(),
+                s.struct.field("low").to_numpy(),
+                s.struct.field("close").to_numpy(),
+                13,
+            ),
+            return_dtype=pl.Float64,
+        )
+
+        # ボラティリティのZスコア計算 (W_max制限に合わせた200期間のローリングを使用)
+        norm_range = (pl.col("high") - pl.col("low")) / (atr_13_expr + 1e-10)
+        z_score = (norm_range - norm_range.rolling_mean(200)) / (
+            norm_range.rolling_std(200, ddof=1) + 1e-10
+        )
+
+        weight_expr = (
+            pl.when(z_score.abs() < 2.0)
+            .then(1.0)
+            .when(z_score.abs() < 3.0)
+            .then(2.0)
+            .when(z_score.abs() < 4.0)
+            .then(4.0)
+            .otherwise(6.0)
+        ).alias("sample_weight")
+
+        result = result.with_columns(weight_expr)
+        # ▲▲ 追加ここまで
+
         logger.info("基本データ処理特徴量計算完了")
         return result
 
-    def apply_quality_assurance(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
-        """品質保証システム適用"""
-        logger.info("品質保証システム適用開始")
+    # ▼▼ 修正前: def apply_quality_assurance(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame: (旧方式)
+    # ▼▼ 修正前: def _apply_qa_to_series(self, values: np.ndarray) -> np.ndarray: (削除)
+    # ▼▼ 修正後: EWMベースの動的±5σクリッピングへ完全一本化（未来情報の混入を防止）
+    # ▼ 引数に timeframe を追加
+    def apply_quality_assurance(
+        self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
+    ) -> pl.LazyFrame:
+        """品質保証システム適用 (EWM動的クリッピング)"""
+        logger.info(f"品質保証システム適用開始 (EWMベース, timeframe={timeframe})")
 
         try:
-            # スキーマ取得
-            schema = lazy_frame.collect_schema()
+            half_life = self.config.timeframe_bars_per_day.get(timeframe, 1440)
 
-            # 特徴量列の取得（タイムスタンプとメタデータ以外）
+            schema = lazy_frame.collect_schema()
             feature_columns = [
                 col
                 for col in schema.names()
@@ -2021,24 +2221,34 @@ class CalculationEngine:
                 and schema[col] in [pl.Float32, pl.Float64]
             ]
 
-            # 品質保証適用
             qa_exprs = []
             for col in feature_columns:
-                qa_exprs.append(
+                # ▼▼ 修正: adjust=False と ignore_nulls=True を両方明示的に指定し、因果律と減衰の正確性を完全担保
+                # 修正後
+                ewm_mean = pl.col(col).ewm_mean(
+                    half_life=half_life, adjust=False, ignore_nulls=True
+                )
+                ewm_std = pl.col(col).ewm_std(
+                    half_life=half_life, adjust=False, ignore_nulls=True
+                )
+
+                upper_bound = ewm_mean + 5.0 * ewm_std
+                lower_bound = ewm_mean - 5.0 * ewm_std
+
+                clipped_expr = (
                     pl.col(col)
-                    .map_batches(
-                        lambda s: self._apply_qa_to_series(s.to_numpy()),
-                        return_dtype=pl.Float64,
-                    )
+                    .fill_nan(0.0)
+                    .fill_null(0.0)
+                    .clip(lower_bound, upper_bound)
                     .alias(col)
                 )
+                qa_exprs.append(clipped_expr)
 
             if qa_exprs:
                 result = lazy_frame.with_columns(qa_exprs)
                 logger.info(f"品質保証適用完了: {len(qa_exprs)}列")
             else:
                 result = lazy_frame
-                logger.info("品質保証対象列なし")
 
             return result
 
@@ -2046,17 +2256,13 @@ class CalculationEngine:
             logger.error(f"品質保証エラー: {e}")
             return lazy_frame
 
-    def _apply_qa_to_series(self, values: np.ndarray) -> np.ndarray:
-        """配列への品質保証適用"""
-        score = self.qa.calculate_quality_score(values)
-
-        if score > 0.6:
-            return self.qa.basic_stabilization(values)
-        else:
-            return self.qa.robust_stabilization(values)
-
+    # ▼ 引数に timeframe を追加 (Engine 1C における calculate_one_group 相当)
     def calculate_feature_group(
-        self, lazy_frame: pl.LazyFrame, group_name: str, feature_list: List[str]
+        self,
+        lazy_frame: pl.LazyFrame,
+        group_name: str,
+        feature_list: List[str],
+        timeframe: str = "M1",
     ) -> pl.LazyFrame:
         """特定グループの特徴量計算（細分化対応）"""
         logger.info(f"グループ計算開始: {group_name}")
@@ -2082,7 +2288,17 @@ class CalculationEngine:
             result = lazy_frame
 
         # 該当グループの特徴量のみを抽出
-        base_columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        # 修正後
+        base_columns = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "timeframe",
+            "sample_weight",
+        ]
         schema = result.collect_schema()
         available_features = [
             col for col in schema.names() if col.startswith(self.prefix)
@@ -2101,7 +2317,8 @@ class CalculationEngine:
         )
 
         # 品質保証適用
-        result = self.apply_quality_assurance(result)
+        # ▼ timeframe を渡す
+        result = self.apply_quality_assurance(result, timeframe=timeframe)
 
         logger.info(
             f"グループ計算完了: {group_name} - {len(selected_features)}個の特徴量"
@@ -2144,6 +2361,12 @@ def create_augmented_frame(
     """
     lf_current = pl.scan_parquet(current_partition_path / "*.parquet")
     df_current = lf_current.collect()
+
+    # ▼▼ 修正: 早期リターンの前に、現在のDFへ確実に timeframe を追加
+    df_current = df_current.with_columns(
+        pl.lit("tick").alias("timeframe").cast(pl.Utf8)
+    )
+
     len_current_partition = df_current.height
 
     if prev_partition_path is None:
@@ -2155,6 +2378,9 @@ def create_augmented_frame(
 
     lf_prev = pl.scan_parquet(prev_partition_path / "*.parquet")
     df_prefix = lf_prev.tail(lookback_required).collect()
+
+    # ▼▼ 修正: 過去のDF（prefix）にも結合前に timeframe を追加（スキーマ不一致エラー防止）
+    df_prefix = df_prefix.with_columns(pl.lit("tick").alias("timeframe").cast(pl.Utf8))
 
     augmented_df = pl.concat([df_prefix, df_current], how="vertical")
 
@@ -2170,8 +2396,8 @@ def run_on_partitions_mode(config: ProcessingConfig):
 
     timeframe = "tick"  # timeframeを明示的に定義
 
+    # ▼▼ ここから下の定義が欠落していました
     PARTITION_ROOT = Path(config.partitioned_tick_path)
-    # 【修正点】プロンプトの命名規則に準拠したディレクトリ名に変更
     FEATURES_ROOT = (
         Path(config.output_base_path) / f"features_{config.engine_id}_{timeframe}/"
     )
@@ -2182,7 +2408,17 @@ def run_on_partitions_mode(config: ProcessingConfig):
 
     sorted_partitions = get_sorted_partitions(PARTITION_ROOT)
 
+    # 運用上の改善（再開ロジック）
+    resume_date = getattr(config, "resume_date", None)
+    if resume_date:
+        logging.info(f"再開モード: {resume_date} 以降のパーティションを処理します。")
+
     for i, current_path in enumerate(sorted_partitions):
+        if resume_date:
+            date_str = f"{current_path.parent.parent.name.split('=')[1]}-{current_path.parent.name.split('=')[1].zfill(2)}-{current_path.name.split('=')[1].zfill(2)}"
+            if date_str < resume_date:
+                continue
+
         logging.info(
             f"=== 水平処理 ({i + 1}/{len(sorted_partitions)}): {current_path.relative_to(PARTITION_ROOT)} ==="
         )
@@ -2201,8 +2437,9 @@ def run_on_partitions_mode(config: ProcessingConfig):
             for group_name, feature_list in feature_groups.items():
                 logging.info(f"--- 垂直グループ処理: {group_name} ---")
 
+                # ▼ timeframe を引数として明示的に渡す
                 group_lf_result = calculation_engine.calculate_feature_group(
-                    augmented_df.lazy(), group_name, feature_list
+                    augmented_df.lazy(), group_name, feature_list, timeframe=timeframe
                 )
 
                 # 一時ファイルとして保存
@@ -2291,7 +2528,74 @@ def process_single_timeframe(config: ProcessingConfig, timeframe: str):
         summary = data_engine.get_data_summary(lazy_frame)
         logger.info(f"データサマリー: {summary}")
 
-        features_lf = calc_engine.calculate_all_features(lazy_frame)
+        # ▼▼ 修正前: features_lf = calc_engine.calculate_all_features(lazy_frame, timeframe=timeframe)
+        # ▼▼ 修正後: 物理的垂直分割（ディスク退避・結合ロジック）に完全置換
+        import gc
+
+        feature_groups = calc_engine.get_feature_groups()
+        temp_dir = calc_engine.temp_dir / f"tf_{timeframe}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_files = []
+
+        base_df = lazy_frame.collect()
+
+        for group_idx, (group_name, group_expressions) in enumerate(
+            feature_groups.items()
+        ):
+            logger.info(
+                f"グループ処理開始: {group_name} ({len(group_expressions)}個の特徴量)"
+            )
+
+            group_result_lf = calc_engine.calculate_feature_group(
+                base_df.lazy(), group_name, group_expressions, timeframe=timeframe
+            )
+
+            group_result_df = group_result_lf.collect(engine="streaming")
+
+            temp_file = temp_dir / f"group_{group_idx:02d}_{group_name}.parquet"
+            group_result_df.write_parquet(str(temp_file), compression="snappy")
+            temp_files.append(temp_file)
+
+            del group_result_df
+            gc.collect()
+
+        logger.info("全グループ計算完了。ファイルの結合を開始します...")
+        result_df = pl.read_parquet(str(temp_files[0]))
+        base_columns = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "timeframe",
+            "sample_weight",
+        ]
+
+        # 修正後
+        for temp_file in temp_files[1:]:
+            next_df = pl.read_parquet(str(temp_file))
+            feature_cols = [
+                col
+                for col in next_df.columns
+                if col not in base_columns and col not in result_df.columns
+            ]
+            if feature_cols:
+                result_df = result_df.hstack(next_df.select(feature_cols))
+            del next_df
+            gc.collect()
+
+        features_lf = result_df.lazy()
+
+        # ▼▼ 次回以降のための追加箇所: 結合完了後に明示的にファイルを削除する ▼▼
+        for temp_file in temp_files:
+            if temp_file.exists():
+                temp_file.unlink()
+        if temp_dir.exists():
+            temp_dir.rmdir()
+        # ▲▲ 追加箇所ここまで ▲▲
+        # ▲▲ 修正ここまで
+
         processed_lf = output_engine.apply_nan_filling(features_lf)
         metadata = output_engine.save_features(processed_lf, timeframe)
 

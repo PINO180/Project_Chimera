@@ -28,6 +28,35 @@ git reset --hard HEAD
 1.変更をステージングする
 git add .
 2.変更をコミットする
-git commit -m "update20260321"
+git commit -m "update20260324"
 3.リモートリポジトリにプッシュする
 git push origin main
+
+
+VS Code内で「新しいリポジトリ」に引っ越す全手順
+ステップ1：GitHub（Webサイト）で新しい空の箱を作る
+ブラウザでGitHubを開き、右上の「＋」から New repository をクリックします。
+
+新しい名前（例: ProjectForge_V6）を入力します。
+
+⚠️ 【超重要】 READMEや.gitignoreのチェックはすべて外したまま（空っぽのまま）、Create repository を押します。
+
+画面に出てくる新しいURL（https://github.com/ユーザー名/新しいリポジトリ名.git）をコピーします。
+
+ステップ2：VS Codeのターミナルで「接続先」を書き換える
+VS Codeのターミナルを開き、以下のコマンドを打ちます。
+
+Bash
+# 1. 念のため、今の接続先を確認（古いURLが出ます）
+git remote -v
+
+# 2. 接続先を「新しいリポジトリ」に上書きする（コピーしたURLを貼り付けてください）
+git remote set-url origin https://github.com/PINO180/Project_Chimera.git
+# 3. もう一度確認（新しいURLに変わっていれば引っ越し準備完了！）
+git remote -v
+ステップ3：新しいリポジトリへコードをアップロード（Push）する
+そのままターミナルで、以下のコマンドを打ちます。
+
+Bash
+git push -u origin main
+※もし今のブランチ名が main ではなく master の場合は git push -u origin master にしてください。

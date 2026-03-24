@@ -1,0 +1,23 @@
+各列の意味 (ヘッダーから推測)
+
+timestamp: 取引が行われた日時
+
+pnl: その取引での損益額 (Profit and Loss)
+
+capital_after_trade: その取引終了後の口座残高
+
+m2_calibrated_proba: AI (M2モデル) が予測した、その取引が成功する確率 (較正済み)
+
+payoff_ratio: その取引のペイオフレシオ (利益確定幅 / 損切り幅)
+
+kelly_f_star: ケリー基準で計算された理論上の最適投資割合
+
+f_star: kelly_f_star を0以上にした値
+
+base_bet_fraction: f_star にケリーフラクション (例: 1.0) を掛けた基本的な投資割合
+
+capped_bet_fraction: base_bet_fraction に最大リスク上限 (例: 50%) を適用した後の投資割合
+
+effective_bet_fraction: 実際に使われた最終的な投資割合 ( capped_bet_fraction と同じ場合が多い)
+
+label: その取引の実際の結果 (1: 勝ち, -1: 負け)

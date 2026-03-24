@@ -3,6 +3,8 @@
 # これが最も重要な設定です
 data/
 
+# --------ALL REUNION/
+
 # VS Codeのワークスペース設定を無視します
 .vscode/
 

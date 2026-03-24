@@ -1,0 +1,44 @@
+Project Forge データディレクトリ最終設計図 (改訂版)
+data/
+└── XAUUSD/
+    ├── stratum_1_base/
+    │   ├── master_tick_exness_raw.parquet
+    │   ├── master_tick_partitioned/
+    │   └── master_from_tick/
+    │
+    ├── stratum_2_features/
+    │   ├── feature_value_a_vast_universeA/
+    │   ├── feature_value_a_vast_universeB/
+    │   ├── feature_value_a_vast_universeC/
+    │   ├── feature_value_a_vast_universeD/
+    │   ├── feature_value_a_vast_universeE/
+    │   ├── feature_value_a_vast_universeF/
+    │   └── feature_value_complexity_theoryA/
+    │
+    ├── stratum_3_artifacts/
+    │   └── 1A_2B/
+    │       ├── stable_feature_list.joblib          // 2.1 feature_validator.py の出力
+    │       ├── adversarial_scores.joblib           // 2.1 feature_validator.py の出力
+    │       ├── final_feature_team.joblib           // 2.3 walk_forward_validator_v2.py の出力
+    │       └── shap_scores.joblib                  // 2.3 walk_forward_validator_v2.py の出力
+    │
+    ├── stratum_4_master/
+    │   └── 1A_2B/
+    │       └── master_table_partitioned/           // 2.2 build_master_table.py の出力
+    │
+    ├── stratum_5_alpha/
+    │   └── 1A_2B/
+    │       └── neutralized_alpha_set_partitioned/  // 2.4 feature_neutralizer.py の出力
+    │
+    ├── stratum_6_training/
+    │   └── 1A_2B/
+    │       ├── labeled_dataset_partitioned/        // 3.1 triple_barrier_labeling.py の出力
+    │       └── weighted_dataset_partitioned/       // 3.2 sample_uniqueness_weighting.py の出力
+    │
+    └── stratum_7_models/
+        └── 1A_2B/
+            ├── m1_model.pkl                        // 3.3 model_training_metalabeling.py の出力
+            ├── m2_model.pkl                        // 3.3 model_training_metalabeling.py の出力
+            ├── m1_calibrated.pkl                   // 4.1 model_training_metalabeling.py の出力
+            ├── m2_calibrated.pkl                   // 4.1 model_training_metalabeling.py の出力
+            └── model_performance_report.json       // 3.3 model_training_metalabeling.py の出力
