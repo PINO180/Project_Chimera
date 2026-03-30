@@ -25,32 +25,13 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-# 修正①：S2_FEATURES_FIXEDを削除し、必要なパス・定数をインポート
 try:
-    from blueprint import (
-        S2_FEATURES_VALIDATED,
-        S5_NEUTRALIZED_ALPHA_SET,
-        S1_RAW_TICK_PARTITIONED,
-        S1_PROCESSED,
-        BARRIER_ATR_PERIOD,
-        ATR_BASELINE_DAYS,
-        S3_OPTUNA_RESULTS_DIR,
-    )
+    from blueprint import S2_FEATURES_FIXED, S5_NEUTRALIZED_ALPHA_SET
 except ImportError:
     logging.warning("blueprint.py not found. Using fallback paths.")
-    S2_FEATURES_VALIDATED = Path("/workspace/data/XAUUSD/stratum_2_features_validated")
-    # 修正①：フォールバックから 1A_2B を削除
+    S2_FEATURES_FIXED = Path("/workspace/data/XAUUSD/stratum_2_features_fixed")
     S5_NEUTRALIZED_ALPHA_SET = Path(
-        "/workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned"
-    )
-    S1_RAW_TICK_PARTITIONED = Path(
-        "/workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned"
-    )
-    S1_PROCESSED = Path("/workspace/data/XAUUSD/stratum_1_base/master_processed")
-    BARRIER_ATR_PERIOD = 13
-    ATR_BASELINE_DAYS = 1
-    S3_OPTUNA_RESULTS_DIR = Path(
-        "/workspace/data/XAUUSD/stratum_3_artifacts/optuna_results"
+        "/workspace/data/XAUUSD/stratum_5_alpha/1A_2B/neutralized_alpha_set_partitioned"
     )
 
 # --- ロギングと定数設定 ---
@@ -58,7 +39,8 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-RESULTS_BASE_DIR = S3_OPTUNA_RESULTS_DIR
+# 【修正要件4】 保存先ベースディレクトリを設定
+RESULTS_BASE_DIR = Path("/workspace/data/XAUUSD/stratum_7_models/1A_2B")
 RESULTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ★テストしたいスプレッドをリストで複数指定
@@ -89,11 +71,15 @@ ATR_PERIODS = [
     13
     #    , 21, 34
 ]
-
-# 修正②：ATR_THRESHOLDSをRatio閾値に変更
-# ATR Ratio閾値（現在のATR / 過去ATR_BASELINE_DAYS日の平均ATR）
-# Ratio >= 閾値 なら「現在のボラティリティが過去平均のN%以上ある正常相場」としてエントリー許可
-ATR_THRESHOLDS = [0.5, 0.8, 1.0, 1.2, 1.5]
+# 低い時間足(M1~M15等)のために、小さい閾値も含めることを推奨します
+ATR_THRESHOLDS = [
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    # 8.0, 10.0, 15.0
+]
 
 PT_MULTS = [
     # 0.5,
@@ -126,13 +112,6 @@ MIN_TOTAL_BETS_PER_FOLD = 100
 
 SEARCH_TIMEFRAMES = TIMEFRAMES + ["mixed"]
 
-# 修正④：timeframe_bars_per_day（ATR Ratio計算用・全スクリプト共通定数）
-timeframe_bars_per_day = {
-    "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
-    "M8": 180, "M15": 96, "M30": 48, "H1": 24,
-    "H4": 6, "H6": 4, "H12": 2, "D1": 1, "W1": 1, "MN": 1,
-}
-
 
 # ====================================================================
 # Numba JIT 高速トリプルバリア関数 (ショート専用に修正)
@@ -158,6 +137,10 @@ def _numba_find_hits_fast(
         pt = bets_pt_barrier[i]
         sl = bets_sl_barrier[i]
 
+        # --- 修正前 ---
+        # start_idx = np.searchsorted(ticks_ts, t0, side="left")
+
+        # --- 修正後 ---
         start_idx = np.searchsorted(ticks_ts, t0, side="right")
         first_pt_found = np.int64(0)
         first_sl_found = np.int64(0)
@@ -169,6 +152,7 @@ def _numba_find_hits_fast(
             tick_high = ticks_high[j]
             tick_low = ticks_low[j]
 
+            # 【修正要件2】 Hit判定の反転
             # ショート利確: LowがPT(目標価格)以下になったら
             if first_pt_found == 0 and tick_low <= pt:
                 first_pt_found = tick_time
@@ -223,6 +207,7 @@ class FoldDataLoader:
         self.tick_np_cache = {}  # Numba用の巨大Tick配列キャッシュ
         self.sig_cache = {}  # S5 + ATRの軽量シグナルキャッシュ
 
+    # ★ 追加：キャッシュをクリアするメソッド
     def clear_all_caches(self):
         self.tick_df_cache.clear()
         self.tick_np_cache.clear()
@@ -240,19 +225,13 @@ class FoldDataLoader:
         fold_key = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
         sig_key = f"{fold_key}_{tf}_{atr_p}"
 
-        # 1. 巨大なTickデータは Fold単位で1回だけロードして共有する (メモリ節約の要)
         if fold_key not in self.tick_np_cache:
             logging.info(
                 f"    [Cache Miss] Loading Raw Tick Data for Fold {fold_key}..."
             )
             tick_end_date = end_date + timedelta(days=2)
-
-            # 修正⑤：tickデータ取得先を S1_RAW_TICK_PARTITIONED に変更
-            # S1_RAW_TICK_PARTITIONEDのカラム：timestamp・bid・ask・last・volume・spread・mid_price
-            # バリア判定は mid_price を high/low/close 代わりに使用する
             lf_tick = (
                 pl.scan_parquet(str(self.base_tick_dir / "**/*.parquet"))
-                .rename({"datetime": "timestamp"})
                 .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
                 .filter(
                     (pl.col("timestamp") >= start_date)
@@ -260,28 +239,23 @@ class FoldDataLoader:
                 )
                 .sort("timestamp")
             )
-            df_tick = lf_tick.select(
-                ["timestamp", "mid_price"]
-            ).collect(engine="streaming")
+            df_tick = lf_tick.select(["timestamp", "high", "low", "close"]).collect(
+                engine="streaming"
+            )
 
             if df_tick.is_empty():
                 self.tick_np_cache[fold_key] = None
                 self.tick_df_cache[fold_key] = None
             else:
-                # mid_price を close・high・low として扱う（tick データに H/L 列は存在しない）
-                self.tick_df_cache[fold_key] = df_tick.select(
-                    ["timestamp", pl.col("mid_price").alias("close")]
-                )
-                ts_np = np.ascontiguousarray(
-                    df_tick.with_columns(
-                        pl.col("timestamp").dt.timestamp("us")
-                    )["timestamp"].to_numpy()
-                )
-                mid_np = np.ascontiguousarray(df_tick["mid_price"].to_numpy())
+                self.tick_df_cache[fold_key] = df_tick.select(["timestamp", "close"])
                 self.tick_np_cache[fold_key] = (
-                    ts_np,
-                    mid_np,  # high の代替（ショート: SL判定に使用）
-                    mid_np,  # low の代替（ショート: PT判定に使用）
+                    np.ascontiguousarray(
+                        df_tick.with_columns(pl.col("timestamp").dt.timestamp("us"))[
+                            "timestamp"
+                        ].to_numpy()
+                    ),
+                    np.ascontiguousarray(df_tick["high"].to_numpy()),
+                    np.ascontiguousarray(df_tick["low"].to_numpy()),
                 )
             del df_tick
             gc.collect()
@@ -289,7 +263,6 @@ class FoldDataLoader:
         if self.tick_np_cache[fold_key] is None:
             return None
 
-        # 2. シグナルデータのロード (S5 + ATR自前計算)
         if sig_key not in self.sig_cache:
             logging.info(
                 f"    [Cache Miss] Loading Signal Data for {tf}, ATR={atr_p}..."
@@ -304,10 +277,20 @@ class FoldDataLoader:
                 )
                 s5_files = [d for d in s5_dirs if d.is_dir()]
 
-            # 修正③：S2_FEATURES_FIXEDからのATR読み込みを削除し、
-            #         S1_PROCESSEDのOHLCVからWilder平滑化でATR絶対値を自前計算する
-            price_dir = S1_PROCESSED / f"timeframe={tf}"
-            if not price_dir.exists() or not s5_files:
+            atr_file, actual_atr = None, None
+            for p in S2_FEATURES_FIXED.rglob(f"features_*_{tf}.parquet"):
+                if "tick" in str(p):
+                    continue
+                try:
+                    cols = pl.scan_parquet(str(p)).collect_schema().names()
+                    a_col = next((c for c in cols if f"atr_{atr_p}" in c), None)
+                    if a_col:
+                        atr_file, actual_atr = p, a_col
+                        break
+                except:
+                    pass
+
+            if not s5_files or not atr_file:
                 self.sig_cache[sig_key] = None
             else:
                 s5_path = s5_files[0]
@@ -325,26 +308,16 @@ class FoldDataLoader:
                     .sort("timestamp")
                 )
 
-                # S1_PROCESSEDのOHLCVからWilder平滑化でATR絶対値を自前計算
                 lf_atr = (
-                    pl.scan_parquet(str(price_dir / "*.parquet"))
-                    .select(["timestamp", "high", "low", "close"])
+                    pl.scan_parquet(str(atr_file))
+                    .select(["timestamp", actual_atr])
                     .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
                     .filter(
                         (pl.col("timestamp") >= start_date)
                         & (pl.col("timestamp") < end_date)
                     )
                     .sort("timestamp")
-                    .with_columns([
-                        pl.max_horizontal(
-                            pl.col("high") - pl.col("low"),
-                            (pl.col("high") - pl.col("close").shift(1)).abs(),
-                            (pl.col("low") - pl.col("close").shift(1)).abs(),
-                        )
-                        .ewm_mean(alpha=1 / atr_p, adjust=False)
-                        .alias(f"atr_{atr_p}")
-                    ])
-                    .select(["timestamp", f"atr_{atr_p}"])
+                    .rename({actual_atr: f"atr_{atr_p}"})
                 )
 
                 df_tick_close = self.tick_df_cache[fold_key]
@@ -353,6 +326,16 @@ class FoldDataLoader:
                 )
                 lf_sig = lf_sig.join_asof(lf_atr, on="timestamp", strategy="backward")
 
+                # --- 修正前 ---
+                # lf_sig = (
+                #     lf_sig.with_columns(
+                #         pl.col(f"atr_{atr_p}")
+                #         .fill_null(strategy="forward")
+                #         .fill_null(strategy="backward")
+                #     )
+                # ...
+
+                # --- 修正後 ---
                 lf_sig = (
                     lf_sig.with_columns(
                         pl.col(f"atr_{atr_p}").fill_null(strategy="forward")
@@ -402,8 +385,8 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
         total_losses_all = 0
         total_timeouts_all = 0
         total_sum_atr_all = 0.0
-        total_net_profit_all = 0.0
-        total_timeout_np_all = 0.0
+        total_net_profit_all = 0.0  # 追加: 全トレード純利益の合算用
+        total_timeout_np_all = 0.0  # 追加: Timeouts損益の合算用
 
         for fold_idx, (_, test_dates) in enumerate(cv_folds):
             if tf_choice == "mixed":
@@ -442,16 +425,8 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                     fold_data
                 )
 
-            # 修正④：ボラティリティフィルターをATR Ratio判定に変更
-            # ATR_BASELINE_DAYS日分のバー数でベースラインATRを計算
-            # NOTE: tf_choice="mixed" は辞書に存在しないため default=1440（M1粒度）をベースラインとする
-            #       mixed は M1〜M15 の混在データであり、最も細かい時間足 M1 を基準にするのが合理的
-            baseline_period = timeframe_bars_per_day.get(tf_choice, 1440) * ATR_BASELINE_DAYS
-            atr_series = pd.Series(sig_atr)
-            baseline_atr = atr_series.rolling(window=baseline_period, min_periods=1).mean().values
-            atr_ratio = sig_atr / (baseline_atr + 1e-10)
-            mask = atr_ratio >= atr_threshold
-
+            # 【修正要件3】 ボラティリティによるフィルタリング（方向性を持たないためそのまま維持）
+            mask = sig_atr >= atr_threshold
             if not np.any(mask):
                 fold_scores.append(0.0)
                 continue
@@ -473,7 +448,7 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                 bets_atr = np.ascontiguousarray(raw_atr[valid_indices])
                 bets_t1_max = bets_t0 + td_us
 
-                # ショート用バリア計算（反転ロジックを維持）
+                # 【修正要件1】 バリアの計算式をショート用に反転（スプレッドの壁を加味）
                 # ショートの利確はスプレッド分さらに下へ遠ざかり、損切は下へ近づく
                 bets_pt = np.ascontiguousarray(
                     bets_close - bets_atr * pt_mult - spread_cost
@@ -493,7 +468,7 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                 )
 
                 # 勝敗判定と利益計算は到達タイミング（timestamp）に依存するため、
-                # Numba関数内の到達判定を反転させたことで既存のロジックがそのまま機能する
+                # Numba関数内の到達判定を反転させたことで既存のロジックがそのまま機能します
                 is_win = (out_pt > 0) & ((out_sl == 0) | (out_pt < out_sl))
                 is_loss = (out_sl > 0) & ((out_pt == 0) | (out_sl <= out_pt))
                 timeouts = int(np.sum(~(is_win | is_loss)))
@@ -520,8 +495,12 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                 total_losses_all += losses
                 total_timeouts_all += timeouts
                 total_sum_atr_all += float(np.sum(bets_atr))
-                total_net_profit_all += total_profit - total_loss_adj
-                total_timeout_np_all += -(timeouts * spread_cost)
+                total_net_profit_all += (
+                    total_profit - total_loss_adj
+                )  # 追加: 純利益を加算
+                total_timeout_np_all += -(
+                    timeouts * spread_cost
+                )  # 追加: Timeout損失を加算
 
             current_mean_score = np.mean(fold_scores)
             trial.report(current_mean_score, step=fold_idx)
@@ -541,10 +520,10 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
         )
         trial.set_user_attr(
             "Total_NP", round(total_net_profit_all * 100 * 150, 0)
-        )
+        )  # 追加: *100*150して記録
         trial.set_user_attr(
             "Timeout_NP", round(total_timeout_np_all * 100 * 150, 0)
-        )
+        )  # 追加: *100*150して記録
 
         return np.mean(fold_scores)
 
@@ -555,8 +534,7 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
 # メイン実行ブロック
 # ====================================================================
 def run_optimization():
-    # 修正⑤：tickデータ取得先を S1_RAW_TICK_PARTITIONED に変更
-    tick_dir = S1_RAW_TICK_PARTITIONED
+    tick_dir = S2_FEATURES_FIXED / "feature_value_a_vast_universeC/features_e1c_tick"
 
     logging.info("Discovering partitions...")
     partitions = []
@@ -593,8 +571,8 @@ def run_optimization():
         "Timeouts",
         "Avg_ATR",
         "Avg_Payoff",
-        "Total_NP",
-        "Timeout_NP",
+        "Total_NP",  # 追加
+        "Timeout_NP",  # 追加
         "Adjusted_PF",
     ]
 
@@ -607,6 +585,7 @@ def run_optimization():
         logging.info("*" * 80)
 
         final_df_list = []
+        # 保存するCSVの名前をショート＆スプレッドごとに分ける
         csv_name = f"optuna_top100_pure_atr_results_short_spread_{current_spread}.csv"
         current_csv_path = RESULTS_BASE_DIR / csv_name
 
@@ -618,6 +597,7 @@ def run_optimization():
                 f"=== Starting Optuna Optimization for {target_tf} [SHORT_ONLY] | Spread: {current_spread} (Trials: {N_TRIALS}) ==="
             )
 
+            # (studyの作成)
             sampler = TPESampler(n_startup_trials=300, multivariate=True)
             study = optuna.create_study(
                 direction="maximize",
@@ -627,12 +607,14 @@ def run_optimization():
                 ),
             )
 
+            # (最適化実行に current_spread を渡す)
             study.optimize(
                 create_objective(cv_folds, data_loader, target_tf, current_spread),
                 n_trials=N_TRIALS,
                 gc_after_trial=True,
             )
 
+            # (データフレーム処理はそのまま)
             df = study.trials_dataframe(
                 attrs=("value", "params", "user_attrs", "state")
             )
@@ -664,6 +646,7 @@ def run_optimization():
             print("=" * 90)
             print(top_100.head(10)[cols_to_print].to_string(index=False))
 
+        # スプレッドごとのループの最後でCSVを保存
         if final_df_list:
             final_csv_df = pl.DataFrame(
                 pd.concat(final_df_list, ignore_index=True)[cols_to_print]

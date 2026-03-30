@@ -15,7 +15,6 @@ import re
 import gc
 import datetime as dt
 import numpy as np
-import calendar
 
 try:
     from numba import njit, prange
@@ -35,10 +34,7 @@ if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 # --- Blueprint Imports ---
-from blueprint import (
-    S5_NEUTRALIZED_ALPHA_SET, S2_FEATURES_VALIDATED, S6_LABELED_DATASET,
-    S1_RAW_TICK_PARTITIONED, S1_PROCESSED, BARRIER_ATR_PERIOD, ATR_BASELINE_DAYS
-)
+from blueprint import S5_NEUTRALIZED_ALPHA_SET, S2_FEATURES_FIXED, S6_LABELED_DATASET
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -56,32 +52,25 @@ except ImportError:
 # --- ▼▼▼ V5 双方向ラベリング ルール定義 ▼▼▼ ---
 
 # 対象タイムフレームとATRの指定
-TARGET_TIMEFRAMES = ["M3"]  # Optunaの結論: M3単体・ratio0.8・TD30min
-ATR_PERIOD = BARRIER_ATR_PERIOD  # blueprintから取得
-ATR_RATIO_THRESHOLD = 0.8  # ATR Ratio閾値（絶対値ではなく相対比率）
+TARGET_TIMEFRAMES = ["M1", "M3", "M5", "M8", "M15"]  # Mixed対応
+ATR_PERIOD = 13
+ATR_SHRINK_THRESHOLD = 2.0
 
-# timeframeごとの1日あたりバー数（ATR Ratio計算のbaseline_period算出に使用）
-timeframe_bars_per_day = {
-    "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
-    "M8": 180, "M15": 96, "M30": 48, "H1": 24,
-    "H4": 6, "H6": 4, "H12": 2, "D1": 1, "W1": 1, "MN": 1
-}
-
-# ★スプレッドコストを定義（spread_pips=50.0 → XAUUSD: 1pip=0.01ドル → 50pips=0.50ドル）
+# ★スプレッドコストを定義
 SPREAD = 0.50
 
 # ロング用ルール
 RULE_LONG = {
-    "pt_mult": 1.0,   # pt_multiplier_long
-    "sl_mult": 5.0,   # sl_multiplier_long
-    "td": "30m",      # td_minutes_long: 30
+    "pt_mult": 1.0,
+    "sl_mult": 5.0,
+    "td": "60m",  # td_mins: 60
 }
 
 # ショート用ルール
 RULE_SHORT = {
-    "pt_mult": 1.0,   # pt_multiplier_short
-    "sl_mult": 5.0,   # sl_multiplier_short
-    "td": "30m",      # td_minutes_short: 30
+    "pt_mult": 1.0,
+    "sl_mult": 5.0,
+    "td": "60m",  # td_mins: 60
 }
 # --- ▲▲▲ 改造ここまで ▲▲▲ ---
 
@@ -92,7 +81,7 @@ class ProxyLabelConfig:
     """Config for creating a context-adaptive, dual-labeled subset for proxy model training."""
 
     input_dir: Path = S5_NEUTRALIZED_ALPHA_SET
-    price_data_source_dir: Path = S1_PROCESSED  # tick/ATRはS1から直接取得（S2_FEATURES_VALIDATEDは不使用）
+    price_data_source_dir: Path = S2_FEATURES_FIXED
     output_dir: Path = S6_LABELED_DATASET
 
     filter_mode: str = "year"  # 'year', 'month', 'all'
@@ -449,59 +438,66 @@ class ProxyLabelingEngine:
             return None
 
     def _load_all_price_data(self) -> Dict[str, Any]:
-        """S1_PROCESSEDからWilder平滑化でATR絶対値・ATR Ratioを自前計算して返す。
-        tick価格データは月次チャンクループ内で直接スキャンするためここでは扱わない。"""
-        tick_dir = S1_RAW_TICK_PARTITIONED
+        """S2の価格データ(Tick)と、ATR(13)を読み込む。"""
+        price_dir = self.config.price_data_source_dir / "feature_value_a_vast_universeC"
+        tick_dir = price_dir / "features_e1c_tick"
         if not tick_dir.exists():
-            raise FileNotFoundError(f"Master tick directory not found: {tick_dir}")
-        logging.info(f"  -> Confirmed tick source: '{tick_dir}' (will be loaded per-month chunk).")
+            raise FileNotFoundError(f"Master price directory not found: {tick_dir}")
+        logging.info(f"  -> Scanning '{tick_dir}' as master price source (S2 Tick).")
 
-        # --- S1_PROCESSEDのOHLCVからWilder平滑化でATR絶対値を自前計算 ---
-        # e1c_atr_13はATR/ATR_13の相対値（≈1.0）のため使用不可
-        # atr_ratioも全期間データで事前計算する（日次ループ内での計算は精度・速度ともに問題あり）
+        base_lf = (
+            pl.scan_parquet(str(tick_dir / "**/*.parquet"))
+            .select("timestamp", "close", "high", "low")
+            .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
+            .unique("timestamp", keep="first", maintain_order=True)
+        )
+
+        atr_files = list(price_dir.glob("features_e1c_*.parquet"))
+        timeframe_pattern = re.compile(
+            r"features_e1c_([a-zA-Z0-9\.]+)(?:_atr_only_tick_fixed)?\.parquet"
+        )
         all_atr_lfs = []
-        for tf in TARGET_TIMEFRAMES:
-            price_dir_tf = S1_PROCESSED / f"timeframe={tf}"
-            if not price_dir_tf.exists():
-                logging.warning(f"  -> S1_PROCESSED/timeframe={tf} が見つかりません。スキップします。")
+
+        # --- [修正] ATRを指定 ---
+        SOURCE_ATR_COLUMN_NAME = f"e1c_atr_{ATR_PERIOD}"
+
+        for f_path in atr_files:
+            match = timeframe_pattern.search(f_path.name)
+            if not match:
                 continue
-            target_atr_name = f"e1c_atr_{ATR_PERIOD}_{tf}"
-            atr_ratio_name = f"atr_ratio_{tf}"
-            baseline_period = timeframe_bars_per_day.get(tf, 1440) * ATR_BASELINE_DAYS
-            atr_lf = (
-                pl.scan_parquet(str(price_dir_tf / "*.parquet"))
-                .select(["timestamp", "high", "low", "close"])
-                .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
-                .sort("timestamp")
-                .with_columns([
-                    pl.max_horizontal(
-                        pl.col("high") - pl.col("low"),
-                        (pl.col("high") - pl.col("close").shift(1)).abs(),
-                        (pl.col("low") - pl.col("close").shift(1)).abs(),
+            timeframe = match.group(1)
+
+            # --- [重要] ターゲットのATRのみ読み込む ---
+            if timeframe not in TARGET_TIMEFRAMES:
+                continue
+
+            target_atr_name = f"e1c_atr_{ATR_PERIOD}_{timeframe}"
+            lf_original = pl.scan_parquet(str(f_path))
+            schema_names = lf_original.collect_schema().names()
+
+            lf = lf_original.with_columns(
+                pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
+            )
+            if SOURCE_ATR_COLUMN_NAME in schema_names:
+                all_atr_lfs.append(
+                    lf.select(["timestamp", SOURCE_ATR_COLUMN_NAME]).rename(
+                        {SOURCE_ATR_COLUMN_NAME: target_atr_name}
                     )
-                    .ewm_mean(alpha=1 / ATR_PERIOD, adjust=False)
-                    .alias(target_atr_name)
-                ])
-                # ATR Ratioも全期間データで計算（日次ループ内での計算より精度・速度ともに優れる）
-                .with_columns([
-                    (
-                        pl.col(target_atr_name) /
-                        (pl.col(target_atr_name).rolling_mean(window_size=baseline_period, min_samples=1) + 1e-10)
-                    ).alias(atr_ratio_name)
-                ])
-                .select(["timestamp", target_atr_name, atr_ratio_name])
-            )
-            all_atr_lfs.append(atr_lf)
-            logging.info(
-                f"  -> Prepared ATR blueprint: S1_PROCESSED/timeframe={tf} -> '{target_atr_name}' + '{atr_ratio_name}' (baseline={baseline_period}bars)"
-            )
+                )
+                logging.info(
+                    f"  -> Prepared ATR blueprint: Loaded '{SOURCE_ATR_COLUMN_NAME}' -> '{target_atr_name}'"
+                )
+            else:
+                logging.warning(
+                    f"  -> Required ATR column '{SOURCE_ATR_COLUMN_NAME}' not found in {f_path.name}."
+                )
 
         if not all_atr_lfs:
             raise ValueError(
-                f"FATAL: No valid ATR columns could be computed for {TARGET_TIMEFRAMES} from S1_PROCESSED."
+                f"FATAL: No valid {SOURCE_ATR_COLUMN_NAME} columns were extracted for {TARGET_TIMEFRAMES}."
             )
 
-        return {"atr_lfs": all_atr_lfs}
+        return {"base_lf": base_lf, "atr_lfs": all_atr_lfs}
 
     # =========================================================================
     # ヘルパー関数群 (パーティション探索・時間計算)
@@ -552,7 +548,7 @@ class ProxyLabelingEngine:
         logging.info(f"Applying filter: {self.config.get_filter_description()}")
         logging.info(f"Target Timeframes: {TARGET_TIMEFRAMES}")
         logging.info(
-            f"ATR Ratio Filter: atr_ratio >= {ATR_RATIO_THRESHOLD} (Period: {ATR_PERIOD}, Baseline: {ATR_BASELINE_DAYS} day)"
+            f"ATR Shrink Filter: ATR > {ATR_SHRINK_THRESHOLD} (Period: {ATR_PERIOD})"
         )
         logging.info(
             f"Long Rule : PT={RULE_LONG['pt_mult']}, SL={RULE_LONG['sl_mult']}, TD={RULE_LONG['td']}"
@@ -591,18 +587,9 @@ class ProxyLabelingEngine:
 
             logging.info("Step 3: Preparing price data blueprints...")
             price_components = self._load_all_price_data()
+            base_price_lf = price_components["base_lf"]
             atr_lfs = price_components["atr_lfs"]
 
-            # max_lookahead_minutesを先に定義（月チャンクのマージン計算に使用）
-            max_lookahead_minutes = max(
-                self._get_duration_in_minutes(RULE_LONG["td"]),
-                self._get_duration_in_minutes(RULE_SHORT["td"]),
-            )
-            max_lookahead_delta = dt.timedelta(minutes=max_lookahead_minutes)
-            # 月末に加算するルックアヘッドマージン（TD分 + 安全バッファ3日）
-            lookahead_margin = dt.timedelta(minutes=max_lookahead_minutes) + dt.timedelta(days=3)
-
-            # ATRは全期間・全時間足で1回だけ事前ロード（軽量なのでOK）
             logging.info(f"   -> Pre-loading {len(atr_lfs)} ATR files into memory...")
             atr_dfs = [lf.collect().sort("timestamp") for lf in atr_lfs]
 
@@ -621,195 +608,138 @@ class ProxyLabelingEngine:
                 self._generate_report()
                 return
 
-            # 処理対象の年月一覧を作成（外側ループ用）
-            months_df = (
-                partitions_df.select(
-                    pl.col("date").dt.year().alias("year"),
-                    pl.col("date").dt.month().alias("month"),
-                )
-                .unique()
-                .sort(["year", "month"])
-            )
+            logging.info("Step 5: Starting daily processing loop...")
 
-            logging.info(
-                f"Step 5: Starting monthly chunked processing loop... "
-                f"({len(months_df)} months / {len(partitions_df)} days)"
+            # --- [重要] ロング・ショートのうち長い方のTDをルックアヘッドとして採用 ---
+            max_lookahead_minutes = max(
+                self._get_duration_in_minutes(RULE_LONG["td"]),
+                self._get_duration_in_minutes(RULE_SHORT["td"]),
             )
+            max_lookahead_delta = dt.timedelta(minutes=max_lookahead_minutes)
 
-            # =========================================================
-            # 外側ループ：月単位でtickをロード→処理→破棄
-            # =========================================================
-            for month_row in tqdm(
-                months_df.iter_rows(named=True),
-                total=len(months_df),
-                desc="Processing Months",
+            total_partitions = len(partitions_df)
+            for row in tqdm(
+                partitions_df.iter_rows(named=True),
+                total=total_partitions,
+                desc="Processing Partitions",
             ):
-                y, m = month_row["year"], month_row["month"]
-                _, last_day = calendar.monthrange(y, m)
-
-                # その月のtick範囲（ルックアヘッドマージン付き）
-                month_start = dt.datetime(y, m, 1, tzinfo=dt.timezone.utc)
-                month_end = (
-                    dt.datetime(y, m, last_day, tzinfo=dt.timezone.utc)
-                    + lookahead_margin
+                current_date = row["date"]
+                year, month, day = (
+                    current_date.year,
+                    current_date.month,
+                    current_date.day,
                 )
 
-                # ★ その月のtickデータだけをメモリに載せる
-                # hive_partitioning=Trueで述語プッシュダウンを確実に有効化
-                logging.debug(f"Loading tick chunk for {y}-{m:02d}...")
-                try:
-                    base_price_chunk_df = (
-                        pl.scan_parquet(
-                            str(S1_RAW_TICK_PARTITIONED / "**/*.parquet"),
-                            hive_partitioning=True,
-                        )
-                        .rename({"datetime": "timestamp"})
-                        .select("timestamp", "mid_price")
-                        .with_columns(
-                            pl.col("timestamp").cast(pl.Datetime("us", "UTC")),
-                            pl.col("mid_price").alias("close"),
-                            pl.col("mid_price").alias("high"),
-                            pl.col("mid_price").alias("low"),
-                        )
-                        .select("timestamp", "close", "high", "low")
-                        .filter(pl.col("timestamp").is_between(month_start, month_end))
-                        .collect()
-                        .unique("timestamp", keep="first")
-                        .sort("timestamp")
+                output_partition_dir = (
+                    cfg.output_dir / f"year={year}/month={month}/day={day}"
+                )
+                if cfg.resume and output_partition_dir.exists():
+                    logging.debug(
+                        f"Resuming: Output exists for {current_date}. Skipping."
                     )
-                except Exception as e:
-                    logging.warning(f"Failed to load tick chunk for {y}-{m:02d}: {e}. Skipping month.")
                     continue
 
-                if base_price_chunk_df.is_empty():
-                    logging.warning(f"No tick data found for {y}-{m:02d}. Skipping month.")
+                if "timestamp" in unified_hive_lf.collect_schema().names():
+                    daily_bets_hive_df = unified_hive_lf.filter(
+                        pl.col("timestamp").dt.date() == current_date
+                    ).collect()
+                else:
+                    daily_bets_hive_df = pl.DataFrame()
+
+                if "timestamp" in unified_file_lf.collect_schema().names():
+                    daily_bets_file_df = unified_file_lf.filter(
+                        pl.col("timestamp").dt.date() == current_date
+                    ).collect()
+                else:
+                    daily_bets_file_df = pl.DataFrame()
+
+                # --- [修正] 行増殖バグ対策 & 上位足データ結合(Forward Fill)対応 ---
+                raw_bets_df = pl.concat(
+                    [daily_bets_hive_df, daily_bets_file_df], how="diagonal"
+                )
+
+                if raw_bets_df.is_empty():
                     continue
 
-                logging.debug(
-                    f"  -> Tick chunk {y}-{m:02d}: {len(base_price_chunk_df):,} rows loaded."
+                # --- [修正] ユニバーサルモデル用の特徴量統合とターゲット抽出 ---
+
+                # 1. 各タイムスタンプで有効なターゲット時間足を抽出 (M1, M5などが同時に存在する場合に対応)
+                valid_targets_df = (
+                    raw_bets_df.filter(pl.col("timeframe").is_in(TARGET_TIMEFRAMES))
+                    .select(["timestamp", "timeframe"])
+                    .unique()
                 )
 
-                # その月に含まれる日のリストを取得
-                days_in_month = partitions_df.filter(
-                    (pl.col("date").dt.year() == y) &
-                    (pl.col("date").dt.month() == m)
+                # 2. 全時間足の特徴量を時系列で一つに統合し、上位足の特徴量を下位足に伝播させる (Master Features)
+                master_features_df = (
+                    raw_bets_df.drop("timeframe")
+                    .group_by("timestamp")
+                    .agg(pl.all().drop_nulls().first())
+                    .sort("timestamp")
+                    # ここで全時間足の特徴量を前方補完し、最新の状態を常に維持する（完全食の完成）
+                    .with_columns(pl.exclude("timestamp").forward_fill())
                 )
 
-                # =====================================================
-                # 内側ループ：日次処理（既存ロジックをそのまま維持）
-                # =====================================================
-                for row in days_in_month.iter_rows(named=True):
-                    current_date = row["date"]
-                    year_d, month_d, day_d = (
-                        current_date.year,
-                        current_date.month,
-                        current_date.day,
+                # 3. 統合された完全な特徴量を、各ターゲット時間足のラベル計算用行に結合
+                daily_bets_df = valid_targets_df.join(
+                    master_features_df, on="timestamp", how="left"
+                ).sort(["timeframe", "timestamp"])
+
+                if daily_bets_df.is_empty():
+                    continue
+
+                min_ts_req = daily_bets_df["timestamp"].min()
+                if min_ts_req is None:
+                    continue
+
+                # ロング/ショートの最長TD + 余裕分(2日)で窓を切り出す
+                max_ts_req = min_ts_req + max_lookahead_delta + dt.timedelta(days=2)
+
+                price_window_df = (
+                    base_price_lf.filter(
+                        pl.col("timestamp").is_between(min_ts_req, max_ts_req)
                     )
+                    .collect()
+                    .sort("timestamp")
+                )
 
-                    output_partition_dir = (
-                        cfg.output_dir / f"year={year_d}/month={month_d}/day={day_d}"
+                if price_window_df.is_empty():
+                    continue
+
+                for atr_df in atr_dfs:
+                    atr_df_small = atr_df.filter(
+                        pl.col("timestamp").is_between(min_ts_req, max_ts_req)
                     )
-                    if cfg.resume and output_partition_dir.exists():
-                        logging.debug(
-                            f"Resuming: Output exists for {current_date}. Skipping."
-                        )
-                        continue
-
-                    if "timestamp" in unified_hive_lf.collect_schema().names():
-                        daily_bets_hive_df = unified_hive_lf.filter(
-                            pl.col("timestamp").dt.date() == current_date
-                        ).collect()
-                    else:
-                        daily_bets_hive_df = pl.DataFrame()
-
-                    if "timestamp" in unified_file_lf.collect_schema().names():
-                        daily_bets_file_df = unified_file_lf.filter(
-                            pl.col("timestamp").dt.date() == current_date
-                        ).collect()
-                    else:
-                        daily_bets_file_df = pl.DataFrame()
-
-                    raw_bets_df = pl.concat(
-                        [daily_bets_hive_df, daily_bets_file_df], how="diagonal"
-                    )
-
-                    if raw_bets_df.is_empty():
-                        continue
-
-                    # 1. 各タイムスタンプで有効なターゲット時間足を抽出（重複排除込み）
-                    valid_targets_df = (
-                        raw_bets_df.filter(pl.col("timeframe").is_in(TARGET_TIMEFRAMES))
-                        .select(["timestamp", "timeframe"])
-                        .unique()
-                    )
-
-                    # 2. 全時間足の特徴量をtimestampごとに1行に集約
-                    # （forward_fillは未来情報リークのリスクがあるため削除、group_by+aggの重複排除は維持）
-                    master_features_df = (
-                        raw_bets_df.drop("timeframe")
-                        .group_by("timestamp")
-                        .agg(pl.all().drop_nulls().first())
-                        .sort("timestamp")
-                    )
-
-                    # 3. 集約済み特徴量を各ターゲット時間足行に結合
-                    daily_bets_df = valid_targets_df.join(
-                        master_features_df, on="timestamp", how="left"
-                    ).sort(["timeframe", "timestamp"])
-
-                    if daily_bets_df.is_empty():
-                        continue
-
-                    min_ts_req = daily_bets_df["timestamp"].min()
-                    if min_ts_req is None:
-                        continue
-
-                    # ロング/ショートの最長TD + 余裕分(2日)で窓を切り出す
-                    max_ts_req = min_ts_req + max_lookahead_delta + dt.timedelta(days=2)
-
-                    # ★ base_price_chunk_df（月チャンク）から窓を切り出す
-                    price_window_df = (
-                        base_price_chunk_df.filter(
-                            pl.col("timestamp").is_between(min_ts_req, max_ts_req)
-                        )
-                        .sort("timestamp")
-                    )
-
-                    if price_window_df.is_empty():
-                        continue
-
-                    for atr_df in atr_dfs:
-                        atr_df_small = atr_df.filter(
-                            pl.col("timestamp").is_between(min_ts_req, max_ts_req)
-                        )
-                        if not atr_df_small.is_empty():
-                            price_window_df = price_window_df.join_asof(
-                                atr_df_small, on="timestamp"
-                            )
-
-                    price_window_df = price_window_df.fill_null(strategy="forward")
-
-                    daily_labeled_df = self._calculate_labels_for_batch(
-                        daily_bets_df, price_window_df
-                    )
-
-                    if daily_labeled_df is not None and not daily_labeled_df.is_empty():
-                        self._update_label_counts_dual(daily_labeled_df)
-                        self._collect_report_data_dual(daily_labeled_df, current_date)
-                        output_partition_dir.mkdir(parents=True, exist_ok=True)
-                        daily_labeled_df.write_parquet(
-                            output_partition_dir / "data.parquet", compression="zstd"
+                    if not atr_df_small.is_empty():
+                        price_window_df = price_window_df.join_asof(
+                            atr_df_small, on="timestamp"
                         )
 
-                    # 日次メモリ解放
-                    del daily_bets_df, price_window_df, daily_labeled_df
-                    del daily_bets_hive_df, daily_bets_file_df
-                    gc.collect()
+                # --- 修正前 ---
+                # price_window_df = price_window_df.fill_null(
+                #     strategy="forward"
+                # ).fill_null(strategy="backward")
 
-                # ★ 月チャンク終了: tickデータをメモリから破棄
-                del base_price_chunk_df
+                # --- 修正後 ---
+                price_window_df = price_window_df.fill_null(strategy="forward")
+
+                # ラベル計算（第4回で定義）
+                daily_labeled_df = self._calculate_labels_for_batch(
+                    daily_bets_df, price_window_df
+                )
+
+                if daily_labeled_df is not None and not daily_labeled_df.is_empty():
+                    self._update_label_counts_dual(daily_labeled_df)
+                    self._collect_report_data_dual(daily_labeled_df, current_date)
+                    output_partition_dir.mkdir(parents=True, exist_ok=True)
+                    daily_labeled_df.write_parquet(
+                        output_partition_dir / "data.parquet", compression="zstd"
+                    )
+
+                # メモリ解放
+                del daily_bets_df, price_window_df, daily_labeled_df
+                del daily_bets_hive_df, daily_bets_file_df
                 gc.collect()
-                logging.debug(f"  -> Tick chunk {y}-{m:02d} released from memory.")
 
             self._log_final_summary()
             self._generate_report()
@@ -870,15 +800,9 @@ class ProxyLabelingEngine:
             )
 
             atr_col_name = f"e1c_atr_{ATR_PERIOD}_{timeframe}"
-            atr_ratio_col_name = f"atr_ratio_{timeframe}"  # 事前計算済みカラム名
             if atr_col_name not in price_window_df.columns:
                 logging.warning(
                     f"Required ATR column '{atr_col_name}' not found. Skipping."
-                )
-                continue
-            if atr_ratio_col_name not in price_window_df.columns:
-                logging.warning(
-                    f"Required ATR ratio column '{atr_ratio_col_name}' not found. Skipping."
                 )
                 continue
 
@@ -888,7 +812,7 @@ class ProxyLabelingEngine:
 
             bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
-                    ["timestamp", "close", "high", "low", atr_col_name, atr_ratio_col_name]
+                    ["timestamp", "close", "high", "low", atr_col_name]
                 ),
                 on="timestamp",
             ).filter(pl.col(atr_col_name).is_not_null())
@@ -896,15 +820,15 @@ class ProxyLabelingEngine:
             if bets_with_price_df.is_empty():
                 continue
 
-            # atr_value・atr_ratioともに事前計算済みカラムをそのまま使用（日次ループ内での再計算なし）
             bets_df_with_atr = bets_with_price_df.with_columns(
-                pl.col(atr_col_name).alias("atr_value"),
-                pl.col(atr_ratio_col_name).alias("atr_ratio"),
+                pl.col(atr_col_name).alias("atr_value")
             )
-
-            # --- 全行を保持しつつ、ATR Ratioでエントリー起点に is_trigger=1 を付与 ---
+            # --- [変更] 全行を保持しつつ、エントリー起点に is_trigger=1 を付与 ---
             bets_df_all = bets_df_with_atr.with_columns(
-                pl.when(pl.col("atr_ratio") >= ATR_RATIO_THRESHOLD)
+                pl.when(
+                    pl.col("atr_value")
+                    >= ATR_SHRINK_THRESHOLD  # ★ ここが「>」ではなく「>=」になっているか
+                )  # > 0 の時、すべて1（対象）にする
                 .then(1)
                 .otherwise(0)
                 .cast(pl.Int8)
@@ -944,7 +868,6 @@ class ProxyLabelingEngine:
                 ).alias("sl_short"),
                 t1_max_short_expr.alias("t1_max_short"),
                 pl.col("atr_value"),
-                pl.col("atr_ratio"),  # ★ S6出力に含める（バックテストシミュレーターが再計算不要になる）
                 pl.col("close"),
                 pl.col(original_cols),
             )
@@ -1170,20 +1093,11 @@ class ProxyLabelingEngine:
             l_win = df.filter(pl.col("label_long") == 1).height
             s_win = df.filter(pl.col("label_short") == 1).height
 
-            # --- Duration統計: 勝ち/負け別に分解 ---
-            df_l_win  = df.filter(pl.col("label_long") == 1)["duration_long"]
-            df_l_loss = df.filter(pl.col("label_long") == 0)["duration_long"]
-            df_s_win  = df.filter(pl.col("label_short") == 1)["duration_short"]
-            df_s_loss = df.filter(pl.col("label_short") == 0)["duration_short"]
-
-            avg_dur_l_win  = df_l_win.mean()  or 0.0
-            med_dur_l_win  = df_l_win.median() or 0.0
-            avg_dur_l_loss = df_l_loss.mean()  or 0.0
-            med_dur_l_loss = df_l_loss.median() or 0.0
-            avg_dur_s_win  = df_s_win.mean()  or 0.0
-            med_dur_s_win  = df_s_win.median() or 0.0
-            avg_dur_s_loss = df_s_loss.mean()  or 0.0
-            med_dur_s_loss = df_s_loss.median() or 0.0
+            # --- [追加] Duration（決済までの時間）の統計を計算 ---
+            avg_duration_l = df["duration_long"].mean()
+            med_duration_l = df["duration_long"].median()
+            avg_duration_s = df["duration_short"].mean()
+            med_duration_s = df["duration_short"].median()
 
             daily_activity = (
                 df.group_by("date").len().sort("len", descending=True).limit(10)
@@ -1200,26 +1114,18 @@ class ProxyLabelingEngine:
 |:---|:---|
 | **Filter Applied** | `{cfg.get_filter_description()}` |
 | **Target Timeframes** | `{TARGET_TIMEFRAMES}` |
-| **ATR Filter** | `atr_ratio >= {ATR_RATIO_THRESHOLD}` (ATR Period: {ATR_PERIOD}, Baseline: {ATR_BASELINE_DAYS} day) |
+| **ATR Filter** | `ATR_{ATR_PERIOD} >= {ATR_SHRINK_THRESHOLD}` |
 | **Long Rule** | `PT: {RULE_LONG["pt_mult"]}, SL: {RULE_LONG["sl_mult"]}, TD: {RULE_LONG["td"]}` |
 | **Short Rule** | `PT: {RULE_SHORT["pt_mult"]}, SL: {RULE_SHORT["sl_mult"]}, TD: {RULE_SHORT["td"]}` |
 
-### 2. Overall Performance
-| Metric | Count | Win Rate |
-|:---|---:|---:|
-| **Total Setups (ATR Ratio >= threshold)** | `{total:,}` | - |
-| **Long Profit-Take** | `{l_win:,}` | `{l_win / total:.2%}` |
-| **Short Profit-Take** | `{s_win:,}` | `{s_win / total:.2%}` |
+### 2. Overall Performance & Event Duration
+| Metric | Count | Win Rate | Avg Duration | Median Duration |
+|:---|---:|---:|---:|---:|
+| **Total Setups (M1 ATR shrink)** | `{total:,}` | - | - | - |
+| **Long Profit-Take** | `{l_win:,}` | `{l_win / total:.2%}` | `{avg_duration_l:.1f} min` | `{med_duration_l:.1f} min` |
+| **Short Profit-Take** | `{s_win:,}` | `{s_win / total:.2%}` | `{avg_duration_s:.1f} min` | `{med_duration_s:.1f} min` |
 
-### 3. Event Duration Breakdown (Win vs Loss)
-| Direction | Outcome | Avg Duration | Median Duration |
-|:---|:---|---:|---:|
-| **Long** | Win (PT hit) | `{avg_dur_l_win:.1f} min` | `{med_dur_l_win:.1f} min` |
-| **Long** | Loss (SL/TD) | `{avg_dur_l_loss:.1f} min` | `{med_dur_l_loss:.1f} min` |
-| **Short** | Win (PT hit) | `{avg_dur_s_win:.1f} min` | `{med_dur_s_win:.1f} min` |
-| **Short** | Loss (SL/TD) | `{avg_dur_s_loss:.1f} min` | `{med_dur_s_loss:.1f} min` |
-
-### 4. Top 10 Busiest Days (Setups)
+### 3. Top 10 Busiest Days (Setups)
 {daily_table.strip()}
 """
             report_path.write_text(report_content.strip())

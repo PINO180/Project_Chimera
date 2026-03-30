@@ -7,9 +7,9 @@ import lightgbm as lgb
 import logging
 
 # --- パス設定 ---
-project_root = Path(__file__).resolve().parents[1]
-if str(project_root) not in sys.path:
-    sys.path.append(str(project_root))
+PROJECT_ROOT = Path("/workspace")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 from blueprint import (
     S7_MODELS,

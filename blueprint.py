@@ -12,9 +12,6 @@ CONFIG_DIR = BASE_DIR / "config"
 # 処理対象シンボル（マルチシンボル対応: ここを切り替えるだけ）
 SYMBOL = "XAUUSD"  # 例: "USDJPY", "EURUSD" など
 
-# データリネージュ識別子（どのエンジンセットを使ったか）
-FEATURE_SET_ID = "1A_2B"
-
 # シンボルルートを1箇所で定義（以下の全Stratumがここに依存）
 _SYM = DATA_DIR / SYMBOL
 
@@ -35,53 +32,106 @@ S1_PROCESSED = S1_BASE / "master_processed"  # 特徴量付加・型統一済み
 
 # --- Stratum 2: 特徴量（エンジン出力・検証後）---
 S2_FEATURES = _SYM / "stratum_2_features"
-S2_FEATURES_AFTER_KS = _SYM / "stratum_2_features_after_ks"
-S2_FEATURES_AFTER_AV = _SYM / "stratum_2_features_after_av"
+S2_FEATURES_AFTER_KS = _SYM / "stratum_2_features_after_ks"  # 廃止（git history 参照）
+S2_FEATURES_AFTER_AV = (
+    _SYM / "stratum_2_features_after_av"
+)  # 廃止（→ S2_FEATURES_VALIDATED に改名）
+
+# --- Stratum 2: 旧定義の改名・追加 ---
+# S2_FEATURES_AFTER_KS は廃止（git history 参照）
+# S2_FEATURES_AFTER_AV → S2_FEATURES_VALIDATED に改名（同一パスで別名定義）
+S2_FEATURES_VALIDATED = _SYM / "stratum_2_features_validated"
+# S2_FEATURES_FIXED は廃止（後方互換のため残す場合はコメントアウト）
+
+# --- Chapter 2 バケツ定義 ---
+HF_TIMEFRAMES = ["M0.5", "M1", "M3", "M5", "M8", "M15", "M30", "H1"]
+LF_SHORT_TIMEFRAMES = ["H4", "H6", "H12"]
+LF_MID_TIMEFRAMES = ["D1"]
+LF_LONG_TIMEFRAMES = ["W1", "MN"]
+LF_ALL_TIMEFRAMES = LF_SHORT_TIMEFRAMES + LF_MID_TIMEFRAMES + LF_LONG_TIMEFRAMES
+
+# --- Chapter 2 WF設定 ---
+# グループ別ターゲットshift（M1バー換算）
+WF_TARGET_SHIFT = {
+    "lf_short": -4800,  # H4×20バー = 80時間
+    "lf_mid": -14400,  # D1×10バー = 10日
+    "lf_long": -40320,  # W1×4バー  = 4週
+}
+# グループ別WF訓練・検証月数
+WF_CONFIG = {
+    "lf_short": {"train_months": 18, "val_months": 3},
+    "lf_mid": {"train_months": 24, "val_months": 6},
+    "lf_long": {"train_months": 36, "val_months": 12},
+}
+
+# --- Chapter 2 統計フィルター閾値 ---
+VARIANCE_THRESHOLD = 1e-6
+NULL_RATE_THRESHOLD = 0.3  # 欠損率30%以上を除外
+CORRELATION_THRESHOLD = 0.95  # 相関0.95以上を双子とみなす
+CORR_SAMPLE_SIZE = 200_000  # 相関計算のサンプル数
+KS_SAMPLE_SIZE = 100_000  # KS検定のサンプル数
+
+# --- Chapter 2 純化設定 ---
+# グループ別：プロキシ時間足とローリングウィンドウ
+NEUTRALIZATION_CONFIG = {
+    "HF": {"proxy_tf": "M5", "window": 2016},
+    "LF_SHORT": {"proxy_tf": "H4", "window": 504},
+    "LF_MID": {"proxy_tf": "D1", "window": 90},
+    "LF_LONG": {"proxy_tf": "W1", "window": 52},
+}
+
+# --- Chapter 2 その他定数 ---
+BARRIER_ATR_PERIOD = 13  # トリプルバリアのATR期間
+# ※ATRの時間足はシグナル発現した時間足（M1/M3/M5等）に対応したものを使用。固定時間足ではない。
+ATR_BASELINE_DAYS = 1  # ATR Ratioのベースライン期間（日数）
+# 各時間足のN = timeframe_bars_per_day[tf] * ATR_BASELINE_DAYS
+# 例：M1なら1440バー・H1なら24バー・D1なら1バーがベースライン
+MAX_WORKERS_DIVISOR = 1  # cpu_count // MAX_WORKERS_DIVISOR でワーカー数決定（旧: 2）
 
 # --- Stratum 3: 検証成果物 ---
-S3_ARTIFACTS = DATA_DIR / SYMBOL / "stratum_3_artifacts" / FEATURE_SET_ID
+S3_ARTIFACTS = _SYM / "stratum_3_artifacts"
 S3_STABLE_FEATURE_LIST = S3_ARTIFACTS / "stable_feature_list.joblib"
 S3_ADVERSARIAL_SCORES = S3_ARTIFACTS / "adversarial_scores.joblib"
 S3_FINAL_FEATURE_TEAM = S3_ARTIFACTS / "final_feature_team.txt"
 S3_SHAP_SCORES = S3_ARTIFACTS / "shap_scores.csv"
 S3_CONCURRENCY_RESULTS = S3_ARTIFACTS / "concurrency_results.parquet_v2"
+S3_SURVIVED_HF_FEATURES = S3_ARTIFACTS / "survived_hf_features.txt"
+S3_FEATURES_FOR_ALPHA_DECAY = S3_ARTIFACTS / "final_feature_set.txt"
+S3_FEATURES_FOR_TRAINING = S3_ARTIFACTS / "final_feature_set_v3.txt"
+S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / "final_feature_set_v5.txt"
+S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / "selected_features_v5"
+S3_SELECTED_FEATURES_PURIFIED_DIR = S3_ARTIFACTS / "selected_features_purified_v5"
+S3_FILTERED_LF_FEATURES = S3_ARTIFACTS / "filtered_lf_features.txt"
+S3_FILTERED_HF_FEATURES = S3_ARTIFACTS / "filtered_hf_features.txt"
+S3_LF_ENVIRONMENT_SCORES = S3_ARTIFACTS / "lf_environment_scores.parquet"
 
-# --- Stratum 3.5: 事前選抜の成果物 ---
-# 第2防衛線の前処理(Phase 0)で生成される軽量な成果物を格納
-S3_PRESELECTION = DATA_DIR / SYMBOL / "stratum_3_artifacts" / "phase_0_preselection"
-S3_ELITE_LF_FEATURES = S3_PRESELECTION / "elite_lf_features.txt"
+# --- Chapter 3 追加パス ---
+# Optunaの最適化結果（spread別・Long/Short別）
+S3_OPTUNA_RESULTS_DIR = S3_ARTIFACTS / "optuna_results"
 
-# --- Stratum 3.6: 第二防衛網の最終成果物 ---
-S3_RUN_ID = "train_12m_val_6m"  # M1/M2検証の実行ID
-S3_SURVIVED_HF_FEATURES = S3_ARTIFACTS / S3_RUN_ID / "survived_hf_features.txt"
-# [MODIFIED] Chapter2のアルファ純化スクリプトが使用する、サフィックス追加前の特徴量リスト
-S3_FEATURES_FOR_ALPHA_DECAY = S3_ARTIFACTS / S3_RUN_ID / "final_feature_set.txt"
-# [ADDED] Chapter3のモデル学習スクリプトが使用する、サフィックス追加後の特徴量リスト
-S3_FEATURES_FOR_TRAINING = S3_ARTIFACTS / S3_RUN_ID / "final_feature_set_v3.txt"
-# ▼▼▼ 新規追加: S3_SELECTED_FEATURES_PURIFIED_DIRの中の４つのファイルテキストの和集合リスト ▼▼▼
-S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / S3_RUN_ID / "final_feature_set_v5.txt"
-# ▼▼▼ V5 双方向ラベリング用: 各モデル専用の厳選特徴量リスト保存ディレクトリ ▼▼▼
-S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / S3_RUN_ID / "selected_features_v5"
-# ▼▼▼ 新規追加: 2周目（純化後）のさらに厳選された特徴量リスト保存ディレクトリ ▼▼▼
-S3_SELECTED_FEATURES_PURIFIED_DIR = (
-    S3_ARTIFACTS / S3_RUN_ID / "selected_features_purified_v5"
-)
+# ラベル生成でATRを自前計算するためのS1_PROCESSEDへの参照
+# （e1c_atr_13は相対値のため使用不可・OHLCVからWilder平滑化で計算する）
+# S1_PROCESSEDは既に定義済みのため追記不要
 
 # Stratum 4: マスターテーブル (廃止 — git history 参照)
 
 # --- Stratum 5: 純化アルファ ---
-S5_ALPHA = DATA_DIR / SYMBOL / "stratum_5_alpha" / FEATURE_SET_ID
+S5_ALPHA = _SYM / "stratum_5_alpha"
 S5_NEUTRALIZED_ALPHA_SET = S5_ALPHA / "neutralized_alpha_set_partitioned"
 
 # --- Stratum 6: 訓練データ ---
-S6_TRAINING = DATA_DIR / SYMBOL / "stratum_6_training" / FEATURE_SET_ID
+S6_TRAINING = _SYM / "stratum_6_training"
 S6_LABELED_DATASET = S6_TRAINING / "labeled_dataset_partitioned_v2"
 S6_LABELED_DATASET_MONTHLY = S6_TRAINING / "labeled_dataset_monthly_v2"
 S6_WEIGHTED_DATASET = S6_TRAINING / "weighted_dataset_partitioned_v2"
 
 # --- Stratum 7: AIモデル ---
-S7_MODELS = DATA_DIR / SYMBOL / "stratum_7_models" / FEATURE_SET_ID
+S7_MODELS = _SYM / "stratum_7_models"
 # [FIX-INFO-1] 旧仕様の単方向モデルパス定義は廃止 (git history 参照)
+
+# --- Chapter 3 追加パス ---
+# バックテスト出力
+S7_BACKTEST_RESULTS = S7_MODELS / "backtest_results"
 
 
 # =====================================================================

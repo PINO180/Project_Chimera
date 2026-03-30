@@ -1,30 +1,18 @@
 # /workspace/update_feature_list_v5.py
-import sys
 import polars as pl
 from pathlib import Path
 
-# プロジェクトのルートディレクトリをPythonの検索パスに追加
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from blueprint import S6_WEIGHTED_DATASET, S3_FEATURES_FOR_TRAINING_V5
-
-
-def find_latest_partition(base_dir: Path) -> Path:
-    """最新の日次パーティションファイルを動的に検索する"""
-    parquet_files = sorted(base_dir.rglob("*.parquet"), reverse=True)
-    if not parquet_files:
-        raise FileNotFoundError(
-            f"S6_WEIGHTED_DATASETにparquetファイルが見つかりません: {base_dir}"
-        )
-    return parquet_files[0]
-
-
 # --- 設定 ---
-# S6_WEIGHTED_DATASETから最新パーティションを動的に検索する
-source_parquet_file = find_latest_partition(S6_WEIGHTED_DATASET)
+# 代表的なParquetファイル（どの日のものでもOK）
+# 実行中のプロセスが完了した後で、確実に存在するものを使用
+source_parquet_file = Path(
+    "/workspace/data/XAUUSD/stratum_6_training/1A_2B/weighted_dataset_partitioned_v2/year=2022/month=5/day=2/data.parquet"
+)
 
 # 出力する新しい特徴量リストのパス
-new_feature_list_path = S3_FEATURES_FOR_TRAINING_V5
+new_feature_list_path = Path(
+    "/workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v3.txt"
+)
 
 
 def create_updated_feature_list(source_file: Path, output_file: Path):
@@ -53,7 +41,6 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
             "is_trigger",  # エントリータイミングのフラグ
             "close",  # エントリー価格 (シミュレーター用)
             "atr_value",  # 動的SL幅計算基準 (シミュレーター用)
-            "atr_ratio",  # ATR Ratio（シミュレーター用・再計算不要）
             # --- V5 双方向ラベリング (Long用) ---
             "label_long",
             "duration_long",
@@ -83,10 +70,6 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
             "high",
             "low",
             "e1c_atr_13_M1",
-            # --- Chapter2 LFスコア（特徴量ではなくスコア系・除外必須）---
-            "lf_short_score",
-            "lf_mid_score",
-            "lf_long_score",
         }
 
         # 動的除外ルールの適用 (完全一致だけでなく、前方一致等も弾く)

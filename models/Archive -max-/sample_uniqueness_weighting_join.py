@@ -14,6 +14,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from blueprint import (
     S6_LABELED_DATASET,
     S6_WEIGHTED_DATASET,
+    BASE_DIR,
     S3_CONCURRENCY_RESULTS,
 )
 
@@ -130,7 +131,7 @@ def main():
             output_path = output_dir / "data.parquet"
 
             # 計算を実行し、結果をファイルに書き出す
-            result_df = final_lf.collect(engine="streaming")
+            result_df = final_lf.collect(streaming=True)
 
             if len(result_df) == 0:
                 logging.warning(

@@ -9,7 +9,7 @@ import os
 # プロジェクトのルートディレクトリをPythonの検索パスに追加
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from blueprint import S6_LABELED_DATASET_MONTHLY, S3_CONCURRENCY_RESULTS
+from blueprint import S6_LABELED_DATASET_MONTHLY, BASE_DIR, S3_CONCURRENCY_RESULTS
 
 # --- 定数 ---
 # Dockerでマウントしたコンテナ内のパス

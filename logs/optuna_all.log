@@ -1,0 +1,78 @@
+nohup: ignoring input
+2026-03-28 14:37:15,654 - INFO - Discovering partitions...
+2026-03-28 14:37:23,269 - INFO - 
+********************************************************************************
+2026-03-28 14:37:23,269 - INFO - ★★★ STARTING OPTIMIZATION FOR SPREAD: 0.36 ★★★
+2026-03-28 14:37:23,270 - INFO - ********************************************************************************
+2026-03-28 14:37:23,270 - INFO - === Starting Optuna Optimization for M1 | Spread: 0.36 (Trials: 1000) ===
+/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/_experimental.py:32: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  warnings.warn(
+[I 2026-03-28 14:37:23,271] A new study created in memory with name: no-name-3639c2f1-a0a0-49f6-92eb-c4a7a5db04e3
+2026-03-28 14:37:23,272 - INFO -     [Cache Miss] Loading Raw Tick Data for Fold 20210712_20220620...
+[W 2026-03-28 14:37:55,096] Trial 0 failed with parameters: {'timeframe': 'M1', 'atr_period': 13, 'atr_threshold': 3.0, 'pt_mult': 2.5, 'sl_mult': 5.0, 'td_mins': 180} because of the following error: ColumnNotFoundError('unable to find column "timestamp"; valid columns: ["datetime", "bid", "ask", "last", "volume", "flags", "spread", "mid_price"]\n\nResolved plan until failure:\n\n\t---> FAILED HERE RESOLVING \'sink\' <---\nParquet SCAN [/workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned/year=2021/month=10/day=1/aa4a28f660184eeabc628755d7be4f34-0.parquet, ... 5642 other sources]\nPROJECT */8 COLUMNS').
+Traceback (most recent call last):
+  File "/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/study/_optimize.py", line 201, in _run_trial
+    value_or_values = func(trial)
+                      ^^^^^^^^^^^
+  File "/workspace/models/optuna_cv_pure_atr.py", line 448, in objective
+    fold_data = data_loader.get_fold_data(test_dates, tf_choice, atr_p)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/models/optuna_cv_pure_atr.py", line 271, in get_fold_data
+    df_tick = lf_tick.select(["timestamp", "mid_price"]).collect(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/polars/_utils/deprecation.py", line 97, in wrapper
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/polars/lazyframe/opt_flags.py", line 328, in wrapper
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/polars/lazyframe/frame.py", line 2415, in collect
+    return wrap_df(ldf.collect(engine, callback))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+polars.exceptions.ColumnNotFoundError: unable to find column "timestamp"; valid columns: ["datetime", "bid", "ask", "last", "volume", "flags", "spread", "mid_price"]
+
+Resolved plan until failure:
+
+	---> FAILED HERE RESOLVING 'sink' <---
+Parquet SCAN [/workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned/year=2021/month=10/day=1/aa4a28f660184eeabc628755d7be4f34-0.parquet, ... 5642 other sources]
+PROJECT */8 COLUMNS
+[W 2026-03-28 14:37:55,103] Trial 0 failed with value None.
+Traceback (most recent call last):
+  File "/workspace/models/optuna_cv_pure_atr.py", line 682, in <module>
+    run_optimization()
+  File "/workspace/models/optuna_cv_pure_atr.py", line 634, in run_optimization
+    study.optimize(
+  File "/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/study/study.py", line 490, in optimize
+    _optimize(
+  File "/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/study/_optimize.py", line 63, in _optimize
+    _optimize_sequential(
+  File "/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/study/_optimize.py", line 160, in _optimize_sequential
+    frozen_trial_id = _run_trial(study, func, catch)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/study/_optimize.py", line 258, in _run_trial
+    raise func_err
+  File "/home/hephaestus-zero/.local/lib/python3.11/site-packages/optuna/study/_optimize.py", line 201, in _run_trial
+    value_or_values = func(trial)
+                      ^^^^^^^^^^^
+  File "/workspace/models/optuna_cv_pure_atr.py", line 448, in objective
+    fold_data = data_loader.get_fold_data(test_dates, tf_choice, atr_p)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/models/optuna_cv_pure_atr.py", line 271, in get_fold_data
+    df_tick = lf_tick.select(["timestamp", "mid_price"]).collect(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/polars/_utils/deprecation.py", line 97, in wrapper
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/polars/lazyframe/opt_flags.py", line 328, in wrapper
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/polars/lazyframe/frame.py", line 2415, in collect
+    return wrap_df(ldf.collect(engine, callback))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+polars.exceptions.ColumnNotFoundError: unable to find column "timestamp"; valid columns: ["datetime", "bid", "ask", "last", "volume", "flags", "spread", "mid_price"]
+
+Resolved plan until failure:
+
+	---> FAILED HERE RESOLVING 'sink' <---
+Parquet SCAN [/workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned/year=2021/month=10/day=1/aa4a28f660184eeabc628755d7be4f34-0.parquet, ... 5642 other sources]
+PROJECT */8 COLUMNS

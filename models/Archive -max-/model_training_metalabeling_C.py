@@ -959,7 +959,7 @@ class FinalAssembler:
         try:
             m2_oof_df = pl.scan_parquet(
                 str(self.config.m2_oof_predictions_tmp / "**/*.parquet")
-            ).collect(engine="streaming")
+            ).collect(streaming=True)
             # --- 修正前 ---
             # m2_oof_df.sort("timestamp").write_parquet(
             #     self.config.m2_oof_predictions, compression="zstd"
