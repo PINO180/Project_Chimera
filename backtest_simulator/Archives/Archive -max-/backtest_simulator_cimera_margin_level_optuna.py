@@ -91,7 +91,7 @@ class BacktestConfig:
     oof_mode: bool = True
     min_capital_threshold: float = 1.0
     min_lot_size: float = 0.01
-    min_atr_threshold: float = 0.8  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
+    min_atr_threshold: float = 2.0  # ★V5: Mixed対応のATRフィルターを追加
 
     max_positions: int = 100
 
@@ -318,7 +318,6 @@ class BacktestSimulator:
             "timeframe",  # ★追加: 行増殖バグを防ぐための必須キー
             "close",
             "atr_value",
-            "atr_ratio",  # ★追加: create_proxy_labelsで計算済み・ATR Ratio判定用 (プロンプト⑯ 修正②)
             "duration_long",
             "duration_short",
         ]
@@ -514,7 +513,6 @@ class BacktestSimulator:
         timestamps_chunk = df_chunk["timestamp"].to_list()
         close_prices_chunk = df_chunk["close"].to_numpy()
         atr_values_chunk = df_chunk["atr_value"].to_numpy()
-        atr_ratios_chunk = df_chunk["atr_ratio"].to_numpy()  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
 
         # V5 Two-Brain の確率とラベル
         p_long_chunk = df_chunk["m2_proba_long"].to_numpy()
@@ -541,7 +539,6 @@ class BacktestSimulator:
 
             current_price_float = close_prices_chunk[i]
             atr_value_float = atr_values_chunk[i]
-            atr_ratio_float = atr_ratios_chunk[i]  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
 
             if (
                 current_price_float is None
@@ -711,10 +708,10 @@ class BacktestSimulator:
 
                 if should_trade:
                     if (
-                        atr_ratio_float is None
-                        or not np.isfinite(atr_ratio_float)
-                        or atr_ratio_float
-                        < self.config.min_atr_threshold  # ★修正: ATR Ratio と比較 (プロンプト⑯ 修正②)
+                        atr_value_float is None
+                        or not np.isfinite(atr_value_float)
+                        or atr_value_float
+                        < self.config.min_atr_threshold  # ★ 0 から 閾値(2.0) に変更
                     ):
                         continue
 

@@ -1,660 +1,388 @@
-# 🔥 Project Forge
+# 🔥 Project Forge V1.0
 
-> **統計的優位性に基づく金融知性体への道**
-> 
-> 最終目標「Project Chimera」実現のための資金獲得システム
-
----
-
-## 🎯 プロジェクトのビジョン
-
-**「裁量の天才」を「再現可能なサイエンス」へ**
-
-ルネサンス・テクノロジーズの哲学を継承し、人間の先入観を排除。市場の統計的パターン（「マーケットの亡霊」）のみを追求する完全自動化取引システム。
-
-- **対象市場**: XAU/USD（金/米ドル）
-- **データ規模**: 約1億5000万行のTickデータ
-- **開発期間**: Python学習開始から2ヶ月で構築
+> **XAU/USD 完全自動化クオンツ取引システム**
+> 統計的優位性に基づく金融時系列解析・Two-Brain メタラベリングアーキテクチャ
 
 ---
 
-## 🌟 システムの特徴
+## 🎯 概要
 
-### ✨ 妥協なき設計思想
+Project Forge は XAU/USD（金/米ドル）を対象とした完全自動化の定量的取引システムです。
+人間の認知バイアスを排除し、データと統計的優位性のみに基づいてエントリー・エグジットを判断します。
 
-**データサンプリング拒否**: 300-500GBの全データを完全活用。Dask-LightGBMで64GB RAMでも処理可能。
-
-**AIは最強の非線形処理エンジン**: LightGBMが数千の決定木で複雑な非線形変換を自動最適化。人間は質の高いベース特徴量を提供するのみ。
-
-**三重防衛網**: カーブフィッティングを徹底排除。統計的に信頼できるエリート特徴量のみを厳選。
-
-### 🛡️ 堅牢性への徹底的こだわり
-
-- **状態永続化**: チェックポインティング＋イベントソーシング
-- **高信頼性通信**: レイジー・パイレート方式（ACK/NACK、リトライ機構）
-- **双方向ハートビート**: 30秒タイムアウトで接続監視
-- **ブローカー整合性検証**: 起動時自動同期
-
-### 🧠 数学的最適性
-
-- ケリー基準によるポジションサイジング
-- 確率キャリブレーション
-- メタラベリング（M1：機会検出 + M2：精度向上）
-- サンプル一意性重み付け（非IID対処）
+- **対象市場**：XAU/USD（金/米ドル）
+- **戦略**：M3 スキャルピング（TD=30分・PT=ATR×1.0・SL=ATR×5.0）
+- **モデル**：Two-Brain（M1 方向予測 + M2 メタラベリング）× Long/Short 独立 = 4モデル
+- **データ**：2021〜2026年の Tick データ（2.1億行超）
 
 ---
 
-## 📊 データアーキテクチャ
+## 🔥 哲学
 
-### 7層ストラタム構造
+金融市場への扉が広く開かれた現代、多くの人々がその舞台に足を踏み入れる。
+そこで待ち受けるのは、しばしば偶然の成功という名の甘い罠だ。
 
-データは明確な7つの層（Stratum）に分離され、各層が特定の責務を持ちます。
+一度その蜜を味わった者は自らの才能を過信し、聖杯を探し求めるかのように
+無数のテクニカル指標を組み合わせ、「必勝法」を見つけようと躍起になる。
+しかしそれは、市場という巨大な生態系を前にして、
+たった一種のプランクトンの動きを追いかけているに等しい。
+
+確かにこの世界には例外が存在する。
+深い経験と天賦の才を持つ「裁量の天才」と呼ばれる人々だ。
+彼らは需給のうねりや投資家心理の微細な変化を瞬時に見抜く。
+ありふれたテクニカル指標でさえ、市場参加者の欲望と恐怖を映し出す鏡と化す。
+それはもはや第六感と呼ぶべきもので、再現性もなければ他者に教え授けることもできない、一種の芸術だ。
+
+しかし、我々凡人は彼らにはなれない。
+人間の脳は、無数の変数が複雑に絡み合う市場の混沌を冷徹かつ高速に処理するようには設計されていない。
+恐怖は視野を狭め、欲望は判断を鈍らせる。
+過去の成功体験と手痛い失敗の記憶が、目の前の客観的な事実を歪め続ける。
+
+であるならば、我々が取るべき道は一つしかない。
+自らの認知能力の限界を謙虚に認め、客観的かつ体系的なアプローチに活路を見出すことだ。
+それは、嵐の夜に自らの感覚を疑い、計器飛行にすべてを委ねるパイロットの決断に似ている。
+
+Project Forge はその答えだ。
+
+2億1千万行のティックデータから 1722 個の特徴量を生成し、
+KS検定・相関フィルター・OLS純化という三重の防衛網でアルファを蒸留する。
+トリプルバリアラベリングは OHLCデータでは解決できない「ヒゲの中の真実」を
+マイクロ秒単位のティックで裁定し、純粋な教師データを作り上げる。
+Two-Brain アーキテクチャは Long と Short を独立した知性として扱い、
+Purged K-Fold でデータリークを排除して鍛えられたモデルが推論する。
+
+このシステムが問うているのは「相場は予測できるか」ではない。
+「統計的に優位なゲームを繰り返し、期待値の積分として利益を得られるか」だ。
+
+個別のトレードに執着しない。勝率より期待値を信じる。短期の損失に揺るがない。
+これが個人投資家としての、唯一の正解だと確信している。
+
+---
+
+## 📐 設計思想
+
+### スケール不変特徴量
+
+全ての特徴量を ATR13 割り・パーセンテージ・比率で正規化し、価格水準・ボラティリティレジームに依存しない表現を採用する。
+
+### ATR Ratio フィルター
+
+エントリー判定に ATR 絶対値ではなく ATR Ratio（現在 ATR / 過去 1 日平均 ATR）を使用する。相場のボラティリティが過去平均に対して十分な水準にある場合のみエントリーする（閾値 0.8）。
+
+### Two-Brain アーキテクチャ
+
+Long と Short を完全に独立した 2 つのモデルとして扱う。M1 が方向を判定し、M2 がそのシグナルの信頼性を判定する 2 段構成。
+
+### 未来情報リーク排除
+
+トリプルバリアラベリングは Tick データの時刻情報を使用し、バーの OHLC では判定できない「ヒゲの中のどちらが先か」問題を完全に解決する。
+
+---
+
+## 🗂️ データ構造（7 層ストラタム）
 
 ```
 data/XAUUSD/
 │
-├── 📁 stratum_1_base/          【原材料】生データ
-│   ├── master_tick_exness_raw.parquet
-│   ├── master_tick_partitioned/
-│   └── master_from_tick/
+├── stratum_0_raw/                    生 Tick データ（MT5 ダウンロード元）
 │
-├── 📁 stratum_2_features/      【鍛造】324個のベース特徴量
-│   ├── feature_value_a_vast_universeA/
-│   ├── feature_value_a_vast_universeB/
-│   ├── feature_value_a_vast_universeC/
-│   ├── feature_value_a_vast_universeD/
-│   ├── feature_value_a_vast_universeE/
-│   ├── feature_value_a_vast_universeF/
-│   └── feature_value_complexity_theoryA/
+├── stratum_1_base/                   クリーニング・整形済みデータ
+│   ├── master_tick_raw.parquet       単一 Parquet（全期間 Tick）
+│   ├── master_tick_partitioned/      Hive パーティション（year/month/day）
+│   ├── master_multitimeframe/        15 時間足 OHLCV
+│   └── master_processed/            特徴量付加・型統一済み（timeframe= で分割）
 │
-├── 📁 stratum_3_artifacts/     【選別】三重防衛網の検証結果
-│   └── 1A_2B/
-│       ├── stable_feature_list.joblib
-│       ├── adversarial_scores.joblib
-│       ├── final_feature_team.joblib
-│       └── shap_scores.joblib
+├── stratum_2_features/               Chapter1 生成の全特徴量
+│   ├── feature_value_a_vast_universeA/  基礎統計・ロバスト統計
+│   ├── feature_value_a_vast_universeB/  時系列・分布・回帰
+│   ├── feature_value_a_vast_universeC/  テクニカル指標（ATR Ratio 化済み）
+│   ├── feature_value_a_vast_universeD/  出来高・価格アクション
+│   ├── feature_value_a_vast_universeE/  信号処理・周波数解析
+│   └── feature_value_a_vast_universeF/  学際的・実験的特徴量
+│   └── stratum_2_features_validated/    Chapter2 フィルター通過後の有効特徴量
 │
-├── 📁 stratum_4_master/        【統合】マスターテーブル
-│   └── 1A_2B/
-│       └── master_table_partitioned/
+├── stratum_3_artifacts/              Chapter2〜3 の中間成果物・特徴量リスト
+│   ├── final_feature_set.txt         Chapter2 完了時点の全特徴量リスト（1722件）
+│   ├── final_feature_set_v5.txt      Chapter3 学習用最終特徴量リスト
+│   ├── selected_features_v5/         1周目学習後 Gain>0 特徴量リスト
+│   ├── selected_features_purified_v5/ 2周目学習後 Gain>0 特徴量リスト（本番用）
+│   ├── concurrency_results.parquet_v2 並行数計算結果
+│   └── optuna_results/               Optuna 最適化 CSV（スプレッド別）
 │
-├── 📁 stratum_5_alpha/         【純化】ベータ除去後のアルファ
-│   └── 1A_2B/
-│       └── neutralized_alpha_set_partitioned/
+├── stratum_5_alpha/
+│   └── neutralized_alpha_set_partitioned/  OLS 純化済み特徴量（Chapter2 出力）
 │
-├── 📁 stratum_6_training/      【準備】学習用データセット
-│   └── 1A_2B/
-│       ├── labeled_dataset_partitioned/
-│       └── weighted_dataset_partitioned/
+├── stratum_6_training/               Chapter3 ラベリング・重み付け済みデータ
+│   ├── labeled_dataset_partitioned_v2/    トリプルバリアラベル付きデータ
+│   ├── labeled_dataset_monthly_v2/        月次集約版（DuckDB 処理用）
+│   └── weighted_dataset_partitioned_v2/   サンプル一意性重み付け済み（学習用）
 │
-└── 📁 stratum_7_models/        【完成】訓練済みAIモデル
-    └── 1A_2B/
-        ├── m1_model.pkl
-        ├── m2_model.pkl
-        ├── m1_calibrated.pkl
-        ├── m2_calibrated.pkl
-        └── model_performance_report.json
+└── stratum_7_models/                 学習済みモデル・OOF 予測
+    ├── m1_model_v2_long.pkl          M1 Long モデル（本番用・2周目）
+    ├── m1_model_v2_short.pkl         M1 Short モデル（本番用・2周目）
+    ├── m2_model_v2_long.pkl          M2 Long モデル（本番用・2周目）
+    ├── m2_model_v2_short.pkl         M2 Short モデル（本番用・2周目）
+    ├── m1_oof_predictions_long.parquet
+    ├── m1_oof_predictions_short.parquet
+    └── model_performance_report_long/short.json
 ```
 
-**実験ID管理**: `1A_2B`などのIDで異なる実験設定を管理
-
 ---
 
-## 🚀 システムフロー
+## 🔄 処理フロー（Chapter1〜4）
 
-### 第1章：ベース特徴量生成（✅ 完了）
+### Chapter 1：データ取り込み・特徴量生成
 
-**入力**: Stratum 1（生データ）
-- 1億5000万行のTickデータ
-- 15種類の時間足（tick, M0.5, M1, M3, M5, M8, M15, M30, H1, H4, H6, H12, D1, W1, MN）
-- Hiveパーティション化Parquet形式
-
-**処理**: 324個の多様な特徴量を体系的に生成
-- 基礎統計・ロバスト統計（約60個）
-- 時系列分析・分布パラメータ（約60個）
-- テクニカル指標・トレンド分析（約70個）
-- 出来高・価格アクション（約70個）
-- 信号処理・周波数解析（約30個）
-- MFDFA、Kolmogorov複雑性など（約34個）
-
-**出力**: Stratum 2（特徴量）
-- `feature_value_a_vast_universeA/` 〜 `F/`
-- `feature_value_complexity_theoryA/`
-- 総容量: 300-500GB
-
----
-
-### 第2章：三重防衛網 - カーブフィッティング排除
-
-#### 🛡️ 第一防衛線：時間的安定性（2.1 feature_validator.py）
-
-**入力**: Stratum 2（324個の特徴量）
-
-**検証内容**:
-- 分布安定性テスト（カイ二乗検定）
-- 重要度安定性テスト（Permutation Importance）
-- 敵対的検証（時間的ドリフト検出）
-
-**出力**: Stratum 3 Artifacts
-- `stable_feature_list.joblib` - 安定した特徴量リスト
-- `adversarial_scores.joblib` - 敵対的検証スコア
-
-**生存率**: 324個 → 数百個
-
----
-
-#### 🔧 マスターテーブル構築（2.2 build_master_table.py）
-
-**入力**: 
-- Stratum 2（特徴量）
-- Stratum 3（stable_feature_list.joblib）
-
-**処理**: 第一防衛線通過特徴量を時系列join_asofで統合
-
-**出力**: Stratum 4 Master
-- `master_table_partitioned/` - 統合マスターテーブル（50-80GB）
-
----
-
-#### 🎯 第二防衛線：SHAP重要度評価（2.3 walk_forward_validator_v2.py）
-
-**入力**: Stratum 4（マスターテーブル）
-
-**処理**:
-- TimeSeriesSplitでウォークフォワード検証
-- SHAP値の並列計算（map_partitions）
-- 平均絶対SHAP値でランク付け
-
-**なぜRFEから転換？**: 計算量O(k × N²) → O(k × N)で実行可能に
-
-**出力**: Stratum 3 Artifacts
-- `final_feature_team.joblib` - 最終選抜特徴量（数個〜数十個）
-- `shap_scores.joblib` - SHAP重要度スコア
-
-**生存率**: 数百個 → 数個〜数十個
-
----
-
-#### ⚡ 第三防衛線：アルファ純化（2.4 feature_neutralizer.py）
-
-**入力**: 
-- Stratum 4（マスターテーブル）
-- Stratum 3（final_feature_team.joblib）
-
-**処理**: 市場ベータを除去し、残差としてアルファを抽出
-
-**出力**: Stratum 5 Alpha
-- `neutralized_alpha_set_partitioned/` - 純化されたアルファ特徴量（数十GB）
-
----
-
-### 第3章：予測AIコア - メタラベリング
-
-#### 🎲 トリプルバリア・ラベリング（3.1 triple_barrier_labeling.py）
-
-**入力**: Stratum 5（純化アルファ特徴量）
-
-**処理**:
-- **利食いバリア**: 現在価格 + 2 × ATR
-- **損切りバリア**: 現在価格 - 1 × ATR
-- **時間バリア**: 最大保有期間
-
-**出力**: Stratum 6 Training
-- `labeled_dataset_partitioned/`
-  - label（1: ロング成功、-1: ショート成功、0: タイムアウト）
-  - barrier_reached（どのバリアに到達したか）
-  - time_to_barrier（到達までの時間）
-  - t0, t1（開始・終了タイムスタンプ）
-
----
-
-#### ⚖️ サンプル一意性重み付け（3.2 sample_uniqueness_weighting.py）
-
-**入力**: Stratum 6（ラベル付きデータセット）
-
-**処理**: 非IID問題に対処
-1. 並行性計算（同時期に複数ポジションが存在）
-2. 一意性 = 1 / 並行性
-3. sample_weight適用
-
-**出力**: Stratum 6 Training
-- `weighted_dataset_partitioned/`
-  - 元データ + sample_weight列
-
----
-
-#### 🧠 メタラベリング訓練（3.3 model_training_metalabeling.py）
-
-**入力**: Stratum 6（重み付きデータセット）
-
-**処理**: 2段階AIシステム
-- **M1（プライマリー）**: 「取引機会か？」（リコール最大化）
-- **M2（メタ）**: 「M1のシグナルは本物か？」（プレシジョン最大化）
-
-**特徴量設計**:
-- 基本特徴量（アルファ）
-- M1出力（確率、クラス）
-- M1性能統計（最近の精度、勝率）
-- 市場レジーム情報
-
-**重要**: パージ＆エンバーゴ付きCVでデータリーケージ防止
-
-**出力**: Stratum 7 Models
-- `m1_model.pkl` - プライマリーモデル
-- `m2_model.pkl` - メタモデル
-- `m1_calibrated.pkl` - 確率キャリブレーション済みM1
-- `m2_calibrated.pkl` - 確率キャリブレーション済みM2
-- `model_performance_report.json` - 性能レポート
-
----
-
-### 第4章：統合・執行エンジン
-
-#### 📊 確率キャリブレーション（4.1 統合）
-
-**処理**: LightGBMの`predict_proba`スコアを真の確率に変換
-- CalibratedClassifierCV使用
-- 信頼性のある確率推定
-
-**出力**: m1_calibrated.pkl、m2_calibrated.pkl（第3章で統合出力）
-
----
-
-#### 💰 リスク管理（extreme_risk_engine_v2.py）
-
-**ケリー基準**: `f* = (b × p - q) / b`
-- **必須安全策**: ハーフケリー（f* / 2）
-
-**その他のリスク管理**:
-- 動的損切り・利食い（ATR基準）
-- GARCHボラティリティ適応
-- 最大ドローダウン制約
-
----
-
-#### 🌡️ 市場レジーム検知（market_regime_detector.py）
-
-HMMまたは時系列クラスタリングで4レジーム分類:
-- 高ボラティリティ上昇
-- 高ボラティリティ下落
-- 低ボラティリティレンジ
-- トレンド転換期
-
-レジーム別にリスクパラメータを動的調整。
-
----
-
-#### 💾 状態管理（state_manager.py）
-
-**チェックポインティング**: 状態スナップショットを定期保存
-
-**イベントソーシング**: 全イベントを連鎖記録、完全な監査証跡
-
-**ブローカー整合性検証**: 起動時に自動同期
-
----
-
-#### 🌉 MQL5ブリッジ（mql5_bridge_publisher_v2.py + ProjectForgeReceiver_v2.mq5）
-
-**レイジー・パイレート方式**:
-- ACK/NACK確認
-- リトライ機構
-- コマンド喪失率0%
-
-**双方向ハートビート**:
-- 30秒タイムアウトで接続監視
-- 平均応答< 100ms
-
----
-
-### 第5章：統合実行環境（main.py）
-
-#### 🔄 5段階初期化
-
-1. 状態管理システム起動
-2. 市場レジーム検知器ロード
-3. AIモデル（M1/M2）ロード
-4. リスク管理エンジン起動
-5. MQL5ブリッジ接続
-
-#### ⚡ 6ステップ取引ループ
-
-1. **データ取得**: 最新市場データ取得
-2. **特徴量抽出**: リアルタイム特徴量計算
-3. **市場情報構築**: レジーム、ボラティリティ分析
-4. **コマンド生成**: M1 → M2 → リスク管理
-5. **送信**: MQL5ブリッジ経由でMT5へ
-6. **状態更新**: 状態永続化、ログ記録
-
-#### 🎮 実行モード
-
-- **デモモード** (`--demo`): ログのみ、実送信なし
-- **本番モード** (`--live`): 実際に取引実行
-
----
-
-## 🛠️ セットアップガイド
-
-### システム要件
-
-**ソフトウェア**:
-- Python 3.8+
-- MetaTrader 5（ビルド3661+）
-
-**ハードウェア推奨**:
-- RAM: 64GB以上
-- CPU: 4コア以上
-- ストレージ: 1TB NVMe SSD
-
-**Pythonライブラリ**:
 ```
-numpy, pandas, polars, dask, lightgbm, scikit-learn, 
-optuna, hmmlearn, tslearn, pyzmq, joblib
+s1_0_X_filter.py          → Tick フィルタリング・クリーニング
+s1_1_A_ingest.py          → Tick → Parquet 変換・Hive パーティション化
+s1_1_B_build_ohlcv.py     → 15 時間足 OHLCV 生成
+s1_1_C_enrich.py          → S1_PROCESSED 生成（型統一・ローリング計算準備）
+engine_1_A〜1_F.py        → 6 カテゴリ・1722 特徴量をタイムフレーム別に生成
+                              A: 基礎統計    B: 時系列      C: テクニカル
+                              D: 出来高      E: 信号処理    F: 学際的
 ```
 
-**MQL5要件**:
-- ZeroMQバインディング
-- JAson.mqh
+**設計原則**：
+- 固定箱（時間足単位の一括更新）を廃止。M1 バーが更新されるたびに全特徴量をローリング再計算。
+- D1・W1 特徴量も M1 粒度で存在。全時間足のサンプル数は 1:1。
+- 全特徴量をスケール不変（ATR13 割り・%・比率）に変換。価格絶対値は出力しない。
 
 ---
 
-### インストール手順
+### Chapter 2：特徴量フィルタリング・アルファ純化
 
-#### 1️⃣ Python環境構築
-
-```bash
-# 仮想環境作成
-python -m venv forge_env
-
-# 仮想環境有効化
-source forge_env/bin/activate  # Linux/Mac
-# または
-forge_env\Scripts\activate  # Windows
-
-# 依存関係インストール
-pip install -r requirements.txt
+```
+2_A KS 安定性フィルター      → 分布変化が大きい特徴量を除去
+2_B 相関フィルター           → 冗長な特徴量を除去（HF 優先）
+2_C LF シグナルスコア生成    → 低周波特徴量の環境スコア生成
+2_E HF メタモデル学習        → HF 特徴量の重要度スコア算出
+2_F 特徴量集約               → LF + HF を統合
+2_G OLS アルファ純化         → 市場プロキシ（M5 リターン）との OLS 回帰で
+                               ベータ除去・純粋アルファを S5 に出力
 ```
 
-#### 2️⃣ ディレクトリ構築
+**出力**：S5_NEUTRALIZED_ALPHA_SET（1722 特徴量・M1 粒度・全期間）
 
-```bash
-# 必要なディレクトリを作成
-mkdir -p data/state data/bridge logs/zmq_bridge_v2 
-mkdir -p models/metalabeling config reports/metalabeling
-mkdir -p chapter1_2 chapter3 chapter4
+---
+
+### Chapter 3：ラベリング・モデル学習
+
+```
+optuna_cv_pure_atr.py               → バリアパラメータ最適化（Long）
+optuna_cv_short_pure_atr.py         → バリアパラメータ最適化（Short）
+create_proxy_labels_Universal_Brain.py → トリプルバリアラベル生成 → S6_LABELED
+aggregate_daily_to_monthly.py        → 日次 → 月次集約
+sample_uniqueness_weighting_calculate.py → 並行数計算
+sample_uniqueness_weighting_join.py  → 一意性重み付け → S6_WEIGHTED
+update_feature_list_v5.py           → S3_FEATURES_FOR_TRAINING_V5 生成
+
+【1周目】
+model_training_metalabeling_A.py    → M1 OOF 予測生成
+model_training_metalabeling_B.py    → M2 学習データ生成
+model_training_metalabeling_C.py    → M1/M2 モデル学習・保存
+analyze_importance_v5.py            → Gain>0 特徴量リスト生成（selected_features_v5）
+
+【2周目・本番モデル】
+model_training_metalabeling_Ax_purified.py → M1 OOF 予測再生成
+model_training_metalabeling_Bx_purified.py → M2 学習データ再生成
+model_training_metalabeling_Cx_purified.py → M1/M2 本番モデル学習・上書き保存
+analyze_importance_purified.py             → 本番用特徴量リスト生成
+                                             → selected_features_purified_v5/
 ```
 
-#### 3️⃣ 設定ファイル準備
+**V1.0 確定パラメータ（Optuna 実証）**：
+- 時間足：M3 単体
+- ATR Ratio 閾値：0.8
+- PT 倍率：1.0 / SL 倍率：5.0 / TD：30 分
+- スプレッドコスト（ラベリング基準）：0.50 ドル
 
-**config/risk_config.json**:
+---
+
+### Chapter 4：リアルタイム本番稼働
+
+```
+main.py                          → 統合制御・取引ループ
+mql5_bridge_publisher.py         → ZMQ 通信（MT5 ↔ Python）
+realtime_feature_engine.py       → 特徴量計算オーケストレーター
+realtime_feature_engine_1A〜1F.py → リアルタイム特徴量計算（バッチ版と完全一致）
+extreme_risk_engine.py           → ロット計算・SL/TP 計算・ATR Ratio フィルター
+state_manager.py                 → 状態管理・チェックポイント・イベントソーシング
+ProjectForgeReceiver.mq5         → MT5 EA（ZMQ ブリッジ・発注実行）
+risk_config.json                 → バリア設定・リスクパラメータ（ホットリロード対応）
+```
+
+**取引ループ（M1 バー確定ごと）**：
+
+```
+① スナップショット保存（15 分間隔）
+② risk_config.json ホットリロード検知
+③ TO タイムアウト監視・強制決済
+④ サイレントクローズ捕捉
+⑤ ブローカー状態同期
+--- M1 バー確定 ---
+⑥ 市場プロキシ更新
+⑦ RealtimeFeatureEngine → シグナルリスト取得
+⑧ Two-Brain 推論（Long M1→M2 / Short M1→M2）
+⑨ Delta フィルター・閾値フィルター
+⑩ 4 段防衛線チェック
+⑪ リスクエンジン → 発注コマンド生成
+⑫ ZMQ 発注 → ACK 確認 → 状態同期
+```
+
+---
+
+## ⚙️ risk_config.json
+
 ```json
 {
-  "kelly_fraction": 0.5,
-  "max_risk_per_trade": 0.02,
-  "max_drawdown": 0.20,
-  "atr_multiplier": 2.0,
-  "pip_multiplier": 100.0
+  "base_capital": 1000.0,
+  "lot_per_base": 0.1,
+  "max_lot_absolute": 200.0,
+  "contract_size": 100.0,
+  "min_lot_size": 0.01,
+  "base_leverage": 2000.0,
+  "sl_multiplier_long": 5.0,
+  "pt_multiplier_long": 1.0,
+  "sl_multiplier_short": 5.0,
+  "pt_multiplier_short": 1.0,
+  "td_minutes_long": 30.0,
+  "td_minutes_short": 30.0,
+  "m2_proba_threshold": 0.30,
+  "m2_delta_threshold": 0.30,
+  "max_consecutive_sl": 2,
+  "cooldown_minutes_after_sl": 30,
+  "spread_pips": 36.0,
+  "value_per_pip": 1.0,
+  "prevent_simultaneous_orders": true,
+  "max_drawdown": 10.0,
+  "max_positions": 100,
+  "min_atr_threshold": 0.8,
+  "use_fixed_risk": true,
+  "fixed_risk_percent": 0.05,
+  "max_allowed_spread": 50.0,
+  "margin_call_percent": 100.0,
+  "stop_out_percent": 20.0
 }
 ```
 
-**pip_multiplier設定**:
-- XAU/USD、USD/JPY: `100.0`
-- EUR/USD、GBP/USD: `10000.0`
-
-**config/regime_config.json**: レジーム別パラメータ（詳細は別途）
-
-#### 4️⃣ MQL5セットアップ
-
-1. MetaTrader 5をインストール
-2. ZeroMQバインディングをインストール
-3. `JAson.mqh`を`MQL5/Include/`に配置
-4. `ProjectForgeReceiver_v2.mq5`を`MQL5/Experts/`にコピー
-5. MT5でコンパイル
+`min_atr_threshold` は ATR 絶対値ではなく ATR Ratio の閾値（現在 ATR / 過去 1 日平均 ATR）。
+`spread_pips` はロット計算のスプレッドコスト見積もり用。実際のスプレッドに合わせて調整する（通常 28〜36）。
 
 ---
 
-## 🎯 使用方法
+## 🛠️ 開発環境・システム要件
 
-### フェーズ1: データ基盤準備
+### ホストマシン（PinoPino）
 
-第1章のスクリプトでベース特徴量を生成（既に完了している場合はスキップ）
+| 項目 | 仕様 |
+|---|---|
+| OS | Windows 11 Pro (64-bit) |
+| CPU | Intel Core i7-8700K @ 3.70GHz |
+| RAM | 64 GB |
+| GPU | NVIDIA GeForce RTX 3060 |
+| マザーボード | ASUSTeK TUF Z390M-PRO GAMING |
+| ストレージ | BIWIN NV7400 4TB NVMe SSD（X ドライブ・本システム格納）<br>CT1000P310SSD8 1.0TB NVMe SSD<br>WDC WDS250G2B0A 250GB SSD<br>Hitachi HDT721010SLA360 1.0TB HDD |
+| ネットワーク | Realtek 8812BU Wireless LAN 802.11ac |
 
-### フェーズ2: 三重防衛網実行
+### 実行環境
 
-```bash
-cd chapter1_2
+VS Code + Docker コンテナで開発・実行する。
 
-# 2.1 時間的安定性検証
-python feature_validator.py
+| コンテナ名 | 用途 |
+|---|---|
+| hephaestus-zero | メイン開発・学習・バックテスト（常時起動） |
+| hermes_talaria | 予備・実験用 |
 
-# 2.2 マスターテーブル構築
-python build_master_table.py
+- イメージ：`vsc-project_forge-82f43...`
+- Chapter1〜3 の全処理はコンテナ内で実行
+- Chapter4 本番稼働もコンテナ内から ZMQ で MT5（Windows 側）と通信
 
-# 2.3 SHAP重要度評価
-python walk_forward_validator_v2.py
+### 主要ライブラリ（CPU 環境）
 
-# 2.4 アルファ純化
-python feature_neutralizer.py
+```
+# データ処理
+polars, pyarrow, duckdb, dask[distributed], numpy<2.0
+
+# 機械学習
+lightgbm, scikit-learn, xgboost, optuna, shap
+
+# 統計・時系列
+statsmodels, arch, hmmlearn, pmdarima, tslearn
+
+# 特殊解析
+MFDFA, nolds, PyCausality, PyWavelets, dcor, EMD-signal, entropy
+
+# インフラ
+pyzmq, tqdm, joblib, psutil, pathos
+
+# 開発
+jupyterlab>=4.0
 ```
 
-**出力確認**: `data/XAUUSD/stratum_3_artifacts/1A_2B/`と`stratum_4_master/`、`stratum_5_alpha/`
+GPU 環境では上記に加えて `torch`, `torchvision`, `tensorflow` を使用。
 
-### フェーズ3: 予測AIコア訓練
+---
 
-```bash
-cd ../chapter3
+## 📁 スクリプト配置
 
-# 3.1 トリプルバリア・ラベリング
-python triple_barrier_labeling.py
-
-# 3.2 サンプル一意性重み付け
-python sample_uniqueness_weighting.py
-
-# 3.3 メタラベリング訓練
-python model_training_metalabeling.py
+```
+/workspace/
+├── blueprint.py              パス・定数の一元管理
+├── risk_config.json          リスクパラメータ（ホットリロード対応）
+│
+├── scripts/                  Chapter1・2 前処理スクリプト
+├── features/                 特徴量生成エンジン（1A〜1F）
+├── models/                   Chapter3 学習スクリプト
+├── execution/                Chapter4 本番稼働スクリプト
+│
+├── data/XAUUSD/              7 層ストラタム（上記参照）
+├── logs/                     システムログ
+└── state/                    チェックポイント・イベントログ
 ```
 
-**出力確認**: `data/XAUUSD/stratum_7_models/1A_2B/`
-- m1_calibrated.pkl
-- m2_calibrated.pkl
-- model_performance_report.json
+---
 
-### フェーズ4: レジーム検知器訓練（オプション）
+## 🚨 重要な注意事項
+
+### e1c_atr_13 の使用禁止
+
+`e1c_atr_13` は `ATR / ATR_13 ≈ 1.0` の相対値であり ATR 絶対値ではない。
+バリア計算・リスクエンジンへの入力には必ず S1_PROCESSED の OHLCV から Wilder 平滑化で自前計算した ATR 絶対値を使用すること。
+`e1c_atr_13` をリスクエンジンに渡すと SL 幅が数ドルになり即座に損切りされ続ける。
+
+### 学習時とリアルタイムの完全一致原則
+
+Chapter1 バッチ版（engine_1_A〜1_F）とリアルタイム版（realtime_feature_engine_1A〜1F）は特徴量名・計算式・スケール不変化処理・ddof が完全に一致していなければならない。
+どちらか一方を改訂した場合は必ずもう一方も同期すること。
+
+### blueprint.py
+
+全スクリプト共通のパス定数・設定定数を一元管理。
+スクリプトは全て `from blueprint import ...` でパスを取得する。
+パスのハードコード（`/workspace` 直書き等）は禁止。
 
 ```python
-from chapter4.market_regime_detector import MarketRegimeDetector
-
-# HMM方式で4レジーム
-detector = MarketRegimeDetector(method='hmm', n_regimes=4)
-# 訓練処理...
-detector.save_model('models/regime_detector_hmm.pkl')
-```
-
-### フェーズ5: 統合システム起動 🚀
-
-```bash
-# デモモード（安全確認）
-python main.py --demo
-
-# 本番モード（実取引）
-python main.py --live
+# 主要定数
+SYMBOL = "XAUUSD"
+BARRIER_ATR_PERIOD = 13
+ATR_BASELINE_DAYS = 1  # ATR Ratio のベースライン期間（日）
 ```
 
 ---
 
-## 🎓 推奨運用フロー
+## 📊 V1.0 実績（Optuna 最適化結果）
 
-段階的にリスクを管理しながらスケールアップ：
+| 指標 | Long | Short |
+|---|---|---|
+| 対象時間足 | M3 | M3 |
+| ATR Ratio 閾値 | 0.8 | 0.8 |
+| TD | 30 分 | 30 分 |
+| Bets 数（全期間） | 344,767 | 344,767 |
+| WIN 率（ラベリング） | 46.2% | 45.8% |
+| scale_pos_weight | 1.17 | 1.19 |
+| Adjusted PF（spread=0.50） | 1.37 | 1.74 |
 
-1. **デモモード検証** - ロジック確認、エラー検出
-2. **デモ口座実証実験** - 数週間〜数ヶ月の実績確認
-3. **小規模資金本番** - 総資本の5-10%で開始
-4. **段階的スケールアップ**:
-   - 10% → 25% → 50% → 100%
-   - 各段階で統計的優位性を再確認
+WIN 率が 50% を下回るのはクールダウンなしで全シグナルを評価しているためであり正常。
+SPW は LightGBM で容易に調整可能な範囲。
 
----
-
-## 🔧 トラブルシューティング
-
-### ZeroMQ接続エラー
-
-**症状**: `ConnectionRefusedError`または`Timeout`
-
-**解決策**:
-- ポート競合確認（デフォルト: 5555）
-- ファイアウォール設定確認
-- MT5でEAが起動しているか確認
-- ログ確認: `logs/zmq_bridge_v2/`
-
-### モデル読み込みエラー
-
-**症状**: `FileNotFoundError`または`pickle error`
-
-**解決策**:
-- モデルファイルの存在確認
-- パスの検証（相対パス/絶対パス）
-- Pythonバージョン互換性確認
-
-### ブローカー整合性失敗
-
-**症状**: 起動時に同期エラー
-
-**解決策**:
-- 自動同期の完了を待つ
-- ログで具体的エラー確認: `logs/state_manager.log`
-- 必要に応じて手動で状態リセット
-
-### メモリ不足
-
-**症状**: `MemoryError`または`Out of Memory`
-
-**解決策**:
-- Daskワーカーのメモリ制限調整
-- パーティション数を増加（より小さいチャンク）
-- 処理する時間範囲を縮小
-
----
-
-## 🏆 アーキテクチャの強み
-
-### 数学的最適性
-- ケリー基準によるポジションサイジング
-- 確率キャリブレーションで正確な確率推定
-- メタラベリングで精度とリコールのバランス
-- サンプル一意性重み付けで非IID対処
-
-### 堅牢性
-- 状態永続化で障害からの復旧
-- イベントソーシングで完全な監査証跡
-- 高信頼性通信（ACK/NACK、リトライ）
-- ブローカー整合性検証
-
-### 適応性
-- 市場レジーム検知で環境変化に対応
-- 動的リスクパラメータ調整
-- GARCHボラティリティ適応
-
-### 型安全性
-- Pylance準拠
-- TypedDict、Optional型の厳格適用
-- 実行時エラーの最小化
-
----
-
-## 🗺️ 開発ロードマップ
-
-### ✅ 完了済み
-1. ベース特徴量生成（324個）
-2. データ基盤構築（7層ストラタム）
-
-### 🔄 進行中
-3. 三重防衛網の完全実装
-   - feature_validator.py
-   - build_master_table.py
-   - walk_forward_validator_v2.py
-   - feature_neutralizer.py
-
-4. 予測AIコア構築
-   - トリプルバリア・ラベリング
-   - サンプル一意性重み付け
-   - メタラベリング訓練
-   - 確率キャリブレーション
-
-### 📋 今後の計画
-5. 執行システム完成
-   - 状態管理システム
-   - 高信頼性MQL5ブリッジ
-   - ケリー基準リスク管理
-   - 市場レジーム検知
-
-6. 実証実験
-   - デモ口座運用
-   - パラメータ最適化
-   - 統計的検証
-
-7. **Project Chimera** 🦁
-   - Transformerベース次世代コア
-   - マルチシンボル対応
-   - クラウドデプロイメント
-
----
-
-## 💡 プロジェクトの背景
-
-### なぜProject Forgeなのか？
-
-個人投資家が市場で持続的に成功するための**唯一の合理的アプローチ**。
-
-人間の認知バイアスと限界を認識し、客観的かつ体系的な定量的アプローチで「裁量の天才」を「再現可能なサイエンス」へ昇華させる。
-
-### ルネサンス・テクノロジーズからの影響
-
-- **データ駆動**: 直感ではなくデータに語らせる
-- **システマティック**: 再現可能で検証可能
-- **科学的厳密性**: 統計的有意性を重視
-- **継続的改善**: 常に学習し進化
-
-### 達成実績
-
-**Python学習開始から2ヶ月**で、個人投資家上位0.01%〜0.001%レベルの技術基盤を構築。
-
----
-
-## 🎨 設計哲学
-
-### 「複雑さは敵ではない。無駄な複雑さこそが敵である。」
-
-本システムは3つの柱で支えられています：
-
-1. **計算実現可能性** - 理論だけでなく実際に動く
-2. **理論的厳密性** - 数学的原則に根差す
-3. **実践的堅牢性** - 実戦で生き残る
-
-必要な複雑性のみを保持し、実行不可能な要素は排除。数学的原則に根差した**最もシンプルで最も強力なアーキテクチャ**。
-
-### 「個別の優秀なコンポーネントではなく、統合された知性体としての全体が、真の価値を生み出す。」
-
-各章は独立して優秀であるだけでなく、統合されることで**創発的な知性**を発揮します。
-
----
-
-## 📜 ライセンス
-
-このプロジェクトは個人利用を目的としています。商用利用については別途ご相談ください。
-
----
-
-## 🌟 最後に
-
-**Project Forge**は単なる取引システムではありません。
-
-それは、個人投資家が機関投資家と同じ土俵で戦うための**武器**であり、**金融知性体への第一歩**です。
-
-データの海から真のアルファを抽出し、統計的優位性を現実の利益に変換する。
-
-**これが、Project Forgeの使命です。** 🔥
-
----
-
-*「マーケットの亡霊」を追い続けろ。*

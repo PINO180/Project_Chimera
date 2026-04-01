@@ -107,11 +107,11 @@ def analyze_and_export(
     print(f"✅ Active features (Gain > 0): {len(df_active)} / {len(feature_names)}")
     print(f"{'Rank':<5} {'Feature Name':<50} {'Gain':>15}")
     print("-" * 75)
-    for i, row in enumerate(df_active.head(300).itertuples()):
+    for i, row in enumerate(df_active.head(2000).itertuples()):
         print(f"{i + 1:<5} {str(row.feature):<50} {row.gain:>15.2f}")
 
-    if len(df_active) > 300:
-        print(f"   ... and {len(df_active) - 300} more features.")
+    if len(df_active) > 2000:
+        print(f"   ... and {len(df_active) - 2000} more features.")
 
     out_path = S3_SELECTED_FEATURES_DIR / output_filename
     with open(out_path, "w") as f:
