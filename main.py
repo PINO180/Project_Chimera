@@ -975,6 +975,8 @@ def main():
                     current_atr = signal.market_info.get(
                         "atr_value", signal.market_info.get("atr", 5.0)
                     )
+                    # ★追加確認: atr_ratioもmarket_infoから取得してrisk_engineに渡す
+                    current_atr_ratio = signal.market_info.get("atr_ratio", 1.0)
                     # ▼追加: M1バーから取得したリアルタイムスプレッド
                     current_spread = new_m1_bar.get("spread", 16.0)
 
@@ -1004,6 +1006,7 @@ def main():
                         sl_multiplier=current_sl_mult,  # 修正反映
                         tp_multiplier=current_tp_mult,  # 修正反映
                         current_spread_pips=current_spread,
+                        atr_ratio=current_atr_ratio,  # ★追加: ATR Ratio をリスクエンジンに渡す
                     )
 
                     # V5エンジンは独立したため、ここでイベントログを記録する

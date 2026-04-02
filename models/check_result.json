@@ -1,0 +1,108 @@
+{
+  "tmp_check": {
+    "LONG ": {
+      "exists": false
+    },
+    "SHORT": {
+      "exists": false
+    }
+  },
+  "file_status": {
+    "m1_calibrated_long": {
+      "exists": true,
+      "mtime": "2026-04-01 22:15:39",
+      "size_kb": 2
+    },
+    "m1_calibrated_short": {
+      "exists": true,
+      "mtime": "2026-04-02 02:14:19",
+      "size_kb": 2
+    },
+    "m2_calibrated_long": {
+      "exists": true,
+      "mtime": "2026-04-01 22:16:59",
+      "size_kb": 1
+    },
+    "m2_calibrated_short": {
+      "exists": true,
+      "mtime": "2026-04-02 02:16:42",
+      "size_kb": 1
+    },
+    "m1_model_long": {
+      "exists": true,
+      "mtime": "2026-04-01 21:47:53",
+      "size_kb": 28114
+    },
+    "m1_model_short": {
+      "exists": true,
+      "mtime": "2026-04-02 01:45:55",
+      "size_kb": 28124
+    },
+    "m2_model_long": {
+      "exists": true,
+      "mtime": "2026-04-01 22:18:23",
+      "size_kb": 27920
+    },
+    "m2_model_short": {
+      "exists": true,
+      "mtime": "2026-04-02 02:15:32",
+      "size_kb": 27943
+    },
+    "m2_oof_long": {
+      "exists": true,
+      "mtime": "2026-04-01 22:18:23",
+      "size_kb": 0
+    },
+    "m2_oof_short": {
+      "exists": true,
+      "mtime": "2026-04-02 02:16:42",
+      "size_kb": 0
+    }
+  },
+  "schema_check": {
+    "M1 LONG  feat vs weighted_dataset": {
+      "n_features": 1328,
+      "n_missing": 0,
+      "missing_columns": [],
+      "data_total_columns": 1733,
+      "extra_in_data_count": 405
+    },
+    "M1 SHORT feat vs weighted_dataset": {
+      "n_features": 1318,
+      "n_missing": 0,
+      "missing_columns": [],
+      "data_total_columns": 1733,
+      "extra_in_data_count": 415
+    },
+    "M2 LONG  feat vs meta_labeled_oof_long": {
+      "n_features": 1381,
+      "n_missing": 0,
+      "missing_columns": [],
+      "data_total_columns": 1387,
+      "extra_in_data_count": 6
+    },
+    "M2 SHORT feat vs meta_labeled_oof_short": {
+      "n_features": 1386,
+      "n_missing": 0,
+      "missing_columns": [],
+      "data_total_columns": 1392,
+      "extra_in_data_count": 6
+    }
+  },
+  "oof_check": {
+    "LONG ": {
+      "exists": true,
+      "rows": 0,
+      "columns": [],
+      "has_true_label": false,
+      "null_true_label": -1
+    },
+    "SHORT": {
+      "exists": true,
+      "rows": 0,
+      "columns": [],
+      "has_true_label": false,
+      "null_true_label": -1
+    }
+  }
+}

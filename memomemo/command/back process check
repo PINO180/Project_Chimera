@@ -1,0 +1,13 @@
+# 定番（使えない環境もある）
+bashps aux | grep python
+
+# 全プロセス一覧からpythonを絞り込む。最もよく使われる定番コマンド。
+bashpgrep -la python
+
+# 同じ目的をよりシンプルに。軽量環境では入っていないことがある。
+
+# 環境を問わず必ず動く
+bashcat /proc/*/cmdline 2>/dev/null | tr '\0' ' ' | grep python | grep -v grep
+# Linuxの /proc ディレクトリを直接読む方法。psもpgrepもない環境でも確実に動く。今回のコンテナ環境ではこれが有効でした。
+
+# 何も出力されなければクリーン、再実行OKです。

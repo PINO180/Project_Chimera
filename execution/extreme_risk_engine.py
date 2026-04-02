@@ -76,14 +76,14 @@ class ExtremeRiskEngineV5:
             )
             return {
                 "base_capital": 1000.0,
-                "lot_per_base": 1.0,
+                "lot_per_base": 0.1,
                 "max_lot_absolute": 200.0,
                 "contract_size": 100.0,
                 "min_lot_size": 0.01,
                 "base_leverage": 2000.0,
                 "spread_pips": 36.0,  # 16.0 -> 36.0 (Trial 0同期)
                 "value_per_pip": 1.0,
-                "min_atr_threshold": 2.0,  # 0.0 -> 2.0 (Trial 0同期)
+                "min_atr_threshold": 0.8,  # ATR Ratio閾値 (絶対値 2.0 → Ratio 0.8)
                 # ▼ 修正: デフォルト値も Long/Short 分割に変更
                 "sl_multiplier_long": 5.0,
                 "pt_multiplier_long": 1.0,
@@ -239,6 +239,7 @@ class ExtremeRiskEngineV5:
         base_capital: Optional[float] = None,
         lot_per_base: Optional[float] = None,
         current_spread_pips: Optional[float] = None,
+        atr_ratio: Optional[float] = None,  # ★追加: realtime_feature_engineから渡されるATR Ratio
     ) -> Dict[str, Any]:
         """外部(司令塔)から受け取った確率とパラメータに基づき、最終的な執行コマンドを生成する"""
 
@@ -260,11 +261,13 @@ class ExtremeRiskEngineV5:
         if action == "HOLD":
             return self._generate_hold_command("司令塔からのHOLD指示", p_long, p_short)
 
-        # 追加: ATR最小閾値フィルター (ボラティリティ枯渇時の発注スキップ)
-        min_atr = self.config.get("min_atr_threshold", 2.0)  # デフォルト0.0 -> 2.0
-        if atr <= min_atr:
+        # 追加: ATR Ratioフィルター (ボラティリティ枯渇時の発注スキップ)
+        # atr_ratioはrealtime_feature_engineのmarket_infoから渡されたものを使用
+        min_atr = self.config.get("min_atr_threshold", 0.8)  # ATR Ratio閾値
+        effective_atr_ratio = atr_ratio if atr_ratio is not None else 1.0
+        if effective_atr_ratio < min_atr:
             return self._generate_hold_command(
-                f"ATR({atr:.3f})が最小閾値({min_atr})以下のためスキップ",
+                f"ATR Ratio({effective_atr_ratio:.3f})が最小閾値({min_atr})未満のためスキップ",
                 p_long,
                 p_short,
             )

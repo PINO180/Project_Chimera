@@ -26,6 +26,7 @@ import re
 import pickle  # ▼追加: スナップショット保存用
 import os  # ▼追加: ファイル存在確認用
 import blueprint as config
+from blueprint import ATR_BASELINE_DAYS
 
 # --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
 project_root = Path(__file__).resolve().parents[1]
@@ -36,6 +37,13 @@ if str(project_root) not in sys.path:
 # 外部モジュール (完全カプセル化クラス群) のインポート
 # 各モジュールは calculate_features(data) メソッドで一括計算を行います
 # ==================================================================
+# --- ATR Ratio計算用：時間足ごとの1日あたりバー数 ---
+TIMEFRAME_BARS_PER_DAY: Dict[str, int] = {
+    "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
+    "M8": 180, "M15": 96, "M30": 48, "H1": 24,
+    "H4": 6, "H6": 4, "H12": 2, "D1": 1,
+}
+
 from execution.realtime_feature_engine_1A_statistics import FeatureModule1A
 from execution.realtime_feature_engine_1B_timeseries import FeatureModule1B
 from execution.realtime_feature_engine_1C_technical import FeatureModule1C
@@ -830,13 +838,31 @@ class RealtimeFeatureEngine:
             if np.isnan(atr_value):
                 return {"is_V5": False, "reason": "atr_is_nan"}
 
-            # ATR閾値フィルター (risk_config.json で管理)
-            atr_threshold = self.risk_config.get("min_atr_threshold", 0.0)
+            # ATR Ratioフィルター (risk_config.json で管理)
+            # ATR Ratio = 現在のATR / 過去ATR_BASELINE_DAYS日の平均ATR
+            atr_threshold = self.risk_config.get("min_atr_threshold", 0.8)  # Ratio閾値
+            baseline_period = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440) * ATR_BASELINE_DAYS
+            # バッファ全体のATR時系列を取得してベースラインを計算
+            if len(close) > 1:
+                tr_full = np.maximum(
+                    high[1:] - low[1:],
+                    np.maximum(
+                        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
+                    ),
+                )
+                if len(tr_full) >= baseline_period:
+                    baseline_atr = np.mean(tr_full[-baseline_period:])
+                else:
+                    baseline_atr = np.mean(tr_full)
+            else:
+                baseline_atr = atr_value
+            atr_ratio = atr_value / (baseline_atr + 1e-10)
 
-            if atr_value > atr_threshold:
+            if atr_ratio >= atr_threshold:
                 # ▼▼▼ 修正: 古い unified キーの取得と payoff_ratio を廃止し、Long/Short 分割キーを取得 ▼▼▼
                 market_info = {
                     "atr_value": atr_value,
+                    "atr_ratio": atr_ratio,  # ★追加：リスクエンジンに渡す
                     "current_price": current_price,
                     "sl_multiplier_long": self.risk_config.get(
                         "sl_multiplier_long", 5.0
@@ -856,14 +882,14 @@ class RealtimeFeatureEngine:
 
                 self.logger.info(
                     f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
-                    f"PASSED (ATR: {atr_value:.2f} > {atr_threshold:.2f})"
+                    f"PASSED (ATR Ratio: {atr_ratio:.3f} >= {atr_threshold:.3f})"
                 )
                 return {"is_V5": True, "market_info": market_info}
             else:
                 # ▼▼▼ 追加: ATR不足で見送った時のログ ▼▼▼
                 self.logger.info(
                     f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
-                    f"FAILED ⛔ (ATR: {atr_value:.2f} <= {atr_threshold:.2f})"
+                    f"FAILED ⛔ (ATR Ratio: {atr_ratio:.3f} < {atr_threshold:.3f})"
                 )
                 # ▲▲▲ ここまで追加 ▲▲▲
                 return {"is_V5": False, "reason": "below_min_atr_threshold"}
@@ -1041,23 +1067,24 @@ class RealtimeFeatureEngine:
 
         close_pct = _pct(data["close"])
 
-        # atr のフォールバック処理 (1Cモジュールから取得できている場合はそれを使用)
-        if "e1c_atr_13" in features:
-            features["atr"] = features["e1c_atr_13"]
+        # atr の計算 (e1c_atr_13は相対値のため使用禁止 → 常にOHLCVバッファからWilder平滑化で自前計算)
+        high, low, close = data["high"], data["low"], data["close"]
+        if len(close) > 1:
+            tr = np.maximum(
+                high[1:] - low[1:],
+                np.maximum(
+                    np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
+                ),
+            )
+            # Wilder平滑化（ewm相当・alpha=1/period）
+            alpha = 1.0 / self.ATR_CALC_PERIOD
+            atr_series = np.zeros(len(tr))
+            atr_series[0] = tr[0]
+            for i in range(1, len(tr)):
+                atr_series[i] = alpha * tr[i] + (1 - alpha) * atr_series[i - 1]
+            features["atr"] = float(atr_series[-1]) if len(atr_series) > 0 else 0.0
         else:
-            high, low, close = data["high"], data["low"], data["close"]
-            if len(close) > 1:
-                tr = np.maximum(
-                    high[1:] - low[1:],
-                    np.maximum(
-                        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
-                    ),
-                )
-                features["atr"] = (
-                    np.mean(_window(tr, 13)) if len(tr) >= 13 else np.mean(tr)
-                )
-            else:
-                features["atr"] = 0.0
+            features["atr"] = 0.0
 
         features["log_return"] = (
             np.log((data["close"][-1] + 1e-10) / (data["close"][-2] + 1e-10))
