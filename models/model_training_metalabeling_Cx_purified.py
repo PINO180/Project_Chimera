@@ -34,6 +34,8 @@ from blueprint import (
     # S3_FEATURES_FOR_TRAINING,  # ← 削除
     S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加 (プロンプト⑬ 修正①)
     S3_SELECTED_FEATURES_DIR,
+    S3_SELECTED_FEATURES_ORTHOGONAL_DIR,  # ★ 追加: 直交分割版
+    S7_RUN_CONFIG,                        # ★ 追加: Bx→Cx間の設定引き継ぎ
     S7_M1_OOF_PREDICTIONS_LONG,
     S7_M1_OOF_PREDICTIONS_SHORT,
     S7_META_LABELED_OOF_LONG,
@@ -179,15 +181,14 @@ class PartitionPurgedKFold(BaseCrossValidator):
 
 
 class FinalAssembler:
-    def __init__(self, config: FinalTrainingConfig):
-        # Blueprintで追加したディレクトリをインポート済みであることを確認 (from blueprint import S3_SELECTED_FEATURES_DIR)
-
+    def __init__(self, config: FinalTrainingConfig, selected_features_dir: Path = None):
         self.config = config
         self.direction = self.config.direction
 
         # --- パターンB: M1とM2それぞれの専用特徴量リストを動的に読み込む ---
-        m1_feature_path = S3_SELECTED_FEATURES_DIR / f"m1_{self.direction}_features.txt"
-        m2_feature_path = S3_SELECTED_FEATURES_DIR / f"m2_{self.direction}_features.txt"
+        _feat_dir = selected_features_dir if selected_features_dir is not None else S3_SELECTED_FEATURES_DIR
+        m1_feature_path = _feat_dir / f"m1_{self.direction}_features.txt"
+        m2_feature_path = _feat_dir / f"m2_{self.direction}_features.txt"
 
         self.features_base: List[str] = self._load_features(m1_feature_path)
         self.features_m2: List[str] = self._load_features(m2_feature_path)
@@ -246,9 +247,12 @@ class FinalAssembler:
             "is_trigger",
         }
 
-        features = ["timeframe"]  # ★変更: 特徴量リストの先頭に明示的にセット (Cに統一)
+        # [FIX] "timeframe"を特徴量リストから除外。
+        # M3専用スナイパーに純化済みのため分散ゼロの無意味な特徴量。
+        # ※ _filter_dataframe()でのデータ管理用カラムとしての使用は継続。
+        features = []
         for col in raw_features:
-            if col in exclude_exact or col == "timeframe":  # ★変更: 重複防止 (Cに統一)
+            if col in exclude_exact or col == "timeframe":
                 continue
             if col.startswith("is_trigger_on"):
                 continue
@@ -508,6 +512,9 @@ class FinalAssembler:
                     y_train = np.concatenate(y_train_list)
                     w_train = np.concatenate(w_train_list)
 
+                    del X_train_list, y_train_list, w_train_list
+                    gc.collect()
+
                     train_params = self.config.lgbm_params_m2.copy()
                     n_estimators = train_params.pop("n_estimators", 1000)
 
@@ -516,9 +523,18 @@ class FinalAssembler:
                     )
                     model = lgb.train(
                         train_params,
-                        lgb.Dataset(X_train, label=y_train, weight=w_train),
+                        lgb.Dataset(
+                            X_train,
+                            label=y_train,
+                            weight=w_train,
+                            feature_name=self.features_m2,
+                        ),
                         num_boost_round=n_estimators,
                     )
+
+                    del X_train, y_train, w_train
+                    gc.collect()
+
                 except Exception as fit_error:
                     logging.error(
                         f"[{self.direction.upper()}] Error fitting M2 model: {fit_error}"
@@ -760,7 +776,12 @@ class FinalAssembler:
 
             model = lgb.train(
                 train_params,
-                lgb.Dataset(X_train, label=y_train, weight=w_train),
+                lgb.Dataset(
+                    X_train,
+                    label=y_train,
+                    weight=w_train,
+                    feature_name=features_to_use,
+                ),
                 num_boost_round=n_estimators,
             )
 
@@ -1035,6 +1056,54 @@ if __name__ == "__main__":
     parser.add_argument("--test", action="store_true", help="Run in quick test mode.")
     args = parser.parse_args()
 
+    # =========================================================
+    # 特徴量セット選択（run_configから引き継ぎ or インタラクティブ）
+    # =========================================================
+    FEATURE_SETS = {
+        "1": {
+            "label": "selected_features_v5          (オリジナル / 全部載せ)",
+            "dir":   S3_SELECTED_FEATURES_DIR,
+        },
+        "2": {
+            "label": "selected_features_orthogonal_v5 (M1/M2直交分割版)",
+            "dir":   S3_SELECTED_FEATURES_ORTHOGONAL_DIR,
+        },
+    }
+
+    selected_dir = S3_SELECTED_FEATURES_DIR  # デフォルト
+    if S7_RUN_CONFIG.exists():
+        with open(S7_RUN_CONFIG) as f:
+            run_config = json.load(f)
+        prev_label = run_config.get("features_label", "不明")
+        prev_dir   = run_config.get("features_dir", str(S3_SELECTED_FEATURES_DIR))
+        print(f"\n前回のBx実行設定: {prev_label}")
+        ans = input("同じ特徴量セットを使用しますか？ [Y/n]: ").strip().lower()
+        if ans in ("", "y"):
+            selected_dir = Path(prev_dir)
+            logging.info(f"📂 前回のBx設定を引き継ぎ: {prev_label}")
+        else:
+            print("\n" + "=" * 60)
+            print("  📂 特徴量セットを選択してください:")
+            for key, val in FEATURE_SETS.items():
+                print(f"    [{key}] {val['label']}")
+            print("=" * 60)
+            fs_ans = input("選択 [1/2, Enterでデフォルト(1)]: ").strip() or "1"
+            if fs_ans not in FEATURE_SETS:
+                fs_ans = "1"
+            selected_dir = FEATURE_SETS[fs_ans]["dir"]
+            logging.info(f"📂 特徴量セット: {FEATURE_SETS[fs_ans]['label']}")
+    else:
+        print("\n⚠️  run_configが見つかりません。特徴量セットを手動選択してください。")
+        print("=" * 60)
+        for key, val in FEATURE_SETS.items():
+            print(f"    [{key}] {val['label']}")
+        print("=" * 60)
+        fs_ans = input("選択 [1/2, Enterでデフォルト(1)]: ").strip() or "1"
+        if fs_ans not in FEATURE_SETS:
+            fs_ans = "1"
+        selected_dir = FEATURE_SETS[fs_ans]["dir"]
+        logging.info(f"📂 特徴量セット: {FEATURE_SETS[fs_ans]['label']}")
+
     for direction in ["long", "short"]:
         print("\n" + "=" * 60)
         print(
@@ -1047,7 +1116,7 @@ if __name__ == "__main__":
             config.lgbm_params_m1["n_estimators"] = 10
             config.lgbm_params_m2["n_estimators"] = 10
 
-        assembler = FinalAssembler(config)
+        assembler = FinalAssembler(config, selected_features_dir=selected_dir)
         assembler.run()
 
     logging.info(

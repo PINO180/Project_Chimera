@@ -27,6 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     tree \
     sudo \
+    procps \
+    tmux \
+    htop \
+    nano \
+    wget \
+    lsof \
     && rm -rf /var/lib/apt/lists/*
 
 # 作業ディレクトリの設定

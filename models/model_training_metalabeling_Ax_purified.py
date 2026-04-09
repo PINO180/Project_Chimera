@@ -23,14 +23,24 @@ project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
+import json
 from blueprint import (
     S6_WEIGHTED_DATASET,
     # S3_FEATURES_FOR_TRAINING,  # ← 削除
     S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加
     S3_SELECTED_FEATURES_DIR,
+    S3_SELECTED_FEATURES_ORTHOGONAL_DIR,
     S7_M1_OOF_PREDICTIONS_LONG,
     S7_M1_OOF_PREDICTIONS_SHORT,
+    S7_RUN_CONFIG,
 )
+from sklearn.metrics import roc_auc_score
+
+# =========================================================
+# lambda_l2 スキャン設定
+# =========================================================
+LAMBDA_L2_CANDIDATES = [0.1, 0.5, 1.0, 2.0, 5.0]
+SCAN_RESULTS = {}  # {lambda_l2: {direction: {auc, proba_stats}}}
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -77,6 +87,7 @@ class TrainingConfig:
     )
     test_limit: int = 0
     test_fold_limit: int = 0
+    scan_mode: bool = False  # ★追加: lambda_l2スキャンモード（OOF保存なし）
 
 
 class PartitionPurgedKFold(BaseCrossValidator):
@@ -162,9 +173,11 @@ class M1CrossValidator:
             "meta_label",  # ★追加: M1学習時には存在しないため除外
         }
 
-        features = ["timeframe"]  # ★変更: timeframeを最重要カテゴリとして先頭に配置
+        # [FIX] "timeframe"を特徴量リストから除外。
+        # M3専用スナイパーに純化済みのため分散ゼロの無意味な特徴量。
+        features = []
         for col in raw_features:
-            if col in exclude_exact or col == "timeframe":  # ★変更: 重複防止
+            if col in exclude_exact or col == "timeframe":
                 continue
             if col.startswith("is_trigger_on"):
                 continue
@@ -419,6 +432,31 @@ class M1CrossValidator:
             del model
             gc.collect()
 
+        # --- lambda_l2スキャン: このdirectionのAUCと分布を記録 ---
+        if hasattr(self, '_current_lambda_l2') and oof_results["prediction"]:
+            all_preds = np.concatenate(oof_results["prediction"]) if oof_results["prediction"] else np.array([])
+            all_labels = np.concatenate(oof_results["true_label"]) if oof_results["true_label"] else np.array([])
+            if len(all_preds) > 0 and len(np.unique(all_labels)) > 1:
+                auc = roc_auc_score(all_labels, all_preds)
+                pct_above_095 = np.mean(all_preds >= 0.95) * 100
+                pct_060_090   = np.mean((all_preds >= 0.60) & (all_preds < 0.90)) * 100
+                avg_proba     = np.mean(all_preds)
+                lam = self._current_lambda_l2
+                if lam not in SCAN_RESULTS:
+                    SCAN_RESULTS[lam] = {}
+                SCAN_RESULTS[lam][direction] = {
+                    "auc": auc,
+                    "pct_above_095": pct_above_095,
+                    "pct_060_090":   pct_060_090,
+                    "avg_proba":     avg_proba,
+                    "n_samples":     len(all_preds),
+                }
+                logging.info(
+                    f"  [SCAN] lambda_l2={lam} {direction.upper()}: "
+                    f"AUC={auc:.4f} | >=0.95: {pct_above_095:.1f}% | "
+                    f"0.60-0.90: {pct_060_090:.1f}% | avg={avg_proba:.3f}"
+                )
+
         logging.info(f"Concatenating OOF results for {direction}...")
         for key in oof_results:
             if oof_results[key]:
@@ -440,54 +478,94 @@ class M1CrossValidator:
             "short": S7_M1_OOF_PREDICTIONS_SHORT,
         }
 
-        # Blueprintで追加したディレクトリをインポート済みであることを確認 (from blueprint import S3_SELECTED_FEATURES_DIR)
+        # --- スキャンモード判定 ---
+        scan_mode = getattr(self.config, 'scan_mode', False)
 
-        # 双方向のループ処理 (Two-Brain Training)
+        if scan_mode:
+            # =========================================================
+            # lambda_l2 スキャンモード: OOF保存なし、指標のみ記録
+            # =========================================================
+            logging.info("=" * 60)
+            logging.info("  🔍 SCAN MODE: lambda_l2 sensitivity scan")
+            logging.info(f"  候補値: {LAMBDA_L2_CANDIDATES}")
+            logging.info(f"  パーティション数: {len(self.partitions)} (--test-limit)")
+            logging.info("=" * 60)
+
+            for direction in directions:
+                _feat_dir = getattr(self, '_selected_features_dir', S3_SELECTED_FEATURES_DIR)
+                dedicated_feature_path = _feat_dir / f"m1_{direction}_features.txt"
+                self.features = self._load_features(dedicated_feature_path)
+                scale_pos_weight = self._calculate_scale_pos_weight(direction)
+
+                for lam in LAMBDA_L2_CANDIDATES:
+                    logging.info(f"\n{'='*50}")
+                    logging.info(f"  lambda_l2 = {lam}  [{direction.upper()}]")
+                    logging.info(f"{'='*50}")
+                    self._current_lambda_l2 = lam
+                    self.config.lgbm_params["lambda_l2"] = lam
+                    self.config.lgbm_params["scale_pos_weight"] = scale_pos_weight
+                    self._train_model_partition_based(direction)
+
+            # --- スキャン結果サマリー表示 ---
+            logging.info("\n" + "=" * 70)
+            logging.info("  📊 SCAN RESULTS SUMMARY")
+            logging.info("=" * 70)
+            logging.info(f"  {'lambda_l2':>10} {'Direction':>10} {'AUC':>8} {'>=0.95%':>9} {'0.60-0.90%':>12} {'avg_proba':>10} {'N':>8}")
+            logging.info("  " + "-" * 68)
+            for lam in LAMBDA_L2_CANDIDATES:
+                if lam not in SCAN_RESULTS:
+                    continue
+                for direction in ["long", "short"]:
+                    if direction not in SCAN_RESULTS[lam]:
+                        continue
+                    r = SCAN_RESULTS[lam][direction]
+                    logging.info(
+                        f"  {lam:>10} {direction.upper():>10} "
+                        f"{r['auc']:>8.4f} {r['pct_above_095']:>8.1f}% "
+                        f"{r['pct_060_090']:>11.1f}% {r['avg_proba']:>10.3f} "
+                        f"{r['n_samples']:>8,}"
+                    )
+            logging.info("=" * 70)
+            logging.info("\n⚠️  OOFファイルは保存されていません（スキャンモード）")
+            logging.info("### lambda_l2 SCAN COMPLETED! ###")
+            return
+
+        # =========================================================
+        # 通常モード: 従来通りOOF保存あり
+        # =========================================================
         for direction in directions:
             logging.info("\n" + "=" * 50)
             logging.info(f"=== Starting Pipeline for: {direction.upper()} ===")
             logging.info("=" * 50)
 
-            # --- パターンB: 専用特徴量リストを動的に読み込む ---
-            dedicated_feature_path = (
-                S3_SELECTED_FEATURES_DIR / f"m1_{direction}_features.txt"
-            )
+            _feat_dir = getattr(self, '_selected_features_dir', S3_SELECTED_FEATURES_DIR)
+            dedicated_feature_path = _feat_dir / f"m1_{direction}_features.txt"
             self.features = self._load_features(dedicated_feature_path)
-
-            # scale_pos_weightを方向ごとに動的計算
             scale_pos_weight = self._calculate_scale_pos_weight(direction)
             self.config.lgbm_params["scale_pos_weight"] = scale_pos_weight
-
-            # 学習とOOF予測
             oof_results = self._train_model_partition_based(direction)
 
-            # 結果の保存
             if oof_results["timestamp"].size > 0:
                 oof_df = pl.DataFrame(
                     {
                         "timestamp": oof_results["timestamp"],
-                        "timeframe": oof_results["timeframe"],  # ★追加
+                        "timeframe": oof_results["timeframe"],
                         "prediction": oof_results["prediction"],
                         "true_label": oof_results["true_label"],
                         "uniqueness": oof_results["uniqueness"],
                     }
                 )
-
-                # ▼▼▼ 追加: 下流でのJoinエラーを防ぐため、Intを文字列に戻す ▼▼▼
                 reverse_map = {0: "M1", 1: "M3", 2: "M5", 3: "M8", 4: "M15"}
                 oof_df = oof_df.with_columns(
+                    pl.col("timestamp").cast(pl.Datetime("us", "UTC")),
                     pl.col("timeframe")
                     .replace_strict(reverse_map, default=None)
-                    .cast(pl.Utf8)
+                    .cast(pl.Utf8),
                 ).sort(["timestamp", "timeframe"])
-                # ▲▲▲ 追加ここまで ▲▲▲
 
                 out_path = output_paths[direction]
                 oof_df.write_parquet(out_path, compression="zstd")
-
-                logging.info(
-                    f"Successfully saved M1 {direction.upper()} OOF predictions to: {out_path}"
-                )
+                logging.info(f"Successfully saved M1 {direction.upper()} OOF predictions to: {out_path}")
                 logging.info(f"  - Total predictions saved: {len(oof_df)}")
             else:
                 logging.warning(f"No OOF predictions generated for {direction}.")
@@ -508,10 +586,60 @@ if __name__ == "__main__":
         help="Limit total partitions discovered for a very small test.",
     )
     parser.add_argument("--test", action="store_true", help="Run in quick test mode.")
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help="lambda_l2スキャンモード（OOF保存なし・指標のみ）。--test-limitと組み合わせて使用。",
+    )
     args = parser.parse_args()
 
     fold_limit = 5 if args.test else 0
-    config = TrainingConfig(test_limit=args.test_limit, test_fold_limit=fold_limit)
+    config = TrainingConfig(
+        test_limit=args.test_limit,
+        test_fold_limit=fold_limit,
+        scan_mode=args.scan,
+    )
+
+    # =========================================================
+    # 特徴量セット選択（インタラクティブ）
+    # =========================================================
+    FEATURE_SETS = {
+        "1": {
+            "label": "selected_features_v5          (オリジナル / 全部載せ)",
+            "dir":   S3_SELECTED_FEATURES_DIR,
+        },
+        "2": {
+            "label": "selected_features_orthogonal_v5 (M1/M2直交分割版)",
+            "dir":   S3_SELECTED_FEATURES_ORTHOGONAL_DIR,
+        },
+    }
+
+    print("\n" + "=" * 60)
+    print("  📂 特徴量セットを選択してください:")
+    for key, val in FEATURE_SETS.items():
+        print(f"    [{key}] {val['label']}")
+    print("=" * 60)
+    fs_ans = input("選択 [1/2, Enterでデフォルト(1)]: ").strip() or "1"
+    if fs_ans not in FEATURE_SETS:
+        fs_ans = "1"
+
+    selected_fs = FEATURE_SETS[fs_ans]
+    selected_dir = selected_fs["dir"]
+    logging.info(f"📂 特徴量セット: {selected_fs['label']}")
+
+    # 選択結果をrun_configに保存（Bx/Cxが参照）
+    run_config = {
+        "features_dir":   str(selected_dir),
+        "features_label": selected_fs["label"],
+        "selected_by":    "Ax",
+        "scan_mode":      args.scan,
+    }
+    S7_RUN_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with open(S7_RUN_CONFIG, "w") as f:
+        json.dump(run_config, f, indent=2, ensure_ascii=False)
+    logging.info(f"📝 実行設定を保存: {S7_RUN_CONFIG}")
 
     validator = M1CrossValidator(config)
+    # 選択された特徴量ディレクトリをvalidatorに反映
+    validator._selected_features_dir = selected_dir
     validator.run()

@@ -101,6 +101,7 @@ S3_FEATURES_FOR_TRAINING = S3_ARTIFACTS / "final_feature_set_v3.txt"
 S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / "final_feature_set_v5.txt"
 S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / "selected_features_v5"
 S3_SELECTED_FEATURES_PURIFIED_DIR = S3_ARTIFACTS / "selected_features_purified_v5"
+S3_SELECTED_FEATURES_ORTHOGONAL_DIR = S3_ARTIFACTS / "selected_features_orthogonal_v5"  # ★追加: M1/M2直交分割版
 S3_FILTERED_LF_FEATURES = S3_ARTIFACTS / "filtered_lf_features.txt"
 S3_FILTERED_HF_FEATURES = S3_ARTIFACTS / "filtered_hf_features.txt"
 S3_LF_ENVIRONMENT_SCORES = S3_ARTIFACTS / "lf_environment_scores.parquet"
@@ -132,6 +133,18 @@ S7_MODELS = _SYM / "stratum_7_models"
 # --- Chapter 3 追加パス ---
 # バックテスト出力
 S7_BACKTEST_RESULTS = S7_MODELS / "backtest_results"
+S7_BACKTEST_OPTUNA_RESULTS = S7_MODELS / "backtest_optuna_results"
+# キャッシュ格納ディレクトリ
+S7_BACKTEST_CACHE_DIR = S7_MODELS / "backtest_preload_cache"
+S7_BACKTEST_CACHE_M2  = S7_BACKTEST_CACHE_DIR / "backtest_preload_cache.pkl"    # M2モード用キャッシュ
+S7_BACKTEST_CACHE_M1  = S7_BACKTEST_CACHE_DIR / "backtest_preload_cache_M1.pkl" # M1モード用キャッシュ
+S7_BACKTEST_CACHE     = S7_BACKTEST_CACHE_M2  # 後方互換エイリアス
+
+# バックテスト結果出力先
+S7_BACKTEST_SIM_RESULTS = S7_MODELS / "backtest_simulator_results"
+
+# --- パイプライン実行設定ファイル（Ax→Bx→Cx間の選択引き継ぎ） ---
+S7_RUN_CONFIG = S7_MODELS / ".current_run_config.json"
 
 
 # =====================================================================

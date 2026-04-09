@@ -29,12 +29,34 @@ logging.basicConfig(
 
 
 def load_purified_features(filename: str) -> list[str]:
-    filepath = S3_SELECTED_FEATURES_DIR / filename  #
+    """Cx_purified.py の _load_features() と同一のロジックで特徴量を読み込む"""
+    filepath = S3_SELECTED_FEATURES_DIR / filename
     if not filepath.exists():
         logging.error(f"Feature list not found: {filepath}")
         return []
+
+    exclude_exact = {
+        "timestamp", "t1", "label", "label_long", "label_short",
+        "uniqueness", "uniqueness_long", "uniqueness_short",
+        "payoff_ratio", "payoff_ratio_long", "payoff_ratio_short",
+        "pt_multiplier", "sl_multiplier", "direction", "exit_type",
+        "first_ex_reason_int", "atr_value", "calculated_body_ratio",
+        "fallback_vol", "open", "high", "low", "close",
+        "meta_label", "m1_pred_proba", "is_trigger",
+    }
+
     with open(filepath, "r") as f:
-        return [line.strip() for line in f if line.strip()]
+        raw_features = [line.strip() for line in f if line.strip()]
+
+    features = ["timeframe"]
+    for col in raw_features:
+        if col in exclude_exact or col == "timeframe":
+            continue
+        if col.startswith("is_trigger_on"):
+            continue
+        features.append(col)
+
+    return features
 
 
 def analyze_and_export(
@@ -101,6 +123,9 @@ def main():
 
     for model_path, label, fname in configs:
         features = load_purified_features(fname)
+        # M2モデルはm1_pred_probaが末尾に追加されている（Cx版と同一処理）
+        if "M2" in label and "m1_pred_proba" not in features:
+            features.append("m1_pred_proba")
         if features:
             analyze_and_export(model_path, label, features, fname)
 

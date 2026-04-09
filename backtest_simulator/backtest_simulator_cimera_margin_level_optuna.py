@@ -2,6 +2,7 @@
 # [V5改修版: Project Cimera 双方向ラベリング仕様 (Part 1)]
 
 import sys
+import pickle
 from pathlib import Path
 import logging
 import argparse
@@ -34,14 +35,19 @@ if str(project_root) not in sys.path:
 from blueprint import (
     S6_WEIGHTED_DATASET,
     S3_SELECTED_FEATURES_PURIFIED_DIR,
+    S7_M1_OOF_PREDICTIONS_LONG,
+    S7_M1_OOF_PREDICTIONS_SHORT,
     S7_M2_OOF_PREDICTIONS_LONG,
     S7_M2_OOF_PREDICTIONS_SHORT,
     S7_MODELS,
+    S7_BACKTEST_CACHE_M1,
+    S7_BACKTEST_CACHE_M2,
+    S7_BACKTEST_SIM_RESULTS,
 )
 
-# --- 出力ファイルパス ---
-FINAL_REPORT_PATH = S7_MODELS / "final_backtest_report_v5.json"
-EQUITY_CURVE_PATH = S7_MODELS / "equity_curve_v5.png"
+# --- 出力ファイルパス（実行時に動的生成）---
+FINAL_REPORT_PATH = S7_MODELS / "final_backtest_report_v5.json"  # 起動時に上書き
+EQUITY_CURVE_PATH = S7_MODELS / "equity_curve_v5.png"  # 起動時に上書き
 
 
 # --- ロギング設定 ---
@@ -80,18 +86,20 @@ class BacktestConfig:
     # ▼▼▼ 追加: 固定比率資金管理のパラメータ ▼▼▼
     use_fixed_risk: bool = True
     fixed_risk_percent: float = (
-        0.05  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
+        0.02  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
     )
     # ▲▲▲ ここまで追加 ▲▲▲
 
-    m2_proba_threshold: float = 0.50
+    m2_proba_threshold: float = 0.70
     m2_delta_threshold: float = 0.50  # ★追加: LongとShortの確率の差分(Delta)閾値
 
     test_limit_partitions: int = 0
     oof_mode: bool = True
     min_capital_threshold: float = 1.0
     min_lot_size: float = 0.01
-    min_atr_threshold: float = 0.8  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
+    min_atr_threshold: float = (
+        0.8  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
+    )
 
     max_positions: int = 100
 
@@ -112,15 +120,15 @@ class BacktestConfig:
     sl_multiplier_short: float = 5.0
     pt_multiplier_short: float = 1.0
 
-    td_minutes_long: float = 60.0
-    td_minutes_short: float = 60.0
+    td_minutes_long: float = 30.0
+    td_minutes_short: float = 30.0
 
     # ▼▼▼ ここから追加 ▼▼▼
     # ==========================================
     # V5 Optuna対応: 証拠金維持率とロスカット設定
     # ==========================================
-    margin_call_percent: float = 100.0  # 証拠金維持率がこれを下回ると新規エントリー禁止
-    stop_out_percent: float = 20.0  # 証拠金維持率がこれを下回ると強制ロスカット
+    margin_call_percent: float = 0.0  # 証拠金維持率がこれを下回ると新規エントリー禁止
+    stop_out_percent: float = 0.0  # 証拠金維持率がこれを下回ると強制ロスカット
     # ▲▲▲ ここまで追加 ▲▲▲
 
 
@@ -347,10 +355,11 @@ class BacktestSimulator:
                 "uniqueness",
             ]
 
-            # 2. Long OOF
+            # 2. Long OOF (timestampをUTC awareに統一)
             long_lf = (
                 pl.scan_parquet(self.config.oof_long_path)
                 .select(oof_cols)
+                .with_columns(pl.col("timestamp").dt.replace_time_zone("UTC"))
                 .rename(
                     {
                         "prediction": "m2_proba_long",
@@ -360,10 +369,11 @@ class BacktestSimulator:
                 )
             )
 
-            # 3. Short OOF
+            # 3. Short OOF (timestampをUTC awareに統一)
             short_lf = (
                 pl.scan_parquet(self.config.oof_short_path)
                 .select(oof_cols)
+                .with_columns(pl.col("timestamp").dt.replace_time_zone("UTC"))
                 .rename(
                     {
                         "prediction": "m2_proba_short",
@@ -514,7 +524,9 @@ class BacktestSimulator:
         timestamps_chunk = df_chunk["timestamp"].to_list()
         close_prices_chunk = df_chunk["close"].to_numpy()
         atr_values_chunk = df_chunk["atr_value"].to_numpy()
-        atr_ratios_chunk = df_chunk["atr_ratio"].to_numpy()  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
+        atr_ratios_chunk = df_chunk[
+            "atr_ratio"
+        ].to_numpy()  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
 
         # V5 Two-Brain の確率とラベル
         p_long_chunk = df_chunk["m2_proba_long"].to_numpy()
@@ -541,7 +553,9 @@ class BacktestSimulator:
 
             current_price_float = close_prices_chunk[i]
             atr_value_float = atr_values_chunk[i]
-            atr_ratio_float = atr_ratios_chunk[i]  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
+            atr_ratio_float = atr_ratios_chunk[
+                i
+            ]  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
 
             if (
                 current_price_float is None
@@ -949,6 +963,7 @@ class BacktestSimulator:
                                 "label": int(valid_label),
                                 "lot_size": float(final_lot_size_decimal),
                                 "atr_value": float(atr_value_float),
+                                "atr_ratio": float(atr_ratio_float),  # ★追加: 相対ATR
                                 "leverage": float(effective_leverage_decimal),  # ★変更
                                 "margin": margin_required_decimal,  # ★変更
                                 "spread": spread_cost_decimal,  # ★変更済のはずですが確認
@@ -982,6 +997,7 @@ class BacktestSimulator:
             "label": pl.Int64,
             "lot_size": pl.Float64,
             "atr_value": pl.Float64,
+            "atr_ratio": pl.Float64,  # ★追加: 相対ATR
             "leverage": pl.Float32,  # ★変更
             "margin": pl.Object,  # ★変更済のはずですが確認
             "spread": pl.Object,  # ★変更済のはずですが確認
@@ -1195,7 +1211,9 @@ class BacktestSimulator:
             strategy_str += f"Fixed Risk ({self.config.fixed_risk_percent * 100:.1f}%)"
         else:
             strategy_str += f"Auto Lot (Base: {self.config.auto_lot_base_capital}, Size: {self.config.auto_lot_size_per_base})"
-        strategy_str += f", M2: {self.config.m2_proba_threshold}, L(PT{self.config.pt_multiplier_long}/SL{self.config.sl_multiplier_long}), S(PT{self.config.pt_multiplier_short}/SL{self.config.sl_multiplier_short})"
+        # OOFパスからM1/M2モードを判定してStrategy文字列に反映
+        _oof_label = "M1" if "m1_oof" in str(self.config.oof_long_path) else "M2"
+        strategy_str += f", {_oof_label}: {self.config.m2_proba_threshold}, L(PT{self.config.pt_multiplier_long}/SL{self.config.sl_multiplier_long}), S(PT{self.config.pt_multiplier_short}/SL{self.config.sl_multiplier_short})"
 
         report_data = {
             "strategy": strategy_str,
@@ -1337,8 +1355,9 @@ class BacktestSimulator:
                 )
 
         if not trade_log.is_empty():
+            _log_suffix = "M1" if "m1_oof" in str(self.config.oof_long_path) else "M2"
             trade_log_output_path = (
-                FINAL_REPORT_PATH.parent / "detailed_trade_log_v5.csv"
+                FINAL_REPORT_PATH.parent / f"detailed_trade_log_v5_{_log_suffix}.csv"
             )
             logging.info(
                 f"Preparing detailed trade log for CSV output ({len(trade_log)} trades)..."
@@ -1380,9 +1399,10 @@ class BacktestSimulator:
                     "m2_proba": 4,
                     "lot_size": 2,
                     "atr_value": 4,
+                    "atr_ratio": 4,  # ★追加: 相対ATR
                     "leverage": 0,
                     "TD": 1,
-                    "DD(%)": 2,  # ★変更
+                    "DD(%)": 2,
                 }
                 for col_name, digits in float_cols_round.items():
                     if col_name in temp_log_formatted.columns:
@@ -1403,15 +1423,16 @@ class BacktestSimulator:
                     "pnl",
                     "balance",
                     "lot_size",
-                    "active(L)",  # ★変更
-                    "active(S)",  # ★変更
+                    "active(L)",
+                    "active(S)",
                     "margin",
                     "leverage",
                     "spread",
                     "close_price",
                     "atr_value",
+                    "atr_ratio",  # ★追加: 相対ATR
                     "TD",
-                    "DD(%)",  # ★変更
+                    "DD(%)",
                 ]
 
                 available_columns_final = [
@@ -1440,7 +1461,7 @@ class BacktestSimulator:
         else:
             logging.info("No trades were executed, skipping detailed trade log output.")
 
-        text_report_path = FINAL_REPORT_PATH.with_suffix(".txt")
+        text_report_path = FINAL_REPORT_PATH.with_suffix(".txt")  # _M1/.txt or _M2/.txt
         logging.info(f"Generating text performance report to {text_report_path}...")
         try:
             # ▼▼▼ 追加計算: 各種統計情報の取得 ▼▼▼
@@ -1485,28 +1506,130 @@ class BacktestSimulator:
                 )
                 m2_lst = trade_log["m2_proba"].to_list()
                 m2_bins = {
-                    "<= 0.5": sum(1 for x in m2_lst if x <= 0.5),
-                    "0.5 - 0.6": sum(1 for x in m2_lst if 0.5 < x <= 0.6),
-                    "0.6 - 0.7": sum(1 for x in m2_lst if 0.6 < x <= 0.7),
-                    "0.7 - 0.8": sum(1 for x in m2_lst if 0.7 < x <= 0.8),
-                    "0.8 - 0.9": sum(1 for x in m2_lst if 0.8 < x <= 0.9),
-                    "> 0.9": sum(1 for x in m2_lst if x > 0.9),
+                    "<= 0.50": sum(1 for x in m2_lst if x <= 0.50),
+                    "0.50-0.55": sum(1 for x in m2_lst if 0.50 < x <= 0.55),
+                    "0.55-0.60": sum(1 for x in m2_lst if 0.55 < x <= 0.60),
+                    "0.60-0.65": sum(1 for x in m2_lst if 0.60 < x <= 0.65),
+                    "0.65-0.70": sum(1 for x in m2_lst if 0.65 < x <= 0.70),
+                    "0.70-0.75": sum(1 for x in m2_lst if 0.70 < x <= 0.75),
+                    "0.75-0.80": sum(1 for x in m2_lst if 0.75 < x <= 0.80),
+                    "0.80-0.85": sum(1 for x in m2_lst if 0.80 < x <= 0.85),
+                    "0.85-0.90": sum(1 for x in m2_lst if 0.85 < x <= 0.90),
+                    "0.90-0.95": sum(1 for x in m2_lst if 0.90 < x <= 0.95),
+                    "0.95-1.00": sum(1 for x in m2_lst if x > 0.95),
                 }
-                atr_lst = trade_log["atr_value"].to_list()
+                # ATRは相対値(atr_ratio)で集計 ── min_atr_thresholdと同じ軸で評価するため
+                # trade_logにatr_ratioカラムがなければatr_valueで代替（警告付き）
+                if "atr_ratio" in trade_log.columns:
+                    atr_rel_lst = trade_log["atr_ratio"].to_list()
+                    atr_label = "ATR Ratio (Relative)"
+                else:
+                    atr_rel_lst = trade_log["atr_value"].to_list()
+                    atr_label = "ATR Value (Absolute) ※atr_ratio列なし"
+                    logging.warning(
+                        "atr_ratio column not found in trade_log. Falling back to atr_value."
+                    )
                 atr_bins = {
-                    "<= 0.1": sum(1 for x in atr_lst if x <= 0.1),
-                    "0.1 - 0.2": sum(1 for x in atr_lst if 0.1 < x <= 0.2),
-                    "0.2 - 0.3": sum(1 for x in atr_lst if 0.2 < x <= 0.3),
-                    "0.3 - 0.4": sum(1 for x in atr_lst if 0.3 < x <= 0.4),
-                    "0.4 - 0.5": sum(1 for x in atr_lst if 0.4 < x <= 0.5),
-                    "> 0.5": sum(1 for x in atr_lst if x > 0.5),
+                    "< 0.5": sum(1 for x in atr_rel_lst if x is not None and x < 0.5),
+                    "0.5-0.8": sum(
+                        1 for x in atr_rel_lst if x is not None and 0.5 <= x < 0.8
+                    ),
+                    "0.8-1.0": sum(
+                        1 for x in atr_rel_lst if x is not None and 0.8 <= x < 1.0
+                    ),
+                    "1.0-1.2": sum(
+                        1 for x in atr_rel_lst if x is not None and 1.0 <= x < 1.2
+                    ),
+                    "1.2-1.5": sum(
+                        1 for x in atr_rel_lst if x is not None and 1.2 <= x < 1.5
+                    ),
+                    ">= 1.5": sum(1 for x in atr_rel_lst if x is not None and x >= 1.5),
                 }
+
+                # pnl・labelリストを帯別分析で共通利用するため先に取得
+                pnl_lst = trade_log["pnl"].to_list()
+                label_lst = trade_log["label"].to_list()
+
+                # ATR絶対値帯別 勝率・PF分析（参考）
+                atr_abs_lst = trade_log["atr_value"].to_list()
+                atr_abs_band_defs = [
+                    ("< 1.0", lambda x: x < 1.0),
+                    ("1.0-2.0", lambda x: 1.0 <= x < 2.0),
+                    ("2.0-3.0", lambda x: 2.0 <= x < 3.0),
+                    ("3.0-5.0", lambda x: 3.0 <= x < 5.0),
+                    (">= 5.0", lambda x: x >= 5.0),
+                ]
+                atr_abs_band_stats = {}
+                for band_name, band_fn in atr_abs_band_defs:
+                    idxs = [
+                        i
+                        for i, x in enumerate(atr_abs_lst)
+                        if x is not None and band_fn(x)
+                    ]
+                    if not idxs:
+                        atr_abs_band_stats[band_name] = None
+                        continue
+                    band_labels = [label_lst[i] for i in idxs]
+                    band_pnls = [
+                        float(pnl_lst[i]) if pnl_lst[i] is not None else 0.0
+                        for i in idxs
+                    ]
+                    wins = [p for p in band_pnls if p > 0]
+                    loses = [p for p in band_pnls if p < 0]
+                    pf = sum(wins) / abs(sum(loses)) if loses else float("inf")
+                    atr_abs_band_stats[band_name] = {
+                        "count": len(idxs),
+                        "win_rate": sum(1 for l in band_labels if l == 1)
+                        / len(idxs)
+                        * 100,
+                        "pf": pf,
+                        "avg_pnl": sum(band_pnls) / len(band_pnls),
+                    }
+
+                # ATR Ratio帯別 勝率・PF分析
+                atr_band_stats = {}
+                atr_band_defs = [
+                    ("< 0.5", lambda x: x < 0.5),
+                    ("0.5-0.8", lambda x: 0.5 <= x < 0.8),
+                    ("0.8-1.0", lambda x: 0.8 <= x < 1.0),
+                    ("1.0-1.2", lambda x: 1.0 <= x < 1.2),
+                    ("1.2-1.5", lambda x: 1.2 <= x < 1.5),
+                    (">= 1.5", lambda x: x >= 1.5),
+                ]
+                for band_name, band_fn in atr_band_defs:
+                    idxs = [
+                        i
+                        for i, x in enumerate(atr_rel_lst)
+                        if x is not None and band_fn(x)
+                    ]
+                    if not idxs:
+                        atr_band_stats[band_name] = None
+                        continue
+                    band_labels = [label_lst[i] for i in idxs]
+                    band_pnls = [
+                        float(pnl_lst[i]) if pnl_lst[i] is not None else 0.0
+                        for i in idxs
+                    ]
+                    wins = [p for p in band_pnls if p > 0]
+                    loses = [p for p in band_pnls if p < 0]
+                    pf = sum(wins) / abs(sum(loses)) if loses else float("inf")
+                    atr_band_stats[band_name] = {
+                        "count": len(idxs),
+                        "win_rate": sum(1 for l in band_labels if l == 1)
+                        / len(idxs)
+                        * 100,
+                        "pf": pf,
+                        "avg_pnl": sum(band_pnls) / len(band_pnls),
+                    }
             else:
                 max_active_l = max_active_s = max_active_tot = count_l = count_s = (
                     to_count
                 ) = 0
                 avg_td_l = avg_td_s = 0.0
                 m2_bins = atr_bins = {}
+                atr_band_stats = {}
+                atr_abs_band_stats = {}
+                atr_label = "ATR Ratio (Relative)"
             # ▲▲▲ ここまで追加 ▲▲▲
 
             with open(text_report_path, "w", encoding="utf-8") as f:
@@ -1582,16 +1705,100 @@ class BacktestSimulator:
                 f.write(f"Avg TD (Short):\t\t{avg_td_s:.1f} mins\n")
                 f.write(f"Timeout (TO) Count:\t{to_count}\n\n")
 
-                f.write("-" * 23 + " M2 Proba Distribution " + "-" * 14 + "\n")
+                _proba_label = (
+                    "M1" if "m1_oof" in str(self.config.oof_long_path) else "M2"
+                )
+
+                # --- 全トリガー分布（OOFファイルから直接計算）---
+                try:
+                    _oof_long = pl.read_parquet(self.config.oof_long_path)
+                    _oof_short = pl.read_parquet(self.config.oof_short_path)
+                    _oof_all = pl.concat([_oof_long, _oof_short])[
+                        "prediction"
+                    ].to_list()
+                    _total_triggers = len(_oof_all)
+                    _all_bins = {
+                        "<= 0.50": sum(1 for x in _oof_all if x <= 0.50),
+                        "0.50-0.55": sum(1 for x in _oof_all if 0.50 < x <= 0.55),
+                        "0.55-0.60": sum(1 for x in _oof_all if 0.55 < x <= 0.60),
+                        "0.60-0.65": sum(1 for x in _oof_all if 0.60 < x <= 0.65),
+                        "0.65-0.70": sum(1 for x in _oof_all if 0.65 < x <= 0.70),
+                        "0.70-0.75": sum(1 for x in _oof_all if 0.70 < x <= 0.75),
+                        "0.75-0.80": sum(1 for x in _oof_all if 0.75 < x <= 0.80),
+                        "0.80-0.85": sum(1 for x in _oof_all if 0.80 < x <= 0.85),
+                        "0.85-0.90": sum(1 for x in _oof_all if 0.85 < x <= 0.90),
+                        "0.90-0.95": sum(1 for x in _oof_all if 0.90 < x <= 0.95),
+                        "0.95-1.00": sum(1 for x in _oof_all if x > 0.95),
+                    }
+                    f.write(
+                        "-" * 23
+                        + f" {_proba_label} Proba Distribution (全トリガー / OOFベース) "
+                        + "-" * 3
+                        + "\n"
+                    )
+                    f.write("  ※ 全シグナル候補に対する生の分布（フィルター前）\n")
+                    for k, v in _all_bins.items():
+                        pct = (v / _total_triggers) * 100 if _total_triggers > 0 else 0
+                        f.write(f"{k.ljust(15)}: {str(v).rjust(8)} ({pct:5.1f} %)\n")
+                    f.write("\n")
+                except Exception as _e:
+                    logging.warning(f"全トリガー分布の計算に失敗しました: {_e}")
+
+                # --- 約定トレード分布（濃縮後）---
+                f.write(
+                    "-" * 23
+                    + f" {_proba_label} Proba Distribution (約定トレードのみ / 濃縮後) "
+                    + "-" * 3
+                    + "\n"
+                )
+                f.write("  ※ フィルター（閾値・Delta・ATR）通過後の約定トレードのみ\n")
                 for k, v in m2_bins.items():
                     pct = (v / total_trades) * 100 if total_trades > 0 else 0
                     f.write(f"{k.ljust(15)}: {str(v).rjust(6)} ({pct:5.1f} %)\n")
                 f.write("\n")
 
-                f.write("-" * 23 + " ATR Value Distribution " + "-" * 13 + "\n")
+                f.write("-" * 23 + f" {atr_label} Distribution " + "-" * 3 + "\n")
+                f.write(f"  (min_atr_threshold = {self.config.min_atr_threshold})\n")
                 for k, v in atr_bins.items():
                     pct = (v / total_trades) * 100 if total_trades > 0 else 0
                     f.write(f"{k.ljust(15)}: {str(v).rjust(6)} ({pct:5.1f} %)\n")
+                f.write("\n")
+
+                f.write("-" * 23 + " ATR Ratio Band Analysis " + "-" * 12 + "\n")
+                f.write(
+                    f"  {'Band':<10} {'件数':>7} {'割合%':>7} {'勝率%':>7} {'PF':>7} {'平均PnL':>12}\n"
+                )
+                f.write("  " + "-" * 56 + "\n")
+                for band_name, stats in atr_band_stats.items():
+                    if stats is None:
+                        f.write(f"  {band_name:<10} {'N/A':>7}\n")
+                        continue
+                    pct = stats["count"] / total_trades * 100 if total_trades > 0 else 0
+                    f.write(
+                        f"  {band_name:<10} {stats['count']:>7} {pct:>7.1f} "
+                        f"{stats['win_rate']:>7.2f} {stats['pf']:>7.2f} {stats['avg_pnl']:>12.2f}\n"
+                    )
+                f.write("\n")
+
+                f.write(
+                    "-" * 23
+                    + " ATR Value Band Analysis (参考: 絶対値) "
+                    + "-" * 0
+                    + "\n"
+                )
+                f.write(
+                    f"  {'Band':<10} {'件数':>7} {'割合%':>7} {'勝率%':>7} {'PF':>7} {'平均PnL':>12}\n"
+                )
+                f.write("  " + "-" * 56 + "\n")
+                for band_name, stats in atr_abs_band_stats.items():
+                    if stats is None:
+                        f.write(f"  {band_name:<10} {'N/A':>7}\n")
+                        continue
+                    pct = stats["count"] / total_trades * 100 if total_trades > 0 else 0
+                    f.write(
+                        f"  {band_name:<10} {stats['count']:>7} {pct:>7.1f} "
+                        f"{stats['win_rate']:>7.2f} {stats['pf']:>7.2f} {stats['avg_pnl']:>12.2f}\n"
+                    )
                 f.write("\n")
                 # ▲▲▲ ここまで追加 ▲▲▲
 
@@ -1819,4 +2026,94 @@ if __name__ == "__main__":
         parser.error("SL multipliers must be greater than 0.")
 
     simulator = BacktestSimulator(config)
-    simulator.run()
+
+    # =========================================================
+    # 推論モード選択: M1単独 or M2 (Two-Brain)
+    # =========================================================
+    print("\n" + "=" * 50)
+    print("  🧠 推論モードを選択してください:")
+    print("    [1] M2モード (通常: Two-Brain) [デフォルト]")
+    print("    [2] M1モード (実験: M1単独)")
+    print("=" * 50)
+    mode_ans = input("選択 [1/2, Enterでデフォルト]: ").strip()
+
+    if mode_ans == "2":
+        config.oof_long_path = S7_M1_OOF_PREDICTIONS_LONG
+        config.oof_short_path = S7_M1_OOF_PREDICTIONS_SHORT
+        inference_mode = "M1"
+        active_cache_path = S7_BACKTEST_CACHE_M1
+        oof_ref_long = S7_M1_OOF_PREDICTIONS_LONG
+        oof_ref_short = S7_M1_OOF_PREDICTIONS_SHORT
+        logging.info("🔬 [M1モード] M1単独OOFを使用します。")
+    else:
+        inference_mode = "M2"
+        active_cache_path = S7_BACKTEST_CACHE_M2
+        oof_ref_long = S7_M2_OOF_PREDICTIONS_LONG
+        oof_ref_short = S7_M2_OOF_PREDICTIONS_SHORT
+        logging.info("🧠 [M2モード] Two-Brain OOFを使用します。")
+
+    # モードに応じて結果フォルダを生成して出力パスを設定
+    import datetime as _dt
+
+    _now_str = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _risk_pct = int(config.fixed_risk_percent * 100)
+    _folder_name = (
+        f"{inference_mode}_{_now_str}"
+        f"_Th{config.m2_proba_threshold}"
+        f"_D{config.m2_delta_threshold}"
+        f"_R{_risk_pct}"
+    )
+    _result_dir = S7_BACKTEST_SIM_RESULTS / _folder_name
+    _result_dir.mkdir(parents=True, exist_ok=True)
+
+    FINAL_REPORT_PATH = _result_dir / f"final_backtest_report_v5_{inference_mode}.json"
+    EQUITY_CURVE_PATH = _result_dir / f"equity_curve_v5_{inference_mode}.png"
+    logging.info(f"出力先フォルダ: {_result_dir}")
+
+    # =========================================================
+    # キャッシュ管理: モード別キャッシュファイルを使い分け
+    # =========================================================
+    def load_or_generate_cache() -> tuple:
+        if active_cache_path.exists():
+            cache_mtime = active_cache_path.stat().st_mtime
+            oof_mtime = max(
+                oof_ref_long.stat().st_mtime,
+                oof_ref_short.stat().st_mtime,
+            )
+            stale = cache_mtime < oof_mtime
+
+            print(f"\n[{inference_mode}] キャッシュが存在します: {active_cache_path}")
+            if stale:
+                print(
+                    "  ⚠️  キャッシュがOOFより古い可能性があります。再生成を推奨します。"
+                )
+            print("  [y] このまま使用する")
+            print("  [r] 削除して再生成する")
+            ans = input("選択 [y/r]: ").strip().lower()
+
+            if ans == "r":
+                active_cache_path.unlink()
+                logging.info(
+                    f"[{inference_mode}] キャッシュを削除しました。再生成します..."
+                )
+            else:
+                logging.info(f"[{inference_mode}] キャッシュを読み込んでいます...")
+                with open(active_cache_path, "rb") as f:
+                    data = pickle.load(f)
+                logging.info(f"[{inference_mode}] キャッシュ読み込み完了。")
+                return data
+
+        logging.info(
+            f"[{inference_mode}] キャッシュがありません。データを生成します..."
+        )
+        data = simulator.preload_data()
+        logging.info(
+            f"[{inference_mode}] データ生成完了。キャッシュに保存しています..."
+        )
+        with open(active_cache_path, "wb") as f:
+            pickle.dump(data, f)
+        logging.info(f"[{inference_mode}] キャッシュ保存完了: {active_cache_path}")
+        return data
+
+    preloaded_data = load_or_generate_cache()
+    simulator.run(preloaded_data=preloaded_data)

@@ -100,7 +100,7 @@ g_market_proxy: Optional[pd.DataFrame] = (
 # 🚨 Project Cimera (V5) 戦略パラメータ 🚨
 # ==================================================================
 risk_engine = ExtremeRiskEngineV5(config_path=str(config.CONFIG_RISK))
-M2_PROBA_THRESHOLD = risk_engine.config.get("m2_proba_threshold", 0.50)
+M2_PROBA_THRESHOLD = risk_engine.config.get("m2_proba_threshold", 0.70)
 MAX_DRAWDOWN = risk_engine.config.get("max_drawdown", 0.50)
 MAX_POSITIONS = risk_engine.config.get("max_positions", 1000)
 
@@ -316,6 +316,8 @@ def main():
                     "Long_M2_Calib",
                     "Short_M2_Raw",
                     "Short_M2_Calib",
+                    "Delta",
+                    "Signal",  # "LONG" / "SHORT" / "NONE"
                 ]
             )
     # ▲▲▲ ここまで追加 ▲▲▲
@@ -405,16 +407,16 @@ def main():
 
             feature_lists = {
                 "long_m1": load_feature_list(
-                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m1_long_features.txt"
+                    config.S3_SELECTED_FEATURES_ORTHOGONAL_DIR / "m1_long_features.txt"
                 ),
                 "long_m2": load_feature_list(
-                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m2_long_features.txt"
+                    config.S3_SELECTED_FEATURES_ORTHOGONAL_DIR / "m2_long_features.txt"
                 ),
                 "short_m1": load_feature_list(
-                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m1_short_features.txt"
+                    config.S3_SELECTED_FEATURES_ORTHOGONAL_DIR / "m1_short_features.txt"
                 ),
                 "short_m2": load_feature_list(
-                    config.S3_SELECTED_FEATURES_PURIFIED_DIR / "m2_short_features.txt"
+                    config.S3_SELECTED_FEATURES_ORTHOGONAL_DIR / "m2_short_features.txt"
                 ),
             }
 
@@ -430,8 +432,38 @@ def main():
             "--- 6. リアルタイム特徴量エンジンの初期化 (ゼロ・シリアライズ) ---"
         )
 
+        # [FIX] orthogonal 4ファイルのユニーク和集合を特徴量名簿として渡す。
+        # 旧: S3_FEATURES_FOR_TRAINING_V5 (final_feature_set_v5.txt / 1714件・D1/H4/W1/MN含む)
+        #   → D1・H4・W1・MNバッファが誤生成され ZMQ を長時間占有するボトルネックの原因だった。
+        # 新: orthogonal_v5 の 4ファイル和集合 (1465件・HF時間足のみ) を一時ファイルに書き出して渡す。
+        import tempfile, itertools
+        _orth_dir = config.S3_SELECTED_FEATURES_ORTHOGONAL_DIR
+        _orth_files = [
+            _orth_dir / "m1_long_features.txt",
+            _orth_dir / "m1_short_features.txt",
+            _orth_dir / "m2_long_features.txt",
+            _orth_dir / "m2_short_features.txt",
+        ]
+        _union: list[str] = []
+        _seen: set[str] = set()
+        for _fp in _orth_files:
+            for _line in open(_fp):
+                _name = _line.strip()
+                if _name and _name not in _seen:
+                    _seen.add(_name)
+                    _union.append(_name)
+        _tmp_feature_list = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        _tmp_feature_list.write("\n".join(_union))
+        _tmp_feature_list.close()
+        logger.info(
+            f"[FIX] 特徴量名簿を orthogonal 4ファイル和集合 ({len(_union)}件) に差し替えました。"
+            f" -> {_tmp_feature_list.name}"
+        )
+
         feature_engine = RealtimeFeatureEngine(
-            feature_list_path=str(config.S3_FEATURES_FOR_TRAINING_V5)
+            feature_list_path=_tmp_feature_list.name
         )
 
         # ▼▼▼ 修正: スナップショットからの爆速復帰と差分取得 ▼▼▼
@@ -751,7 +783,12 @@ def main():
                     # 2. M2モデル (M1が0.50以上の場合のみ推論、それ以外は強制0.0)
                     if p_long_m1_raw >= 0.50:
                         feature_dict_long = feature_dict.copy()
-                        feature_dict_long["m1_pred_proba"] = p_long_m1_raw
+                        # ★ Logit変換: 学習時（Bx）と同じ変換を本番推論時にも適用
+                        _p_l_clipped = np.clip(p_long_m1_raw, 1e-7, 1 - 1e-7)
+                        _logit_long = float(np.clip(
+                            np.log(_p_l_clipped / (1 - _p_l_clipped)), -10.0, 10.0
+                        ))
+                        feature_dict_long["m1_pred_proba"] = _logit_long
                         X_long_m2 = np.array(
                             [
                                 [
@@ -776,7 +813,12 @@ def main():
                     # 2. M2モデル (M1が0.50以上の場合のみ推論、それ以外は強制0.0)
                     if p_short_m1_raw >= 0.50:
                         feature_dict_short = feature_dict.copy()
-                        feature_dict_short["m1_pred_proba"] = p_short_m1_raw
+                        # ★ Logit変換: 学習時（Bx）と同じ変換を本番推論時にも適用
+                        _p_s_clipped = np.clip(p_short_m1_raw, 1e-7, 1 - 1e-7)
+                        _logit_short = float(np.clip(
+                            np.log(_p_s_clipped / (1 - _p_s_clipped)), -10.0, 10.0
+                        ))
+                        feature_dict_short["m1_pred_proba"] = _logit_short
                         X_short_m2 = np.array(
                             [
                                 [
@@ -795,29 +837,7 @@ def main():
                         f"M2(L: {p_long_m2_raw:.4f}, S: {p_short_m2_raw:.4f})"
                     )
 
-                    # ▼▼▼ Excel用CSVに1行追記 ▼▼▼
-                    try:
-                        with open(
-                            predictions_csv_path, "a", newline="", encoding="utf-8"
-                        ) as f:
-                            writer = csv.writer(f)
-                            writer.writerow(
-                                [
-                                    signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                                    signal.market_info["current_price"],
-                                    round(p_long_m1_raw, 4),
-                                    0.0,  # 廃止(M1 Calib)
-                                    round(p_short_m1_raw, 4),
-                                    0.0,  # 廃止(M1 Calib)
-                                    round(p_long_m2_raw, 4),
-                                    0.0,  # 廃止(M2 Calib)
-                                    round(p_short_m2_raw, 4),
-                                    0.0,  # 廃止(M2 Calib)
-                                ]
-                            )
-                    except Exception as e:
-                        logger.warning(f"CSVへの書き込みに失敗しました: {e}")
-                    # ▲▲▲ ここまで追加 ▲▲▲
+
 
                     # ▼▼▼ 修正: Delta (差分) フィルター & 判定理由の明記 ▼▼▼
                     current_m2_thresh = risk_engine.config.get(
@@ -855,6 +875,34 @@ def main():
                             f"🚧 [Delta Filter: SKIP] 差分不足 (Delta {delta:.4f} < 閾値 {current_m2_delta})"
                         )
                     # ▲▲▲ ここまで修正 ▲▲▲
+
+                    # ▼▼▼ Delta・Signal確定後にCSV記録 ▼▼▼
+                    try:
+                        signal_str = "LONG" if should_trade_long else ("SHORT" if should_trade_short else "NONE")
+                        with open(
+                            predictions_csv_path, "a", newline="", encoding="utf-8"
+                        ) as f:
+                            writer = csv.writer(f)
+                            writer.writerow(
+                                [
+                                    signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                                    signal.market_info["current_price"],
+                                    round(p_long_m1_raw, 4),
+                                    0.0,  # 廃止(M1 Calib)
+                                    round(p_short_m1_raw, 4),
+                                    0.0,  # 廃止(M1 Calib)
+                                    round(p_long_m2_raw, 4),
+                                    0.0,  # 廃止(M2 Calib)
+                                    round(p_short_m2_raw, 4),
+                                    0.0,  # 廃止(M2 Calib)
+                                    round(delta, 4),
+                                    signal_str,
+                                ]
+                            )
+                    except Exception as e:
+                        logger.warning(f"CSVへの書き込みに失敗しました: {e}")
+                    # ▲▲▲ ここまで追加 ▲▲▲
+
                     if should_trade_long or should_trade_short:
                         try:
                             dump_csv_path = (

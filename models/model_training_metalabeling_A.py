@@ -491,9 +491,12 @@ class M1CrossValidator:
                 # ▼▼▼ 追加: 下流でのJoinエラーを防ぐため、Intを文字列に戻す ▼▼▼
                 reverse_map = {0: "M1", 1: "M3", 2: "M5", 3: "M8", 4: "M15"}
                 oof_df = oof_df.with_columns(
+                    pl.col("timestamp").cast(
+                        pl.Datetime("us", "UTC")
+                    ),  # ★修正: 欠落したタイムゾーンを復元
                     pl.col("timeframe")
                     .replace_strict(reverse_map, default=None)
-                    .cast(pl.Utf8)
+                    .cast(pl.Utf8),
                 ).sort(["timestamp", "timeframe"])
                 # ▲▲▲ 追加ここまで ▲▲▲
 

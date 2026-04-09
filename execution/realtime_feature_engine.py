@@ -41,7 +41,7 @@ if str(project_root) not in sys.path:
 TIMEFRAME_BARS_PER_DAY: Dict[str, int] = {
     "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
     "M8": 180, "M15": 96, "M30": 48, "H1": 24,
-    "H4": 6, "H6": 4, "H12": 2, "D1": 1,
+    # "H4": 6, "H6": 4, "H12": 2, "D1": 1,  # [FIX] 使用されない時間足
 }
 
 from execution.realtime_feature_engine_1A_statistics import FeatureModule1A
@@ -81,36 +81,38 @@ class RealtimeFeatureEngine:
     """
 
     ALL_TIMEFRAMES = {
+        "M0.5": 0.5,  # [FIX] orthogonal特徴量リストに存在するため有効化。30秒足（M1の半分）
         "M1": 1,
         "M3": 3,
         "M5": 5,
         "M8": 8,
         "M15": 15,
-        # "M30": 30,  # [V5] 110件リストに存在しないためスキップ
+        # "M30": 30,  # [V5] orthogonalリストに存在しないためスキップ
         "H1": 60,
         "H4": 240,
-        "H6": 360,
-        "H12": 720,
-        "D1": 1440,
-        # "W1": 10080, # [V5] 110件リストに存在しないためスキップ
-        # "MN": 43200, # [V5] 110件リストに存在しないためスキップ
-        # "tick": None, # [V5] 110件リストに存在しないためスキップ
-        # "M0.5": None, # [V5] 110件リストに存在しないためスキップ
+        # "H6": 360,   # [FIX] orthogonal全4ファイルで gain 0.006%以下・削除
+        # "H12": 720,  # [FIX] orthogonal全4ファイルで gain 0.004%以下・削除
+        # "D1": 1440,  # [FIX] orthogonalリストに存在しないためスキップ
+        # "W1": 10080,  # [V5] orthogonalリストに存在しないためスキップ
+        # "MN": 43200,  # [V5] orthogonalリストに存在しないためスキップ
+        # "tick": None, # [V5] orthogonalリストに存在しないためスキップ
     }
 
     TF_RESAMPLE_RULES = {
+        # [FIX] M0.5はpandasの"30s"でリサンプル（M1=60秒の半分=30秒足）
+        "M0.5": "30s",
         "M3": "3min",
         "M5": "5min",
         "M8": "8min",
         "M15": "15min",
-        # "M30": "30min", # [V5] スキップ
+        # "M30": "30min", # [V5] orthogonalリストに存在しないためスキップ
         "H1": "1h",
-        "H4": "4h",
-        "H6": "6h",
-        "H12": "12h",
-        "D1": "1D",
-        # "W1": "1W",     # [V5] スキップ
-        # "MN": "1MS",    # [V5] スキップ
+        # "H4": "4h",   # [FIX] orthogonalリストに存在しないためスキップ
+        # "H6": "6h",   # [FIX] gain 0.006%以下・削除
+        # "H12": "12h", # [FIX] gain 0.004%以下・削除
+        # "D1": "1D",   # [FIX] orthogonalリストに存在しないためスキップ
+        # "W1": "1W",   # [V5] スキップ
+        # "MN": "1MS",  # [V5] スキップ
     }
 
     OHLCV_COLS = ["open", "high", "low", "close", "volume"]
@@ -309,6 +311,7 @@ class RealtimeFeatureEngine:
 
         # [FIX-INFO-2] Pandas 2.2以降の推奨エイリアスに更新 (T→min, H→h)
         freq_map = {
+            "M0.5": "30s",   # [FIX] M0.5追加
             "M1": "1min",
             "M3": "3min",
             "M5": "5min",
@@ -316,12 +319,12 @@ class RealtimeFeatureEngine:
             "M15": "15min",
             "M30": "30min",
             "H1": "1h",
-            "H4": "4h",
-            "H6": "6h",
-            "H12": "12h",
-            "D1": "1D",
-            "W1": "1W",
-            "MN": "1MS",
+            # "H4": "4h",  # 未使用
+            # "H6": "6h",  # [FIX] 削除済み
+            # "H12": "12h", # [FIX] 削除済み
+            # "D1": "1D",  # 未使用
+            # "W1": "1W",  # 未使用
+            # "MN": "1MS", # 未使用
         }
         freq = freq_map.get(tf_name, "1T")
 

@@ -12,6 +12,8 @@ import shutil
 from dataclasses import dataclass
 from typing import List
 
+import json
+import numpy as np
 import polars as pl
 from tqdm import tqdm
 
@@ -29,6 +31,8 @@ from blueprint import (
     # S3_FEATURES_FOR_TRAINING,  # ← 削除
     S3_FEATURES_FOR_TRAINING_V5,  # ★ 追加 (プロンプト⑫ 修正①)
     S3_SELECTED_FEATURES_DIR,     # ★ 追加: 方向別動的特徴量ロードのため
+    S3_SELECTED_FEATURES_ORTHOGONAL_DIR,  # ★ 追加: 直交分割版
+    S7_RUN_CONFIG,                # ★ 追加: Ax→Bx間の設定引き継ぎ
 )
 
 logging.basicConfig(
@@ -123,9 +127,11 @@ class MetaLabelGenerator:
             "m1_pred_proba",
         }
 
-        features = ["timeframe"]  # ★変更: 特徴量リストの先頭に明示的にセット (Bに統一)
+        # [FIX] "timeframe"を除外。Ax・Cxに合わせて完全統一。
+        # M3専用スナイパーに純化済みのため分散ゼロの無意味な特徴量。
+        features = []
         for col in raw_features:
-            if col in exclude_exact or col == "timeframe":  # ★変更: 重複防止 (Bに統一)
+            if col in exclude_exact or col == "timeframe":
                 continue
             if col.startswith("is_trigger_on"):
                 continue
@@ -147,7 +153,8 @@ class MetaLabelGenerator:
             )
 
             # M2専用特徴量リストの動的読み込み (プロンプト⑫ 修正①・Bに統一)
-            dedicated_path = S3_SELECTED_FEATURES_DIR / f"m2_{direction}_features.txt"
+            _feat_dir = getattr(self, '_selected_features_dir', S3_SELECTED_FEATURES_DIR)
+            dedicated_path = _feat_dir / f"m2_{direction}_features.txt"
             raw_m2_features = self._load_features(dedicated_path)
 
             # m1_pred_proba はS6には存在せず後段でJoinされるため、S6抽出用リストからは除外
@@ -191,6 +198,29 @@ class MetaLabelGenerator:
                 m1_oof_df = m1_oof_df.with_columns(
                     pl.col("timestamp").cast(pl.Datetime("us", "UTC"))
                 )
+                # ★変更: Temperature Scaling → Logit直接入力
+                # 確率空間でのフィルタリング（THRESHOLD=0.50）は後続で行うため
+                # ここでは「確率→ロジット変換」のみを行いm1_pred_probaとして保持
+                # M2への入力がロジット空間になることで0.95以上の帯域の解像度が最大化される
+                # ※M2の出力は常にobjective='binary'により0〜1の確率に戻るため
+                #   シミュレーターの閾値（th=0.7等）への影響は一切ない
+                if "prediction" in m1_oof_df.columns:
+                    raw_proba = m1_oof_df["prediction"].to_numpy()
+                    raw_proba_clipped = np.clip(raw_proba, 1e-7, 1 - 1e-7)
+                    logits = np.log(raw_proba_clipped / (1 - raw_proba_clipped))
+                    # ★ ロジット空間で[-10.0, +10.0]にクリッピング
+                    # 1e-7クリップだと[-16.1, +16.1]になりmin_data_in_leaf=100と
+                    # 衝突してビンが無駄になるため、有効範囲に収める
+                    logits = np.clip(logits, -10.0, 10.0)
+                    m1_oof_df = m1_oof_df.with_columns(
+                        pl.Series("prediction", logits)
+                    )
+                    logging.info(
+                        f"  📐 Logit変換: "
+                        f"proba avg {raw_proba.mean():.3f} → logit avg {logits.mean():.3f}, "
+                        f"logit range [{logits.min():.2f}, {logits.max():.2f}], "
+                        f"proba>=0.95: {(raw_proba>=0.95).mean()*100:.1f}%"
+                    )
                 if "prediction" in m1_oof_df.columns:
                     m1_oof_df = m1_oof_df.rename({"prediction": "m1_pred_proba"})
                 m1_oof_df = m1_oof_df.with_columns(
@@ -204,9 +234,11 @@ class MetaLabelGenerator:
                 continue
 
             # --- 特徴量カラムの選定 ---
-            # ★修正: "timeframe" は self.features の中に既に含まれているため外す (Bに統一)
+            # [FIX] "timeframe" を self.features から除外したため、データ管理用として明示的に追加。
+            # joinキー（timestamp + timeframe）として必須のため、特徴量リストとは独立して保持する。
             columns_to_select = [
                 "timestamp",
+                "timeframe",
                 "atr_value",
                 label_col,
                 uniqueness_col,
@@ -250,12 +282,12 @@ class MetaLabelGenerator:
                     # ★修正: Top 50%サンプリング(未来情報リーク)を廃止し
                     #         固定閾値フィルタに変更 (プロンプト⑫ 修正②・Bに統一)
                     # 2. 一定の確率（例：0.5以上）を超えた「自信のあるシグナル」だけをメタモデルに渡す
-                    THRESHOLD = (
-                        0.50  # ※ベースモデルの強さに応じて 0.55 等に調整してください
-                    )
+                    # ロジット変換後のm1_pred_probaはlogit空間の値
+                    # 確率0.50はlogit=0.0に相当するため閾値は0.0
+                    THRESHOLD_LOGIT = 0.0  # = logit(0.50)
                     top_n_keys = (
-                        daily_m1_oof.filter(pl.col("m1_pred_proba") >= THRESHOLD)
-                        .select(["timestamp", "timeframe"])  # ★修正: timeframe追加 (プロンプト⑫ 修正②)
+                        daily_m1_oof.filter(pl.col("m1_pred_proba") >= THRESHOLD_LOGIT)
+                        .select(["timestamp", "timeframe"])
                         .unique()
                     )
                     if top_n_keys.is_empty():
@@ -284,12 +316,13 @@ class MetaLabelGenerator:
                         daily_m1_oof.lazy().select(
                             [
                                 "timestamp",
-                                "timeframe",  # ★修正: timeframe追加 (Bに統一)
+                                "timeframe",
                                 "m1_pred_proba",
                             ]
                         ),
-                        on=["timestamp", "timeframe"],  # ★修正: 複合キーに変更 (プロンプト⑫ 修正②)
+                        on=["timestamp", "timeframe"],
                         how="inner",
+                        coalesce=True,  # [FIX] 両側テーブルにtimeframeが存在するため重複解消
                     )
 
                     merged_chunk_df = merged_chunk_lf.collect()
@@ -340,8 +373,75 @@ if __name__ == "__main__":
         help="Run in quick test mode, processing only the first 5 partitions.",
     )
 
-    args = parser.parse_args()
-    config = MetaLabelingConfig(test=args.test)
 
+    args = parser.parse_args()
+
+    # =========================================================
+    # 特徴量セット選択（run_configから引き継ぎ or インタラクティブ）
+    # =========================================================
+    FEATURE_SETS = {
+        "1": {
+            "label": "selected_features_v5          (オリジナル / 全部載せ)",
+            "dir":   S3_SELECTED_FEATURES_DIR,
+        },
+        "2": {
+            "label": "selected_features_orthogonal_v5 (M1/M2直交分割版)",
+            "dir":   S3_SELECTED_FEATURES_ORTHOGONAL_DIR,
+        },
+    }
+
+    selected_dir = S3_SELECTED_FEATURES_DIR  # デフォルト
+    if S7_RUN_CONFIG.exists():
+        with open(S7_RUN_CONFIG) as f:
+            run_config = json.load(f)
+        prev_label = run_config.get("features_label", "不明")
+        prev_dir   = run_config.get("features_dir", str(S3_SELECTED_FEATURES_DIR))
+        print(f"\n前回のAx実行設定: {prev_label}")
+        ans = input("同じ特徴量セットを使用しますか？ [Y/n]: ").strip().lower()
+        if ans in ("", "y"):
+            selected_dir = Path(prev_dir)
+            logging.info(f"📂 前回のAx設定を引き継ぎ: {prev_label}")
+        else:
+            print("\n" + "=" * 60)
+            print("  📂 特徴量セットを選択してください:")
+            for key, val in FEATURE_SETS.items():
+                print(f"    [{key}] {val['label']}")
+            print("=" * 60)
+            fs_ans = input("選択 [1/2, Enterでデフォルト(1)]: ").strip() or "1"
+            if fs_ans not in FEATURE_SETS:
+                fs_ans = "1"
+            selected_dir = FEATURE_SETS[fs_ans]["dir"]
+            logging.info(f"📂 特徴量セット: {FEATURE_SETS[fs_ans]['label']}")
+    else:
+        print("\n⚠️  run_configが見つかりません。特徴量セットを手動選択してください。")
+        print("=" * 60)
+        for key, val in FEATURE_SETS.items():
+            print(f"    [{key}] {val['label']}")
+        print("=" * 60)
+        fs_ans = input("選択 [1/2, Enterでデフォルト(1)]: ").strip() or "1"
+        if fs_ans not in FEATURE_SETS:
+            fs_ans = "1"
+        selected_dir = FEATURE_SETS[fs_ans]["dir"]
+        logging.info(f"📂 特徴量セット: {FEATURE_SETS[fs_ans]['label']}")
+
+    # =========================================================
+    # 変換方式: Logit直接入力（固定）
+    # =========================================================
+    logging.info("📐 m1_pred_proba変換: Logit直接入力（0.95以上の帯域解像度最大化）")
+
+    # run_configを更新（Cxへ引き継ぎ）
+    run_config_data = {
+        "features_dir":   str(selected_dir),
+        "features_label": str(selected_dir.name),
+        "selected_by":    "Bx",
+        "transform":      "logit",
+    }
+    S7_RUN_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with open(S7_RUN_CONFIG, "w") as f:
+        json.dump(run_config_data, f, indent=2, ensure_ascii=False)
+    logging.info(f"📝 実行設定を更新: {S7_RUN_CONFIG}")
+
+    config = MetaLabelingConfig(test=args.test)
     generator = MetaLabelGenerator(config)
+    generator._selected_features_dir = selected_dir
     generator.run()
