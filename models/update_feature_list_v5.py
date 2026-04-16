@@ -97,6 +97,8 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
             # 動的に生成されるトリガーフラグ系なども特徴量から除外
             if col.startswith("is_trigger_on"):
                 continue
+            if "sample_weight" in col:
+                continue
             feature_cols.append(col)
 
         # =====================================================================

@@ -3,6 +3,13 @@
 革新的特徴量収集スクリプト - Engine 1A: 基礎統計・ロバスト統計特徴量 (アーキテクチャ刷新版)
 【修正内容】参照スクリプトのアーキテクチャに完全準拠、特徴量計算ロジックは従来版を保持
 
+【Step 2 変更記録】core_indicators.py への移行 (Single Source of Truth)
+  - __temp_atr_13 の計算: SMA方式 (rolling_mean(TR, 13)) → calculate_atr_wilder(period=13)
+    ※ ATR値は意図的に変化する（SMAとWilderは異なる平滑化）。全エンジン統一が目的。
+  - sample_weight の計算: Polars Expression直書き → calculate_sample_weight()
+    ※ calculate_sample_weight は内部で calculate_atr_wilder を呼び出す。
+  - インポート追加: from core_indicators import calculate_atr_wilder, scale_by_atr, calculate_sample_weight
+
 Project Forge - 軍資金増大プロジェクト
 最終目標: Project Chimera開発・完成のための資金調達
 
@@ -19,11 +26,17 @@ Project Forge - 軍資金増大プロジェクト
 
 import sys
 from pathlib import Path
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
+sys.path.append(str(Path(__file__).resolve().parent.parent))  # /workspace をパスに追加
 import blueprint as config
-import os, sys, time, warnings, json, logging, math, tempfile, datetime
+sys.path.append(str(config.CORE_DIR))
+from core_indicators import (
+    calculate_atr_wilder,    # Wilder平滑化ATR（SMA方式から置き換え）
+    scale_by_atr,            # ゼロ除算保護付きATR割り
+    calculate_sample_weight, # サンプルウェイト計算（ATR内包）
+    calculate_mad,           # ローリングMAD（mad_rolling_numbaを置き換え）
+)
+
+import os, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field
@@ -370,58 +383,6 @@ class DataEngine:
 
 
 # 改修対象スクリプトからNumba UDFを移植
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def fast_rolling_mean_numba(arr, out):
-    """Numba最適化ローリング平均（カスタムウィンドウ用）"""
-    n = len(arr)
-    for i in range(n):
-        if i < 20:  # 最小ウィンドウサイズ
-            out[i] = np.nan
-        else:
-            window_sum = 0.0
-            count = 0
-            for j in range(max(0, i - 19), i + 1):
-                if not np.isnan(arr[j]):
-                    window_sum += arr[j]
-                    count += 1
-            out[i] = window_sum / count if count > 0 else np.nan
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def fast_rolling_std_numba(arr, out):
-    """Numba最適化ローリング標準偏差"""
-    n = len(arr)
-    for i in range(n):
-        if i < 20:
-            out[i] = np.nan
-        else:
-            # 平均計算
-            window_sum = 0.0
-            count = 0
-            for j in range(max(0, i - 19), i + 1):
-                if not np.isnan(arr[j]):
-                    window_sum += arr[j]
-                    count += 1
-
-            if count <= 1:
-                out[i] = np.nan
-                continue
-
-            mean_val = window_sum / count
-
-            # 分散計算
-            var_sum = 0.0
-            for j in range(max(0, i - 19), i + 1):
-                if not np.isnan(arr[j]):
-                    diff = arr[j] - mean_val
-                    var_sum += diff * diff
-
-            # ▼▼ 修正箇所: ddof=1 の意図を明記するのみとし、値自体のシフト(+ 1e-10)は行わない
-            variance = var_sum / (
-                count - 1
-            )  # Polars rolling_std() のデフォルト(ddof=1)と一致
-            out[i] = np.sqrt(variance)
-
 
 @nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
 def fast_quality_score_numba(arr, out):
@@ -449,38 +410,6 @@ def fast_quality_score_numba(arr, out):
                 finite_ratio = finite_count / window_size
                 out[i] = finite_ratio * 0.8 + 0.2  # 基本品質スコア
 
-
-# 改修対象スクリプトから高度なロバスト統計のNumba UDFを移植
-# 修正後
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def mad_rolling_numba(arr, out):
-    """ローリングMAD計算"""
-    n = len(arr)
-    window = 20
-
-    finite_buffer = np.empty(window, dtype=np.float64)
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            # ウィンドウ内データ取得
-            window_data = arr[max(0, i - window + 1) : i + 1]
-            count = 0
-            for j in range(len(window_data)):
-                if not np.isnan(window_data[j]):
-                    finite_buffer[count] = window_data[j]
-                    count += 1
-            finite_data = finite_buffer[:count]
-
-            if count < 3:
-                out[i] = np.nan
-            else:
-                # 中央値計算
-                median_val = np.median(finite_data)
-                # 絶対偏差の中央値
-                abs_deviations = np.abs(finite_data - median_val)
-                out[i] = np.median(abs_deviations)
 
 
 # 修正後
@@ -1057,7 +986,7 @@ class CalculationEngine:
         # --- Advanced Robust Features ---
         expressions[f"{p}robust_mad_20"] = (
             pl.col("close").map_batches(
-                lambda s: mad_rolling_numba(s.to_numpy()), return_dtype=pl.Float64
+                lambda s: pl.Series(calculate_mad(s.to_numpy(), 20)), return_dtype=pl.Float64
             )
             / pl.col("__temp_atr_13")
         ).alias(f"{p}robust_mad_20")
@@ -1134,23 +1063,9 @@ class CalculationEngine:
                 / (pl.col("volume").rolling_mean(lookback_bars) + 1e-10)
             ).alias(f"{p}fast_volume_mean_{window}")
         # --- Numba Optimized Basic Features ---
-        expressions[f"{p}fast_rolling_mean_numba_20"] = (
-            (
-                pl.col("close")
-                - pl.col("close").map_batches(
-                    lambda s: fast_rolling_mean_numba(s.to_numpy()),
-                    return_dtype=pl.Float64,
-                )
-            )
-            / pl.col("__temp_atr_13")
-        ).alias(f"{p}fast_rolling_mean_numba_20")
-        expressions[f"{p}fast_rolling_std_numba_20"] = (
-            pl.col("close").map_batches(
-                lambda s: fast_rolling_std_numba(s.to_numpy()),
-                return_dtype=pl.Float64,
-            )
-            / pl.col("__temp_atr_13")
-        ).alias(f"{p}fast_rolling_std_numba_20")
+        # fast_rolling_mean_numba_20 / fast_rolling_std_numba_20 は
+        # fast_rolling_mean_20 / fast_rolling_std_20 (Polarsネイティブ版) と同等のため削除済み
+
         expressions[f"{p}fast_quality_score_50"] = (
             pl.col("close")
             .map_batches(
@@ -1206,44 +1121,48 @@ class CalculationEngine:
         """
         logger.info(f"グループ計算開始: {group_name}")
 
-        # ATR13の一時計算とゼロ除算保護
-        tr_expr = pl.max_horizontal(
+        # ▼▼ Step 2: ATR計算を SMA方式 → calculate_atr_wilder に統一
+        # 旧実装: tr_expr.rolling_mean(13) — SMA方式（Wilder平滑化ではない）
+        # 新実装: calculate_atr_wilder(period=13) — 全エンジン統一のWilder方式
+        # 注意: ATR値は意図的に変化する（SMA→Wilder）。これは設計上の変更。
+        # epsilon(1e-10) を加算してゼロ除算を防止（scale_by_atr の epsilon 相当）
+        lazy_frame = lazy_frame.with_columns(
             [
-                pl.col("high") - pl.col("low"),
-                (pl.col("high") - pl.col("close").shift(1)).abs(),
-                (pl.col("low") - pl.col("close").shift(1)).abs(),
+                (
+                    pl.struct(["high", "low", "close"]).map_batches(
+                        lambda s: pl.Series(
+                            calculate_atr_wilder(
+                                s.struct.field("high").to_numpy(),
+                                s.struct.field("low").to_numpy(),
+                                s.struct.field("close").to_numpy(),
+                                13,
+                            )
+                        ),
+                        return_dtype=pl.Float64,
+                    )
+                    + 1e-10
+                ).alias("__temp_atr_13")
             ]
         )
+        # ▲▲
+
+        # ▼▼ Step 2: sample_weight を calculate_sample_weight に統一
+        # 旧実装: Polars Expressionで直書き（SMA-ATRに依存していた）
+        # 新実装: calculate_sample_weight（内部でcalculate_atr_wilderを呼び出す）
         lazy_frame = lazy_frame.with_columns(
-            [tr_expr.rolling_mean(13).add(1e-10).alias("__temp_atr_13")]
+            [
+                pl.struct(["high", "low", "close"]).map_batches(
+                    lambda s: pl.Series(
+                        calculate_sample_weight(
+                            s.struct.field("high").to_numpy(),
+                            s.struct.field("low").to_numpy(),
+                            s.struct.field("close").to_numpy(),
+                        )
+                    ),
+                    return_dtype=pl.Float64,
+                ).alias("sample_weight")
+            ]
         )
-
-        # ▼▼ 新規追加: ルール3.5に基づく sample_weight の自動計算
-        # 1. ATR割り後の値幅を算出
-        atr_ratio = (pl.col("high") - pl.col("low")) / pl.col("__temp_atr_13")
-
-        # 2. その系列のローリングZスコア（絶対値）を計算（ウィンドウは直近の分布を見るため50を設定）
-        z_score_abs = (
-            (atr_ratio - atr_ratio.rolling_mean(50))
-            / (atr_ratio.rolling_std(50) + 1e-10)
-        ).abs()
-
-        # 3. Zスコアに基づく重みづけロジック
-        weight_expr = (
-            (
-                pl.when(z_score_abs < 2.0)
-                .then(1.0)
-                .when(z_score_abs < 3.0)
-                .then(2.0)
-                .when(z_score_abs < 4.0)
-                .then(4.0)
-                .otherwise(6.0)
-            )
-            .cast(pl.Float64)
-            .alias("sample_weight")
-        )
-
-        lazy_frame = lazy_frame.with_columns([weight_expr])
         # ▲▲
 
         # メモリ安全性チェック（必須）
@@ -1475,8 +1394,6 @@ class CalculationEngine:
             if any(
                 pattern in name
                 for pattern in [
-                    "fast_rolling_mean_numba",
-                    "fast_rolling_std_numba",
                     "fast_quality_score",
                 ]
             )
@@ -1702,7 +1619,7 @@ class CalculationEngine:
         exprs.append(
             (
                 pl.col("close").map_batches(
-                    lambda s: mad_rolling_numba(s.to_numpy()), return_dtype=pl.Float64
+                    lambda s: pl.Series(calculate_mad(s.to_numpy(), 20)), return_dtype=pl.Float64
                 )
                 / pl.col("__temp_atr_13")
             ).alias(f"{p}robust_mad_20")
@@ -1816,27 +1733,10 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # ▼▼ 修正前: 絶対値出力
-        # ▼▼ 修正後: DPO化およびATRスケール不変化
+        # fast_rolling_mean_numba_20 / fast_rolling_std_numba_20 は削除済み
+        # （fast_rolling_mean_20 / fast_rolling_std_20 のPolarsネイティブ版と重複）
         exprs.extend(
             [
-                (
-                    (
-                        pl.col("close")
-                        - pl.col("close").map_batches(
-                            lambda s: fast_rolling_mean_numba(s.to_numpy()),
-                            return_dtype=pl.Float64,
-                        )
-                    )
-                    / pl.col("__temp_atr_13")
-                ).alias(f"{p}fast_rolling_mean_numba_20"),
-                (
-                    pl.col("close").map_batches(
-                        lambda s: fast_rolling_std_numba(s.to_numpy()),
-                        return_dtype=pl.Float64,
-                    )
-                    / pl.col("__temp_atr_13")
-                ).alias(f"{p}fast_rolling_std_numba_20"),
                 pl.col("close")
                 .map_batches(
                     lambda s: fast_quality_score_numba(s.to_numpy()),

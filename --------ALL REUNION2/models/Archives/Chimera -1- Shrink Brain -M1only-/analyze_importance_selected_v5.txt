@@ -1,0 +1,209 @@
+hephaestus-zero@xxxxx18x:/workspace$ /usr/local/bin/python /workspace/models/analyze_importance_purified.py
+
+========================================
+ M1 Model (LONG) 
+========================================
+✅ Active features (Gain > 0): 42 / 42
+Rank  Feature Name                                                  Gain
+---------------------------------------------------------------------------
+1     e1c_rsi_momentum_21_neutralized_M1                       481413.55
+2     e1f_vocabulary_diversity_80_neutralized_M1               259472.14
+3     e1f_vocabulary_diversity_40_neutralized_M1                88033.94
+4     e1f_kinetic_energy_10_neutralized_M1                      67588.99
+5     e1f_golden_ratio_adherence_55_neutralized_M1              34148.38
+6     e1f_vocabulary_diversity_15_neutralized_M1                15293.26
+7     e1f_vocabulary_diversity_25_neutralized_M1                 9611.72
+8     e1f_golden_ratio_adherence_34_neutralized_M1               9463.46
+9     e1f_golden_ratio_adherence_21_neutralized_M1               8916.90
+10    e1f_network_density_30_neutralized_M1                      8475.55
+11    e1f_network_density_50_neutralized_M1                      7940.32
+12    e1f_semantic_flow_40_neutralized_M1                        7859.10
+13    e1f_harmony_96_neutralized_M1                              7186.73
+14    e1f_symmetry_measure_34_neutralized_M1                     7121.01
+15    e1f_harmony_48_neutralized_M1                              7028.63
+16    e1f_musical_tension_48_neutralized_M1                      6794.52
+17    e1f_network_density_100_neutralized_M1                     6684.18
+18    e1f_linguistic_complexity_40_neutralized_M1                6544.79
+19    e1f_musical_tension_96_neutralized_M1                      6345.63
+20    e1f_rhythm_pattern_48_neutralized_M1                       6067.66
+21    e1f_symmetry_measure_21_neutralized_M1                     5806.08
+22    e1f_tonality_96_neutralized_M1                             5792.46
+23    e1f_musical_tension_24_neutralized_M1                      5634.32
+24    e1f_aesthetic_balance_89_neutralized_M1                    5496.90
+25    e1f_network_clustering_50_neutralized_M1                   5396.38
+26    e1f_network_clustering_100_neutralized_M1                  5339.56
+27    e1f_rhythm_pattern_96_neutralized_M1                       5334.15
+28    e1f_network_density_20_neutralized_M1                      5329.20
+29    e1f_tonality_48_neutralized_M1                             5037.74
+30    e1f_symmetry_measure_89_neutralized_M1                     4753.67
+31    e1f_linguistic_complexity_25_neutralized_M1                4658.38
+32    e1f_aesthetic_balance_34_neutralized_M1                    4496.81
+33    e1f_symmetry_measure_55_neutralized_M1                     4469.34
+34    e1f_tonality_24_neutralized_M1                             4352.57
+35    e1f_tonality_12_neutralized_M1                             4282.85
+36    e1f_aesthetic_balance_55_neutralized_M1                    4162.78
+37    e1f_aesthetic_balance_21_neutralized_M1                    3895.10
+38    e1f_semantic_flow_15_neutralized_M1                        3606.35
+39    e1f_semantic_flow_25_neutralized_M1                        3362.22
+40    e1f_network_clustering_30_neutralized_M1                   3232.85
+41    e1f_network_clustering_20_neutralized_M1                   3119.27
+42    e1f_rhythm_pattern_24_neutralized_M1                       2918.38
+💾 Saved 42 active features to: m1_long_features.txt
+
+========================================
+ M1 Model (SHORT) 
+========================================
+✅ Active features (Gain > 0): 42 / 42
+Rank  Feature Name                                                  Gain
+---------------------------------------------------------------------------
+1     e1c_rsi_momentum_21_neutralized_M1                      1545056.29
+2     e1f_kinetic_energy_10_neutralized_M1                     195142.27
+3     e1f_golden_ratio_adherence_55_neutralized_M1              87369.58
+4     e1f_vocabulary_diversity_80_neutralized_M1                52950.64
+5     e1f_golden_ratio_adherence_21_neutralized_M1              22623.35
+6     e1f_vocabulary_diversity_40_neutralized_M1                20717.56
+7     e1f_harmony_48_neutralized_M1                             19464.69
+8     e1f_golden_ratio_adherence_34_neutralized_M1              19377.38
+9     e1f_semantic_flow_40_neutralized_M1                       18107.71
+10    e1f_vocabulary_diversity_15_neutralized_M1                16507.16
+11    e1f_network_density_30_neutralized_M1                     11920.79
+12    e1f_symmetry_measure_21_neutralized_M1                    11818.02
+13    e1f_harmony_96_neutralized_M1                             11727.16
+14    e1f_vocabulary_diversity_25_neutralized_M1                10939.78
+15    e1f_network_density_20_neutralized_M1                     10641.20
+16    e1f_semantic_flow_15_neutralized_M1                       10302.64
+17    e1f_network_density_50_neutralized_M1                     10224.62
+18    e1f_network_density_100_neutralized_M1                     9655.59
+19    e1f_tonality_12_neutralized_M1                             9651.07
+20    e1f_musical_tension_48_neutralized_M1                      9534.05
+21    e1f_linguistic_complexity_40_neutralized_M1                9474.46
+22    e1f_semantic_flow_25_neutralized_M1                        9416.55
+23    e1f_aesthetic_balance_89_neutralized_M1                    9208.78
+24    e1f_rhythm_pattern_48_neutralized_M1                       8456.83
+25    e1f_tonality_96_neutralized_M1                             8213.33
+26    e1f_musical_tension_96_neutralized_M1                      8046.96
+27    e1f_symmetry_measure_89_neutralized_M1                     7829.91
+28    e1f_linguistic_complexity_25_neutralized_M1                7682.38
+29    e1f_tonality_48_neutralized_M1                             7656.04
+30    e1f_tonality_24_neutralized_M1                             7579.65
+31    e1f_symmetry_measure_34_neutralized_M1                     7416.56
+32    e1f_network_clustering_100_neutralized_M1                  7391.19
+33    e1f_network_clustering_50_neutralized_M1                   7091.34
+34    e1f_musical_tension_24_neutralized_M1                      7034.59
+35    e1f_rhythm_pattern_96_neutralized_M1                       6975.12
+36    e1f_aesthetic_balance_21_neutralized_M1                    6778.61
+37    e1f_network_clustering_20_neutralized_M1                   6702.28
+38    e1f_aesthetic_balance_55_neutralized_M1                    6138.58
+39    e1f_symmetry_measure_55_neutralized_M1                     6098.23
+40    e1f_aesthetic_balance_34_neutralized_M1                    5578.29
+41    e1f_rhythm_pattern_24_neutralized_M1                       5531.67
+42    e1f_network_clustering_30_neutralized_M1                   5259.51
+💾 Saved 42 active features to: m1_short_features.txt
+
+========================================
+ M2 Model (LONG) 
+========================================
+✅ Active features (Gain > 0): 43 / 43
+Rank  Feature Name                                                  Gain
+---------------------------------------------------------------------------
+1     m1_pred_proba                                              9182.85
+2     e1c_rsi_momentum_21_neutralized_M1                         1478.80
+3     e1f_kinetic_energy_10_neutralized_M1                       1273.23
+4     e1f_golden_ratio_adherence_55_neutralized_M1               1110.30
+5     e1f_rhythm_pattern_48_neutralized_M1                       1107.00
+6     e1f_semantic_flow_15_neutralized_M1                         983.90
+7     e1f_symmetry_measure_21_neutralized_M1                      955.55
+8     e1f_symmetry_measure_55_neutralized_M1                      933.94
+9     e1f_network_clustering_100_neutralized_M1                   884.27
+10    e1f_vocabulary_diversity_80_neutralized_M1                  878.34
+11    e1f_musical_tension_24_neutralized_M1                       874.08
+12    e1f_vocabulary_diversity_15_neutralized_M1                  872.23
+13    e1f_musical_tension_48_neutralized_M1                       845.97
+14    e1f_aesthetic_balance_89_neutralized_M1                     831.76
+15    e1f_rhythm_pattern_96_neutralized_M1                        825.12
+16    e1f_symmetry_measure_34_neutralized_M1                      819.04
+17    e1f_symmetry_measure_89_neutralized_M1                      806.91
+18    e1f_tonality_96_neutralized_M1                              800.34
+19    e1f_tonality_48_neutralized_M1                              773.40
+20    e1f_rhythm_pattern_24_neutralized_M1                        765.99
+21    e1f_aesthetic_balance_21_neutralized_M1                     759.54
+22    e1f_aesthetic_balance_34_neutralized_M1                     757.43
+23    e1f_golden_ratio_adherence_21_neutralized_M1                751.55
+24    e1f_harmony_96_neutralized_M1                               748.58
+25    e1f_musical_tension_96_neutralized_M1                       742.55
+26    e1f_linguistic_complexity_25_neutralized_M1                 738.72
+27    e1f_network_clustering_20_neutralized_M1                    736.06
+28    e1f_golden_ratio_adherence_34_neutralized_M1                733.33
+29    e1f_network_density_30_neutralized_M1                       718.17
+30    e1f_network_density_100_neutralized_M1                      701.20
+31    e1f_network_clustering_30_neutralized_M1                    696.21
+32    e1f_harmony_48_neutralized_M1                               695.68
+33    e1f_tonality_12_neutralized_M1                              683.12
+34    e1f_linguistic_complexity_40_neutralized_M1                 670.99
+35    e1f_semantic_flow_25_neutralized_M1                         670.59
+36    e1f_tonality_24_neutralized_M1                              666.35
+37    e1f_network_density_50_neutralized_M1                       659.26
+38    e1f_aesthetic_balance_55_neutralized_M1                     653.44
+39    e1f_vocabulary_diversity_25_neutralized_M1                  624.75
+40    e1f_semantic_flow_40_neutralized_M1                         602.08
+41    e1f_network_density_20_neutralized_M1                       585.67
+42    e1f_network_clustering_50_neutralized_M1                    568.58
+43    e1f_vocabulary_diversity_40_neutralized_M1                  485.34
+💾 Saved 43 active features to: m2_long_features.txt
+
+========================================
+ M2 Model (SHORT) 
+========================================
+✅ Active features (Gain > 0): 43 / 43
+Rank  Feature Name                                                  Gain
+---------------------------------------------------------------------------
+1     m1_pred_proba                                             20837.41
+2     e1f_golden_ratio_adherence_34_neutralized_M1               2328.27
+3     e1c_rsi_momentum_21_neutralized_M1                         2307.82
+4     e1f_kinetic_energy_10_neutralized_M1                       2222.35
+5     e1f_symmetry_measure_55_neutralized_M1                     1893.25
+6     e1f_harmony_48_neutralized_M1                              1842.67
+7     e1f_semantic_flow_25_neutralized_M1                        1802.35
+8     e1f_harmony_96_neutralized_M1                              1684.39
+9     e1f_symmetry_measure_21_neutralized_M1                     1639.64
+10    e1f_aesthetic_balance_21_neutralized_M1                    1602.84
+11    e1f_network_density_30_neutralized_M1                      1599.43
+12    e1f_symmetry_measure_89_neutralized_M1                     1583.46
+13    e1f_network_clustering_20_neutralized_M1                   1577.69
+14    e1f_tonality_96_neutralized_M1                             1563.72
+15    e1f_vocabulary_diversity_15_neutralized_M1                 1562.71
+16    e1f_semantic_flow_15_neutralized_M1                        1551.25
+17    e1f_network_density_100_neutralized_M1                     1539.32
+18    e1f_symmetry_measure_34_neutralized_M1                     1530.55
+19    e1f_tonality_12_neutralized_M1                             1527.82
+20    e1f_rhythm_pattern_48_neutralized_M1                       1527.39
+21    e1f_linguistic_complexity_40_neutralized_M1                1514.04
+22    e1f_network_density_20_neutralized_M1                      1480.70
+23    e1f_network_density_50_neutralized_M1                      1473.54
+24    e1f_tonality_24_neutralized_M1                             1461.67
+25    e1f_vocabulary_diversity_40_neutralized_M1                 1454.34
+26    e1f_aesthetic_balance_55_neutralized_M1                    1434.26
+27    e1f_musical_tension_48_neutralized_M1                      1431.27
+28    e1f_network_clustering_30_neutralized_M1                   1430.69
+29    e1f_vocabulary_diversity_25_neutralized_M1                 1407.87
+30    e1f_linguistic_complexity_25_neutralized_M1                1397.80
+31    e1f_aesthetic_balance_89_neutralized_M1                    1393.64
+32    e1f_network_clustering_100_neutralized_M1                  1376.79
+33    e1f_rhythm_pattern_96_neutralized_M1                       1375.17
+34    e1f_golden_ratio_adherence_55_neutralized_M1               1356.83
+35    e1f_semantic_flow_40_neutralized_M1                        1353.70
+36    e1f_musical_tension_96_neutralized_M1                      1336.10
+37    e1f_rhythm_pattern_24_neutralized_M1                       1305.40
+38    e1f_tonality_48_neutralized_M1                             1298.72
+39    e1f_musical_tension_24_neutralized_M1                      1281.26
+40    e1f_aesthetic_balance_34_neutralized_M1                    1274.80
+41    e1f_network_clustering_50_neutralized_M1                   1264.80
+42    e1f_vocabulary_diversity_80_neutralized_M1                 1232.66
+43    e1f_golden_ratio_adherence_21_neutralized_M1               1200.99
+💾 Saved 43 active features to: m2_short_features.txt
+
+======================================================================
+🎉 ALL DONE! 4 Purified Feature Lists generated in: 
+/workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/selected_features_purified_v5
+======================================================================
+hephaestus-zero@xxxxx18x:/workspace$ 

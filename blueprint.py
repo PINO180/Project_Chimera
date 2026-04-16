@@ -8,6 +8,7 @@ BASE_DIR = Path("/workspace")
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 CONFIG_DIR = BASE_DIR / "config"
+CORE_DIR = BASE_DIR / "core"  # core_indicators.py 等のコアライブラリ置き場
 
 # 処理対象シンボル（マルチシンボル対応: ここを切り替えるだけ）
 SYMBOL = "XAUUSD"  # 例: "USDJPY", "EURUSD" など
@@ -59,9 +60,33 @@ WF_TARGET_SHIFT = {
 }
 # グループ別WF訓練・検証月数
 WF_CONFIG = {
-    "lf_short": {"train_months": 18, "val_months": 3},
-    "lf_mid": {"train_months": 24, "val_months": 6},
-    "lf_long": {"train_months": 36, "val_months": 12},
+    "lf_short": {
+        "train_months": 18,
+        "val_months": 3,
+        "purge_days": 5,
+        "embargo_days": 2,
+    },
+    "lf_mid": {
+        "train_months": 24,
+        "val_months": 6,
+        "purge_days": 12,
+        "embargo_days": 3,
+    },
+    "lf_long": {
+        "train_months": 36,
+        "val_months": 12,
+        "purge_days": 30,
+        "embargo_days": 5,
+    },
+}
+
+# --- Chapter 2 ラベル生成設定（トリプルバリア）---
+# risk_config.json（本番用）とは独立した訓練用パラメータ
+LABEL_CONFIG = {
+    "pt_multiplier": 1.0,
+    "sl_multiplier": 5.0,
+    "td_minutes": 60,  # H1データ基準: 1バー = 60分
+    "min_atr_threshold": 0.8,
 }
 
 # --- Chapter 2 統計フィルター閾値 ---
@@ -101,7 +126,9 @@ S3_FEATURES_FOR_TRAINING = S3_ARTIFACTS / "final_feature_set_v3.txt"
 S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / "final_feature_set_v5.txt"
 S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / "selected_features_v5"
 S3_SELECTED_FEATURES_PURIFIED_DIR = S3_ARTIFACTS / "selected_features_purified_v5"
-S3_SELECTED_FEATURES_ORTHOGONAL_DIR = S3_ARTIFACTS / "selected_features_orthogonal_v5"  # ★追加: M1/M2直交分割版
+S3_SELECTED_FEATURES_ORTHOGONAL_DIR = (
+    S3_ARTIFACTS / "selected_features_orthogonal_v5"
+)  # ★追加: M1/M2直交分割版
 S3_FILTERED_LF_FEATURES = S3_ARTIFACTS / "filtered_lf_features.txt"
 S3_FILTERED_HF_FEATURES = S3_ARTIFACTS / "filtered_hf_features.txt"
 S3_LF_ENVIRONMENT_SCORES = S3_ARTIFACTS / "lf_environment_scores.parquet"
@@ -136,9 +163,13 @@ S7_BACKTEST_RESULTS = S7_MODELS / "backtest_results"
 S7_BACKTEST_OPTUNA_RESULTS = S7_MODELS / "backtest_optuna_results"
 # キャッシュ格納ディレクトリ
 S7_BACKTEST_CACHE_DIR = S7_MODELS / "backtest_preload_cache"
-S7_BACKTEST_CACHE_M2  = S7_BACKTEST_CACHE_DIR / "backtest_preload_cache.pkl"    # M2モード用キャッシュ
-S7_BACKTEST_CACHE_M1  = S7_BACKTEST_CACHE_DIR / "backtest_preload_cache_M1.pkl" # M1モード用キャッシュ
-S7_BACKTEST_CACHE     = S7_BACKTEST_CACHE_M2  # 後方互換エイリアス
+S7_BACKTEST_CACHE_M2 = (
+    S7_BACKTEST_CACHE_DIR / "backtest_preload_cache.pkl"
+)  # M2モード用キャッシュ
+S7_BACKTEST_CACHE_M1 = (
+    S7_BACKTEST_CACHE_DIR / "backtest_preload_cache_M1.pkl"
+)  # M1モード用キャッシュ
+S7_BACKTEST_CACHE = S7_BACKTEST_CACHE_M2  # 後方互換エイリアス
 
 # バックテスト結果出力先
 S7_BACKTEST_SIM_RESULTS = S7_MODELS / "backtest_simulator_results"
@@ -215,5 +246,6 @@ ZMQ = {
     "control_endpoint": "tcp://host.docker.internal:5555",  # コマンド/ハンドシェイク
     "data_endpoint": "tcp://host.docker.internal:5556",  # バルクデータ転送 (PUSH/PULL)
     "heartbeat_endpoint": "tcp://host.docker.internal:5558",  # ハートビート
+    "m3_notify_endpoint": "tcp://host.docker.internal:5557",  # M3確定通知 (PUSH/PULL)
     "heartbeat_timeout": 9000,  # ハートビートのタイムアウト(ms)
 }

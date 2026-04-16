@@ -91,7 +91,7 @@ class BacktestConfig:
     # ▲▲▲ ここまで追加 ▲▲▲
 
     m2_proba_threshold: float = 0.70
-    m2_delta_threshold: float = 0.50  # ★追加: LongとShortの確率の差分(Delta)閾値
+    m2_delta_threshold: float = 0.30  # ★追加: LongとShortの確率の差分(Delta)閾値
 
     test_limit_partitions: int = 0
     oof_mode: bool = True
@@ -2110,6 +2110,7 @@ if __name__ == "__main__":
         logging.info(
             f"[{inference_mode}] データ生成完了。キャッシュに保存しています..."
         )
+        active_cache_path.parent.mkdir(parents=True, exist_ok=True)  # ← これを追加
         with open(active_cache_path, "wb") as f:
             pickle.dump(data, f)
         logging.info(f"[{inference_mode}] キャッシュ保存完了: {active_cache_path}")

@@ -1,0 +1,28 @@
+concurrency=1 クランプの実装方法
+万が一 inf 重みが発生した場合の防御策として concurrency を1にクランプするには、あなたの言う通り sample_uniqueness_weighting_join.py を修正します。
+
+sample_uniqueness_weighting_calculate.py: こちらは修正不要です。このスクリプトは concurrency の値を計算するだけで、ゼロ除算は行いません。
+
+sample_uniqueness_weighting_join.py: こちらが uniqueness = 1.0 / concurrency を計算する場所なので、ここを修正します。
+
+具体的な修正 (L117):
+
+修正前:
+
+Python
+
+.with_columns((1.0 / pl.col("concurrency")).alias("uniqueness"))
+修正後 (クランプ適用):
+
+Python
+
+.with_columns(
+    (1.0 / pl.max_horizontal(1, pl.col("concurrency").fill_null(1))).alias("uniqueness") # concurrencyが0 or NULLなら1を使う
+)
+pl.col("concurrency").fill_null(1): もし concurrency が NULL だった場合（JOIN失敗など）、それを 1 に置き換えます。
+
+pl.max_horizontal(1, ...): concurrency の値と 1 を比較し、大きい方（つまり最低でも1）を採用します。
+
+これで、concurrency が 0 や NULL であっても、分母が最低 1 になるため、inf やエラーが発生しなくなります。
+
+まずは両端テストで problem_count=0 であることを確認し、もし問題が見つかった場合にこの修正を検討するのが良いでしょう。

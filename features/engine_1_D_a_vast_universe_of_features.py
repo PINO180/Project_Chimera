@@ -23,6 +23,18 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import blueprint as config
+
+# --- [Step 8] core_indicators: Single Source of Truth ---
+import sys as _sys_ci
+_sys_ci.path.append(str(config.CORE_DIR))
+from core_indicators import (
+    calculate_atr_wilder,  # Wilder平滑化ATR（SMA版 calculate_atr_numba を置き換え）
+    scale_by_atr,          # ゼロ除算保護付きATR割り（NumPy配列用・将来のrealtime側で使用）
+    calculate_sample_weight,  # Zスコアサンプルウェイト（Polarsインライン計算を置き換え）
+)
+del _sys_ci
+# --------------------------------------------------------
+
 import os, sys, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -369,33 +381,9 @@ class DataEngine:
 # ===============================
 
 
-# ▼▼ 修正追加: ATR (Average True Range) の計算 (内部正規化用・高速化実装)
-@nb.njit(fastmath=True, cache=True)
-def calculate_atr_numba(
-    high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int
-) -> np.ndarray:
-    n = len(close)
-    atr = np.full(n, np.nan, dtype=np.float64)
-    if n < window:
-        return atr
-
-    tr = np.zeros(n, dtype=np.float64)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        hl = high[i] - low[i]
-        hc = np.abs(high[i] - close[i - 1])
-        lc = np.abs(low[i] - close[i - 1])
-        tr[i] = max(hl, hc, lc)
-
-    # ワイルダーの平滑化ではなく単純移動平均(SMA)によるベースATR計算
-    sum_tr = np.sum(tr[:window])
-    atr[window - 1] = sum_tr / window
-    for i in range(window, n):
-        atr[i] = atr[i - 1] + (tr[i] - tr[i - window]) / window
-    return atr
-
-
-# ▲▲ 修正追加ここまで
+# [Step 8] calculate_atr_numba (SMA方式) を削除。
+# core_indicators.calculate_atr_wilder (Wilder平滑化) に統一済み。
+# 以下の全 map_batches 呼び出しは calculate_atr_wilder を使用する。
 
 # =============================================================================
 # ボラティリティ指標 (Numba UDF集)
@@ -1058,9 +1046,9 @@ class CalculationEngine:
         expressions = {}
         p = self.prefix
 
-        # 内部正規化用の ATR13 計算式 (Phase 1追加分)
+        # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1069,26 +1057,20 @@ class CalculationEngine:
             return_dtype=pl.Float64,
         )
 
-        # ▼▼ 修正追加: Phase 3 (ルール3.5) Zスコア重みづけの自動計算
-        # 値幅(high - low) の ATR比率を算出 (ルール5: ゼロ除算防止)
-        hl_atr_ratio = (pl.col("high") - pl.col("low")) / (atr_13_internal_expr + 1e-10)
-
-        # 局所レジーム(50期間)におけるZスコアの算出 (ルール4: ddof=1厳守)
-        ratio_mean = hl_atr_ratio.rolling_mean(window_size=50)
-        ratio_std = hl_atr_ratio.rolling_std(window_size=50, ddof=1)
-        z_score = (hl_atr_ratio - ratio_mean) / (ratio_std + 1e-10)
-
-        # Zスコアに基づく段階的ウェイト付与
+        # [Step 8] サンプルウェイト: Polars版インライン計算 → calculate_sample_weight に統一
+        # 設計書注意点: 旧Polars版は z_score >= 2.0 のみ重み付けだったが、
+        # calculate_sample_weight は |z| < 2.0 を判定基準とする（符号の扱いが異なる）。
+        # calculate_sample_weight は絶対値ベースのため、正負両方向の外れバーを重視する。
         expressions[f"{p}sample_weight"] = (
-            pl.when(z_score >= 4.0)
-            .then(6.0)
-            .when(z_score >= 3.0)
-            .then(4.0)
-            .when(z_score >= 2.0)
-            .then(2.0)
-            .otherwise(1.0)
+            pl.struct(["high", "low", "close"]).map_batches(
+                lambda s: calculate_sample_weight(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                ),
+                return_dtype=pl.Float64,
+            )
         ).alias(f"{p}sample_weight")
-        # ▲▲ 修正追加ここまで
 
         # ボラティリティ指標系 - 全ての式に明示的なaliasを付与
         for window in self.config.window_sizes["volatility"]:
@@ -1780,9 +1762,9 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # ▼▼ 修正追加: Phase 3 (ルール3.5) Zスコア重みづけの自動計算
+        # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1791,23 +1773,19 @@ class CalculationEngine:
             return_dtype=pl.Float64,
         )
 
-        hl_atr_ratio = (pl.col("high") - pl.col("low")) / (atr_13_internal_expr + 1e-10)
-        ratio_mean = hl_atr_ratio.rolling_mean(window_size=50)
-        ratio_std = hl_atr_ratio.rolling_std(window_size=50, ddof=1)
-        z_score = (hl_atr_ratio - ratio_mean) / (ratio_std + 1e-10)
-
+        # [Step 8] サンプルウェイト: Polars版インライン計算 → calculate_sample_weight に統一
         sample_weight_expr = (
-            pl.when(z_score >= 4.0)
-            .then(6.0)
-            .when(z_score >= 3.0)
-            .then(4.0)
-            .when(z_score >= 2.0)
-            .then(2.0)
-            .otherwise(1.0)
+            pl.struct(["high", "low", "close"]).map_batches(
+                lambda s: calculate_sample_weight(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                ),
+                return_dtype=pl.Float64,
+            )
         ).alias(f"{p}sample_weight")
 
         exprs.append(sample_weight_expr)
-        # ▲▲ 修正追加ここまで
 
         # ボラティリティ指標系 - 全ての式に明示的なaliasを付与
         for window in self.config.window_sizes["volatility"]:
@@ -1912,9 +1890,9 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # 内部正規化用の ATR13 計算式
+        # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1922,8 +1900,6 @@ class CalculationEngine:
             ),
             return_dtype=pl.Float64,
         )
-
-        # 出来高関連指標系 - 全ての式に明示的なaliasを付与
         # 修正後
         for window in self.config.window_sizes["volume"]:
             # CMF（重量UDF）
@@ -2041,9 +2017,9 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # ▼▼ 修正追加: 内部正規化用の ATR13 計算式
+        # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -2120,9 +2096,9 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # ▼▼ 修正追加: 内部正規化用の ATR13 計算式 (ルール3.5)
+        # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -2203,9 +2179,9 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # 内部正規化用の ATR13 計算式
+        # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -2213,8 +2189,6 @@ class CalculationEngine:
             ),
             return_dtype=pl.Float64,
         )
-
-        # 価格アクション指標 - 全ての式に明示的なaliasを付与
         typical_p = (pl.col("high") + pl.col("low") + pl.col("close")) / 3.0
         weighted_c = (pl.col("high") + pl.col("low") + 2 * pl.col("close")) / 4.0
         median_p = (pl.col("high") + pl.col("low")) / 2.0

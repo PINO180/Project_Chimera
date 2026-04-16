@@ -25,13 +25,19 @@ import json
 import re
 import pickle  # ▼追加: スナップショット保存用
 import os  # ▼追加: ファイル存在確認用
-import blueprint as config
-from blueprint import ATR_BASELINE_DAYS
 
-# --- プロジェクトのルートディレクトリをPythonの検索パスに追加 ---
+# --- /workspace をパスに追加してから blueprint をインポート ---
+# engine_1_A と同じルールに統一: sys.path.append が blueprint より必ず先
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
+
+import blueprint as config  # noqa: E402
+from blueprint import ATR_BASELINE_DAYS  # noqa: E402
+
+# --- core_indicators: Single Source of Truth ---
+sys.path.append(str(config.CORE_DIR))
+from core_indicators import calculate_atr_wilder, neutralize_ols  # noqa: E402
 
 # ==================================================================
 # 外部モジュール (完全カプセル化クラス群) のインポート
@@ -39,8 +45,14 @@ if str(project_root) not in sys.path:
 # ==================================================================
 # --- ATR Ratio計算用：時間足ごとの1日あたりバー数 ---
 TIMEFRAME_BARS_PER_DAY: Dict[str, int] = {
-    "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
-    "M8": 180, "M15": 96, "M30": 48, "H1": 24,
+    "M0.5": 2880,
+    "M1": 1440,
+    "M3": 480,
+    "M5": 288,
+    "M8": 180,
+    "M15": 96,
+    "M30": 48,
+    "H1": 24,
     # "H4": 6, "H6": 4, "H12": 2, "D1": 1,  # [FIX] 使用されない時間足
 }
 
@@ -89,7 +101,7 @@ class RealtimeFeatureEngine:
         "M15": 15,
         # "M30": 30,  # [V5] orthogonalリストに存在しないためスキップ
         "H1": 60,
-        "H4": 240,
+        # "H4": 240,
         # "H6": 360,   # [FIX] orthogonal全4ファイルで gain 0.006%以下・削除
         # "H12": 720,  # [FIX] orthogonal全4ファイルで gain 0.004%以下・削除
         # "D1": 1440,  # [FIX] orthogonalリストに存在しないためスキップ
@@ -135,7 +147,7 @@ class RealtimeFeatureEngine:
             )
             self.risk_config = {}
 
-        # 1. 特徴量名簿をロード (304個の精鋭リスト)
+        # 1. 特徴量名簿をロード
         try:
             self.feature_list = self._load_feature_list(feature_list_path)
             self.logger.info(
@@ -206,15 +218,7 @@ class RealtimeFeatureEngine:
             self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(maxlen=2016)
 
             self.ols_state[tf_name] = {}
-            for feat in PROXY_FEATURES:
-                self.ols_state[tf_name][feat] = {
-                    "sum_x": 0.0,
-                    "sum_y": 0.0,
-                    "sum_xy": 0.0,
-                    "sum_x_sq": 0.0,
-                    "sum_y_sq": 0.0,
-                    "count": 0.0,
-                }
+            # 各エントリは _update_incremental_ols で特徴量登場時に動的初期化される
 
         self.logger.info(f"M1 Dequeバッファを初期化 (maxlen: {max_m1_bars_needed})")
 
@@ -311,7 +315,7 @@ class RealtimeFeatureEngine:
 
         # [FIX-INFO-2] Pandas 2.2以降の推奨エイリアスに更新 (T→min, H→h)
         freq_map = {
-            "M0.5": "30s",   # [FIX] M0.5追加
+            "M0.5": "30s",  # [FIX] M0.5追加
             "M1": "1min",
             "M3": "3min",
             "M5": "5min",
@@ -414,7 +418,7 @@ class RealtimeFeatureEngine:
             self.logger.warning(
                 f"  -> {tf_name:<3} 利用可能データが不足 ({n_rows} < {ols_total_needed})。"
                 f" OLS精度が低下する可能性があります。"
-                f" 取得する M1 バー数を増やすことを検討してください。"
+                f" 取得する M0.5(tick→resample) バー数を増やすことを検討してください。"
             )
 
         # --- Numpy配列として一括抽出 ---
@@ -427,31 +431,22 @@ class RealtimeFeatureEngine:
 
         base_features: dict = {}
 
+        # (1) OHLCVバッファを先に一括充填（全行・超高速）
+        for col in self.OHLCV_COLS:
+            self.data_buffers[tf_name][col].extend(
+                df_for_processing[col].values[-buffer_len:]
+            )
+        self.last_bar_timestamps[tf_name] = timestamps[-1]
+
+        # (2) OLSウォームアップ：フルウィンドウ分のみ計算（buffer_len未満はスキップ）
         for i in range(n_rows):
-            # (1) OHLCVバッファに1行追加 (deque の maxlen=buffer_len が古い行を自動で押し出す)
-            self.data_buffers[tf_name]["open"].append(arr_open[i])
-            self.data_buffers[tf_name]["high"].append(arr_high[i])
-            self.data_buffers[tf_name]["low"].append(arr_low[i])
-            self.data_buffers[tf_name]["close"].append(arr_close[i])
-            self.data_buffers[tf_name]["volume"].append(arr_vol[i])
-
-            ts = timestamps[i]
-            self.last_bar_timestamps[tf_name] = ts
-
-            # (2) [修正の核心] 固定スライディングウィンドウでデータを切り出す。
-            #
-            # 旧実装: arr[:i+1]  ← 成長スライス（バグの根本原因）
-            # 新実装: arr[window_start : i+1]  ← 固定ウィンドウ（リアルタイム推論と同一）
-            #
-            # 例 (buffer_len=2116):
-            #   i=   0 → arr[0:1]      (1本)    <- 起動直後は仕方なく短いが…
-            #   i=2115 → arr[0:2116]   (2116本) <- ここからフルウィンドウ
-            #   i=2116 → arr[1:2117]   (2116本) <- スライドして常に2116本 ✓
-            #   i=4131 → arr[2015:4132](2116本) <- 最終ステップ
-            #
-            # これにより VPT 等の累積特徴量が「フルウィンドウ分」のみ蓄積された
-            # 値となり、OLS が学習する分布がリアルタイム推論と完全に一致する。
             window_start = max(0, i + 1 - buffer_len)
+            window_size = i + 1 - window_start
+
+            # フルウィンドウ未満はOLSスキップ（無駄な計算を排除）
+            if window_size < buffer_len:
+                continue
+
             data = {
                 "open": arr_open[window_start : i + 1],
                 "high": arr_high[window_start : i + 1],
@@ -460,24 +455,12 @@ class RealtimeFeatureEngine:
                 "volume": arr_vol[window_start : i + 1],
             }
 
-            # 最低 30 本未満ではほぼすべての特徴量が NaN になるためスキップ
-            if (i + 1 - window_start) < 30:
-                continue
-
             base_features = self._calculate_base_features(data, tf_name)
 
-            # ↓ 一時デバッグ用（M1のi=100のときだけ出力）
-            if tf_name == "M1" and i == 100:
-                self.logger.info(
-                    f"DEBUG: base_features keys count = {len(base_features)}"
-                )
-                self.logger.info(
-                    f"DEBUG: ols_state M1 keys = {list(self.ols_state.get('M1', {}).keys())[:5]}"
-                )
-
             # (3) 固定ウィンドウ特徴量値で OLS 状態を更新
-            self._update_incremental_ols(tf_name, base_features, market_proxy_cache, ts)
-
+            self._update_incremental_ols(
+                tf_name, base_features, market_proxy_cache, timestamps[i]
+            )
         if n_rows > 0:
             self.is_buffer_filled[tf_name] = True
 
@@ -491,13 +474,13 @@ class RealtimeFeatureEngine:
             except Exception as e:
                 self.logger.warning(f"{tf_name} ウォームアップキャッシュ保存失敗: {e}")
 
-        # OLS の有効サンプル数を報告（十分な精度かを確認するため）
+        # proxy_feature_buffersのDequeサイズをOLS学習サンプル数として報告
+        # （V5でols_stateのWelford変数は廃止済み・Dequeが実体）
         ols_n = 0
-        if tf_name in self.ols_state:
-            # いずれかの特徴量の count を代表値として取得
-            for feat_state in self.ols_state[tf_name].values():
-                ols_n = int(feat_state.get("count", 0))
-                break
+        if tf_name in self.proxy_feature_buffers:
+            mp_deque = self.proxy_feature_buffers[tf_name].get("market_proxy")
+            if mp_deque:
+                ols_n = len(mp_deque)
         self.logger.info(
             f"  -> {tf_name:<3} ウォームアップ完了 (固定ウィンドウ版)。"
             f" OLS学習サンプル数: ~{ols_n} / {OLS_WINDOW}"
@@ -513,17 +496,38 @@ class RealtimeFeatureEngine:
         2. M1バッファを充填
         3. M1データから M3〜MN のすべてをリサンプリングして充填する
         """
-        self.logger.info("全時間足の履歴データでNumpyバッファを一括充填中 (M1 Only)...")
+        self.logger.info(
+            "全時間足の履歴データでNumpyバッファを一括充填中 (V12.0: M0.5起点)..."
+        )
 
-        if "M1" not in history_data_map:
-            raise ValueError("履歴データに M1 がありません。リサンプリングできません。")
+        if "M0.5" not in history_data_map:
+            raise ValueError(
+                "履歴データに M0.5 がありません。リサンプリングできません。"
+            )
 
-        m1_history_pd = history_data_map["M1"]
-        if "timestamp" not in m1_history_pd.columns:
-            raise ValueError("M1履歴データに 'timestamp' カラムが見つかりません。")
-        m1_history_pd = m1_history_pd.set_index("timestamp")
+        m05_history_pd = history_data_map["M0.5"]
+        if "timestamp" not in m05_history_pd.columns:
+            raise ValueError("M0.5履歴データに 'timestamp' カラムが見つかりません。")
+        m05_history_pd = m05_history_pd.set_index("timestamp")
 
-        self.logger.info(f"  -> M1 バッファをMT5データから充填中...")
+        self.logger.info(f"  -> M0.5 バッファをMT5データから充填中...")
+        self._replace_buffer_from_dataframe("M0.5", m05_history_pd, market_proxy_cache)
+
+        # M1をM0.5からリサンプリングして生成し、m1_dataframeを構築
+        self.logger.info(f"  -> M1  をM0.5からリサンプリング中...")
+        m1_history_pd = (
+            m05_history_pd.resample("1min")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+        )
         self._replace_buffer_from_dataframe("M1", m1_history_pd, market_proxy_cache)
 
         self.m1_dataframe.clear()
@@ -531,13 +535,13 @@ class RealtimeFeatureEngine:
         self.m1_dataframe.extend(m1_records)
 
         for tf_name, rule in self.TF_RESAMPLE_RULES.items():
-            if tf_name not in self.data_buffers or tf_name == "M1":
+            if tf_name not in self.data_buffers or tf_name in ("M0.5", "M1"):
                 continue
 
             try:
-                self.logger.info(f"  -> {tf_name:<3} をM1からリサンプリング中...")
+                self.logger.info(f"  -> {tf_name:<3} をM0.5からリサンプリング中...")
                 resampled_df = (
-                    m1_history_pd.resample(rule)
+                    m05_history_pd.resample(rule)
                     .agg(
                         {
                             "open": "first",
@@ -684,22 +688,24 @@ class RealtimeFeatureEngine:
             )
             return []
 
-    def process_new_m1_bar(
-        self, m1_bar: Dict[str, Any], market_proxy_cache: pd.DataFrame
+    def process_new_m05_bar(
+        self, m05_bar: Dict[str, Any], market_proxy_cache: pd.DataFrame
     ) -> List[Signal]:
         """
-        [メインループ] main.py から M1 バーを受け取り、全バッファを更新し、
-        シグナルをチェックして返す。
+        [メインループ] main.py から M0.5 バーを受け取り、全バッファを更新し、
+        M3確定時のみシグナルをチェックして返す。
         """
         signal_list: List[Signal] = []
 
         try:
-            m1_timestamp = m1_bar["timestamp"]
+            m05_timestamp = m05_bar["timestamp"]
 
-            # 1. M1バッファに新しいバーを追加
-            self.m1_dataframe.append(m1_bar)
-            m1_bar_df = pd.DataFrame([m1_bar]).set_index("timestamp")
-            self._append_bar_to_buffer("M1", m1_bar_df, market_proxy_cache)
+            # 1. M0.5バッファに新しいバーを追加
+            # m1_dataframe はリサンプリング起点として引き続き使用するため
+            # M0.5バーをM1粒度に変換して追加する（2本に1回M1バーが確定）
+            self.m1_dataframe.append(m05_bar)
+            m05_bar_df = pd.DataFrame([m05_bar]).set_index("timestamp")
+            self._append_bar_to_buffer("M0.5", m05_bar_df, market_proxy_cache)
 
             # ▼▼▼▼▼▼ 【修正】Tick特徴量のOLS純化とキャッシュ登録 ▼▼▼▼▼▼
             # [V5] Tick特徴量は110件リストに存在しないためコメントアウトして処理をスキップ
@@ -735,77 +741,74 @@ class RealtimeFeatureEngine:
                 if new_timestamps:
                     newly_closed_timeframes[tf_name] = new_timestamps
 
-            newly_closed_timeframes["M1"] = [m1_timestamp]
+            newly_closed_timeframes["M0.5"] = [m05_timestamp]
 
-            # 3. 新しくバーが確定した各時間足について処理
-            for tf_name, timestamps in newly_closed_timeframes.items():
-                for timestamp in timestamps:
-                    # 特徴量キャッシュの更新 (クロス参照対応)
-                    if self.is_buffer_filled[tf_name]:
-                        try:
-                            data = {
-                                col: np.array(
-                                    self.data_buffers[tf_name][col], dtype=np.float64
-                                )
-                                for col in self.OHLCV_COLS
-                            }
-                            base_features = self._calculate_base_features(data, tf_name)
+            # 3. M3確定時のみ全時間足を強制再計算・シグナルチェック
+            # M3非確定時はSTEP1・2のバッファ更新のみで完結（処理なし）
+            if "M3" not in newly_closed_timeframes:
+                return signal_list
 
-                            # ★ 追加: 算出された全特徴量のOLSバッファを動的更新
-                            self._update_incremental_ols(
-                                tf_name, base_features, market_proxy_cache, timestamp
-                            )
+            m3_timestamp = newly_closed_timeframes["M3"][-1] + pd.Timedelta(minutes=3)
 
-                            neutralized = self._calculate_neutralized_features(
-                                base_features, tf_name, timestamp, market_proxy_cache
-                            )
-                            self.latest_features_cache[tf_name] = neutralized
-                        except Exception as e:
-                            self.logger.warning(
-                                f"{tf_name} 特徴量キャッシュ更新失敗: {e}"
-                            )
+            # M3確定時：全時間足のバッファから強制再計算（学習側と一致）
+            for tf_name in self.ALL_TIMEFRAMES.keys():
+                if not self.is_buffer_filled.get(tf_name, False):
+                    continue
+                try:
+                    data = {
+                        col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
+                        for col in self.OHLCV_COLS
+                    }
+                    base_features = self._calculate_base_features(data, tf_name)
 
-                    # シグナルチェック (V5レジームフィルター)
-                    V5_check_result = self._check_for_signal(tf_name, timestamp)
+                    self._update_incremental_ols(
+                        tf_name, base_features, market_proxy_cache, m3_timestamp
+                    )
 
-                    if V5_check_result["is_V5"]:
-                        feature_vector = self.calculate_feature_vector(
-                            tf_name, timestamp, market_proxy_cache
-                        )
+                    neutralized = self._calculate_neutralized_features(
+                        base_features, tf_name, m3_timestamp, market_proxy_cache
+                    )
+                    self.latest_features_cache[tf_name] = neutralized
+                except Exception as e:
+                    self.logger.warning(f"{tf_name} 特徴量キャッシュ更新失敗: {e}")
 
-                        if feature_vector is not None:
-                            # 修正: 上書きを防ぎ、モデルが期待するサフィックス付きの完全な辞書を構築
-                            combined_features = dict(
-                                zip(self.feature_list, feature_vector[0])
-                            )
+            # シグナルチェックはM3のみ
+            V5_check_result = self._check_for_signal("M3", m3_timestamp)
 
-                            signal = Signal(
-                                features=feature_vector,
-                                timestamp=timestamp,
-                                timeframe=tf_name,
-                                market_info=V5_check_result["market_info"],
-                                atr_value=V5_check_result["market_info"].get(
-                                    "atr_value", 0.0
-                                ),
-                                close_price=V5_check_result["market_info"].get(
-                                    "current_price", 0.0
-                                ),
-                                feature_dict=combined_features,
-                            )
-                            signal_list.append(signal)
+            if V5_check_result["is_V5"]:
+                feature_vector = self.calculate_feature_vector(
+                    "M3", m3_timestamp, market_proxy_cache
+                )
+
+                if feature_vector is not None:
+                    combined_features = dict(zip(self.feature_list, feature_vector[0]))
+
+                    signal = Signal(
+                        features=feature_vector,
+                        timestamp=m3_timestamp,
+                        timeframe="M3",
+                        market_info=V5_check_result["market_info"],
+                        atr_value=V5_check_result["market_info"].get("atr_value", 0.0),
+                        close_price=V5_check_result["market_info"].get(
+                            "current_price", 0.0
+                        ),
+                        feature_dict=combined_features,
+                    )
+                    signal_list.append(signal)
 
             return signal_list
 
         except Exception as e:
-            self.logger.error(f"process_new_m1_bar でエラー: {e}", exc_info=True)
+            self.logger.error(f"process_new_m05_bar でエラー: {e}", exc_info=True)
             return []
 
     def _check_for_signal(self, tf_name: str, timestamp: datetime) -> Dict[str, Any]:
         """
         指定された時間足のバッファがV5レジーム (ATR比率条件) かを判定する。
         """
-        # ▼▼▼ 修正: シグナル判定を Mixed (M1〜M15) に拡大 ▼▼▼
-        ALLOWED_TIMEFRAMES = ["M1", "M3", "M5", "M8", "M15"]
+        # [設計根拠] create_proxy_labels の TARGET_TIMEFRAMES = ["M3"] に準拠
+        # Optunaの結論: M3単体・ATR ratio 0.8・TD 30min
+        ALLOWED_TIMEFRAMES = ["M3"]
         if tf_name not in ALLOWED_TIMEFRAMES:
             return {"is_V5": False, "reason": "timeframe_not_allowed"}
         if tf_name not in self.data_buffers:
@@ -844,7 +847,9 @@ class RealtimeFeatureEngine:
             # ATR Ratioフィルター (risk_config.json で管理)
             # ATR Ratio = 現在のATR / 過去ATR_BASELINE_DAYS日の平均ATR
             atr_threshold = self.risk_config.get("min_atr_threshold", 0.8)  # Ratio閾値
-            baseline_period = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440) * ATR_BASELINE_DAYS
+            baseline_period = (
+                TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440) * ATR_BASELINE_DAYS
+            )
             # バッファ全体のATR時系列を取得してベースラインを計算
             if len(close) > 1:
                 tr_full = np.maximum(
@@ -909,11 +914,15 @@ class RealtimeFeatureEngine:
         timestamp: datetime,
     ):
         """
-        【V5完全修正版】 脆弱なWelford状態変数(sum_x, sum_x_sq等)の維持を廃止し、
-        純粋にDeque（リングバッファ）へ最新値を追加するだけの処理に特化。
+        【インクリメンタルOLS版】
+        Dequeへの追加と並行して ols_state の sum_x/sum_x2/sum_y/sum_xy/count を
+        スライディングウィンドウで逐次更新する。
+        x_deque と y_deque は同一タイミングで積み上げられるため、
+        満杯判定は x_deque で統一して old_x/old_y のペアを正確に取得する。
         """
         from datetime import timezone
-        import numpy as np
+
+        OLS_WINDOW = 2016
 
         try:
             search_ts = timestamp
@@ -922,39 +931,75 @@ class RealtimeFeatureEngine:
             else:
                 search_ts = search_ts.astimezone(timezone.utc)
 
-            idx = market_proxy_cache.index.get_indexer([search_ts], method="ffill")[0]
-
-            if idx == -1:
-                latest_x = 0.0
-            else:
-                latest_x = float(market_proxy_cache.iloc[idx]["market_proxy"])
-
+            # 重複除去・ソートしてからffill検索
+            proxy_cache_unique = market_proxy_cache[
+                ~market_proxy_cache.index.duplicated(keep="last")
+            ].sort_index()
+            idx = proxy_cache_unique.index.get_indexer([search_ts], method="ffill")[0]
+            latest_x = (
+                float(proxy_cache_unique.iloc[idx]["market_proxy"])
+                if idx != -1
+                else 0.0
+            )
             if not np.isfinite(latest_x):
                 latest_x = 0.0
 
-            # リングバッファの初期化チェック
+            # バッファ・状態の初期化
             if tf_name not in self.proxy_feature_buffers:
-                buf_len = self.lookbacks_by_tf.get(tf_name, 2016)
                 self.proxy_feature_buffers[tf_name] = {
-                    "market_proxy": deque(maxlen=buf_len)
+                    "market_proxy": deque(maxlen=OLS_WINDOW)
                 }
+            if tf_name not in self.ols_state:
+                self.ols_state[tf_name] = {}
 
             x_deque = self.proxy_feature_buffers[tf_name]["market_proxy"]
 
-            # 各特徴量の最新値をバッファへ追加
+            # x_dequeが満杯かどうかをループ前に1回だけ確認する
+            # x_dequeとy_dequeは同一タイミングで積み上げられるため、
+            # x_dequeの満杯 = y_dequeの満杯 が保証される
+            x_is_full = len(x_deque) == OLS_WINDOW
+            old_x = float(x_deque[0]) if x_is_full else 0.0
+
             for feat_name, latest_y in latest_proxy_features.items():
                 if not np.isfinite(latest_y):
                     latest_y = 0.0
 
                 if feat_name not in self.proxy_feature_buffers[tf_name]:
-                    buf_len = self.lookbacks_by_tf.get(tf_name, 2016)
                     self.proxy_feature_buffers[tf_name][feat_name] = deque(
-                        maxlen=buf_len
+                        maxlen=OLS_WINDOW
                     )
 
-                self.proxy_feature_buffers[tf_name][feat_name].append(latest_y)
+                if feat_name not in self.ols_state[tf_name]:
+                    self.ols_state[tf_name][feat_name] = {
+                        "sum_x": 0.0,
+                        "sum_x2": 0.0,
+                        "sum_y": 0.0,
+                        "sum_xy": 0.0,
+                        "count": 0,
+                    }
 
-            # 市場プロキシの最新値をバッファへ追加
+                state = self.ols_state[tf_name][feat_name]
+                y_deque = self.proxy_feature_buffers[tf_name][feat_name]
+
+                # ウィンドウ満杯なら最古の値を減算（x_dequeの満杯で統一判定）
+                if x_is_full:
+                    old_y = float(y_deque[0])
+                    state["sum_x"] -= old_x
+                    state["sum_x2"] -= old_x * old_x
+                    state["sum_y"] -= old_y
+                    state["sum_xy"] -= old_x * old_y
+                    state["count"] -= 1
+
+                # 新しい値を加算
+                state["sum_x"] += latest_x
+                state["sum_x2"] += latest_x * latest_x
+                state["sum_y"] += latest_y
+                state["sum_xy"] += latest_x * latest_y
+                state["count"] += 1
+
+                y_deque.append(latest_y)
+
+            # x_dequeはループ後に1回だけ更新
             x_deque.append(latest_x)
 
         except Exception as e:
@@ -972,11 +1017,15 @@ class RealtimeFeatureEngine:
         market_proxy_cache_df: pd.DataFrame,
     ) -> Dict[str, float]:
         """
-        【V5完全修正版】 Welfordの逐次減算による情報落ち(Catastrophic Cancellation)を排除し、
-        毎ティックNumpyのC言語バックエンドで2016期間の分散・共分散をO(N)でフル計算する。
-        """
-        import numpy as np
+        【V5完全修正版 + core_indicators統一版】
+        OLS純化を core_indicators.neutralize_ols に統一し、
+        学習側 (2_G_alpha_neutralizer.py) と物理的に同一のロジックを保証する。
 
+        処理フロー:
+            1. proxy_feature_buffers からウィンドウ分の x_arr / y_arr を抽出
+            2. neutralize_ols(y_arr, x_arr, window=2016, min_periods=30) を呼び出し
+            3. 結果配列の末尾要素 [-1] を最新の純化済み値として採用
+        """
         neutralized_features: Dict[str, float] = {}
 
         try:
@@ -986,46 +1035,38 @@ class RealtimeFeatureEngine:
             if not latest_x_deque:
                 return base_features_dict
 
-            # 過去最大2016件を抽出 (Polarsの rolling_window=2016 に完全一致させる)
-            x_arr = np.array(latest_x_deque, dtype=np.float64)[-2016:]
-            n = len(x_arr)
-
-            # Polarsの min_periods=30 に準拠
-            if n < 30:
-                return base_features_dict
-
-            # Numpyベクトル演算で一括計算 (過去の蓄積値に依存しないためドリフトは物理的に発生しない)
-            mean_x = np.mean(x_arr)
-            # Polarsの var_x = mean(x^2) - mean(x)^2 と数学的に完全一致
-            var_x = np.maximum(0.0, np.mean(x_arr**2) - mean_x**2)
-            latest_x = x_arr[-1]
+            # x_latest を x_deque から直接取得（x_arr生成不要）
+            x_latest = (
+                float(latest_x_deque[-1])
+                if latest_x_deque and np.isfinite(latest_x_deque[-1])
+                else 0.0
+            )
 
             for base_name, latest_y in base_features_dict.items():
-                y_deque = self.proxy_feature_buffers[tf_name].get(base_name)
-                if not y_deque:
+                # ols_stateからインクリメンタル統計量を取得
+                state = self.ols_state.get(tf_name, {}).get(base_name)
+                if state is None or state["count"] < 30:
                     neutralized_features[base_name] = latest_y
                     continue
 
-                y_arr = np.array(y_deque, dtype=np.float64)[-2016:]
-                # XとYのデータ数が一致しない場合のフェイルセーフ
-                if len(y_arr) != n:
-                    neutralized_features[base_name] = latest_y
-                    continue
-
-                mean_y = np.mean(y_arr)
-
-                # Polarsの cov_xy = mean(x*y) - mean(x)*mean(y) と数学的に完全一致
-                cov_xy = np.mean(x_arr * y_arr) - (mean_x * mean_y)
-
-                # 学習時と全く同じ純化式 (ゼロ除算防止の 1e-10 も同一)
+                count = state["count"]
+                mean_x = state["sum_x"] / count
+                mean_x2 = state["sum_x2"] / count
+                var_x = max(0.0, mean_x2 - mean_x * mean_x)
+                mean_y = state["sum_y"] / count
+                mean_xy = state["sum_xy"] / count
+                cov_xy = mean_xy - mean_x * mean_y
                 beta = cov_xy / (var_x + 1e-10)
                 alpha = mean_y - beta * mean_x
 
-                latest_y_safe = latest_y if np.isfinite(latest_y) else 0.0
-                neutralized_features[base_name] = latest_y_safe - (
-                    beta * latest_x + alpha
-                )
+                y_latest = float(latest_y) if np.isfinite(latest_y) else 0.0
+                val = y_latest - (beta * x_latest + alpha)
 
+                if np.isfinite(val):
+                    neutralized_features[base_name] = val
+                else:
+                    latest_y_safe = latest_y if np.isfinite(latest_y) else 0.0
+                    neutralized_features[base_name] = latest_y_safe
             return neutralized_features
 
         except Exception as e:
@@ -1070,22 +1111,18 @@ class RealtimeFeatureEngine:
 
         close_pct = _pct(data["close"])
 
-        # atr の計算 (e1c_atr_13は相対値のため使用禁止 → 常にOHLCVバッファからWilder平滑化で自前計算)
+        # atr の計算 (e1c_atr_13は相対値のため使用禁止 → core_indicators.calculate_atr_wilderで統一)
         high, low, close = data["high"], data["low"], data["close"]
         if len(close) > 1:
-            tr = np.maximum(
-                high[1:] - low[1:],
-                np.maximum(
-                    np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
-                ),
+            atr_arr = calculate_atr_wilder(
+                high.astype(np.float64),
+                low.astype(np.float64),
+                close.astype(np.float64),
+                self.ATR_CALC_PERIOD,
             )
-            # Wilder平滑化（ewm相当・alpha=1/period）
-            alpha = 1.0 / self.ATR_CALC_PERIOD
-            atr_series = np.zeros(len(tr))
-            atr_series[0] = tr[0]
-            for i in range(1, len(tr)):
-                atr_series[i] = alpha * tr[i] + (1 - alpha) * atr_series[i - 1]
-            features["atr"] = float(atr_series[-1]) if len(atr_series) > 0 else 0.0
+            atr_last = float(atr_arr[-1]) if len(atr_arr) > 0 else np.nan
+            # nan ガード: バッファが ATR_CALC_PERIOD 未満の極端な起動直後でも 0.0 で安全に逃げる
+            features["atr"] = atr_last if np.isfinite(atr_last) else 0.0
         else:
             features["atr"] = 0.0
 
@@ -1133,7 +1170,7 @@ class RealtimeFeatureEngine:
                 base_name = (
                     feat_name.split("_neutralized_")[0]
                     if "_neutralized_" in feat_name
-                    else feat_name.rsplit("_", 1)[0]
+                    else feat_name.rsplit("_", 1)[0]  # ← ここがデッドコード
                 )
                 val = self.latest_features_cache[target_tf].get(base_name, 0.0)
                 vector.append(val)
@@ -1229,3 +1266,12 @@ class RealtimeFeatureEngine:
             return False
 
     # ▲▲▲ ここまで追加 ▲▲▲
+
+
+# ファイル末尾に追加
+from execution import profiling_patch
+
+RealtimeFeatureEngine.process_new_m05_bar = profiling_patch.process_new_m05_bar
+RealtimeFeatureEngine._calculate_base_features = (
+    profiling_patch._calculate_base_features
+)

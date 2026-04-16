@@ -20,9 +20,61 @@ Project Forge - 軍資金増大プロジェクト
 import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+# -----------------------------------------------------------------------
+# パス解決: blueprint → core_indicators の順で解決する
+# ① まず親ディレクトリ (/workspace) を sys.path に追加して blueprint を解決
+# ② 次に blueprint.CORE_DIR (/workspace/core) を追加して core_indicators を解決
+# ③ blueprint が見つからない場合は相対パスの fallback を使用
+# -----------------------------------------------------------------------
+_parent_dir = str(Path(__file__).resolve().parents[1])  # /workspace
+if _parent_dir not in sys.path:
+    sys.path.append(_parent_dir)
 
 import blueprint as config
+
+# =============================================================================
+# [Step 10] core_indicators — Single Source of Truth からのインポート
+# =============================================================================
+try:
+    _core_dir = str(config.CORE_DIR)          # /workspace/core
+    if _core_dir not in sys.path:
+        sys.path.append(_core_dir)
+except (AttributeError, ModuleNotFoundError):
+    # blueprint が見つからない場合 (テスト環境など) は相対 fallback
+    _fallback_core = str(Path(__file__).resolve().parent / "core")
+    if _fallback_core not in sys.path:
+        sys.path.append(_fallback_core)
+
+from core_indicators import (
+    # [ATR & VOLATILITY]
+    calculate_atr_wilder,
+    scale_by_atr,
+    # [WEIGHT]
+    calculate_sample_weight,
+    # [DSP] — FFT・解析信号・スペクトル系
+    numba_fft,
+    numba_ifft,
+    get_analytic_signal,
+    spectral_centroid_udf,
+    spectral_bandwidth_udf,
+    spectral_rolloff_udf,
+    spectral_flux_udf,
+    spectral_flatness_udf,
+    spectral_entropy_udf,
+    # [DSP] — ウェーブレット系
+    wavelet_energy_udf,
+    wavelet_entropy_udf,
+    # [DSP] — ヒルベルト変換系
+    hilbert_amplitude_udf,
+    hilbert_phase_var_udf,
+    hilbert_phase_stability_udf,
+    hilbert_freq_mean_udf,
+    hilbert_freq_std_udf,
+    # [DSP] — 音響系
+    acoustic_power_udf,
+    acoustic_frequency_udf,
+)
+
 import os, sys, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -32,12 +84,15 @@ from dataclasses import dataclass, field
 import numpy as np
 import polars as pl
 import numba as nb
-from numba import guvectorize, float64, int64
-from scipy import stats
-from scipy.stats import jarque_bera, anderson, shapiro, trim_mean
-from scipy.fft import fft, fftfreq
-from scipy.signal import hilbert
-import pywt
+# ▼▼ [Step 10] guvectorize / scipy / pywt はこのファイルでは直接使用しない。
+#    DSP UDF はすべて core_indicators 経由で提供される。
+#    将来このファイル独自のUDFが必要になった場合のみ再インポートすること。
+# from numba import guvectorize, float64, int64  # 廃止
+# from scipy import stats                          # 廃止
+# from scipy.stats import jarque_bera, anderson, shapiro, trim_mean  # 廃止
+# from scipy.fft import fft, fftfreq              # 廃止
+# from scipy.signal import hilbert                # 廃止
+# import pywt                                     # 廃止
 
 # メモリ監視
 import psutil
@@ -361,765 +416,27 @@ class DataEngine:
             return {"error": str(e)}
 
 
-# =============================================================================
-# NumbaネイティブFFT実装 (np.fftサポート外への対策) - 安定版
-# =============================================================================
-
-
-@nb.njit(fastmath=True, cache=True)
-def numba_fft(x: np.ndarray) -> np.ndarray:
-    """
-    Numbaで実装された反復的Cooley-Tukey FFTアルゴリズム（安定版）。
-    再帰を排除し、メモリ効率と並列処理への耐性を向上。
-    """
-    n = x.shape[0]
-
-    # nが2のべき乗でない場合、ゼロパディングを行う
-    if (n & (n - 1)) != 0 and n > 0:
-        target_n = 1 << int(np.ceil(np.log2(n)))
-        padded_x = np.zeros(target_n, dtype=np.complex128)
-        padded_x[:n] = x
-        x = padded_x
-        n = target_n
-    else:
-        x = x.astype(np.complex128)
-
-    if n <= 1:
-        return x
-
-    # ビット反転置換
-    j = 0
-    for i in range(1, n):
-        bit = n >> 1
-        while j & bit:
-            j ^= bit
-            bit >>= 1
-        j ^= bit
-        if i < j:
-            x[i], x[j] = x[j], x[i]
-
-    # バタフライ演算（反復処理）
-    len_ = 2
-    while len_ <= n:
-        half_len = len_ >> 1
-        w_step = np.exp(-2j * np.pi / len_)
-        for i in range(0, n, len_):
-            w = 1.0 + 0.0j
-            for j in range(half_len):
-                u = x[i + j]
-                v = x[i + j + half_len] * w
-                x[i + j] = u + v
-                x[i + j + half_len] = u - v
-                w *= w_step
-        len_ <<= 1
-
-    return x
-
 
 # =============================================================================
-# 真の解析信号（Analytic Signal）生成用 IFFT & Hilbert Transform (新規追加)
+# [Step 10 リファクタリング] DSP UDF 群は core_indicators.py から一括 import 済み
 # =============================================================================
-@nb.njit(fastmath=True, cache=True)
-def numba_ifft(x: np.ndarray) -> np.ndarray:
-    """Numbaによる逆高速フーリエ変換 (IFFT)"""
-    return np.conj(numba_fft(np.conj(x))) / len(x)
-
-
-@nb.njit(fastmath=True, cache=True)
-def get_analytic_signal(x: np.ndarray) -> np.ndarray:
-    """学術的に厳密なFFTベースの離散ヒルベルト変換（scipy.signal.hilbert同等）"""
-    # ▼▼ 修正前: n = len(x) を基準にしていたため、numba_fftのゼロパディング仕様と衝突しSegfaultが発生
-    # ▼▼ 修正後: パディング後のサイズ(n_fft)に合わせて計算し、最後に元のサイズ(n_orig)で切り取る
-    n_orig = len(x)
-    X = numba_fft(x)
-    n_fft = len(X)
-
-    h = np.zeros(n_fft, dtype=np.complex128)
-    if n_fft > 0:
-        h[0] = 1.0
-        if n_fft % 2 == 0:
-            h[1 : n_fft // 2] = 2.0
-            h[n_fft // 2] = 1.0
-        else:
-            h[1 : (n_fft + 1) // 2] = 2.0
-
-    analytic_padded = numba_ifft(X * h)
-    return analytic_padded[:n_orig]
-
-
-# ===============================
-# Numba UDF定義（クラス外必須）
-# ===============================
-
-# 【重要】全てのNumba UDFは必ずクラス外で定義すること
-# クラス内定義は循環参照エラーを引き起こすため絶対禁止
-
+# 以下の関数はすべて core_indicators.[CATEGORY: DSP] セクションで定義されており、
+# ファイル冒頭の import 文で取り込まれています。このファイルへの重複定義は廃止。
+#
+#   numba_fft, numba_ifft, get_analytic_signal
+#   spectral_centroid_udf, spectral_bandwidth_udf, spectral_rolloff_udf
+#   spectral_flux_udf, spectral_flatness_udf, spectral_entropy_udf
+#   wavelet_energy_udf, wavelet_entropy_udf
+#   hilbert_amplitude_udf, hilbert_phase_var_udf, hilbert_phase_stability_udf
+#   hilbert_freq_mean_udf, hilbert_freq_std_udf
+#   acoustic_power_udf, acoustic_frequency_udf
+#
+# 変更の恩恵:
+#   - engine_1_E (学習側) と realtime_feature_engine_1E (本番側) が
+#     同一の Numba 関数オブジェクトを参照するため、物理的に値の乖離が発生しない。
+#   - fastmath=True (旧) → fastmath=False (core_indicators 統一値) に変更され、
+#     浮動小数点の再現性が向上する。
 # =============================================================================
-# スペクトル特徴量 (Numba UDF集) - 重量UDF（map_batches + 動的並列化制御）
-# =============================================================================
-
-
-# ▼▼ 修正前: @nb.njit(fastmath=True, cache=True, parallel=True)
-# ▼▼ 修正後: スレッド衝突を避けるため parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def spectral_centroid_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトル重心計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: ループ外でのバッファ事前確保（Pre-allocation）
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正前: num_iterations と prange の条件分岐
-    # ▼▼ 修正後: Polars側で並列化するため、内部はシンプルな range に統一
-    for i in range(window_size - 1, n):
-        # ▼▼ 修正前: window_data = ... ; finite_data = window_data[np.isfinite(window_data)]
-        # ▼▼ 修正後: 事前確保したバッファへ、有効な値だけを詰め込む
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        # NumbaネイティブFFTによるスペクトル計算
-        fft_values = numba_fft(buffer[:valid_count])
-        mag_len = valid_count // 2
-        magnitude_spectrum = np.abs(fft_values[:mag_len])
-
-        if mag_len == 0:
-            continue
-
-        total_magnitude = np.sum(magnitude_spectrum)
-        if total_magnitude > 0:
-            centroid = 0.0
-            # ▼▼ 修正前: freqs = np.linspace(0, 0.5, len(magnitude_spectrum))
-            # ▼▼ 修正後: 配列生成を避け、インデックスから直接周波数を計算
-            for k in range(mag_len):
-                freq = k * 0.5 / max(1, mag_len - 1)
-                centroid += freq * magnitude_spectrum[k]
-            result[i] = centroid / total_magnitude
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def spectral_bandwidth_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトル帯域幅計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: ループ外でのバッファ事前確保
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正後: prange廃止
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        fft_values = numba_fft(buffer[:valid_count])
-        mag_len = valid_count // 2
-        magnitude_spectrum = np.abs(fft_values[:mag_len])
-
-        if mag_len == 0:
-            continue
-
-        total_magnitude = np.sum(magnitude_spectrum)
-        if total_magnitude > 0:
-            # ▼▼ 修正後: np.linspace を排除しインデックスベースで分散を計算
-            centroid = 0.0
-            for k in range(mag_len):
-                freq = k * 0.5 / max(1, mag_len - 1)
-                centroid += freq * magnitude_spectrum[k]
-            centroid /= total_magnitude
-
-            variance = 0.0
-            for k in range(mag_len):
-                freq = k * 0.5 / max(1, mag_len - 1)
-                variance += ((freq - centroid) ** 2) * magnitude_spectrum[k]
-
-            result[i] = np.sqrt(variance / total_magnitude)
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def spectral_rolloff_udf(
-    signal: np.ndarray, window_size: int, rolloff_ratio: float = 0.85
-) -> np.ndarray:
-    """
-    スペクトルロールオフ計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: ループ外事前バッファ
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正後: prange廃止
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        fft_values = numba_fft(buffer[:valid_count])
-        mag_len = valid_count // 2
-        magnitude_spectrum = np.abs(fft_values[:mag_len])
-
-        if mag_len == 0:
-            continue
-
-        power_spectrum = magnitude_spectrum**2
-        total_power = np.sum(power_spectrum)
-
-        if total_power > 0:
-            # ▼▼ 修正前: cumulative_power = np.cumsum(power_spectrum) / np.where(...)
-            # ▼▼ 修正後: 配列生成(cumsum/where)を避け、加算ループとbreakでメモリ確保を排除
-            threshold = rolloff_ratio * total_power
-            cumulative_power = 0.0
-            for k in range(mag_len):
-                cumulative_power += power_spectrum[k]
-                if cumulative_power >= threshold:
-                    result[i] = k / (2.0 * mag_len)
-                    break
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def spectral_flux_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトルフラックス計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size * 2:
-        return result
-
-    # ▼▼ 修正後: ループ外で2つのバッファを事前確保
-    curr_buffer = np.zeros(window_size, dtype=np.float64)
-    prev_buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正後: prange廃止
-    for i in range(window_size * 2 - 1, n):
-        # 現在フレームのバッファ詰め
-        curr_valid = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                curr_buffer[curr_valid] = val
-                curr_valid += 1
-
-        # 前フレームのバッファ詰め
-        prev_valid = 0
-        for j in range(window_size):
-            val = signal[i - window_size * 2 + 1 + j]
-            if np.isfinite(val):
-                prev_buffer[prev_valid] = val
-                prev_valid += 1
-
-        if curr_valid < window_size // 2 or prev_valid < window_size // 2:
-            continue
-
-        curr_fft = numba_fft(curr_buffer[:curr_valid])
-        prev_fft = numba_fft(prev_buffer[:prev_valid])
-
-        mag_curr = np.abs(curr_fft[: curr_valid // 2])
-        mag_prev = np.abs(prev_fft[: prev_valid // 2])
-
-        min_size = min(len(mag_curr), len(mag_prev))
-        if min_size > 0:
-            # ▼▼ 修正前: flux = np.sqrt(np.sum((current_spectrum - prev_spectrum) ** 2) + 1e-10)
-            # ▼▼ 修正後: 配列演算を避け、スカラ演算ループでL2ノルムを計算
-            flux_sq = 0.0
-            for k in range(min_size):
-                diff = mag_curr[k] - mag_prev[k]
-                flux_sq += diff * diff
-            result[i] = np.sqrt(flux_sq + 1e-10)
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def spectral_flatness_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトル平坦度計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        fft_values = numba_fft(buffer[:valid_count])
-        mag_len = valid_count // 2
-        magnitude_spectrum = np.abs(fft_values[:mag_len])
-
-        if mag_len == 0:
-            continue
-
-        # ▼▼ 修正前: geometric_mean = np.exp(np.mean(np.log(magnitude_spectrum + 1e-10)))
-        # ▼▼ 修正後: 配列生成を排除し、ループで直接集計
-        geom_sum = 0.0
-        arith_sum = 0.0
-        for k in range(mag_len):
-            val = magnitude_spectrum[k] + 1e-10
-            geom_sum += np.log(val)
-            arith_sum += val
-
-        geometric_mean = np.exp(geom_sum / mag_len)
-        arithmetic_mean = arith_sum / mag_len
-
-        if arithmetic_mean > 0:
-            result[i] = geometric_mean / arithmetic_mean
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def spectral_entropy_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    スペクトルエントロピー計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        fft_values = numba_fft(buffer[:valid_count])
-        mag_len = valid_count // 2
-        magnitude_spectrum = np.abs(fft_values[:mag_len])
-
-        if mag_len == 0:
-            continue
-
-        # ▼▼ 修正前: power_spectrum = np.abs(...)**2; probability = power_spectrum / total_power
-        # ▼▼ 修正後: 配列を新規作成せず、スカラ演算で直接エントロピーを加算
-        total_power = 0.0
-        for k in range(mag_len):
-            total_power += magnitude_spectrum[k] ** 2
-
-        if total_power > 0:
-            entropy = 0.0
-            for k in range(mag_len):
-                p = (magnitude_spectrum[k] ** 2) / total_power
-                if p > 1e-10:
-                    entropy -= p * np.log2(p)
-            result[i] = entropy
-
-    return result
-
-
-# =============================================================================
-# ウェーブレット特徴量 (Numba UDF集) - 重量UDF（map_batches + 動的並列化制御）
-# =============================================================================
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def wavelet_energy_udf(
-    signal: np.ndarray, window_size: int, levels: int = 4
-) -> np.ndarray:
-    """
-    ウェーブレットエネルギー計算（インプレースDWT・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: DWT用のインプレース操作バッファを事前確保
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        level_energy = 0.0
-        current_len = valid_count
-
-        # ▼▼ 修正前: approx = np.zeros(len(current_signal) // 2) ... （毎レベル配列生成）
-        # ▼▼ 修正後: buffer内の前方要素を上書きし続けるインプレースHaar変換
-        for level in range(min(levels, 4)):
-            if current_len < 4:
-                break
-
-            next_len = current_len // 2
-            for j in range(next_len):
-                idx = j * 2
-                val1 = buffer[idx]
-                val2 = buffer[idx + 1]
-                # Haar基底 (1/√2)
-                approx = (val1 + val2) / 1.41421356237
-                detail = (val1 - val2) / 1.41421356237
-
-                level_energy += detail * detail
-                # j <= idx が常に成り立つため、前方から安全に上書き可能
-                buffer[j] = approx
-
-            current_len = next_len
-
-        result[i] = level_energy
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def hilbert_amplitude_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ヒルベルト変換による振幅包絡線計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        # ▼▼ 修正後: 厳密なスライスを渡し、結果の絶対値もループで集計
-        analytic_signal = get_analytic_signal(buffer[:valid_count])
-        amp_sum = 0.0
-        for k in range(valid_count):
-            real = analytic_signal[k].real
-            imag = analytic_signal[k].imag
-            amp_sum += np.sqrt(real * real + imag * imag)
-
-        result[i] = amp_sum / valid_count
-
-    return result
-
-
-# =============================================================================
-# 音響特徴量 (Numba UDF集) - 重量UDF（map_batches + 動的並列化制御）
-# =============================================================================
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def acoustic_power_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    音響パワー計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        # ▼▼ 修正前: rms_power = np.sqrt(np.mean(finite_data**2))
-        # ▼▼ 修正後: 配列生成を排除し、ループで直接RMSを計算
-        power_sum = 0.0
-        for k in range(valid_count):
-            power_sum += buffer[k] * buffer[k]
-
-        result[i] = np.sqrt(power_sum / valid_count)
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def acoustic_frequency_udf(
-    signal: np.ndarray, window_size: int, sample_rate: float = 1.0
-) -> np.ndarray:
-    """
-    音響周波数計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-
-        zero_crossings = 0
-        # ▼▼ 修正後: 厳密に valid_count の範囲内だけでゼロクロス判定
-        for k in range(1, valid_count):
-            if buffer[k - 1] * buffer[k] < 0:
-                zero_crossings += 1
-
-        if valid_count > 1:
-            result[i] = (zero_crossings / (2.0 * valid_count)) * sample_rate
-
-    return result
-
-
-# =============================================================================
-# 軽量UDFを重量級パターンに昇格（prange並列化）
-# =============================================================================
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def wavelet_entropy_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    """
-    ウェーブレットエントロピー計算（メモリ事前確保・HPC最適化版）
-    """
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count < window_size // 2:
-            continue
-        # ▼▼ 修正前: squared_data = window_data**2; result[i] = -np.sum(...)
-        # ▼▼ 修正後: 配列生成を排除し、ループで直接エントロピーを加算
-        entropy = 0.0
-        for j in range(valid_count):
-            sq = buffer[j] * buffer[j]
-            entropy -= sq * np.log2(sq + 1e-10)
-        result[i] = entropy
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def hilbert_phase_var_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count > 1:
-            # ▼▼ 修正箇所: Numba未サポートのddof=1を廃止し、手動でベッセル補正を適用
-            analytic_signal = get_analytic_signal(buffer[:valid_count])
-            phases = np.angle(analytic_signal)
-
-            # 標本分散(ddof=0)を計算
-            var_0 = np.var(phases)
-            # 不偏分散(ddof=1)へ補正: var_1 = var_0 * (n / (n-1))
-            result[i] = var_0 * (valid_count / (valid_count - 1.0))
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def hilbert_phase_stability_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: ループ外でバッファを事前確保
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正後: prange廃止
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        # diffを取ってさらにstdを計算するため、最低要素数3が必要（ddof=1なら尚更）
-        if valid_count > 2:
-            sliced_buffer = buffer[:valid_count]
-
-            # ▼▼ 修正箇所: ddof=1を廃止し、標準偏差の補正係数 sqrt(n/(n-1)) を適用
-            std_0 = np.std(sliced_buffer)
-            std_1 = std_0 * np.sqrt(valid_count / (valid_count - 1.0))
-
-            if std_1 < 1e-10:
-                result[i] = 1.0
-                continue
-
-            analytic_signal = get_analytic_signal(sliced_buffer)
-            diffs = np.diff(np.angle(analytic_signal))
-            n_diff = len(diffs)
-
-            if n_diff <= 1:
-                continue
-            phase_diff_std_0 = np.std(diffs)
-            phase_diff_std_1 = phase_diff_std_0 * np.sqrt(n_diff / (n_diff - 1.0))
-
-            result[i] = 1.0 / (1.0 + phase_diff_std_1 + 1e-10)
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def hilbert_freq_mean_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: ループ外でバッファを事前確保
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正後: prange廃止
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count > 2:
-            # ▼▼ 修正後: 厳密なスライスを渡す
-            analytic_signal = get_analytic_signal(buffer[:valid_count])
-            # np.unwrapはNumbaでサポートされていないため、単純な差分で近似
-            instant_freq = np.abs(np.diff(np.angle(analytic_signal)))
-            result[i] = np.mean(instant_freq)
-
-    return result
-
-
-# ▼▼ 修正後: parallel=True を削除
-@nb.njit(fastmath=True, cache=True)
-def hilbert_freq_std_udf(signal: np.ndarray, window_size: int) -> np.ndarray:
-    n = len(signal)
-    result = np.full(n, np.nan)
-    if n < window_size:
-        return result
-
-    # ▼▼ 修正後: ループ外でバッファを事前確保
-    buffer = np.zeros(window_size, dtype=np.float64)
-
-    # ▼▼ 修正後: prange廃止
-    for i in range(window_size - 1, n):
-        valid_count = 0
-        for j in range(window_size):
-            val = signal[i - window_size + 1 + j]
-            if np.isfinite(val):
-                buffer[valid_count] = val
-                valid_count += 1
-
-        if valid_count > 2:
-            analytic_signal = get_analytic_signal(buffer[:valid_count])
-            instant_freq = np.abs(np.diff(np.angle(analytic_signal)))
-            n_freq = len(instant_freq)
-
-            # ▼▼ 修正箇所: ddof=1を廃止し、標準偏差の補正を適用
-            if n_freq <= 1:
-                continue
-            std_0 = np.std(instant_freq)
-            result[i] = std_0 * np.sqrt(n_freq / (n_freq - 1.0))
-
-    return result
-
 
 class CalculationEngine:
     """
@@ -1353,13 +670,21 @@ class CalculationEngine:
         )
 
         # 周波数エネルギー比（Polarsネイティブ）
-        # ▼▼ 修正前: ((pl.col("close").pct_change() ** 2).rolling_sum(100) / (pl.col("close") ** 2).rolling_sum(100))
-        # ▼▼ 修正後: 次元を「%ベースの無次元」に統一。分母をATR13(%)の分散スケール基準に置き換えて正規化
-        atr_13_expr_hilbert = pl.max_horizontal(
-            pl.col("high") - pl.col("low"),
-            (pl.col("high") - pl.col("close").shift(1)).abs(),
-            (pl.col("low") - pl.col("close").shift(1)).abs(),
-        ).rolling_mean(13)
+        # ▼▼ [Step 10] SMA rolling_mean(13) → calculate_atr_wilder(period=13) に統一
+        # ▼▼ 修正前: atr_13_expr_hilbert = pl.max_horizontal(...).rolling_mean(13)
+        # ▼▼ 修正後: core_indicators.calculate_atr_wilder を map_batches 経由で呼び出す
+        atr_13_expr_hilbert = (
+            pl.struct(["high", "low", "close"])
+            .map_batches(
+                lambda s: calculate_atr_wilder(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                    13,
+                ),
+                return_dtype=pl.Float64,
+            )
+        )
         atr_13_pct_expr = atr_13_expr_hilbert / (pl.col("close") + 1e-10)
 
         expressions[f"{p}hilbert_freq_energy_ratio_100"] = (
@@ -1390,12 +715,20 @@ class CalculationEngine:
                 .alias(f"{p}acoustic_frequency_{window}")
             )
 
-        # ▼▼ 新規追加: インラインATR13（スケール不変変換用。PolarsのCSEで最適化されるため高速）
-        atr_100_expr = pl.max_horizontal(
-            pl.col("high") - pl.col("low"),
-            (pl.col("high") - pl.col("close").shift(1)).abs(),
-            (pl.col("low") - pl.col("close").shift(1)).abs(),
-        ).rolling_mean(100)
+        # ▼▼ [Step 10] SMA rolling_mean(100) → calculate_atr_wilder(period=100) に統一
+        # ▼▼ インラインコメント: Polars CSEの代わりに map_batches 経由で Wilder ATR を呼び出す
+        atr_100_expr = (
+            pl.struct(["high", "low", "close"])
+            .map_batches(
+                lambda s: calculate_atr_wilder(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                    100,
+                ),
+                return_dtype=pl.Float64,
+            )
+        )
 
         expressions[f"{p}signal_rms_50"] = (
             (pl.col("close").pct_change() ** 2)
@@ -1477,8 +810,11 @@ class CalculationEngine:
                 base_columns.append("timeframe")
 
             # このグループの特徴量カラムのみを抽出
+            # ▼▼ e1e_sample_weight は base_columns で管理するため除外する
+            #    prefix ("e1e_") でフィルタすると e1e_sample_weight も拾われて重複するため
             group_feature_columns = [
-                col for col in available_columns if col.startswith(self.prefix)
+                col for col in available_columns
+                if col.startswith(self.prefix) and col != "e1e_sample_weight"
             ]
             select_columns = base_columns + group_feature_columns
 
@@ -1662,8 +998,12 @@ class CalculationEngine:
         logger.info("品質保証システム適用開始: 全ての特徴量に安定化処理を適用します。")
 
         # スキーマからプレフィックスを持つ特徴量カラムを特定
+        # ▼▼ e1e_sample_weight は QA（EWMクリッピング）対象外のため除外する
         schema = lazy_frame.collect_schema()
-        feature_columns = [col for col in schema.names() if col.startswith(self.prefix)]
+        feature_columns = [
+            col for col in schema.names()
+            if col.startswith(self.prefix) and col != "e1e_sample_weight"
+        ]
 
         if not feature_columns:
             logger.warning("品質保証対象の特徴量が見つかりません。")
@@ -1940,12 +1280,19 @@ class CalculationEngine:
         )
 
         # 周波数エネルギー比（Polarsネイティブ）
-        # ▼▼ 修正後: ファクトリ側と同様に、ATR13(%)ベースのエネルギー基準で正規化
-        atr_13_expr_hilbert = pl.max_horizontal(
-            pl.col("high") - pl.col("low"),
-            (pl.col("high") - pl.col("close").shift(1)).abs(),
-            (pl.col("low") - pl.col("close").shift(1)).abs(),
-        ).rolling_mean(13)
+        # ▼▼ [Step 10] SMA rolling_mean(13) → calculate_atr_wilder(period=13) に統一
+        atr_13_expr_hilbert = (
+            pl.struct(["high", "low", "close"])
+            .map_batches(
+                lambda s: calculate_atr_wilder(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                    13,
+                ),
+                return_dtype=pl.Float64,
+            )
+        )
         atr_13_pct_expr = atr_13_expr_hilbert / (pl.col("close") + 1e-10)
 
         exprs.append(
@@ -1993,12 +1340,19 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
-        # ▼▼ 新規追加: インラインATR100（signal_peak_to_peak_100の期間と整合）
-        atr_100_expr = pl.max_horizontal(
-            pl.col("high") - pl.col("low"),
-            (pl.col("high") - pl.col("close").shift(1)).abs(),
-            (pl.col("low") - pl.col("close").shift(1)).abs(),
-        ).rolling_mean(100)
+        # ▼▼ [Step 10] SMA rolling_mean(100) → calculate_atr_wilder(period=100) に統一
+        atr_100_expr = (
+            pl.struct(["high", "low", "close"])
+            .map_batches(
+                lambda s: calculate_atr_wilder(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                    100,
+                ),
+                return_dtype=pl.Float64,
+            )
+        )
 
         # 追加の信号処理特徴量（Polarsネイティブ）
         exprs.append(
@@ -2069,8 +1423,10 @@ class OutputEngine:
         all_columns = schema.names()
 
         # プレフィックスを持つ特徴量カラムを特定
+        # ▼▼ e1e_sample_weight は basic_columns で管理するため除外する
         feature_columns = [
-            col for col in all_columns if col.startswith(f"{self.engine_id}_")
+            col for col in all_columns
+            if col.startswith(f"{self.engine_id}_") and col != "e1e_sample_weight"
         ]
 
         # NaN埋め式生成
@@ -2335,6 +1691,19 @@ def run_on_partitions_mode(
                 f"データ読み込み完了: 実データ{current_day_rows}行、総データ{augmented_df.height}行"
             )
 
+            # ▼▼ [Step 10] e1e_sample_weight を calculate_sample_weight (Wilder ATR統一版) で計算・付加
+            # 意図: engine_1_D が先行して付加した列（SMA-ATRベース）であっても
+            #       Wilder ATR統一後の値で必ず上書きする。
+            sw = calculate_sample_weight(
+                augmented_df["high"].to_numpy(),
+                augmented_df["low"].to_numpy(),
+                augmented_df["close"].to_numpy(),
+            )
+            augmented_df = augmented_df.with_columns(
+                pl.Series("e1e_sample_weight", sw)
+            )
+            logging.info("[Step 10] e1e_sample_weight を calculate_sample_weight (Wilder ATR) で計算・上書きしました。")
+
             # 【修正】親方（この関数）が工程管理を行う物理的垂直分割
             logging.info(f"特徴量計算開始: {day_name}")
 
@@ -2518,6 +1887,20 @@ def process_single_timeframe(config: ProcessingConfig, timeframe: str):
 
         # 各グループ計算の土台とするため、ベースのOHLCVを一度実現化（300万行でもOHLCVのみなら数百MBで超軽量）
         base_df = lazy_frame.collect()
+
+        # ▼▼ [Step 10] e1e_sample_weight を calculate_sample_weight (Wilder ATR統一版) で計算・付加
+        # 意図: engine_1_D が先行して付加した列（SMA-ATRベース）であっても
+        #       Wilder ATR統一後の値で必ず上書きする。
+        #       if ガードは設けず、常に上書きすることで Single Source of Truth を保証する。
+        sw = calculate_sample_weight(
+            base_df["high"].to_numpy(),
+            base_df["low"].to_numpy(),
+            base_df["close"].to_numpy(),
+        )
+        base_df = base_df.with_columns(
+            pl.Series("e1e_sample_weight", sw)
+        )
+        logger.info("[Step 10] e1e_sample_weight を calculate_sample_weight (Wilder ATR) で計算・上書きしました。")
 
         for group_idx, (group_name, group_expressions) in enumerate(
             feature_groups.items()

@@ -36,7 +36,6 @@ Chapter 2 スクリプト E — HF メタモデルトレーナー
 """
 
 import sys
-import json
 import warnings
 import argparse
 import datetime
@@ -56,14 +55,16 @@ import blueprint
 # =============================================================================
 # blueprint から必須パスをインポート
 # =============================================================================
+# 修正後（58〜67行）
 from blueprint import (
     BARRIER_ATR_PERIOD,
+    ATR_BASELINE_DAYS,
     HF_TIMEFRAMES,
     S2_FEATURES_VALIDATED,
     S3_LF_ENVIRONMENT_SCORES,
     S3_FILTERED_HF_FEATURES,
     S3_SURVIVED_HF_FEATURES,
-    CONFIG_RISK,
+    LABEL_CONFIG,
 )
 
 # =============================================================================
@@ -119,27 +120,6 @@ EMBARGO_DAYS = 2
 
 
 # =============================================================================
-# ユーティリティ
-# =============================================================================
-
-
-def load_risk_config() -> dict:
-    """
-    risk_config.json からトリプルバリア設定を読み込む。
-    ハードコード禁止（ルール7準拠）。
-    """
-    config_path = CONFIG_RISK
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"risk_config.json が見つかりません: {config_path}\n"
-            "CONFIG_RISK パスを blueprint.py で確認してください。"
-        )
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg
-
-
-# =============================================================================
 # トリプルバリアラベル生成（time_between 法・tick データ不要）
 # =============================================================================
 
@@ -150,22 +130,21 @@ def generate_triple_barrier_labels(
     sl_multiplier: float,
     max_hold_minutes: int,
     min_atr_threshold: float,
-    # TODO: 相対値化予定（現段階では ATR 閾値は絶対値 2.0ドル のまま使用）
-    # Chapter1・2 の相対値化完了後に相対値化する
 ) -> pl.DataFrame:
     """
     トリプルバリアラベルを生成する（time_between 法）。
 
-    - PT 倍率・SL 倍率・保有期間上限は risk_config.json から読み込む。
-    - ATR 収縮フィルター: ATR <= min_atr_threshold のエントリーをスキップ。
+    - PT 倍率・SL 倍率・保有期間上限は blueprint.LABEL_CONFIG から読み込む。
+    - ATR 収縮フィルター: atr_rel（現在ATR÷ベースラインATR）<= min_atr_threshold のエントリーをスキップ。
+    - バリア価格計算: atr_abs（絶対値ATR）を使用。
     - ルール4: 分母は +1e-10 でゼロ除算防止。
 
     Args:
-        data: timestamp / close / high / low / atr_value カラムを持つ DataFrame
+        data: timestamp / close / high / low / atr_abs / atr_rel カラムを持つ DataFrame
         pt_multiplier: PT バリア倍率
         sl_multiplier: SL バリア倍率
         max_hold_minutes: 最大保有分数
-        min_atr_threshold: ATR 収縮フィルター閾値（絶対値）
+        min_atr_threshold: ATR 収縮フィルター閾値（ATR/close の相対値）
 
     Returns:
         label カラム（1=勝ち, 0=負け/タイムアウト）が追加された DataFrame
@@ -176,16 +155,16 @@ def generate_triple_barrier_labels(
     close_col = data["close"].cast(pl.Float64)
     high_col = data["high"].cast(pl.Float64)
     low_col = data["low"].cast(pl.Float64)
-    atr_col = data["atr_value"].cast(pl.Float64)
+    atr_abs_col = data["atr_abs"].cast(pl.Float64)  # バリア計算用（絶対値）
+    atr_rel_col = data["atr_rel"].cast(pl.Float64)  # フィルター用（ATR/close）
 
     n = len(data)
 
     for i in tqdm(range(n), desc="  Triple-Barrier labeling", leave=False):
-        atr = atr_col[i]
+        atr_rel = atr_rel_col[i]
 
-        # ATR 収縮フィルター
-        # TODO: 相対値化予定（現段階では絶対値 min_atr_threshold で比較）
-        if atr is None or np.isnan(atr) or atr <= min_atr_threshold:
+        # ATR 収縮フィルター（相対値で判定）
+        if atr_rel is None or np.isnan(atr_rel) or atr_rel <= min_atr_threshold:
             labels.append(-1)  # スキップ（後でフィルタリング）
             continue
 
@@ -195,9 +174,10 @@ def generate_triple_barrier_labels(
             minutes=max_hold_minutes
         )  # timedeltaを使用
 
-        # ルール4: atr が 0 になりうる場合の保護（+1e-10）
-        pt_price = entry_price + pt_multiplier * (atr + 1e-10)
-        sl_price = entry_price - sl_multiplier * (atr + 1e-10)
+        atr_abs = atr_abs_col[i]
+        # ルール4: atr_abs が 0 になりうる場合の保護（+1e-10）
+        pt_price = entry_price + pt_multiplier * (atr_abs + 1e-10)
+        sl_price = entry_price - sl_multiplier * (atr_abs + 1e-10)
 
         label = 0
         for j in range(i + 1, n):
@@ -281,17 +261,13 @@ def main(test_mode: bool = False) -> None:
     print("=" * 70)
 
     # -----------------------------------------------------------------------
-    # 0. risk_config.json 読み込み
+    # 0. ラベル生成パラメータ読み込み（blueprint.LABEL_CONFIG）
     # -----------------------------------------------------------------------
-    print("\n[Step 0] risk_config.json 読み込み中...")
-    risk_cfg = load_risk_config()
-
-    # risk_config.json はフラット構造。ネストキー ("triple_barrier.*") は存在しない。
-    pt_multiplier: float = float(risk_cfg.get("pt_multiplier_long", 1.0))
-    sl_multiplier: float = float(risk_cfg.get("sl_multiplier_long", 5.0))
-    max_hold_minutes: int = int(risk_cfg.get("td_minutes_long", 60))
-    min_atr_threshold: float = float(risk_cfg.get("min_atr_threshold", 2.0))
-    # TODO: 相対値化予定（現段階では ATR 閾値は絶対値 2.0ドル のまま使用）
+    print("\n[Step 0] ラベル生成パラメータ読み込み中...")
+    pt_multiplier: float = LABEL_CONFIG["pt_multiplier"]
+    sl_multiplier: float = LABEL_CONFIG["sl_multiplier"]
+    max_hold_minutes: int = int(LABEL_CONFIG["td_minutes"])
+    min_atr_threshold: float = LABEL_CONFIG["min_atr_threshold"]
 
     print(f"  PT 倍率: {pt_multiplier} / SL 倍率: {sl_multiplier}")
     print(f"  最大保有分数: {max_hold_minutes} / ATR 閾値: {min_atr_threshold}")
@@ -396,23 +372,36 @@ def main(test_mode: bool = False) -> None:
     base_lf = base_lf.join_asof(lf_score_lf, on="timestamp", strategy="backward")
     print(f"  LF スコア ({LF_SCORE_COLS}) を backward join で結合完了")
 
-    # -----------------------------------------------------------------------
     # 3. ATR を S1_PROCESSED の OHLCV から自前計算（Wilderの平滑化 = RMA）
-    #    Engine1C の出力は相対値化されているため絶対値（ドル値）をここで算出する。
     #    TR = max(high-low, |high-prev_close|, |low-prev_close|)
-    #    ATR = ewm_mean(TR, alpha=1/period, adjust=False)  ← Wilder RMA
+    #    atr_abs: 絶対値ATR（ドル値）→ バリア価格計算に使用
+    #    atr_rel: ATR Ratio（現在ATR÷ベースラインATR）→ ATR収縮フィルターに使用
+    #             本番 realtime_feature_engine.py と同一定義
+    #             ベースライン = H1×24バー×ATR_BASELINE_DAYS の平均ATR
     #    ルール1: adjust=False で過去方向のみ参照（adjust=True は未来リーク禁止）
     # -----------------------------------------------------------------------
     print(f"\n[Step 3] ATR 算出中 (period={BARRIER_ATR_PERIOD}, Wilder RMA)...")
+    tr_expr = pl.max_horizontal(
+        pl.col("high") - pl.col("low"),
+        (pl.col("high") - pl.col("close").shift(1)).abs(),
+        (pl.col("low") - pl.col("close").shift(1)).abs(),
+    )
+    # H1固定: 1日=24バー
+    _baseline_window = 24 * ATR_BASELINE_DAYS
+    _atr_wilder = tr_expr.ewm_mean(alpha=1 / BARRIER_ATR_PERIOD, adjust=False)
     base_lf = base_lf.with_columns(
-        pl.max_horizontal(
-            pl.col("high") - pl.col("low"),
-            (pl.col("high") - pl.col("close").shift(1)).abs(),
-            (pl.col("low") - pl.col("close").shift(1)).abs(),
-        )
-        .ewm_mean(alpha=1 / BARRIER_ATR_PERIOD, adjust=False)
-        .cast(pl.Float32)
-        .alias("atr_value")
+        [
+            # atr_abs: バリア価格計算用（絶対値ドル）
+            _atr_wilder.cast(pl.Float32).alias("atr_abs"),
+            # atr_rel: ATR Ratio = 現在ATR / ベースラインATR
+            # ルール4: baseline + 1e-10 でゼロ除算防止
+            (
+                _atr_wilder
+                / (_atr_wilder.rolling_mean(window_size=_baseline_window) + 1e-10)
+            )
+            .cast(pl.Float32)
+            .alias("atr_rel"),
+        ]
     )
 
     # -----------------------------------------------------------------------
@@ -467,8 +456,8 @@ def main(test_mode: bool = False) -> None:
 
     print(f"  collect 完了: {data_df.shape[0]} 行 × {data_df.shape[1]} カラム")
 
-    # close / high / low / atr_value が存在するか確認
-    required_cols = {"timestamp", "close", "high", "low", "atr_value"}
+    # close / high / low / atr_abs / atr_rel が存在するか確認
+    required_cols = {"timestamp", "close", "high", "low", "atr_abs", "atr_rel"}
     missing = required_cols - set(data_df.columns)
     if missing:
         raise RuntimeError(f"必須カラムが不足しています: {missing}")

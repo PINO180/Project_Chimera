@@ -1,0 +1,428 @@
+2026-03-16 11:43:49,206 - INFO - Loading features from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v5.txt...
+2026-03-16 11:43:49,222 - INFO -    -> Loaded 110 valid features (filtered out V5 metadata).
+2026-03-16 11:43:49,222 - INFO - Discovering all physical partitions...
+2026-03-16 11:43:49,450 - INFO -   -> Discovered and sorted 1180 daily partitions.
+2026-03-16 11:43:49,451 - INFO - ### Script 1/3: M1 Two-Brain Cross-Validation (V5) ###
+2026-03-16 11:43:49,455 - INFO - 
+==================================================
+2026-03-16 11:43:49,455 - INFO - === Starting Pipeline for: LONG ===
+2026-03-16 11:43:49,455 - INFO - ==================================================
+2026-03-16 11:43:49,456 - INFO - Calculating scale_pos_weight for LONG (is_trigger=1)...
+Scanning long labels: 100%|██████████| 1180/1180 [01:23<00:00, 14.07it/s]
+2026-03-16 11:45:13,325 - INFO -   -> Total samples (is_trigger=1): 288398
+2026-03-16 11:45:13,326 - INFO -   -> Calculated scale_pos_weight (long): 1.1391
+2026-03-16 11:45:13,326 - INFO - --- Starting BATCH Training for M1 (LONG) ---
+2026-03-16 11:45:13,326 - INFO -   [LONG] Fold 1/5...
+  Loading Train Fold 1: 100%|██████████| 943/943 [01:23<00:00, 11.26it/s]
+2026-03-16 11:46:37,289 - INFO -     -> fitting model on 255236 samples...
+[LightGBM] [Info] Number of positive: 122105, number of negative: 133131
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.071279 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27527
+[LightGBM] [Info] Number of data points in the train set: 255236, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.450171 -> initscore=-0.199981
+[LightGBM] [Info] Start training from score -0.199981
+  Predicting Fold 1: 100%|██████████| 236/236 [00:21<00:00, 11.03it/s]
+2026-03-16 11:51:18,339 - INFO -   [LONG] Fold 2/5...
+  Loading Train Fold 2: 100%|██████████| 940/940 [01:22<00:00, 11.40it/s]
+2026-03-16 11:52:40,979 - INFO -     -> fitting model on 259198 samples...
+[LightGBM] [Info] Number of positive: 124642, number of negative: 134556
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.070840 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27561
+[LightGBM] [Info] Number of data points in the train set: 259198, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.452230 -> initscore=-0.191665
+[LightGBM] [Info] Start training from score -0.191665
+  Predicting Fold 2: 100%|██████████| 236/236 [00:21<00:00, 10.94it/s]
+2026-03-16 11:57:23,317 - INFO -   [LONG] Fold 3/5...
+  Loading Train Fold 3: 100%|██████████| 941/941 [01:22<00:00, 11.37it/s]
+2026-03-16 11:58:46,304 - INFO -     -> fitting model on 264195 samples...
+[LightGBM] [Info] Number of positive: 127429, number of negative: 136766
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.072864 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27563
+[LightGBM] [Info] Number of data points in the train set: 264195, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.454241 -> initscore=-0.183550
+[LightGBM] [Info] Start training from score -0.183550
+  Predicting Fold 3: 100%|██████████| 236/236 [00:21<00:00, 11.21it/s]
+2026-03-16 12:03:30,981 - INFO -   [LONG] Fold 4/5...
+  Loading Train Fold 4: 100%|██████████| 942/942 [01:23<00:00, 11.30it/s]
+2026-03-16 12:04:54,497 - INFO -     -> fitting model on 215491 samples...
+[LightGBM] [Info] Number of positive: 101910, number of negative: 113581
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.060391 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27588
+[LightGBM] [Info] Number of data points in the train set: 215491, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.434866 -> initscore=-0.262025
+[LightGBM] [Info] Start training from score -0.262025
+  Predicting Fold 4: 100%|██████████| 236/236 [00:23<00:00, 10.15it/s]
+2026-03-16 12:09:05,393 - INFO -   [LONG] Fold 5/5...
+  Loading Train Fold 5: 100%|██████████| 942/942 [01:22<00:00, 11.39it/s]
+2026-03-16 12:10:28,230 - INFO -     -> fitting model on 156377 samples...
+[LightGBM] [Info] Number of positive: 61925, number of negative: 94452
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.041855 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27592
+[LightGBM] [Info] Number of data points in the train set: 156377, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.383126 -> initscore=-0.476302
+[LightGBM] [Info] Start training from score -0.476302
+  Predicting Fold 5: 100%|██████████| 236/236 [00:25<00:00,  9.25it/s]
+2026-03-16 12:14:00,550 - INFO - Concatenating OOF results for long...
+2026-03-16 12:14:00,665 - INFO - Successfully saved M1 LONG OOF predictions to: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_long.parquet
+2026-03-16 12:14:00,665 - INFO -   - Total predictions saved: 288398
+2026-03-16 12:14:00,665 - INFO - 
+==================================================
+2026-03-16 12:14:00,666 - INFO - === Starting Pipeline for: SHORT ===
+2026-03-16 12:14:00,666 - INFO - ==================================================
+2026-03-16 12:14:00,666 - INFO - Calculating scale_pos_weight for SHORT (is_trigger=1)...
+Scanning short labels: 100%|██████████| 1180/1180 [01:23<00:00, 14.14it/s]
+2026-03-16 12:15:24,102 - INFO -   -> Total samples (is_trigger=1): 288398
+2026-03-16 12:15:24,103 - INFO -   -> Calculated scale_pos_weight (short): 1.1658
+2026-03-16 12:15:24,103 - INFO - --- Starting BATCH Training for M1 (SHORT) ---
+2026-03-16 12:15:24,103 - INFO -   [SHORT] Fold 1/5...
+  Loading Train Fold 1: 100%|██████████| 943/943 [01:25<00:00, 11.00it/s]
+2026-03-16 12:16:50,011 - INFO -     -> fitting model on 255236 samples...
+[LightGBM] [Info] Number of positive: 120773, number of negative: 134463
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.067879 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27527
+[LightGBM] [Info] Number of data points in the train set: 255236, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.456568 -> initscore=-0.174167
+[LightGBM] [Info] Start training from score -0.174167
+  Predicting Fold 1: 100%|██████████| 236/236 [00:21<00:00, 11.00it/s]
+2026-03-16 12:21:28,122 - INFO -   [SHORT] Fold 2/5...
+  Loading Train Fold 2: 100%|██████████| 940/940 [01:24<00:00, 11.07it/s]
+2026-03-16 12:22:53,246 - INFO -     -> fitting model on 259198 samples...
+[LightGBM] [Info] Number of positive: 123112, number of negative: 136086
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.073820 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27561
+[LightGBM] [Info] Number of data points in the train set: 259198, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.460096 -> initscore=-0.159957
+[LightGBM] [Info] Start training from score -0.159957
+  Predicting Fold 2: 100%|██████████| 236/236 [00:24<00:00,  9.65it/s]
+2026-03-16 12:27:40,326 - INFO -   [SHORT] Fold 3/5...
+  Loading Train Fold 3: 100%|██████████| 941/941 [01:29<00:00, 10.47it/s]
+2026-03-16 12:29:10,419 - INFO -     -> fitting model on 264195 samples...
+[LightGBM] [Info] Number of positive: 125438, number of negative: 138757
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.071993 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27563
+[LightGBM] [Info] Number of data points in the train set: 264195, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.460182 -> initscore=-0.159609
+[LightGBM] [Info] Start training from score -0.159609
+  Predicting Fold 3: 100%|██████████| 236/236 [00:23<00:00, 10.08it/s]
+2026-03-16 12:34:04,829 - INFO -   [SHORT] Fold 4/5...
+  Loading Train Fold 4: 100%|██████████| 942/942 [01:22<00:00, 11.48it/s]
+2026-03-16 12:35:27,041 - INFO -     -> fitting model on 215491 samples...
+[LightGBM] [Info] Number of positive: 100431, number of negative: 115060
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.057303 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27588
+[LightGBM] [Info] Number of data points in the train set: 215491, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.440982 -> initscore=-0.237177
+[LightGBM] [Info] Start training from score -0.237177
+  Predicting Fold 4: 100%|██████████| 236/236 [00:22<00:00, 10.37it/s]
+2026-03-16 12:39:38,017 - INFO -   [SHORT] Fold 5/5...
+  Loading Train Fold 5: 100%|██████████| 942/942 [01:22<00:00, 11.48it/s]
+2026-03-16 12:41:00,205 - INFO -     -> fitting model on 156377 samples...
+[LightGBM] [Info] Number of positive: 61483, number of negative: 94894
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.043967 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27592
+[LightGBM] [Info] Number of data points in the train set: 156377, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.391779 -> initscore=-0.439842
+[LightGBM] [Info] Start training from score -0.439842
+  Predicting Fold 5: 100%|██████████| 236/236 [00:25<00:00,  9.39it/s]
+2026-03-16 12:44:31,712 - INFO - Concatenating OOF results for short...
+2026-03-16 12:44:31,815 - INFO - Successfully saved M1 SHORT OOF predictions to: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_short.parquet
+2026-03-16 12:44:31,816 - INFO -   - Total predictions saved: 288398
+2026-03-16 12:44:31,816 - INFO - 
+============================================================
+2026-03-16 12:44:31,816 - INFO - ### V5 Two-Brain Training COMPLETED! ###
+2026-03-16 12:44:31,817 - INFO - ============================================================
+2026-03-16 12:44:32,438 - INFO - Discovering all physical partitions from the weighted dataset...
+2026-03-16 12:44:32,724 - INFO -   -> Discovered 1180 daily partitions.
+2026-03-16 12:44:32,725 - INFO - Loading feature list from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v5.txt...
+2026-03-16 12:44:32,742 - INFO -   -> Loaded 110 valid features.
+2026-03-16 12:44:32,743 - INFO - ### Script 2/3: Meta-Label Generation (V5 Bidirectional / Context Plus) ###
+2026-03-16 12:44:32,744 - INFO - Using dynamic sampling: Top 50% of M1 predictions per day.
+2026-03-16 12:44:32,744 - INFO - 
+============================================================
+=== Starting Meta-Label Generation for LONG ===
+============================================================
+2026-03-16 12:44:32,756 - INFO - Loading LONG M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_long.parquet...
+Generating Long Meta-Labels: 100%|██████████| 1180/1180 [01:40<00:00, 11.74it/s]
+2026-03-16 12:46:13,369 - INFO - Finished LONG -> Total samples generated: 123868
+2026-03-16 12:46:13,369 - INFO - 
+============================================================
+=== Starting Meta-Label Generation for SHORT ===
+============================================================
+2026-03-16 12:46:13,377 - INFO - Loading SHORT M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_short.parquet...
+Generating Short Meta-Labels: 100%|██████████| 1180/1180 [01:44<00:00, 11.33it/s]
+2026-03-16 12:47:57,622 - INFO - Finished SHORT -> Total samples generated: 119971
+2026-03-16 12:47:57,622 - INFO - 
+============================================================
+2026-03-16 12:47:57,622 - INFO - ### Script 2/3 FINISHED! (V5 Bidirectional Context Plus) ###
+2026-03-16 12:47:57,622 - INFO - ============================================================
+2026-03-16 12:47:59,583 - INFO - [LONG] Loading base feature list from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v5.txt...
+2026-03-16 12:47:59,590 - INFO -    -> Loaded 110 valid base features.
+
+============================================================
+### PROJECT FORGE: STARTING PROCESSING FOR DIRECTION: LONG ###
+============================================================
+
+[LONG] Scale weight (M1): 100%|██████████| 1180/1180 [01:41<00:00, 11.63it/s]
+2026-03-16 12:49:48,942 - INFO - [LONG] Using scale_pos_weight for M1: 1.1391
+[LONG] Scale weight (M2): 100%|██████████| 1007/1007 [01:23<00:00, 12.12it/s]
+2026-03-16 12:51:12,021 - INFO - [LONG] Using scale_pos_weight for M2: 0.3584
+2026-03-16 12:51:12,021 - INFO - [LONG] ### Script 3/3: M2 CV, Final Training, Calibration, and Reporting ###
+2026-03-16 12:51:12,031 - INFO - [LONG] --- Starting BATCH Training for M2 (Meta) CV ---
+2026-03-16 12:51:12,031 - INFO - [LONG]  [M2 (Meta)] Fold 1/5...
+[LONG]  Loading M2 Train Fold 1: 100%|██████████| 805/805 [01:10<00:00, 11.42it/s]
+2026-03-16 12:52:22,621 - INFO - [LONG]    -> Training M2 model on 112570 samples...
+[LightGBM] [Info] Number of positive: 82990, number of negative: 29580
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.033268 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27614
+[LightGBM] [Info] Number of data points in the train set: 112570, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.743953 -> initscore=1.066618
+[LightGBM] [Info] Start training from score 1.066618
+[LONG]  Predicting M2 Fold 1: 100%|██████████| 201/201 [00:25<00:00,  7.89it/s]
+2026-03-16 12:55:11,452 - INFO - [LONG]  [M2 (Meta)] Fold 2/5...
+[LONG]  Loading M2 Train Fold 2: 100%|██████████| 802/802 [01:11<00:00, 11.28it/s]
+2026-03-16 12:56:22,691 - INFO - [LONG]    -> Training M2 model on 115302 samples...
+[LightGBM] [Info] Number of positive: 85012, number of negative: 30290
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.034171 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27609
+[LightGBM] [Info] Number of data points in the train set: 115302, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.742579 -> initscore=1.059414
+[LightGBM] [Info] Start training from score 1.059414
+[LONG]  Predicting M2 Fold 2: 100%|██████████| 201/201 [00:23<00:00,  8.46it/s]
+2026-03-16 12:59:12,943 - INFO - [LONG]  [M2 (Meta)] Fold 3/5...
+[LONG]  Loading M2 Train Fold 3: 100%|██████████| 803/803 [01:13<00:00, 10.87it/s]
+2026-03-16 13:00:26,929 - INFO - [LONG]    -> Training M2 model on 115753 samples...
+[LightGBM] [Info] Number of positive: 85506, number of negative: 30247
+[LightGBM] [Info] Auto-choosing col-wise multi-threading, the overhead of testing was 0.113865 seconds.
+You can set `force_col_wise=true` to remove the overhead.
+[LightGBM] [Info] Total Bins 27644
+[LightGBM] [Info] Number of data points in the train set: 115753, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.746377 -> initscore=1.079380
+[LightGBM] [Info] Start training from score 1.079380
+[LONG]  Predicting M2 Fold 3: 100%|██████████| 201/201 [00:24<00:00,  8.36it/s]
+2026-03-16 13:03:42,628 - INFO - [LONG]  [M2 (Meta)] Fold 4/5...
+[LONG]  Loading M2 Train Fold 4: 100%|██████████| 803/803 [01:08<00:00, 11.70it/s]
+2026-03-16 13:04:51,410 - INFO - [LONG]    -> Training M2 model on 91732 samples...
+[LightGBM] [Info] Number of positive: 68578, number of negative: 23154
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.026816 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27489
+[LightGBM] [Info] Number of data points in the train set: 91732, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.752874 -> initscore=1.114000
+[LightGBM] [Info] Start training from score 1.114000
+[LONG]  Predicting M2 Fold 4: 100%|██████████| 201/201 [00:25<00:00,  7.84it/s]
+2026-03-16 13:07:25,057 - INFO - [LONG]  [M2 (Meta)] Fold 5/5...
+[LONG]  Loading M2 Train Fold 5: 100%|██████████| 801/801 [01:13<00:00, 10.93it/s]
+2026-03-16 13:08:38,507 - INFO - [LONG]    -> Training M2 model on 58450 samples...
+[LightGBM] [Info] Number of positive: 41495, number of negative: 16955
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.016675 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27711
+[LightGBM] [Info] Number of data points in the train set: 58450, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.730638 -> initscore=0.997863
+[LightGBM] [Info] Start training from score 0.997863
+[LONG]  Predicting M2 Fold 5: 100%|██████████| 203/203 [00:24<00:00,  8.13it/s]
+2026-03-16 13:10:47,399 - INFO - [LONG] --- Training and Calibrating Final Models ---
+2026-03-16 13:10:47,402 - INFO - [LONG]   - Training M1 (Final) on 944 partitions (BATCH Mode)...
+[LONG]   Loading Data for M1 (Final): 100%|██████████| 944/944 [01:26<00:00, 10.92it/s]
+2026-03-16 13:12:13,971 - INFO - [LONG]     -> fitting M1 (Final) on 156712 samples...
+2026-03-16 13:15:22,431 - INFO - [LONG]   -> M1 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_model_v2_long.pkl.
+2026-03-16 13:15:22,435 - INFO - [LONG]   - Training M2 (Final) on 805 partitions (BATCH Mode)...
+[LightGBM] [Info] Number of positive: 62081, number of negative: 94631
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.042957 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27593
+[LightGBM] [Info] Number of data points in the train set: 156712, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.383363 -> initscore=-0.475298
+[LightGBM] [Info] Start training from score -0.475298
+[LONG]   Loading Data for M2 (Final): 100%|██████████| 805/805 [01:07<00:00, 11.97it/s]
+2026-03-16 13:16:29,778 - INFO - [LONG]     -> fitting M2 (Final) on 59094 samples...
+2026-03-16 13:18:14,261 - INFO - [LONG]   -> M2 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_model_v2_long.pkl.
+2026-03-16 13:18:14,261 - INFO - [LONG]   - Calibrating models (Manual, Memory-Safe Mode)...
+2026-03-16 13:18:14,265 - INFO - [LONG]     -> Calibrating M1 model...
+[LightGBM] [Info] Number of positive: 41922, number of negative: 17172
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.016653 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27714
+[LightGBM] [Info] Number of data points in the train set: 59094, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.730286 -> initscore=0.996077
+[LightGBM] [Info] Start training from score 0.996077
+[LONG]   Gathering M1 calib predictions: 100%|██████████| 236/236 [00:26<00:00,  8.77it/s]
+2026-03-16 13:18:41,195 - INFO - [LONG]   -> Calibrated M1 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_calibrated_v2_long.pkl.
+2026-03-16 13:18:41,199 - INFO - [LONG]     -> Calibrating M2 model...
+[LONG]   Gathering M2 calib predictions: 100%|██████████| 202/202 [00:19<00:00, 10.11it/s]
+2026-03-16 13:19:01,193 - INFO - [LONG]   -> Calibrated M2 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_calibrated_v2_long.pkl.
+2026-03-16 13:19:01,200 - INFO - [LONG] Aggregating M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_long...
+2026-03-16 13:19:17,990 - INFO - [LONG] Successfully aggregated 123868 M2 OOF predictions into: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_long.parquet
+2026-03-16 13:19:17,995 - INFO - [LONG] --- Generating Final Performance Report ---
+2026-03-16 13:19:17,997 - INFO - [LONG]   -> Loading M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_long.parquet...
+2026-03-16 13:19:18,143 - INFO - [LONG]   -> M1 AUC calculated.
+2026-03-16 13:19:18,148 - INFO - [LONG]   -> Loading aggregated M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_long.parquet...
+2026-03-16 13:19:18,213 - INFO - [LONG]   -> M2 AUC calculated.
+2026-03-16 13:19:18,225 - INFO - [LONG] Performance report saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/model_performance_report_long.json
+2026-03-16 13:19:18,228 - INFO - [LONG] Cleaning up temporary directory: /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_long
+2026-03-16 13:19:21,980 - INFO - [SHORT] Loading base feature list from /workspace/data/XAUUSD/stratum_3_artifacts/1A_2B/train_12m_val_6m/final_feature_set_v5.txt...
+2026-03-16 13:19:21,984 - INFO -    -> Loaded 110 valid base features.
+
+[LONG] Performance Report:
+{
+    "m1_performance": {
+        "auc": 0.8361835513555411
+    },
+    "m2_performance": {
+        "auc": 0.6772032972723047
+    }
+}
+
+============================================================
+### PROJECT FORGE: STARTING PROCESSING FOR DIRECTION: SHORT ###
+============================================================
+
+[SHORT] Scale weight (M1): 100%|██████████| 1180/1180 [01:42<00:00, 11.53it/s]
+2026-03-16 13:21:12,416 - INFO - [SHORT] Using scale_pos_weight for M1: 1.1658
+[SHORT] Scale weight (M2): 100%|██████████| 1020/1020 [01:21<00:00, 12.52it/s]
+2026-03-16 13:22:33,889 - INFO - [SHORT] Using scale_pos_weight for M2: 0.3503
+2026-03-16 13:22:33,890 - INFO - [SHORT] ### Script 3/3: M2 CV, Final Training, Calibration, and Reporting ###
+2026-03-16 13:22:33,897 - INFO - [SHORT] --- Starting BATCH Training for M2 (Meta) CV ---
+2026-03-16 13:22:33,897 - INFO - [SHORT]  [M2 (Meta)] Fold 1/5...
+[SHORT]  Loading M2 Train Fold 1: 100%|██████████| 815/815 [01:13<00:00, 11.02it/s]
+2026-03-16 13:23:47,967 - INFO - [SHORT]    -> Training M2 model on 107883 samples...
+[LightGBM] [Info] Number of positive: 80369, number of negative: 27514
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.031631 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27598
+[LightGBM] [Info] Number of data points in the train set: 107883, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.754917 -> initscore=1.125010
+[LightGBM] [Info] Start training from score 1.125010
+[SHORT]  Predicting M2 Fold 1: 100%|██████████| 204/204 [00:23<00:00,  8.75it/s]
+2026-03-16 13:26:29,482 - INFO - [SHORT]  [M2 (Meta)] Fold 2/5...
+[SHORT]  Loading M2 Train Fold 2: 100%|██████████| 814/814 [01:08<00:00, 11.95it/s]
+2026-03-16 13:27:37,712 - INFO - [SHORT]    -> Training M2 model on 111297 samples...
+[LightGBM] [Info] Number of positive: 82646, number of negative: 28651
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.031327 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27604
+[LightGBM] [Info] Number of data points in the train set: 111297, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.753147 -> initscore=1.115467
+[LightGBM] [Info] Start training from score 1.115467
+[SHORT]  Predicting M2 Fold 2: 100%|██████████| 204/204 [00:24<00:00,  8.41it/s]
+2026-03-16 13:30:23,949 - INFO - [SHORT]  [M2 (Meta)] Fold 3/5...
+[SHORT]  Loading M2 Train Fold 3: 100%|██████████| 813/813 [01:08<00:00, 11.93it/s]
+2026-03-16 13:31:32,190 - INFO - [SHORT]    -> Training M2 model on 112130 samples...
+[LightGBM] [Info] Number of positive: 83186, number of negative: 28944
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.031840 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27663
+[LightGBM] [Info] Number of data points in the train set: 112130, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.752526 -> initscore=1.112129
+[LightGBM] [Info] Start training from score 1.112129
+[SHORT]  Predicting M2 Fold 3: 100%|██████████| 204/204 [00:24<00:00,  8.19it/s]
+2026-03-16 13:34:19,669 - INFO - [SHORT]  [M2 (Meta)] Fold 4/5...
+[SHORT]  Loading M2 Train Fold 4: 100%|██████████| 813/813 [01:11<00:00, 11.35it/s]
+2026-03-16 13:35:31,380 - INFO - [SHORT]    -> Training M2 model on 88551 samples...
+[LightGBM] [Info] Number of positive: 65870, number of negative: 22681
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.025064 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27531
+[LightGBM] [Info] Number of data points in the train set: 88551, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.753280 -> initscore=1.116185
+[LightGBM] [Info] Start training from score 1.116185
+[SHORT]  Predicting M2 Fold 4: 100%|██████████| 204/204 [00:28<00:00,  7.08it/s]
+2026-03-16 13:38:14,709 - INFO - [SHORT]  [M2 (Meta)] Fold 5/5...
+[SHORT]  Loading M2 Train Fold 5: 100%|██████████| 815/815 [01:15<00:00, 10.77it/s]
+2026-03-16 13:39:30,505 - INFO - [SHORT]    -> Training M2 model on 58954 samples...
+[LightGBM] [Info] Number of positive: 42527, number of negative: 16427
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.018140 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27708
+[LightGBM] [Info] Number of data points in the train set: 58954, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.741813 -> initscore=1.055411
+[LightGBM] [Info] Start training from score 1.055411
+[SHORT]  Predicting M2 Fold 5: 100%|██████████| 204/204 [00:28<00:00,  7.19it/s]
+2026-03-16 13:41:47,083 - INFO - [SHORT] --- Training and Calibrating Final Models ---
+2026-03-16 13:41:47,087 - INFO - [SHORT]   - Training M1 (Final) on 944 partitions (BATCH Mode)...
+[SHORT]   Loading Data for M1 (Final): 100%|██████████| 944/944 [01:29<00:00, 10.56it/s]
+2026-03-16 13:43:16,643 - INFO - [SHORT]     -> fitting M1 (Final) on 156712 samples...
+2026-03-16 13:46:25,014 - INFO - [SHORT]   -> M1 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_model_v2_short.pkl.
+2026-03-16 13:46:25,018 - INFO - [SHORT]   - Training M2 (Final) on 816 partitions (BATCH Mode)...
+[LightGBM] [Info] Number of positive: 61645, number of negative: 95067
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.042648 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27593
+[LightGBM] [Info] Number of data points in the train set: 156712, number of used features: 110
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.391985 -> initscore=-0.438976
+[LightGBM] [Info] Start training from score -0.438976
+[SHORT]   Loading Data for M2 (Final): 100%|██████████| 816/816 [01:12<00:00, 11.33it/s]
+2026-03-16 13:47:37,140 - INFO - [SHORT]     -> fitting M2 (Final) on 58996 samples...
+2026-03-16 13:49:19,208 - INFO - [SHORT]   -> M2 model saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_model_v2_short.pkl.
+2026-03-16 13:49:19,208 - INFO - [SHORT]   - Calibrating models (Manual, Memory-Safe Mode)...
+2026-03-16 13:49:19,211 - INFO - [SHORT]     -> Calibrating M1 model...
+[LightGBM] [Info] Number of positive: 42557, number of negative: 16439
+[LightGBM] [Info] Auto-choosing row-wise multi-threading, the overhead of testing was 0.016424 seconds.
+You can set `force_row_wise=true` to remove the overhead.
+And if memory is not enough, you can set `force_col_wise=true`.
+[LightGBM] [Info] Total Bins 27710
+[LightGBM] [Info] Number of data points in the train set: 58996, number of used features: 111
+[LightGBM] [Info] [binary:BoostFromScore]: pavg=0.741835 -> initscore=1.055527
+[LightGBM] [Info] Start training from score 1.055527
+[SHORT]   Gathering M1 calib predictions: 100%|██████████| 236/236 [00:27<00:00,  8.66it/s]
+2026-03-16 13:49:46,492 - INFO - [SHORT]   -> Calibrated M1 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_calibrated_v2_short.pkl.
+2026-03-16 13:49:46,494 - INFO - [SHORT]     -> Calibrating M2 model...
+[SHORT]   Gathering M2 calib predictions: 100%|██████████| 204/204 [00:20<00:00, 10.00it/s]
+2026-03-16 13:50:06,915 - INFO - [SHORT]   -> Calibrated M2 (IsotonicRegressor) saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_calibrated_v2_short.pkl.
+2026-03-16 13:50:06,923 - INFO - [SHORT] Aggregating M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_short...
+2026-03-16 13:50:24,273 - INFO - [SHORT] Successfully aggregated 119971 M2 OOF predictions into: /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_short.parquet
+2026-03-16 13:50:24,277 - INFO - [SHORT] --- Generating Final Performance Report ---
+2026-03-16 13:50:24,280 - INFO - [SHORT]   -> Loading M1 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m1_oof_predictions_short.parquet...
+2026-03-16 13:50:24,417 - INFO - [SHORT]   -> M1 AUC calculated.
+2026-03-16 13:50:24,422 - INFO - [SHORT]   -> Loading aggregated M2 OOF predictions from /workspace/data/XAUUSD/stratum_7_models/1A_2B/m2_oof_predictions_short.parquet...
+2026-03-16 13:50:24,486 - INFO - [SHORT]   -> M2 AUC calculated.
+2026-03-16 13:50:24,498 - INFO - [SHORT] Performance report saved to /workspace/data/XAUUSD/stratum_7_models/1A_2B/model_performance_report_short.json
+2026-03-16 13:50:24,502 - INFO - [SHORT] Cleaning up temporary directory: /workspace/data/XAUUSD/stratum_7_models/1A_2B/tmp_m2_oof_predictions_short
+2026-03-16 13:50:28,434 - INFO - 
+============================================================
+### PROJECT FORGE: ALL STAGES (LONG & SHORT) COMPLETED! ###
+============================================================
+
+[SHORT] Performance Report:
+{
+    "m1_performance": {
+        "auc": 0.8432697803228797
+    },
+    "m2_performance": {
+        "auc": 0.6854028713511233
+    }
+}

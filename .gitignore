@@ -4,6 +4,7 @@
 data/
 
 # --------ALL REUNION/
+# --------ALL REUNION2/
 
 # VS Codeのワークスペース設定を無視します
 .vscode/
@@ -34,3 +35,10 @@ __pycache__/
 
 # ================== logs ==================
 echo "logs/" >> .gitignore
+
+*.tar.gz
+*.zip
+*.db
+*.duckdb
+duckdb_temp/
+.tmp/

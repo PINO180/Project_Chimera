@@ -92,7 +92,9 @@ ALL_TIMEFRAMES = {
 }
 
 # --- グローバルキャッシュ ---
-g_last_processed_bar_time: Optional[int] = None  # M1ループの最終処理時刻
+g_last_processed_bar_time: Optional[int] = (
+    None  # ループの最終処理時刻（廃止予定・後方互換のため残す）
+)
 g_market_proxy: Optional[pd.DataFrame] = (
     None  # M5リターン (アルファ純化用) [Pandasに事前変換済み]
 )
@@ -100,6 +102,11 @@ g_market_proxy: Optional[pd.DataFrame] = (
 # 🚨 Project Cimera (V5) 戦略パラメータ 🚨
 # ==================================================================
 risk_engine = ExtremeRiskEngineV5(config_path=str(config.CONFIG_RISK))
+# 【未使用グローバル変数・参照禁止】
+# 以下の値はループ内で risk_engine.config.get() により都度読み直されるため
+# この変数は実際の発注判定では使われていない。
+# ホットリロード（risk_config.jsonの動的反映）に対応するための設計上、
+# グローバルへのキャッシュは意図的に使用しない。
 M2_PROBA_THRESHOLD = risk_engine.config.get("m2_proba_threshold", 0.70)
 MAX_DRAWDOWN = risk_engine.config.get("max_drawdown", 0.50)
 MAX_POSITIONS = risk_engine.config.get("max_positions", 1000)
@@ -141,61 +148,60 @@ def initialize_data_buffer(
     M1データの量を動的に計算してリクエストする。
     """
     logger.info(
-        "ZMQ経由で全時間足の履歴データを取得中 (V11.0: M1 Only / Zero-Serialization)..."
+        "ZMQ経由で全時間足の履歴データを取得中 (V12.0: M0.5 起点 / Zero-Serialization)..."
     )
 
     history_data_map = {}
 
-    # 1. M1データのみをリクエストする
-    tf_name = "M1"
+    # 1. M0.5（30秒足）データをリクエストする
+    # [V12.0] M0.5が最細粒度のためここを起点とし、Python側でM1以上を全てリサンプリングする
+    tf_name = "M0.5"
 
-    # 2. 必要なM1本数を計算 (動的算出)
-    # エンジンの要求する最大ルックバック期間を M1 本数に換算する
-    max_m1_bars_needed = 0
+    # 2. 必要なM0.5本数を計算 (動的算出)
+    # エンジンの要求する最大ルックバック期間を M0.5 本数に換算する
+    max_m05_bars_needed = 0
 
-    # エンジンの定数定義を利用して上位足の必要期間をM1換算する
-    # (例: D1でLookback 200の場合 -> 200 * 1440 = 288,000本必要)
+    # エンジンの定数定義を利用して上位足の必要期間をM0.5換算する
     for tf_key, lookback_val in engine.lookbacks_by_tf.items():
         # 分数換算 (ALL_TIMEFRAMESの値を使用)
         minutes_per_bar = engine.ALL_TIMEFRAMES.get(tf_key)
         if minutes_per_bar is None:
             continue  # tickなどはスキップ
 
-        # 必要なM1本数 = 上位足のLookback * その足の分数
-        total_m1_needed = lookback_val * minutes_per_bar
+        # 必要なM0.5本数 = 上位足のLookback * その足の分数 * 2（M0.5はM1の2倍の本数）
+        total_m05_needed = lookback_val * minutes_per_bar * 2
 
-        if total_m1_needed > max_m1_bars_needed:
-            max_m1_bars_needed = total_m1_needed
+        if total_m05_needed > max_m05_bars_needed:
+            max_m05_bars_needed = total_m05_needed
 
-    # D1のOLS学習サンプルを十分確保するため最低ラインを200,000本に引き上げ
-    # D1: 200,000 / 1440 ≈ 138本 → OLS2016サンプルには届かないが実用上許容範囲
-    lookback = max(200000, max_m1_bars_needed + 5000)
+    # M0.5換算800,000本を最低ラインに設定（稼働率約71%を考慮してH1=4,132本をカバー）
+    lookback = max(800000, max_m05_bars_needed + 10000)
 
     logger.info(
-        f"  -> {tf_name} の履歴データを {lookback} 本取得中 (Engine要求: {max_m1_bars_needed} M1 bars)..."
+        f"  -> {tf_name} の履歴データを {lookback} 本取得中 (Engine要求: {max_m05_bars_needed} M0.5 bars)..."
     )
 
-    # ✨ [V11.0] ZMQ リクエスト (PULLによるストリーミング受信)
-    df_rates_m1 = bridge.request_historical_data(
+    # ✨ [V12.0] ZMQ リクエスト (PULLによるストリーミング受信)
+    df_rates_m05 = bridge.request_historical_data(
         symbol=STRATEGY_SYMBOL,
         timeframe_name=tf_name,
         lookback_bars=lookback,
     )
 
-    if df_rates_m1 is None or len(df_rates_m1) == 0:
+    if df_rates_m05 is None or len(df_rates_m05) == 0:
         logger.error(
             f"ZMQ {tf_name} 履歴データの取得に失敗しました。起動を中止します。"
         )
         return False
 
-    # ▼▼▼ 修正: M1履歴データから市場プロキシ(M5)を動的生成 ▼▼▼
+    # ▼▼▼ M0.5履歴データから市場プロキシ(M5)を動的生成 ▼▼▼
     global g_market_proxy
-    logger.info("  -> 取得したM1履歴データから初期の市場プロキシ(M5)を動的生成中...")
+    logger.info("  -> 取得したM0.5履歴データから初期の市場プロキシ(M5)を動的生成中...")
     try:
-        temp_df = df_rates_m1[["timestamp", "close"]].copy()
+        temp_df = df_rates_m05[["timestamp", "close"]].copy()
         temp_df.set_index("timestamp", inplace=True)
 
-        # M1をM5にリサンプリング(5分ごとの終値)し、リターンを計算
+        # M0.5をM5にリサンプリング(5分ごとの終値)し、リターンを計算
         m5_close = (
             temp_df["close"]
             .resample("5min", label="right", closed="right")
@@ -221,67 +227,26 @@ def initialize_data_buffer(
         )
     # ▲▲▲ ここまで修正 ▲▲▲
 
-    # 3. history_data_map には M1 だけを格納
-    history_data_map[tf_name] = df_rates_m1
-
-    # (M3, M5, M8, H6, H12, D1, W1, MN のリクエストは一切行わない)
+    # 3. history_data_map には M0.5 を格納（fill_all_buffersがここを起点にリサンプリング）
+    history_data_map[tf_name] = df_rates_m05
 
     # エンジンに全履歴データを一括で渡す
-    # [修正] market_proxy_cache ではなく、たった今動的生成した g_market_proxy を渡す
     engine.fill_all_buffers(history_data_map, g_market_proxy)
 
-    # M1ループの開始時刻をセット
+    # M1ループの開始時刻をセット（リアルタイム監視はM1バー確定を継続使用）
     global g_last_processed_bar_time
-    if len(history_data_map["M1"]) > 0:
+    if len(history_data_map["M0.5"]) > 0:
         g_last_processed_bar_time = int(
-            history_data_map["M1"]["timestamp"].iloc[-1].timestamp()
+            history_data_map["M0.5"]["timestamp"].iloc[-1].timestamp()
         )
         logger.info(
             f"M1ループの最終処理時刻: {datetime.fromtimestamp(g_last_processed_bar_time, timezone.utc)}"
         )
     else:
-        logger.warning("M1データが空のため、最終処理時刻を現在時刻に設定します。")
+        logger.warning("M0.5データが空のため、最終処理時刻を現在時刻に設定します。")
         g_last_processed_bar_time = int(time.time())
 
     return True
-
-
-def get_latest_m1_bar(bridge: MQL5BridgePublisherV3) -> Optional[Dict[str, Any]]:
-    """
-    [V11.0 修正]
-    ZMQ経由で ProjectForgeReceiver.mq5 から「M1」の新しい確定足ができたか確認する。
-    """
-    global g_last_processed_bar_time
-
-    # ▼▼▼ 追加: 時刻が None のまま突入してきたら強制的に 0 にしてエラーを回避 ▼▼▼
-    if g_last_processed_bar_time is None:
-        g_last_processed_bar_time = 0
-    # ▲▲▲ ここまで追加 ▲▲▲
-
-    # ✨ ZMQ リクエストを送信
-    bar = bridge.request_latest_m1_bar(symbol=STRATEGY_SYMBOL)
-
-    if bar is None:
-        return None
-
-    # bar["time"] は Unix timestamp (int)、bar["timestamp"] は datetime
-    if bar.get("time", 0) > g_last_processed_bar_time:
-        g_last_processed_bar_time = bar["time"]  # 最終処理時刻を更新
-        bar_time_dt = datetime.fromtimestamp(bar["time"], timezone.utc)
-        logger.debug(f"新しいM1バーを検出: {bar_time_dt}")
-
-        return {
-            "timestamp": bar_time_dt,
-            "open": bar["open"],
-            "high": bar["high"],
-            "low": bar["low"],
-            "close": bar["close"],
-            "volume": float(bar["volume"]),
-            "tick_volume_mean_5": float(bar.get("tick_volume_mean_5", 0.0)),
-            "spread": float(bar.get("spread", 16.0)),  # ▼追加: MT5からスプレッドを取得
-        }
-    else:
-        return None
 
 
 # [V11.1] get_correct_d1_context 関数は廃止されました
@@ -437,6 +402,7 @@ def main():
         #   → D1・H4・W1・MNバッファが誤生成され ZMQ を長時間占有するボトルネックの原因だった。
         # 新: orthogonal_v5 の 4ファイル和集合 (1465件・HF時間足のみ) を一時ファイルに書き出して渡す。
         import tempfile, itertools
+
         _orth_dir = config.S3_SELECTED_FEATURES_ORTHOGONAL_DIR
         _orth_files = [
             _orth_dir / "m1_long_features.txt",
@@ -462,9 +428,7 @@ def main():
             f" -> {_tmp_feature_list.name}"
         )
 
-        feature_engine = RealtimeFeatureEngine(
-            feature_list_path=_tmp_feature_list.name
-        )
+        feature_engine = RealtimeFeatureEngine(feature_list_path=_tmp_feature_list.name)
 
         # ▼▼▼ 修正: スナップショットからの爆速復帰と差分取得 ▼▼▼
         state_file = config.STATE_CHECKPOINT_DIR / "feature_engine_state.pkl"
@@ -487,63 +451,64 @@ def main():
 
                         if diff_minutes > 0:
                             logger.info(
-                                f"  -> 停止していた {diff_minutes} 分の差分データをM1履歴から取得して穴埋めします..."
+                                f"  -> 停止していた {diff_minutes} 分の差分データをM0.5(tick→resample)で取得して穴埋めします..."
                             )
-                            # 余裕を持たせて diff_minutes + 10 本を取得
+                            # M0.5は30秒足なので diff_minutes × 2 本 + 余裕
                             diff_df = bridge.request_historical_data(
                                 symbol=STRATEGY_SYMBOL,
-                                timeframe_name="M1",
-                                lookback_bars=diff_minutes + 10,
+                                timeframe_name="M0.5",
+                                lookback_bars=diff_minutes * 2 + 60,
                             )
                             if diff_df is not None and len(diff_df) > 0:
-                                # まだ処理していない新しいバーだけを抽出してエンジンに流し込む
-                                new_bars = diff_df[
+                                # まだ処理していない新しいM0.5バーだけを抽出
+                                new_m05_bars = diff_df[
                                     diff_df["timestamp"]
                                     > datetime.fromtimestamp(
                                         g_last_processed_bar_time, timezone.utc
                                     )
                                 ]
-                                for _, row in new_bars.iterrows():
-                                    bar_dict = {
-                                        "timestamp": row["timestamp"],
-                                        "open": row["open"],
-                                        "high": row["high"],
-                                        "low": row["low"],
-                                        "close": row["close"],
-                                        "volume": float(row["volume"]),
-                                        "spread": 16.0,  # 過去の差分なので固定値で代用
-                                    }
-                                    # プロキシの更新
-                                    past_close = feature_engine.m1_dataframe[-25][
-                                        "close"
-                                    ]
-                                    new_proxy_val = (
-                                        bar_dict["close"] - past_close
-                                    ) / past_close
-                                    new_proxy_df = pd.DataFrame(
-                                        {"market_proxy": [new_proxy_val]},
-                                        index=pd.DatetimeIndex(
-                                            [bar_dict["timestamp"]], tz="UTC"
-                                        ),
-                                    )
-                                    # ▼▼▼ FutureWarning対策: 空の場合はconcatせずに代入 ▼▼▼
-                                    if g_market_proxy.empty:
-                                        g_market_proxy = new_proxy_df
-                                    else:
-                                        g_market_proxy = pd.concat(
-                                            [g_market_proxy, new_proxy_df]
-                                        )
-                                    # ▲▲▲ ここまで修正 ▲▲▲
+                                # M0.5バーを直接エンジンに流し込む
+                                if not new_m05_bars.empty:
+                                    new_m05_bars = new_m05_bars.reset_index()
+                                    for _, row in new_m05_bars.iterrows():
+                                        bar_dict = {
+                                            "timestamp": row["timestamp"],
+                                            "open": row["open"],
+                                            "high": row["high"],
+                                            "low": row["low"],
+                                            "close": row["close"],
+                                            "volume": float(row["volume"]),
+                                            "spread": 16.0,
+                                        }
+                                        if len(feature_engine.m1_dataframe) >= 25:
+                                            past_close = feature_engine.m1_dataframe[
+                                                -25
+                                            ]["close"]
+                                            new_proxy_val = (
+                                                bar_dict["close"] - past_close
+                                            ) / past_close
+                                            new_proxy_df = pd.DataFrame(
+                                                {"market_proxy": [new_proxy_val]},
+                                                index=pd.DatetimeIndex(
+                                                    [bar_dict["timestamp"]], tz="UTC"
+                                                ),
+                                            )
+                                            if g_market_proxy.empty:
+                                                g_market_proxy = new_proxy_df
+                                            else:
+                                                g_market_proxy = pd.concat(
+                                                    [g_market_proxy, new_proxy_df]
+                                                )
 
-                                    feature_engine.process_new_m1_bar(
-                                        bar_dict, g_market_proxy
-                                    )
-                                    g_last_processed_bar_time = int(
-                                        row["timestamp"].timestamp()
-                                    )
+                                        feature_engine.process_new_m05_bar(
+                                            bar_dict, g_market_proxy
+                                        )
+                                        g_last_processed_bar_time = int(
+                                            row["timestamp"].timestamp()
+                                        )
 
                                 logger.info(
-                                    f"✓ 差分 {len(new_bars)} 本の追いつき計算が完了しました！完全に同期しています。"
+                                    f"✓ 差分 {len(new_m05_bars)} 本(M0.5換算)の追いつき計算が完了しました！完全に同期しています。"
                                 )
 
                             # ▼▼▼ 追加: 穴埋め完了直後に確実にセーブする ▼▼▼
@@ -575,7 +540,7 @@ def main():
                 raise RuntimeError("特徴量エンジンのマルチバッファ充填に失敗しました。")
         # ▲▲▲ ここまで修正 ▲▲▲
 
-        # --- 7. リアルタイム取引ループ開始 (M1ループ) ---
+        # --- 7. リアルタイム取引ループ開始 (M3イベント駆動ループ) ---
         logger.info("=" * 60)
         logger.info(f"🚀 リアルタイム取引ループ開始 ")
         logger.info("=" * 60)
@@ -587,9 +552,14 @@ def main():
 
         while True:
             try:
-                # ▼▼▼ 追加: 15分間隔でスナップショットを強制保存 ▼▼▼
+                # M3確定通知をポーリング（最大1秒待機）
+                new_m05_bar = bridge.poll_m3_bar(timeout_ms=100)
+
+                # 毎秒実行される定期処理
                 current_time_sec = time.time()
-                if current_time_sec - last_snapshot_time > 900:  # 900秒 = 15分
+
+                # 15分間隔でスナップショットを強制保存
+                if current_time_sec - last_snapshot_time > 900:
                     if feature_engine:
                         state_file = (
                             config.STATE_CHECKPOINT_DIR / "feature_engine_state.pkl"
@@ -599,9 +569,8 @@ def main():
                             "💾 [定期保存] 特徴量エンジンの状態をスナップショットに保存しました。"
                         )
                     last_snapshot_time = current_time_sec
-                # ▲▲▲ ここまで追加 ▲▲▲
 
-                # ▼追加: 毎ループ、設定ファイル(risk_config.json)の更新日時をチェック
+                # 設定ファイル(risk_config.json)の更新日時をチェック
                 current_mtime = os.path.getmtime(config.CONFIG_RISK)
                 if current_mtime > last_config_mtime:
                     logger.info(
@@ -611,6 +580,7 @@ def main():
                         config_path=str(config.CONFIG_RISK)
                     )
                     last_config_mtime = current_mtime
+
                 # ==========================================================
                 # 【シミュレーター完全同期 1】 タイムアウト(TO)決済の監視と実行
                 # ==========================================================
@@ -618,24 +588,17 @@ def main():
                 if state_manager and state_manager.current_state:
                     for trade in state_manager.current_state.trades:
                         duration_mins = trade.get_duration_minutes(current_time)
-
-                        # ▼▼▼ 修正: Optunaの最強パラメータ(Mixed)に準拠 ▼▼▼
                         is_timeout = False
-                        # コンフィグから個別のTO時間を取得 (デフォルト60.0)
-                        td_long = risk_engine.config.get("td_minutes_long", 60.0)
-                        td_short = risk_engine.config.get("td_minutes_short", 60.0)
-
+                        td_long = risk_engine.config.get("td_minutes_long", 30.0)
+                        td_short = risk_engine.config.get("td_minutes_short", 30.0)
                         if trade.direction == "BUY" and duration_mins >= td_long:
                             is_timeout = True
                         elif trade.direction == "SELL" and duration_mins >= td_short:
                             is_timeout = True
-
                         if is_timeout:
                             logger.info(
                                 f"⏱️ タイムアウト(TO)条件到達。強制決済を実行: Ticket={trade.ticket}, Direction={trade.direction}, Duration={duration_mins:.1f}分"
                             )
-                            # ZMQで単一ポジションの決済コマンドを送信
-                            # ▼▼▼ 修正: 幽霊ポジション・無限ループの防止 ▼▼▼
                             success = bridge.send_trade_command(
                                 {
                                     "action": "CLOSE",
@@ -643,9 +606,7 @@ def main():
                                     "magic": 77777,
                                 }
                             )
-
                             if success:
-                                # 送信成功時のみローカル状態を更新
                                 event_data = {
                                     "ticket": trade.ticket,
                                     "close_reason": "TO",
@@ -653,7 +614,7 @@ def main():
                                         "max_consecutive_sl", 2
                                     ),
                                     "cooldown_minutes_after_sl": risk_engine.config.get(
-                                        "cooldown_minutes_after_sl", 10
+                                        "cooldown_minutes_after_sl", 30
                                     ),
                                 }
                                 state_manager.apply_event_and_update(
@@ -663,18 +624,15 @@ def main():
                                 logger.warning(
                                     f"⚠️ タイムアウト決済コマンドの送信に失敗しました。次ループで再試行します: Ticket={trade.ticket}"
                                 )
-                            # ▲▲▲ ここまで修正 ▲▲▲
 
                 # ==========================================================
                 # 【シミュレーター完全同期 2】 サイレント・クローズ(SL/PT)の確実な捕捉
                 # ==========================================================
-                # ※ MQL5側 (ProjectForgeReceiver.mq5) に request_recent_history() を実装する前提
                 if hasattr(bridge, "request_recent_history"):
                     recent_history = bridge.request_recent_history()
                     if recent_history:
                         for closed_pos in recent_history:
                             ticket = closed_pos.get("ticket")
-                            # ローカルでまだActiveとして認識されているポジションが決済されていた場合
                             active_trade = next(
                                 (
                                     t
@@ -688,10 +646,9 @@ def main():
                                 logger.warning(
                                     f"🔔 ブローカー側での決済を検知 (サイレントクローズ捕捉): Ticket={ticket}, Reason={reason}"
                                 )
-                                # [FIX-8] パブリック API apply_event_and_update を使用
                                 event_data = {
                                     "ticket": ticket,
-                                    "close_reason": reason,  # "SL" または "PT"
+                                    "close_reason": reason,
                                     "max_consecutive_sl": risk_engine.config.get(
                                         "max_consecutive_sl", 2
                                     ),
@@ -703,48 +660,43 @@ def main():
                                     EventType.POSITION_CLOSED, event_data
                                 )
 
-                # 新しい足が確定したタイミングで、ブローカーと最終同期
+                # ブローカーと最終同期
                 broker_state_sync = bridge.request_broker_state()
                 if broker_state_sync:
                     state_manager.reconcile_with_broker(broker_state_sync)
 
-                # (A) M1の新しいバーの確定を待機
-                new_m1_bar = get_latest_m1_bar(bridge)
-                if new_m1_bar is None:
-                    time.sleep(1.0)  # CPU負荷軽減
+                # M3未確定の場合はここで次のループへ
+                if new_m05_bar is None:
                     continue
 
-                # ▼▼▼ 修正: 市場プロキシ (g_market_proxy) の永久凍結防止 ▼▼▼
-                # global g_market_proxy  # ▲ 削除（関数の先頭に移動済みのため）
+                # 市場プロキシの更新
                 if feature_engine and len(feature_engine.m1_dataframe) >= 25:
-                    current_close = new_m1_bar["close"]
+                    current_close = new_m05_bar["close"]
                     past_close = feature_engine.m1_dataframe[-25]["close"]
                     if past_close > 0:
                         new_proxy_val = (current_close - past_close) / past_close
                         new_proxy_df = pd.DataFrame(
                             {"market_proxy": [new_proxy_val]},
-                            index=pd.DatetimeIndex([new_m1_bar["timestamp"]], tz="UTC"),
+                            index=pd.DatetimeIndex(
+                                [new_m05_bar["timestamp"]], tz="UTC"
+                            ),
                         )
-                        # ▼▼▼ FutureWarning対策: 空の場合はconcatせずに代入 ▼▼▼
                         if g_market_proxy.empty:
                             g_market_proxy = new_proxy_df
                         else:
                             g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
-                        # ▲▲▲ ここまで修正 ▲▲▲
-                        # メモリ溢れ保護
                         if len(g_market_proxy) > 10000:
                             g_market_proxy = g_market_proxy.iloc[-5000:]
-                # ▲▲▲ ここまで修正 ▲▲▲
 
-                # (B) M1バーをエンジンに渡し、シグナルを待つ
-                signal_list = feature_engine.process_new_m1_bar(
-                    new_m1_bar, g_market_proxy
+                # M0.5バーをエンジンに渡し、シグナルを待つ
+                signal_list = feature_engine.process_new_m05_bar(
+                    new_m05_bar, g_market_proxy
                 )
 
                 if not signal_list:
                     continue  # シグナルなし
 
-                # (C) シグナル処理ループ
+                # シグナル処理ループ
                 for signal in signal_list:
                     logger.info("-" * 30)
                     logger.info(
@@ -785,9 +737,11 @@ def main():
                         feature_dict_long = feature_dict.copy()
                         # ★ Logit変換: 学習時（Bx）と同じ変換を本番推論時にも適用
                         _p_l_clipped = np.clip(p_long_m1_raw, 1e-7, 1 - 1e-7)
-                        _logit_long = float(np.clip(
-                            np.log(_p_l_clipped / (1 - _p_l_clipped)), -10.0, 10.0
-                        ))
+                        _logit_long = float(
+                            np.clip(
+                                np.log(_p_l_clipped / (1 - _p_l_clipped)), -10.0, 10.0
+                            )
+                        )
                         feature_dict_long["m1_pred_proba"] = _logit_long
                         X_long_m2 = np.array(
                             [
@@ -815,9 +769,11 @@ def main():
                         feature_dict_short = feature_dict.copy()
                         # ★ Logit変換: 学習時（Bx）と同じ変換を本番推論時にも適用
                         _p_s_clipped = np.clip(p_short_m1_raw, 1e-7, 1 - 1e-7)
-                        _logit_short = float(np.clip(
-                            np.log(_p_s_clipped / (1 - _p_s_clipped)), -10.0, 10.0
-                        ))
+                        _logit_short = float(
+                            np.clip(
+                                np.log(_p_s_clipped / (1 - _p_s_clipped)), -10.0, 10.0
+                            )
+                        )
                         feature_dict_short["m1_pred_proba"] = _logit_short
                         X_short_m2 = np.array(
                             [
@@ -837,15 +793,13 @@ def main():
                         f"M2(L: {p_long_m2_raw:.4f}, S: {p_short_m2_raw:.4f})"
                     )
 
-
-
                     # ▼▼▼ 修正: Delta (差分) フィルター & 判定理由の明記 ▼▼▼
                     current_m2_thresh = risk_engine.config.get(
-                        "m2_proba_threshold", 0.30
-                    )
+                        "m2_proba_threshold", 0.70
+                    )  # バックテストと統一
                     current_m2_delta = risk_engine.config.get(
-                        "m2_delta_threshold", 0.50
-                    )
+                        "m2_delta_threshold", 0.30
+                    )  # バックテストと統一
 
                     p_l = p_long_m2_raw
                     p_s = p_short_m2_raw
@@ -878,7 +832,11 @@ def main():
 
                     # ▼▼▼ Delta・Signal確定後にCSV記録 ▼▼▼
                     try:
-                        signal_str = "LONG" if should_trade_long else ("SHORT" if should_trade_short else "NONE")
+                        signal_str = (
+                            "LONG"
+                            if should_trade_long
+                            else ("SHORT" if should_trade_short else "NONE")
+                        )
                         with open(
                             predictions_csv_path, "a", newline="", encoding="utf-8"
                         ) as f:
@@ -952,21 +910,21 @@ def main():
                             logger.warning(f"特徴量CSVの保存に失敗: {e}")
                     # ▲▲▲ ここまで追加 ▲▲▲
 
-                    # --- 1. 同時発注禁止 & 両建て防止 (prevent_simultaneous_orders) ---
-                    # ※バックテストの default_config.prevent_simultaneous_orders = True に準拠
-                    prevent_simultaneous_orders = risk_engine.config.get(
-                        "prevent_simultaneous_orders", True
-                    )
+                    # # --- 1. 同時発注禁止 & 両建て防止 (prevent_simultaneous_orders) ---
+                    # # ※バックテストの default_config.prevent_simultaneous_orders = True に準拠
+                    # prevent_simultaneous_orders = risk_engine.config.get(
+                    #     "prevent_simultaneous_orders", True
+                    # )
 
-                    if prevent_simultaneous_orders:
-                        # ステップA: ノイズ検知（両方向のシグナルが同時に出た場合は問答無用で両方キャンセル）
-                        # ※バックテスト同様、別タイミングでの両建て(ヘッジ)は許可するためステップBは削除
-                        if should_trade_long and should_trade_short:
-                            logger.warning(
-                                f"⚠️ 【防衛線1-A】相場混乱検知: Long/Shortの同時シグナルにつき強制キャンセル。"
-                            )
-                            should_trade_long = False
-                            should_trade_short = False
+                    # if prevent_simultaneous_orders:
+                    #     # ステップA: ノイズ検知（両方向のシグナルが同時に出た場合は問答無用で両方キャンセル）
+                    #     # ※バックテスト同様、別タイミングでの両建て(ヘッジ)は許可するためステップBは削除
+                    #     if should_trade_long and should_trade_short:
+                    #         logger.warning(
+                    #             f"⚠️ 【防衛線1-A】相場混乱検知: Long/Shortの同時シグナルにつき強制キャンセル。"
+                    #         )
+                    #         should_trade_long = False
+                    #         should_trade_short = False
 
                     # --- 2. サーキットブレーカー（連続SL）のチェック ---
                     # ステップC: クールダウン中かどうかの最終確認
@@ -983,7 +941,7 @@ def main():
                         should_trade_short = False
 
                     # --- 3. ドローダウン上限チェック (防衛線3) ---
-                    current_max_dd = risk_engine.config.get("max_drawdown", 1.0)
+                    current_max_dd = risk_engine.config.get("max_drawdown", 20.0)
                     current_dd = state_manager.current_state.current_drawdown
                     if current_dd >= current_max_dd:
                         logger.warning(
@@ -1021,12 +979,12 @@ def main():
                     # --- リスクエンジンへの委譲 (V5 Pure Math Mode) ---
                     # ATRはリアルタイムエンジンの値(atr_value)を優先取得
                     current_atr = signal.market_info.get(
-                        "atr_value", signal.market_info.get("atr", 5.0)
+                        "atr_value", signal.market_info.get("atr", 0.0)
                     )
                     # ★追加確認: atr_ratioもmarket_infoから取得してrisk_engineに渡す
-                    current_atr_ratio = signal.market_info.get("atr_ratio", 1.0)
+                    current_atr_ratio = signal.market_info.get("atr_ratio", 0.0)
                     # ▼追加: M1バーから取得したリアルタイムスプレッド
-                    current_spread = new_m1_bar.get("spread", 16.0)
+                    current_spread = new_m05_bar.get("spread", 999.0)
 
                     # ▼▼▼ 修正: Long/Shortで独立したSL/PT倍率をコンフィグから取得 ▼▼▼
                     if direction == "BUY":

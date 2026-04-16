@@ -25,15 +25,20 @@ import warnings
 import json
 import logging
 import math
-import sys
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-import blueprint as config
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))  # /workspace をパスに追加
+import blueprint as config
+sys.path.append(str(config.CORE_DIR))
+from core_indicators import (
+    calculate_atr_wilder,
+    scale_by_atr,
+    calculate_rsi_wilder,
+    calculate_adx,
+    calculate_sample_weight,
+)
 
 # 外部ライブラリ（バージョン固定）
 import numpy as np
@@ -208,269 +213,79 @@ class MemoryMonitor:
 # Numba UDF関数（モジュールレベル）
 # ========================================
 
+# calculate_adx (core_indicators) は ADX のみを返す。
+# DI+/DI- を同一の Wilder 平滑化アルゴリズムで計算するため、
+# ここに calculate_adx 内部と完全一致したローカルヘルパーを定義する。
+# ※ 将来 core_indicators に calculate_adx_full(returns ADX+DI+DI-) が追加された際は
+#    このローカル関数を削除して移行すること。
+@nb.njit(fastmath=False, cache=True)
+def _calculate_di_wilder(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int,
+) -> tuple:
+    """
+    DI+ / DI- — calculate_adx (core_indicators) の内部ロジックと完全同一の
+    Wilder 平滑化実装。ADX と DI が同一の ATR 平滑化を参照することを保証する。
 
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_rsi_numba(prices, period, out):
-    """RSI計算 (Numba最適化版)"""
-    n = len(prices)
-
-    # ▼▼ 追加: ルール7（バッファ不足時の安全な保護処理）
-    if n < period:
-        for i in range(n):
-            out[i] = np.nan
-        return
-    # ▲▲ 追加ここまで
-
-    for i in range(n):
-        if i < period:
-            out[i] = np.nan
-        else:
-            gains = 0.0
-            losses = 0.0
-
-            # 初期期間の計算
-            for j in range(i - period + 1, i + 1):
-                diff = prices[j] - prices[j - 1]
-                # ▼▼ 修正前: if diff > 0: ...
-                # ▼▼ 修正後: ルール8（型の厳格化）に基づき、0.0 と明記
-                if diff > 0.0:
-                    gains += diff
-                else:
-                    losses += abs(diff)
-
-            # ▼▼ 修正前: if gains + losses == 0: ...
-            # ▼▼ 修正後: 型の厳格化
-            if gains + losses == 0.0:
-                out[i] = 50.0
-            else:
-                avg_gain = gains / period
-                avg_loss = losses / period
-
-                if avg_loss == 0:
-                    out[i] = 100.0
-                else:
-                    rs = avg_gain / avg_loss
-                    out[i] = 100.0 - (100.0 / (1.0 + rs))
-
-
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], int64, float64[:])"],
-    "(n),(n),(n),()->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_atr_numba(high, low, close, period, out):
-    """ATR計算 (Numba最適化版)"""
+    Returns:
+        (di_plus_arr, di_minus_arr): 各 shape=(n,) の ndarray
+    """
     n = len(high)
+    di_plus_out = np.full(n, np.nan, dtype=np.float64)
+    di_minus_out = np.full(n, np.nan, dtype=np.float64)
+    if n <= period:
+        return di_plus_out, di_minus_out
 
-    # True Range計算
-    tr = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            tr[i] = high[i] - low[i]
-        else:
-            h_l = high[i] - low[i]
-            h_pc = abs(high[i] - close[i - 1])
-            l_pc = abs(low[i] - close[i - 1])
-            tr[i] = max(h_l, h_pc, l_pc)
+    # TR, DM+, DM- — calculate_adx 内部と同一
+    tr = np.zeros(n, dtype=np.float64)
+    dm_plus = np.zeros(n, dtype=np.float64)
+    dm_minus = np.zeros(n, dtype=np.float64)
 
-    # ATR計算
-    for i in range(n):
-        if i < period:
-            out[i] = np.nan
-        else:
-            sum_tr = 0.0
-            for j in range(i - period + 1, i + 1):
-                sum_tr += tr[j]
-            out[i] = sum_tr / period
-
-
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], int64, float64[:])"],
-    "(n),(n),(n),()->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_adx_numba(high, low, close, period, out):
-    """ADX計算 (Numba最適化版) - ADXのみ返す"""
-    n = len(high)
-
-    # True Range計算
-    tr = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            tr[i] = high[i] - low[i]
-        else:
-            h_l = high[i] - low[i]
-            h_pc = abs(high[i] - close[i - 1])
-            l_pc = abs(low[i] - close[i - 1])
-            tr[i] = max(h_l, h_pc, l_pc)
-
-    # Directional Movement計算
-    dm_plus = np.zeros(n)
-    dm_minus = np.zeros(n)
+    tr[0] = high[0] - low[0]
     for i in range(1, n):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i - 1])
+        lc = abs(low[i] - close[i - 1])
+        tr[i] = max(hl, hc, lc)
         up_move = high[i] - high[i - 1]
         down_move = low[i - 1] - low[i]
+        dm_plus[i] = up_move if (up_move > down_move and up_move > 0.0) else 0.0
+        dm_minus[i] = down_move if (down_move > up_move and down_move > 0.0) else 0.0
 
-        if up_move > down_move and up_move > 0:
-            dm_plus[i] = up_move
-        else:
-            dm_plus[i] = 0.0
+    # Wilder 平滑化 — calculate_adx 内部と同一（単純合計シード）
+    atr_w = np.zeros(n, dtype=np.float64)
+    dmp_w = np.zeros(n, dtype=np.float64)
+    dmm_w = np.zeros(n, dtype=np.float64)
 
-        if down_move > up_move and down_move > 0:
-            dm_minus[i] = down_move
-        else:
-            dm_minus[i] = 0.0
+    init_tr = 0.0
+    init_dmp = 0.0
+    init_dmm = 0.0
+    for j in range(period):
+        init_tr += tr[j]
+        init_dmp += dm_plus[j]
+        init_dmm += dm_minus[j]
 
-    # DI計算用の配列
-    di_plus = np.zeros(n)
-    di_minus = np.zeros(n)
+    atr_w[period - 1] = init_tr
+    dmp_w[period - 1] = init_dmp
+    dmm_w[period - 1] = init_dmm
 
-    for i in range(n):
-        if i < period:
-            di_plus[i] = np.nan
-            di_minus[i] = np.nan
-            out[i] = np.nan
-        else:
-            atr_val = 0.0
-            dm_plus_sum = 0.0
-            dm_minus_sum = 0.0
+    for i in range(period, n):
+        atr_w[i] = atr_w[i - 1] - atr_w[i - 1] / period + tr[i]
+        dmp_w[i] = dmp_w[i - 1] - dmp_w[i - 1] / period + dm_plus[i]
+        dmm_w[i] = dmm_w[i - 1] - dmm_w[i - 1] / period + dm_minus[i]
 
-            for j in range(i - period + 1, i + 1):
-                atr_val += tr[j]
-                dm_plus_sum += dm_plus[j]
-                dm_minus_sum += dm_minus[j]
+    # DI+ / DI- 計算
+    for i in range(period - 1, n):
+        if atr_w[i] > 1e-10:
+            di_plus_out[i] = dmp_w[i] / atr_w[i] * 100.0
+            di_minus_out[i] = dmm_w[i] / atr_w[i] * 100.0
 
-            atr_val = atr_val / period
-
-            if atr_val > 0:
-                di_plus[i] = (dm_plus_sum / period) / atr_val * 100
-                di_minus[i] = (dm_minus_sum / period) / atr_val * 100
-            else:
-                di_plus[i] = 0.0
-                di_minus[i] = 0.0
-
-    # ADX計算
-    for i in range(n):
-        if i < period * 2:
-            out[i] = np.nan
-        else:
-            dx_sum = 0.0
-            for j in range(i - period + 1, i + 1):
-                di_sum = di_plus[j] + di_minus[j]
-                if di_sum > 0:
-                    dx = abs(di_plus[j] - di_minus[j]) / di_sum * 100
-                else:
-                    dx = 0.0
-                dx_sum += dx
-            out[i] = dx_sum / period
+    return di_plus_out, di_minus_out
 
 
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], int64, float64[:])"],
-    "(n),(n),(n),()->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_di_plus_numba(high, low, close, period, out):
-    """DI+ 計算 (Numba最適化版)"""
-    n = len(high)
 
-    # True Range計算
-    tr = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            tr[i] = high[i] - low[i]
-        else:
-            h_l = high[i] - low[i]
-            h_pc = abs(high[i] - close[i - 1])
-            l_pc = abs(low[i] - close[i - 1])
-            tr[i] = max(h_l, h_pc, l_pc)
-
-    # Directional Movement計算
-    dm_plus = np.zeros(n)
-    for i in range(1, n):
-        up_move = high[i] - high[i - 1]
-        down_move = low[i - 1] - low[i]
-
-        if up_move > down_move and up_move > 0:
-            dm_plus[i] = up_move
-        else:
-            dm_plus[i] = 0.0
-
-    # DI+計算
-    for i in range(n):
-        if i < period:
-            out[i] = np.nan
-        else:
-            atr_val = 0.0
-            dm_plus_sum = 0.0
-
-            for j in range(i - period + 1, i + 1):
-                atr_val += tr[j]
-                dm_plus_sum += dm_plus[j]
-
-            atr_val = atr_val / period
-
-            if atr_val > 0:
-                out[i] = (dm_plus_sum / period) / atr_val * 100
-            else:
-                out[i] = 0.0
-
-
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], int64, float64[:])"],
-    "(n),(n),(n),()->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_di_minus_numba(high, low, close, period, out):
-    """DI- 計算 (Numba最適化版)"""
-    n = len(high)
-
-    # True Range計算
-    tr = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            tr[i] = high[i] - low[i]
-        else:
-            h_l = high[i] - low[i]
-            h_pc = abs(high[i] - close[i - 1])
-            l_pc = abs(low[i] - close[i - 1])
-            tr[i] = max(h_l, h_pc, l_pc)
-
-    # Directional Movement計算
-    dm_minus = np.zeros(n)
-    for i in range(1, n):
-        up_move = high[i] - high[i - 1]
-        down_move = low[i - 1] - low[i]
-
-        if down_move > up_move and down_move > 0:
-            dm_minus[i] = down_move
-        else:
-            dm_minus[i] = 0.0
-
-    # DI-計算
-    for i in range(n):
-        if i < period:
-            out[i] = np.nan
-        else:
-            atr_val = 0.0
-            dm_minus_sum = 0.0
-
-            for j in range(i - period + 1, i + 1):
-                atr_val += tr[j]
-                dm_minus_sum += dm_minus[j]
-
-            atr_val = atr_val / period
-
-            if atr_val > 0:
-                out[i] = (dm_minus_sum / period) / atr_val * 100
-            else:
-                out[i] = 0.0
 
 
 # ========================================
@@ -1413,11 +1228,12 @@ class CalculationEngine:
         exprs = []
 
         # 標準RSI（Polars Expression）
+        # calculate_rsi_wilder: core_indicators の Wilder 平滑化 RSI (SMA 方式から移行)
         for period in self.config.window_sizes["rsi"]:
             exprs.append(
                 pl.col("close")
                 .map_batches(
-                    lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
+                    lambda s, p=period: calculate_rsi_wilder(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}rsi_{period}")
@@ -1426,7 +1242,7 @@ class CalculationEngine:
             exprs.append(
                 pl.col("close")
                 .map_batches(
-                    lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
+                    lambda s, p=period: calculate_rsi_wilder(s.to_numpy(), p),
                     return_dtype=pl.Float64,
                 )
                 .diff()
@@ -1435,7 +1251,7 @@ class CalculationEngine:
 
         for period in [14, 21]:
             rsi_col = pl.col("close").map_batches(
-                lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
+                lambda s, p=period: calculate_rsi_wilder(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
 
@@ -1456,7 +1272,7 @@ class CalculationEngine:
                 "close"
             ).shift(period)
             rsi_col = pl.col("close").map_batches(
-                lambda s, p=period: calculate_rsi_numba(s.to_numpy(), p),
+                lambda s, p=period: calculate_rsi_wilder(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
             rsi_change = (rsi_col - rsi_col.shift(period)) / 50 - 1
@@ -1484,9 +1300,9 @@ class CalculationEngine:
             (19, 39, 9),  # 長期
         ]
 
-        # 内部正規化用のATR13ベース
+        # 内部正規化用のATR13ベース (calculate_atr_wilder: core_indicators の Wilder 版)
         atr_13_base = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1503,25 +1319,44 @@ class CalculationEngine:
             # 生MACDライン（エイリアスなし・内部計算用）
             macd_raw = ema_fast - ema_slow
 
-            # MACDライン（ATR13で割りスケール不変化）
-            macd_line = (macd_raw / (atr_13_base + 1e-10)).alias(
-                f"{self.prefix}macd_{fast}_{slow}"
-            )
+            # MACDライン（scale_by_atr: core_indicators の ATR割り統一関数）
+            macd_line = (
+                pl.struct([macd_raw.alias("_macd"), atr_13_base.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_macd").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}macd_{fast}_{slow}")
             exprs.append(macd_line)
 
             # 生シグナルライン（エイリアスなし・内部計算用）
             signal_raw = macd_raw.ewm_mean(span=signal, adjust=False)
 
-            # シグナルライン（ATR13で割りスケール不変化）
-            signal_line = (signal_raw / (atr_13_base + 1e-10)).alias(
-                f"{self.prefix}macd_signal_{fast}_{slow}_{signal}"
-            )
+            # シグナルライン（scale_by_atr: core_indicators の ATR割り統一関数）
+            signal_line = (
+                pl.struct([signal_raw.alias("_sig"), atr_13_base.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_sig").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}macd_signal_{fast}_{slow}_{signal}")
             exprs.append(signal_line)
 
-            # ヒストグラム（ATR13で割りスケール不変化）
-            histogram = ((macd_raw - signal_raw) / (atr_13_base + 1e-10)).alias(
-                f"{self.prefix}macd_histogram_{fast}_{slow}_{signal}"
-            )
+            # ヒストグラム（scale_by_atr: core_indicators の ATR割り統一関数）
+            hist_raw = macd_raw - signal_raw
+            histogram = (
+                pl.struct([hist_raw.alias("_hist"), atr_13_base.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_hist").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}macd_histogram_{fast}_{slow}_{signal}")
             exprs.append(histogram)
 
         result = lazy_frame.with_columns(exprs)
@@ -1535,8 +1370,9 @@ class CalculationEngine:
         exprs = []
 
         # ▼▼ 追加: 内部計算用のATR13（スケール不変性用）
+        # calculate_atr_wilder: core_indicators の Wilder 版（SMA 方式から移行）
         atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1563,12 +1399,25 @@ class CalculationEngine:
                 upper_raw = sma + num_std * std
                 lower_raw = sma - num_std * std
 
-                upper = ((upper_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
-                    f"{self.prefix}bb_upper_{period}_{num_std}"
-                )
-                lower = ((pl.col("close") - lower_raw) / (atr_13_expr + 1e-10)).alias(
-                    f"{self.prefix}bb_lower_{period}_{num_std}"
-                )
+                # scale_by_atr: core_indicators の ATR割り統一関数
+                upper = (
+                    pl.struct([(upper_raw - pl.col("close")).alias("_u"), atr_13_expr.alias("_atr")]).map_batches(
+                        lambda s: scale_by_atr(
+                            s.struct.field("_u").to_numpy(),
+                            s.struct.field("_atr").to_numpy(),
+                        ),
+                        return_dtype=pl.Float64,
+                    )
+                ).alias(f"{self.prefix}bb_upper_{period}_{num_std}")
+                lower = (
+                    pl.struct([(pl.col("close") - lower_raw).alias("_l"), atr_13_expr.alias("_atr")]).map_batches(
+                        lambda s: scale_by_atr(
+                            s.struct.field("_l").to_numpy(),
+                            s.struct.field("_atr").to_numpy(),
+                        ),
+                        return_dtype=pl.Float64,
+                    )
+                ).alias(f"{self.prefix}bb_lower_{period}_{num_std}")
 
                 exprs.extend([upper, lower])
 
@@ -1578,12 +1427,16 @@ class CalculationEngine:
                 ).alias(f"{self.prefix}bb_percent_{period}_{num_std}")
                 exprs.append(percent_b)
 
-                # BB幅
-                # ▼▼ 修正前: width = (upper - lower).alias(...)
-                # ▼▼ 修正後: バンド幅もATRで正規化
-                width = ((upper_raw - lower_raw) / (atr_13_expr + 1e-10)).alias(
-                    f"{self.prefix}bb_width_{period}_{num_std}"
-                )
+                # BB幅 (scale_by_atr: core_indicators の ATR割り統一関数)
+                width = (
+                    pl.struct([(upper_raw - lower_raw).alias("_w"), atr_13_expr.alias("_atr")]).map_batches(
+                        lambda s: scale_by_atr(
+                            s.struct.field("_w").to_numpy(),
+                            s.struct.field("_atr").to_numpy(),
+                        ),
+                        return_dtype=pl.Float64,
+                    )
+                ).alias(f"{self.prefix}bb_width_{period}_{num_std}")
                 exprs.append(width)
 
                 # BB幅のパーセンタイル
@@ -1614,8 +1467,9 @@ class CalculationEngine:
         atr_periods = self.config.window_sizes["atr"]  # [13, 21, 34, 55]
 
         # 内部正規化用のATR13ベース（スケール不変化の基準）
+        # calculate_atr_wilder: core_indicators の Wilder 版（SMA 方式から移行）
         atr_13_base = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1626,8 +1480,9 @@ class CalculationEngine:
 
         for period in atr_periods:
             # 生ATR計算（エイリアスなし・内部計算用）
+            # calculate_atr_wilder: core_indicators の Wilder 版（SMA 方式から移行）
             atr_raw = pl.struct(["high", "low", "close"]).map_batches(
-                lambda s, p=period: calculate_atr_numba(
+                lambda s, p=period: calculate_atr_wilder(
                     s.struct.field("high").to_numpy(),
                     s.struct.field("low").to_numpy(),
                     s.struct.field("close").to_numpy(),
@@ -1636,9 +1491,15 @@ class CalculationEngine:
                 return_dtype=pl.Float64,
             )
 
-            # ATR比率（ATR13で割ったスケール不変値）
+            # ATR比率（ATR13で割ったスケール不変値）- scale_by_atr: core_indicators の ATR割り統一関数
             exprs.append(
-                (atr_raw / (atr_13_base + 1e-10)).alias(f"{self.prefix}atr_{period}")
+                pl.struct([atr_raw.alias("_atr_raw"), atr_13_base.alias("_atr13")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_atr_raw").to_numpy(),
+                        s.struct.field("_atr13").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                ).alias(f"{self.prefix}atr_{period}")
             )
 
             # ATRパーセンテージ（closeに対する比率）はすでにスケール不変
@@ -1648,18 +1509,32 @@ class CalculationEngine:
                 )
             )
 
-            # ATRトレンド（ATRの変化分をATR13で割りスケール不変化）
+            # ATRトレンド（ATRの変化分をATR13で割りスケール不変化）- scale_by_atr: core_indicators
             exprs.append(
-                (atr_raw.diff() / (atr_13_base + 1e-10)).alias(
-                    f"{self.prefix}atr_trend_{period}"
-                )
+                pl.struct([atr_raw.diff().alias("_diff"), atr_13_base.alias("_atr13")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_diff").to_numpy(),
+                        s.struct.field("_atr13").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                ).alias(f"{self.prefix}atr_trend_{period}")
             )
 
-            # ATRボラティリティ（ATR自体の標準偏差をATR13で割りスケール不変化）
+            # ATRボラティリティ（ATR自体の標準偏差をATR13で割りスケール不変化）- scale_by_atr: core_indicators
+            # 【設計上の制約】リアルタイム側との差異を記録する:
+            #   学習側（ここ）: rolling_std(atr_{period}_arr, window=period)[i] / atr_13_arr[i]
+            #                  → 分母は各バー時点の atr_13（時系列配列・バーごとに変化）
+            #   リアルタイム側: std(_window(atr_{period}_arr, period)) / _last(atr_13_arr)
+            #                  → 分母は最新バーの atr_13 スカラー（時系列保持不可のため）
+            #   この差異はリアルタイム推論の構造的制約として許容する。
             exprs.append(
-                (atr_raw.rolling_std(period, ddof=1) / (atr_13_base + 1e-10)).alias(
-                    f"{self.prefix}atr_volatility_{period}"
-                )
+                pl.struct([atr_raw.rolling_std(period, ddof=1).alias("_std"), atr_13_base.alias("_atr13")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_std").to_numpy(),
+                        s.struct.field("_atr13").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                ).alias(f"{self.prefix}atr_volatility_{period}")
             )
 
             # ▼▼ 削除: ATRベースの絶対値バンド（atr_upper / atr_lower）のループ処理を丸ごと削除
@@ -1716,14 +1591,15 @@ class CalculationEngine:
             )
             exprs.append(slow_d)
 
-        # ADX, DI+, DI- (個別のNumba関数)
+        # ADX, DI+, DI- — calculate_adx (core_indicators) と _calculate_di_wilder を使用
+        # _calculate_di_wilder は calculate_adx 内部と完全同一の Wilder 平滑化を実装しており、
+        # ADX と DI が同一の ATR 平滑化を参照することを保証する。
         for period in self.config.window_sizes["adx"]:  # [13, 21, 34]
-            # ADX
+            # ADX (calculate_adx: core_indicators の Wilder 版)
             adx = (
                 pl.struct(["high", "low", "close"])
-                # 修正後
                 .map_batches(
-                    lambda s, p=period: calculate_adx_numba(
+                    lambda s, p=period: calculate_adx(
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
@@ -1735,34 +1611,32 @@ class CalculationEngine:
             )
             exprs.append(adx)
 
-            # DI+
+            # DI+ (_calculate_di_wilder: calculate_adx 内部と同一 Wilder 平滑化)
             di_plus = (
                 pl.struct(["high", "low", "close"])
-                # 修正後
                 .map_batches(
-                    lambda s, p=period: calculate_di_plus_numba(
+                    lambda s, p=period: _calculate_di_wilder(
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
                         p,
-                    ),
+                    )[0],
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}di_plus_{period}")
             )
             exprs.append(di_plus)
 
-            # DI-
+            # DI- (_calculate_di_wilder: calculate_adx 内部と同一 Wilder 平滑化)
             di_minus = (
                 pl.struct(["high", "low", "close"])
-                # 修正後
                 .map_batches(
-                    lambda s, p=period: calculate_di_minus_numba(
+                    lambda s, p=period: _calculate_di_wilder(
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
                         p,
-                    ),
+                    )[1],
                     return_dtype=pl.Float64,
                 )
                 .alias(f"{self.prefix}di_minus_{period}")
@@ -1831,8 +1705,9 @@ class CalculationEngine:
         exprs = []
 
         # ▼▼ 追加: 内部計算用のATR13
+        # calculate_atr_wilder: core_indicators の Wilder 版（SMA 方式から移行）
         atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -1841,15 +1716,20 @@ class CalculationEngine:
             return_dtype=pl.Float64,
         )
 
-        # Detrended Price Oscillator (DPO)
+        # Detrended Price Oscillator (DPO) — scale_by_atr: core_indicators の ATR割り統一関数
         dpo_periods = [20, 30, 50]
         for period in dpo_periods:
             sma = pl.col("close").rolling_mean(period)
-            # ▼▼ 修正前: dpo = (pl.col("close") - sma).alias(...)
-            # ▼▼ 修正後: ATR割り
-            dpo = ((pl.col("close") - sma) / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}dpo_{period}"
-            )
+            dpo_raw = pl.col("close") - sma
+            dpo = (
+                pl.struct([dpo_raw.alias("_dpo"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_dpo").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}dpo_{period}")
             exprs.append(dpo)
 
         # TRIX (Numba版)
@@ -1906,14 +1786,18 @@ class CalculationEngine:
             ).alias(f"{self.prefix}rate_of_change_{period}")
             exprs.append(roc)
 
-        # Momentum
+        # Momentum — scale_by_atr: core_indicators の ATR割り統一関数
         momentum_periods = [10, 20, 30, 50]
         for period in momentum_periods:
-            # ▼▼ 修正前: momentum = (pl.col("close") - pl.col("close").shift(period)).alias(...)
-            # ▼▼ 修正後: ATR割り
+            mom_raw = pl.col("close") - pl.col("close").shift(period)
             momentum = (
-                (pl.col("close") - pl.col("close").shift(period))
-                / (atr_13_expr + 1e-10)
+                pl.struct([mom_raw.alias("_mom"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_mom").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
+                    return_dtype=pl.Float64,
+                )
             ).alias(f"{self.prefix}momentum_{period}")
             exprs.append(momentum)
 
@@ -2035,8 +1919,9 @@ class CalculationEngine:
 
         exprs = []
         # 内部計算用のATR13
+        # calculate_atr_wilder: core_indicators の Wilder 版（SMA 方式から移行）
         atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),
@@ -2049,11 +1934,14 @@ class CalculationEngine:
         ma_periods = [10, 20, 50, 100, 200]
 
         for period in ma_periods:
-            # SMA
+            # SMA — scale_by_atr: core_indicators の ATR割り統一関数
             sma_raw = pl.col("close").rolling_mean(period)
-            sma = ((sma_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}sma_{period}"
-            )
+            sma = (
+                pl.struct([(sma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}sma_{period}")
             exprs.append(sma)
 
             # SMA乖離率 (生価格ベースでの乖離比率を維持)
@@ -2062,11 +1950,14 @@ class CalculationEngine:
             ).alias(f"{self.prefix}sma_deviation_{period}")
             exprs.append(sma_deviation)
 
-            # EMA
+            # EMA — scale_by_atr: core_indicators の ATR割り統一関数
             ema_raw = pl.col("close").ewm_mean(span=period, adjust=False)
-            ema = ((ema_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}ema_{period}"
-            )
+            ema = (
+                pl.struct([(ema_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}ema_{period}")
             exprs.append(ema)
 
             # EMA乖離率
@@ -2075,67 +1966,73 @@ class CalculationEngine:
             ).alias(f"{self.prefix}ema_deviation_{period}")
             exprs.append(ema_deviation)
 
-            # ▼▼ 修正前: WMA (簡略版: 既存ロジック準拠)
-            # ▼▼ 修正前: wma_raw = pl.col("close").rolling_mean(period)
-            # ▼▼ 修正後: 先ほど新設したNumba UDFを用いた真のWMAへ置換
-            # 修正後
+            # WMA (Numba版) — scale_by_atr: core_indicators の ATR割り統一関数
             wma_raw = pl.col("close").map_batches(
                 lambda s, p=period: calculate_wma_numba(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
-            wma = ((wma_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}wma_{period}"
-            )
+            wma = (
+                pl.struct([(wma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}wma_{period}")
             exprs.append(wma)
 
-        # HMA (Hull Moving Average) - Numba版
+        # HMA (Hull Moving Average) - Numba版 — scale_by_atr: core_indicators の ATR割り統一関数
         for period in self.config.window_sizes["hma"]:  # [21, 34, 55]
-            # 修正後
             hma_raw = pl.col("close").map_batches(
                 lambda s, p=period: calculate_hma_numba(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
-            hma = ((hma_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}hma_{period}"
-            )
+            hma = (
+                pl.struct([(hma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}hma_{period}")
             exprs.append(hma)
 
-        # KAMA (Kaufman Adaptive Moving Average) - Numba版
+        # KAMA (Kaufman Adaptive Moving Average) - Numba版 — scale_by_atr: core_indicators の ATR割り統一関数
         for period in self.config.window_sizes["kama"]:  # [21, 34]
-            # 修正後
             kama_raw = pl.col("close").map_batches(
                 lambda s, p=period: calculate_kama_numba(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
-            kama = ((kama_raw - pl.col("close")) / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}kama_{period}"
-            )
+            kama = (
+                pl.struct([(kama_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}kama_{period}")
             exprs.append(kama)
 
         # トレンド分析
         trend_periods = [20, 50, 100]
         for period in trend_periods:
-            # ▼▼ 修正前: トレンド傾き（簡略版：価格変化率で代用）
-            # ▼▼ 修正前: trend_slope = ((pl.col("close") - pl.col("close").shift(period)) / (atr_13_expr * period + 1e-10)).alias(...)
-            # ▼▼ 修正後: 真の線形回帰(OLS)の傾きを WMA と SMA の恒等式から計算し、ATR割り
+            # 真の線形回帰(OLS)の傾きを WMA と SMA の恒等式から計算し、ATR割り
+            # scale_by_atr: core_indicators の ATR割り統一関数
             sma_for_slope = pl.col("close").rolling_mean(period)
-            # 修正後
             wma_for_slope = pl.col("close").map_batches(
                 lambda s, p=period: calculate_wma_numba(s.to_numpy(), p),
                 return_dtype=pl.Float64,
             )
             true_ols_slope = 6.0 * (wma_for_slope - sma_for_slope) / (period - 1.0)
 
-            trend_slope = (true_ols_slope / (atr_13_expr + 1e-10)).alias(
-                f"{self.prefix}trend_slope_{period}"
-            )
+            trend_slope = (
+                pl.struct([true_ols_slope.alias("_slope"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_slope").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
+            ).alias(f"{self.prefix}trend_slope_{period}")
             exprs.append(trend_slope)
 
-            # トレンド強度（R²の代用として標準偏差の逆数）
-            # ▼▼ 修正前: trend_strength = (1 / (pl.col("close").rolling_std(period) + 1e-10)).alias(...)
-            # ▼▼ 修正後: 案Aを採用（無次元化した上で上限100.0でクリップ）
-            normalized_std = pl.col("close").rolling_std(period, ddof=1) / (
-                atr_13_expr + 1e-10
+            # トレンド強度 — scale_by_atr で無次元化した normalized_std を利用
+            normalized_std = (
+                pl.struct([pl.col("close").rolling_std(period, ddof=1).alias("_std"), atr_13_expr.alias("_atr")]).map_batches(
+                    lambda s: scale_by_atr(s.struct.field("_std").to_numpy(), s.struct.field("_atr").to_numpy()),
+                    return_dtype=pl.Float64,
+                )
             )
             trend_strength = (
                 (1.0 / (normalized_std + 1e-10))
@@ -2167,35 +2064,19 @@ class CalculationEngine:
         result = self.create_advanced_features(result)
         result = self.create_moving_average_features(result)
 
-        # ▼▼ 追加: スケール不変のZスコアを用いた自動重み付け（sample_weight）
-        atr_13_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
-                s.struct.field("high").to_numpy(),
-                s.struct.field("low").to_numpy(),
-                s.struct.field("close").to_numpy(),
-                13,
-            ),
-            return_dtype=pl.Float64,
+        # ▼▼ sample_weight: calculate_sample_weight (core_indicators) に統一
+        # Polars 直書き式（atr_numba + z_score 計算）を廃止し、
+        # core_indicators の calculate_sample_weight（Wilder ATR・|z| < 2.0 基準）に統一する。
+        result = result.with_columns(
+            pl.struct(["high", "low", "close"]).map_batches(
+                lambda s: calculate_sample_weight(
+                    s.struct.field("high").to_numpy(),
+                    s.struct.field("low").to_numpy(),
+                    s.struct.field("close").to_numpy(),
+                ),
+                return_dtype=pl.Float64,
+            ).alias("sample_weight")
         )
-
-        # ボラティリティのZスコア計算 (W_max制限に合わせた200期間のローリングを使用)
-        norm_range = (pl.col("high") - pl.col("low")) / (atr_13_expr + 1e-10)
-        z_score = (norm_range - norm_range.rolling_mean(200)) / (
-            norm_range.rolling_std(200, ddof=1) + 1e-10
-        )
-
-        weight_expr = (
-            pl.when(z_score.abs() < 2.0)
-            .then(1.0)
-            .when(z_score.abs() < 3.0)
-            .then(2.0)
-            .when(z_score.abs() < 4.0)
-            .then(4.0)
-            .otherwise(6.0)
-        ).alias("sample_weight")
-
-        result = result.with_columns(weight_expr)
-        # ▲▲ 追加ここまで
 
         logger.info("基本データ処理特徴量計算完了")
         return result

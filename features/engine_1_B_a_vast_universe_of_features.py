@@ -18,13 +18,16 @@ Project Forge - 軍資金増大プロジェクト
 """
 
 import sys
+import os
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
+# blueprint より先にパスを追加しないと ModuleNotFoundError が発生する
+sys.path.append(str(Path(__file__).resolve().parent.parent))  # /workspace をパスに追加
 import blueprint as config
-import os, sys, time, warnings, json, logging, math, tempfile, datetime
-from pathlib import Path
+sys.path.append(str(config.CORE_DIR))
+from core_indicators import calculate_atr_wilder
+
+import time, warnings, json, logging, math, tempfile, datetime
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field
 
@@ -367,31 +370,10 @@ class DataEngine:
 # クラス内定義は循環参照エラーを引き起こすため絶対禁止
 
 
-# ▼▼ 修正後: 新規追加（ATR計算用UDF - スケール不変性のための基盤）
-@nb.njit(fastmath=True, cache=True)
-def calculate_atr_numba(
-    highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int
-) -> np.ndarray:
-    n = len(highs)
-    atr = np.zeros(n, dtype=np.float64)
-    if n == 0:
-        return atr
-
-    tr = np.zeros(n, dtype=np.float64)
-    tr[0] = highs[0] - lows[0]
-    for i in range(1, n):
-        hl = highs[i] - lows[i]
-        hc = np.abs(highs[i] - closes[i - 1])
-        lc = np.abs(lows[i] - closes[i - 1])
-        tr[i] = max(hl, hc, lc)
-
-    atr[0] = tr[0]
-    for i in range(1, n):
-        if i < period:
-            atr[i] = np.mean(tr[: i + 1])
-        else:
-            atr[i] = (atr[i - 1] * (period - 1.0) + tr[i]) / period
-    return atr
+# [REFACTORED: Step 4]
+# calculate_atr_numba (旧: ウォームアップ期間に np.mean(tr[:i+1]) を使う独自実装) は削除。
+# core_indicators.calculate_atr_wilder (Wilder平滑化・シード=TR[0]) を使用すること。
+# → from core_indicators import calculate_atr_wilder（ファイル冒頭でインポート済み）
 
 
 # =============================================================================
@@ -1074,8 +1056,11 @@ class CalculationEngine:
     def inject_temp_atr(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
         """グループ分割前にATR13を一度だけ計算して注入する（パフォーマンス最適化）"""
         logger.info("内部計算用ATR13 (__temp_atr_safe) を事前注入します...")
+        # [REFACTORED: Step 4] calculate_atr_numba → calculate_atr_wilder (core_indicators)
+        # 旧実装はウォームアップ期間 (i < period) に np.mean(tr[:i+1]) を使っていたが、
+        # calculate_atr_wilder はシード=TR[0] の純粋なWilder平滑化で統一する。
         atr_expr = pl.struct(["high", "low", "close"]).map_batches(
-            lambda s: calculate_atr_numba(
+            lambda s: calculate_atr_wilder(
                 s.struct.field("high").to_numpy(),
                 s.struct.field("low").to_numpy(),
                 s.struct.field("close").to_numpy(),

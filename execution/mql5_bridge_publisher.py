@@ -49,6 +49,9 @@ class BridgeConfig:
     # blueprint.py の ZMQ 設定に対応
     control_endpoint: str = config.ZMQ.get("control_endpoint", "tcp://127.0.0.1:5555")
     data_endpoint: str = config.ZMQ.get("data_endpoint", "tcp://127.0.0.1:5556")
+    m3_notify_endpoint: str = config.ZMQ.get(
+        "m3_notify_endpoint", "tcp://127.0.0.1:5557"
+    )
     # [V11.02] デフォルトを5558に変更
     heartbeat_endpoint: str = config.ZMQ.get(
         "heartbeat_endpoint", "tcp://127.0.0.1:5558"
@@ -135,6 +138,7 @@ class MQL5BridgePublisherV3:
         # V11.0 ソケット構成
         self.control_socket: Optional[zmq.Socket] = None  # REQ (5555)
         self.data_socket: Optional[zmq.Socket] = None  # PULL (5556)
+        self.m3_notify_socket: Optional[zmq.Socket] = None  # PULL (5557) M3確定通知
         self.heartbeat_socket: Optional[zmq.Socket] = None  # REQ (5558)
 
         self.is_connected = False
@@ -171,8 +175,14 @@ class MQL5BridgePublisherV3:
             self.data_socket.set_hwm(10000)
             logger.info(f"  Data Endpoint: {self.config.data_endpoint}")
 
+            # 3. M3確定通知チャネル (PULL) - M3確定をMT5からPushで受け取る
+            self.m3_notify_socket = self.context.socket(zmq.PULL)
+            self.m3_notify_socket.connect(self.config.m3_notify_endpoint)
+            self.m3_notify_socket.set_hwm(100)
+            logger.info(f"  M3 Notify Endpoint: {self.config.m3_notify_endpoint}")
+
             # ▼▼▼ 修正: ZMQソケットのマルチスレッド違反を解消 ▼▼▼
-            # 3. ハートビートチャネル (REQ) のソケット作成は _heartbeat_loop (別スレッド) 内部で行うためここでは作成しない
+            # 4. ハートビートチャネル (REQ) のソケット作成は _heartbeat_loop (別スレッド) 内部で行うためここでは作成しない
             # ▲▲▲ ここまで修正 ▲▲▲
 
             self.is_connected = True
@@ -192,6 +202,8 @@ class MQL5BridgePublisherV3:
             self.control_socket.close()
         if self.data_socket:
             self.data_socket.close()
+        if self.m3_notify_socket:
+            self.m3_notify_socket.close()
         # ▼▼▼ 修正: heartbeat_socket のクローズはスレッド側で行うため削除 ▼▼▼
         # if self.heartbeat_socket:
         #     self.heartbeat_socket.close()
@@ -347,49 +359,6 @@ class MQL5BridgePublisherV3:
 
     # ========== その他のリクエスト (V11.0 互換実装) ==========
 
-    def request_latest_m1_bar(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """最新のM1バーリクエスト (V11.02 修正版)"""
-        if not self.is_connected:
-            return None
-
-        try:
-            # 1. リクエスト送信 (Control Channel)
-            # JSON形式ではなく単純なコマンド文字列を送る
-            self.control_socket.send_string("REQUEST_M1_BAR")
-
-            # 2. レスポンス待機
-            poller = zmq.Poller()
-            poller.register(self.control_socket, zmq.POLLIN)
-
-            if poller.poll(self.config.request_timeout):
-                response_bytes = self.control_socket.recv()
-
-                # 既存のヘルパーでパース (JSON文字列 -> Dict)
-                bar_data = parse_response(response_bytes)
-
-                if isinstance(bar_data, dict) and "time" in bar_data:
-                    # エンジン側の仕様に合わせてキー名を調整
-                    if "tick_volume" in bar_data:
-                        bar_data["volume"] = bar_data.pop("tick_volume")
-
-                    # datetimeオブジェクトを追加 (main.pyで必要)
-                    bar_data["timestamp"] = datetime.fromtimestamp(
-                        bar_data["time"], timezone.utc
-                    )
-                    return bar_data
-                else:
-                    # エラー応答の場合など
-                    return None
-            else:
-                logger.warning("M1バーリクエストがタイムアウトしました")
-                self._recreate_control_socket()
-                return None
-
-        except Exception as e:
-            logger.error(f"M1バーリクエストエラー: {e}")
-            self._recreate_control_socket()
-            return None
-
     def send_trade_command(self, command: Dict[str, Any]) -> bool:
         """
         取引コマンドをZMQ経由でMT5に送信する (V11.0 実装版)
@@ -444,6 +413,24 @@ class MQL5BridgePublisherV3:
         except Exception as e:
             logger.error(f"Exception in send_trade_command: {e}", exc_info=True)
             return False
+
+    def poll_m3_bar(self, timeout_ms: int = 1000) -> Optional[Dict[str, Any]]:
+        """
+        M3確定通知をPULLソケットで受け取る。
+        timeout_ms以内に通知が来なければNoneを返す。
+        """
+        if not self.is_connected or self.m3_notify_socket is None:
+            return None
+        try:
+            if self.m3_notify_socket.poll(timeout_ms):
+                msg = self.m3_notify_socket.recv_string()
+                bar = json.loads(msg)
+                bar["timestamp"] = datetime.fromtimestamp(bar["time"], tz=timezone.utc)
+                return bar
+            return None
+        except Exception as e:
+            logger.error(f"M3通知受信エラー: {e}")
+            return None
 
     def request_broker_state(self) -> Optional[Dict[str, Any]]:
         """
