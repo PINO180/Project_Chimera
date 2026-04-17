@@ -879,6 +879,13 @@ class RealtimeFeatureEngine:
                 baseline_atr = atr_value
             atr_ratio = atr_value / (baseline_atr + 1e-10)
 
+            # atr_ratio を latest_features_cache に書き込む
+            # → calculate_feature_vector が atr_ratio_M3 を処理する際に
+            #   latest_features_cache[tf_name].get("atr_ratio", 0.0) で正しい値を取得できる
+            # 学習側（S6）と同じ計算式・ベースライン期間なので純化不要
+            if tf_name in self.latest_features_cache:
+                self.latest_features_cache[tf_name]["atr_ratio"] = atr_ratio
+
             if atr_ratio >= atr_threshold:
                 # ▼▼▼ 修正: 古い unified キーの取得と payoff_ratio を廃止し、Long/Short 分割キーを取得 ▼▼▼
                 market_info = {

@@ -230,6 +230,7 @@ def _calculate_base_features(self, data, tf_name):
 
     # [乖離①修正] qa_stateとlookback_barsを時間足に合わせて渡す
     from execution.realtime_feature_engine import TIMEFRAME_BARS_PER_DAY
+
     tf_qa = self.qa_states.get(tf_name, {})
     lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
     module_keys = ["1A", "1B", "1C", "1D", "1E", "1F"]
@@ -237,7 +238,9 @@ def _calculate_base_features(self, data, tf_name):
     for tag, module in MODULES:
         try:
             ta = _t()
-            result = module.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get(tag))
+            result = module.calculate_features(
+                data, lookback_bars=lb, qa_state=tf_qa.get(tag)
+            )
             tb = _t()
             features.update(result)
             if PROFILING_ENABLED:

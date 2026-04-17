@@ -388,6 +388,14 @@ def main():
                 ),
             }
 
+            # m1_pred_probaをM2特徴量リストの末尾に強制配置
+            # Cx2・analyze_importance_orthogonal.pyと統一（ファイルの状態に依存しない堅牢な設計）
+            for key in ["long_m2", "short_m2"]:
+                fl = feature_lists[key]
+                if "m1_pred_proba" in fl:
+                    fl.remove("m1_pred_proba")
+                fl.append("m1_pred_proba")
+
             logger.info(
                 "✓ Two-Brainモデル、較正器、および専用特徴量リストのロード完了。"
             )
@@ -819,6 +827,20 @@ def main():
                         f"🧠 [Raw Proba] M1(L: {p_long_m1_raw:.4f}, S: {p_short_m1_raw:.4f}) -> "
                         f"M2(L: {p_long_m2_raw:.4f}, S: {p_short_m2_raw:.4f})"
                     )
+
+                    # ▼▼▼ ツール①: 特徴量スナップショット保存 ▼▼▼
+                    try:
+                        from feature_snapshot_tool import save_feature_snapshot
+                        save_feature_snapshot(
+                            feature_dict=feature_dict,
+                            p_m1_long=p_long_m1_raw,
+                            p_m1_short=p_short_m1_raw,
+                            p_m2_long=p_long_m2_raw,
+                            p_m2_short=p_short_m2_raw,
+                            atr_ratio=signal.market_info.get("atr_ratio", 0.0),
+                        )
+                    except Exception as _snap_e:
+                        logger.debug(f"スナップショット保存スキップ: {_snap_e}")
 
                     # ▼▼▼ 修正: Delta (差分) フィルター & 判定理由の明記 ▼▼▼
                     current_m2_thresh = risk_engine.config.get(

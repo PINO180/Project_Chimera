@@ -1504,6 +1504,13 @@ class BacktestSimulator:
                 ]
                 trade_log_final_csv = temp_log_formatted.select(available_columns_final)
 
+                # timestampをUTC→JSTに変換（+9時間）して上書き
+                trade_log_final_csv = trade_log_final_csv.with_columns(
+                    pl.col("timestamp").str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
+                    .dt.offset_by("9h")
+                    .alias("timestamp")
+                )
+
                 trade_log_final_csv.write_csv(
                     trade_log_output_path,
                     null_value="NaN",
@@ -1724,6 +1731,76 @@ class BacktestSimulator:
                 atr_label = "ATR Ratio (Relative)"
             # ▲▲▲ ここまで追加 ▲▲▲
 
+            # --- 時間帯・曜日分析の事前計算（CSVとTXT両方で使用）---
+            def _session(h):
+                """JST時間帯でセッション分類"""
+                if 9 <= h < 16:   return "Tokyo"
+                elif 16 <= h < 21: return "London"
+                elif h >= 21 or h < 1: return "Overlap"
+                elif 1 <= h < 6:  return "NY"
+                else:              return "Oceania"  # 6-9 JST
+
+            def _band_stats(indices, pnl_lst, label_lst):
+                if not indices:
+                    return None
+                p = [float(pnl_lst[i]) for i in indices if pnl_lst[i] is not None]
+                wins   = [x for x in p if x > 0]
+                losses = [x for x in p if x < 0]
+                wr  = len(wins) / len(p) * 100 if p else 0.0
+                pf  = sum(wins) / abs(sum(losses)) if losses else float("inf")
+                avg = sum(p) / len(p) if p else 0.0
+                tot = sum(p)
+                return {"count": len(p), "win_rate": wr, "pf": pf, "avg_pnl": avg, "total_pnl": tot}
+
+            hourly_stats  = {}
+            weekday_stats = {}
+            hxatr_stats   = {}
+
+            if not trade_log.is_empty():
+                ts_list2  = trade_log["timestamp"].to_list()
+                pnl_lst2  = trade_log["pnl"].to_list()
+                lbl_lst2  = trade_log["label"].to_list()
+                atr_lst2  = trade_log["atr_ratio"].to_list() if "atr_ratio" in trade_log.columns else [1.0] * len(ts_list2)
+
+                atr_bands = [
+                    ("< 0.5",   lambda x: x < 0.5),
+                    ("0.5-0.8", lambda x: 0.5 <= x < 0.8),
+                    ("0.8-1.0", lambda x: 0.8 <= x < 1.0),
+                    ("1.0-1.2", lambda x: 1.0 <= x < 1.2),
+                    ("1.2-1.5", lambda x: 1.2 <= x < 1.5),
+                    (">= 1.5",  lambda x: x >= 1.5),
+                ]
+
+                hour_idx    = {}
+                weekday_idx = {}
+                hxatr_idx   = {}
+
+                for i, ts in enumerate(ts_list2):
+                    try:
+                        # UTC→JST変換（+9時間）
+                        h_jst  = (ts.hour + 9) % 24
+                        # 日またぎ考慮: UTC時刻+9が24を超えた場合は翌日
+                        day_offset = 1 if (ts.hour + 9) >= 24 else 0
+                        wd_jst = (ts.weekday() + day_offset) % 7
+                    except Exception:
+                        continue
+                    hour_idx.setdefault(h_jst, []).append(i)
+                    weekday_idx.setdefault(wd_jst, []).append(i)
+                    ar = atr_lst2[i]
+                    if ar is not None and isinstance(ar, (int, float)):
+                        for band_name, band_fn in atr_bands:
+                            if band_fn(float(ar)):
+                                hxatr_idx.setdefault((h_jst, band_name), []).append(i)
+                                break
+
+                for h in range(24):
+                    hourly_stats[h] = _band_stats(hour_idx.get(h, []), pnl_lst2, lbl_lst2)
+                for wd in range(7):
+                    weekday_stats[wd] = _band_stats(weekday_idx.get(wd, []), pnl_lst2, lbl_lst2)
+                for h in range(24):
+                    for band_name, _ in atr_bands:
+                        hxatr_stats[(h, band_name)] = _band_stats(hxatr_idx.get((h, band_name), []), pnl_lst2, lbl_lst2)
+
             with open(text_report_path, "w", encoding="utf-8") as f:
                 f.write("=" * 60 + "\n")
                 f.write("    V5 Two-Brain Strategy Performance Report (MT5 Style)\n")
@@ -1821,6 +1898,35 @@ class BacktestSimulator:
                     "M1" if "m1_oof" in str(self.config.oof_long_path) else "M2"
                 )
 
+                # --- M1 全トリガー分布（参考値・M2モード時のみ追加表示）---
+                if "m1_oof" not in str(self.config.oof_long_path):
+                    try:
+                        _m1_oof_long  = pl.read_parquet(S7_M1_OOF_PREDICTIONS_LONG)
+                        _m1_oof_short = pl.read_parquet(S7_M1_OOF_PREDICTIONS_SHORT)
+                        _m1_all = pl.concat([_m1_oof_long, _m1_oof_short])["prediction"].to_list()
+                        _m1_total = len(_m1_all)
+                        _m1_bins = {
+                            "<= 0.50":   sum(1 for x in _m1_all if x <= 0.50),
+                            "0.50-0.55": sum(1 for x in _m1_all if 0.50 < x <= 0.55),
+                            "0.55-0.60": sum(1 for x in _m1_all if 0.55 < x <= 0.60),
+                            "0.60-0.65": sum(1 for x in _m1_all if 0.60 < x <= 0.65),
+                            "0.65-0.70": sum(1 for x in _m1_all if 0.65 < x <= 0.70),
+                            "0.70-0.75": sum(1 for x in _m1_all if 0.70 < x <= 0.75),
+                            "0.75-0.80": sum(1 for x in _m1_all if 0.75 < x <= 0.80),
+                            "0.80-0.85": sum(1 for x in _m1_all if 0.80 < x <= 0.85),
+                            "0.85-0.90": sum(1 for x in _m1_all if 0.85 < x <= 0.90),
+                            "0.90-0.95": sum(1 for x in _m1_all if 0.90 < x <= 0.95),
+                            "0.95-1.00": sum(1 for x in _m1_all if x > 0.95),
+                        }
+                        f.write("-" * 23 + " M1 Proba Distribution (参考 / OOFベース) " + "-" * 3 + "\n")
+                        f.write("  ※ M1の生の出力分布（M2への入力前）\n")
+                        for k, v in _m1_bins.items():
+                            pct = (v / _m1_total) * 100 if _m1_total > 0 else 0
+                            f.write(f"{k.ljust(15)}: {str(v).rjust(8)} ({pct:5.1f} %)\n")
+                        f.write("\n")
+                    except Exception as _e:
+                        logging.warning(f"M1分布の計算に失敗しました: {_e}")
+
                 # --- 全トリガー分布（OOFファイルから直接計算）---
                 try:
                     _oof_long = pl.read_parquet(self.config.oof_long_path)
@@ -1913,6 +2019,70 @@ class BacktestSimulator:
                     )
                 f.write("\n")
                 # ▲▲▲ ここまで追加 ▲▲▲
+
+                # --- TXTに時間帯・曜日サマリーを追記 ---
+                wd_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                session_order = ["Tokyo","London","Overlap","NY","Oceania"]
+
+                # セッション別集計
+                session_stats = {}
+                for h, st in hourly_stats.items():
+                    if st is None:
+                        continue
+                    s = _session(h)
+                    if s not in session_stats:
+                        session_stats[s] = {"count":0,"wins":0,"pnl_wins":0.0,"pnl_losses":0.0}
+                    session_stats[s]["count"] += st["count"]
+                    w = int(st["count"] * st["win_rate"] / 100)
+                    session_stats[s]["wins"] += w
+                    if st["pf"] != float("inf"):
+                        l_cnt = st["count"] - w
+                        if l_cnt > 0:
+                            avg_loss = st["avg_pnl"] - st["win_rate"]/100 * (st["avg_pnl"] * st["pf"] / (1 + st["pf"]) if st["pf"] > 0 else 0)
+                    session_stats[s]["pnl_wins"] += st["total_pnl"] if st["total_pnl"] > 0 else 0
+                    session_stats[s]["pnl_losses"] += st["total_pnl"] if st["total_pnl"] < 0 else 0
+
+                f.write("-" * 22 + " Session Summary " + "-" * 21 + "\n")
+                f.write(f"  {'Session':<10}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n")
+                f.write("  " + "-" * 66 + "\n")
+                for s in session_order:
+                    hs = [st for h, st in hourly_stats.items() if _session(h) == s and st is not None]
+                    if not hs:
+                        continue
+                    tc  = sum(x["count"] for x in hs)
+                    tw  = sum(int(x["count"]*x["win_rate"]/100) for x in hs)
+                    wr  = tw/tc*100 if tc > 0 else 0
+                    all_pnl = [x["total_pnl"] for x in hs]
+                    pw = sum(x for x in all_pnl if x > 0)
+                    pl_neg = sum(x for x in all_pnl if x < 0)
+                    pf_s = pw/abs(pl_neg) if pl_neg != 0 else float("inf")
+                    pf_str = f"{pf_s:.2f}" if pf_s != float("inf") else "inf"
+                    tot = sum(all_pnl)
+                    avg = tot/tc if tc > 0 else 0
+                    f.write(f"  {s:<10}{tc:>8}{wr:>9.2f}%{pf_str:>8}{avg:>14,.0f}{tot:>16,.0f}\n")
+                f.write("\n")
+
+                f.write("-" * 22 + " Weekday Summary " + "-" * 21 + "\n")
+                f.write(f"  {'Weekday':<12}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n")
+                f.write("  " + "-" * 66 + "\n")
+                for wd in range(7):
+                    st = weekday_stats.get(wd)
+                    if st is None:
+                        continue
+                    pf_str = f"{st['pf']:.2f}" if st['pf'] != float("inf") else "inf"
+                    f.write(f"  {wd_names[wd]:<12}{st['count']:>8}{st['win_rate']:>9.2f}%{pf_str:>8}{st['avg_pnl']:>14,.0f}{st['total_pnl']:>16,.0f}\n")
+                f.write("\n")
+
+                # ベスト・ワースト時間帯
+                valid_hours = [(h, st) for h, st in hourly_stats.items() if st and st["count"] >= 10]
+                if valid_hours:
+                    best_wr  = max(valid_hours, key=lambda x: x[1]["win_rate"])
+                    worst_wr = min(valid_hours, key=lambda x: x[1]["win_rate"])
+                    best_pf  = max(valid_hours, key=lambda x: x[1]["pf"] if x[1]["pf"] != float("inf") else 0)
+                    f.write("-" * 22 + " Hourly Highlights " + "-" * 19 + "\n")
+                    f.write(f"  Best  Win Rate : {best_wr[0]:02d}:00 UTC ({_session(best_wr[0])}) → {best_wr[1]['win_rate']:.2f}%\n")
+                    f.write(f"  Worst Win Rate : {worst_wr[0]:02d}:00 UTC ({_session(worst_wr[0])}) → {worst_wr[1]['win_rate']:.2f}%\n")
+                    f.write(f"  Best  PF       : {best_pf[0]:02d}:00 UTC ({_session(best_pf[0])}) → PF {best_pf[1]['pf']:.2f}\n\n")
 
                 f.write("=" * 60 + "\n")
             logging.info(f"Text performance report saved successfully.")
@@ -2007,6 +2177,92 @@ class BacktestSimulator:
                 logging.info(f"Monthly breakdown CSV saved to {monthly_path}")
         except Exception as e:
             logging.error(f"Failed to save monthly breakdown CSV: {e}", exc_info=True)
+
+        # --- 時間帯別分析 CSV ---
+        try:
+            if not trade_log.is_empty() and hourly_stats:
+                import csv as _csv
+                hourly_path = FINAL_REPORT_PATH.parent / (
+                    FINAL_REPORT_PATH.stem + "_hourly_analysis.csv"
+                )
+                fields = ["hour_jst","session","trades","win_rate_%","profit_factor","avg_pnl","total_pnl"]
+                with open(hourly_path, "w", newline="", encoding="utf-8") as f:
+                    w = _csv.DictWriter(f, fieldnames=fields)
+                    w.writeheader()
+                    for h in range(24):
+                        st = hourly_stats.get(h)
+                        if st is None:
+                            w.writerow({"hour_jst": h, "session": _session(h), "trades": 0,
+                                        "win_rate_%": "", "profit_factor": "", "avg_pnl": "", "total_pnl": ""})
+                        else:
+                            pf_val = round(st["pf"], 3) if st["pf"] != float("inf") else None
+                            w.writerow({"hour_jst": h, "session": _session(h),
+                                        "trades": st["count"],
+                                        "win_rate_%": round(st["win_rate"], 2),
+                                        "profit_factor": pf_val,
+                                        "avg_pnl": round(st["avg_pnl"], 2),
+                                        "total_pnl": round(st["total_pnl"], 2)})
+                logging.info(f"Hourly analysis CSV saved to {hourly_path}")
+        except Exception as e:
+            logging.error(f"Failed to save hourly analysis CSV: {e}", exc_info=True)
+
+        # --- 曜日別分析 CSV ---
+        try:
+            if not trade_log.is_empty() and weekday_stats:
+                import csv as _csv
+                wd_path = FINAL_REPORT_PATH.parent / (
+                    FINAL_REPORT_PATH.stem + "_weekday_analysis.csv"
+                )
+                wd_names_csv = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                fields = ["weekday","weekday_name","trades","win_rate_%","profit_factor","avg_pnl","total_pnl"]
+                with open(wd_path, "w", newline="", encoding="utf-8") as f:
+                    w = _csv.DictWriter(f, fieldnames=fields)
+                    w.writeheader()
+                    for wd in range(7):
+                        st = weekday_stats.get(wd)
+                        if st is None:
+                            w.writerow({"weekday": wd, "weekday_name": wd_names_csv[wd], "trades": 0,
+                                        "win_rate_%": "", "profit_factor": "", "avg_pnl": "", "total_pnl": ""})
+                        else:
+                            pf_val = round(st["pf"], 3) if st["pf"] != float("inf") else None
+                            w.writerow({"weekday": wd, "weekday_name": wd_names_csv[wd],
+                                        "trades": st["count"],
+                                        "win_rate_%": round(st["win_rate"], 2),
+                                        "profit_factor": pf_val,
+                                        "avg_pnl": round(st["avg_pnl"], 2),
+                                        "total_pnl": round(st["total_pnl"], 2)})
+                logging.info(f"Weekday analysis CSV saved to {wd_path}")
+        except Exception as e:
+            logging.error(f"Failed to save weekday analysis CSV: {e}", exc_info=True)
+
+        # --- 時間帯×ATR帯 分析 CSV ---
+        try:
+            if not trade_log.is_empty() and hxatr_stats:
+                import csv as _csv
+                hxatr_path = FINAL_REPORT_PATH.parent / (
+                    FINAL_REPORT_PATH.stem + "_hour_x_atr_analysis.csv"
+                )
+                atr_band_names = ["< 0.5","0.5-0.8","0.8-1.0","1.0-1.2","1.2-1.5",">= 1.5"]
+                fields = ["hour_jst","session","atr_band","trades","win_rate_%","profit_factor","avg_pnl","total_pnl"]
+                with open(hxatr_path, "w", newline="", encoding="utf-8") as f:
+                    w = _csv.DictWriter(f, fieldnames=fields)
+                    w.writeheader()
+                    for h in range(24):
+                        for band_name in atr_band_names:
+                            st = hxatr_stats.get((h, band_name))
+                            if st is None or st["count"] == 0:
+                                continue
+                            pf_val = round(st["pf"], 3) if st["pf"] != float("inf") else None
+                            w.writerow({"hour_jst": h, "session": _session(h),
+                                        "atr_band": band_name,
+                                        "trades": st["count"],
+                                        "win_rate_%": round(st["win_rate"], 2),
+                                        "profit_factor": pf_val,
+                                        "avg_pnl": round(st["avg_pnl"], 2),
+                                        "total_pnl": round(st["total_pnl"], 2)})
+                logging.info(f"Hour x ATR analysis CSV saved to {hxatr_path}")
+        except Exception as e:
+            logging.error(f"Failed to save hour x ATR analysis CSV: {e}", exc_info=True)
 
         return report_data
 
