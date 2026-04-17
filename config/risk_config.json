@@ -19,7 +19,7 @@
   "value_per_pip": 1.0,
   "_prevent_simultaneous_orders_note": "main.py参照",
   "prevent_simultaneous_orders": true,
-  "max_drawdown": 20.0,
+  "max_drawdown": 1.0,
   "max_positions": 100,
   "min_atr_threshold": 0.8,
   "use_fixed_risk": true,

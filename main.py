@@ -82,13 +82,13 @@ ALL_TIMEFRAMES = {
     "M8": "M8",
     "M15": "M15",
     "M30": "M30",
-    "H1": "H1",
-    "H4": "H4",
-    "H6": "H6",
-    "H12": "H12",
-    "D1": "D1",
-    "W1": "W1",
-    "MN": "MN",
+    # "H1": "H1",
+    # "H4": "H4",
+    # "H6": "H6",
+    # "H12": "H12",
+    # "D1": "D1",
+    # "W1": "W1",
+    # "MN": "MN",
 }
 
 # --- グローバルキャッシュ ---
@@ -201,7 +201,10 @@ def initialize_data_buffer(
         temp_df = df_rates_m05[["timestamp", "close"]].copy()
         temp_df.set_index("timestamp", inplace=True)
 
-        # M0.5をM5にリサンプリング(5分ごとの終値)し、リターンを計算
+        # [乖離④修正] 学習側(2_G_alpha_neutralizer)と計算方式を統一:
+        #   学習側: close / close.shift(1) - 1  ← M5の1バー前比リターン
+        #   旧本番: m5_close.pct_change(5)  ← 5バー前比リターン（OLSのX分布が異なっていた）
+        #   新本番: m5_close.pct_change(1)  ← 1バー前比リターン（学習側と一致）
         m5_close = (
             temp_df["close"]
             .resample("5min", label="right", closed="right")
@@ -209,7 +212,7 @@ def initialize_data_buffer(
             .dropna()
         )
         proxy_df = (
-            m5_close.pct_change(MARKET_PROXY_LOOKBACK)
+            m5_close.pct_change(1)
             .to_frame(name="market_proxy")
             .dropna()
         )
@@ -233,14 +236,14 @@ def initialize_data_buffer(
     # エンジンに全履歴データを一括で渡す
     engine.fill_all_buffers(history_data_map, g_market_proxy)
 
-    # M1ループの開始時刻をセット（リアルタイム監視はM1バー確定を継続使用）
+    # M3イベント駆動ループの開始時刻をセット
     global g_last_processed_bar_time
     if len(history_data_map["M0.5"]) > 0:
         g_last_processed_bar_time = int(
             history_data_map["M0.5"]["timestamp"].iloc[-1].timestamp()
         )
         logger.info(
-            f"M1ループの最終処理時刻: {datetime.fromtimestamp(g_last_processed_bar_time, timezone.utc)}"
+            f"M0.5バー最終処理時刻: {datetime.fromtimestamp(g_last_processed_bar_time, timezone.utc)}"
         )
     else:
         logger.warning("M0.5データが空のため、最終処理時刻を現在時刻に設定します。")
@@ -439,10 +442,10 @@ def main():
                 # 1. とりあえずロードを試みる
                 if feature_engine.load_state(str(state_file)):
                     logger.info("⚡ スナップショットからの爆速復帰に成功しました！")
-                    if len(feature_engine.m1_dataframe) > 0:
+                    if len(feature_engine.m05_dataframe) > 0:
                         global g_last_processed_bar_time
                         g_last_processed_bar_time = int(
-                            feature_engine.m1_dataframe[-1]["timestamp"].timestamp()
+                            feature_engine.m05_dataframe[-1]["timestamp"].timestamp()
                         )
 
                         # 差分（ギャップ）の時間を計算
@@ -478,27 +481,38 @@ def main():
                                             "low": row["low"],
                                             "close": row["close"],
                                             "volume": float(row["volume"]),
-                                            "spread": 16.0,
+                                            "spread": 36.0,
                                         }
-                                        if len(feature_engine.m1_dataframe) >= 25:
-                                            past_close = feature_engine.m1_dataframe[
-                                                -25
-                                            ]["close"]
-                                            new_proxy_val = (
-                                                bar_dict["close"] - past_close
-                                            ) / past_close
-                                            new_proxy_df = pd.DataFrame(
-                                                {"market_proxy": [new_proxy_val]},
-                                                index=pd.DatetimeIndex(
-                                                    [bar_dict["timestamp"]], tz="UTC"
-                                                ),
+                                        # [乖離④修正] M5の1バー前比リターン（学習側2Gと完全一致）
+                                        # m05_dataframeをリサンプリングしてM5クローズ2本を取得
+                                        if len(feature_engine.m05_dataframe) >= 20:
+                                            _recent = pd.DataFrame(
+                                                list(feature_engine.m05_dataframe)[-20:]
+                                            ).set_index("timestamp")
+                                            _m5 = (
+                                                _recent["close"]
+                                                .resample("5min", closed="right", label="right")
+                                                .last()
+                                                .dropna()
                                             )
-                                            if g_market_proxy.empty:
-                                                g_market_proxy = new_proxy_df
-                                            else:
-                                                g_market_proxy = pd.concat(
-                                                    [g_market_proxy, new_proxy_df]
+                                            if len(_m5) >= 2:
+                                                new_proxy_val = (
+                                                    float(_m5.iloc[-1]) - float(_m5.iloc[-2])
+                                                ) / (float(_m5.iloc[-2]) + 1e-10)
+                                                new_proxy_df = pd.DataFrame(
+                                                    {"market_proxy": [new_proxy_val]},
+                                                    index=pd.DatetimeIndex(
+                                                        [_m5.index[-1]], tz="UTC"
+                                                    ),
                                                 )
+                                                if g_market_proxy.empty:
+                                                    g_market_proxy = new_proxy_df
+                                                else:
+                                                    # 同一タイムスタンプの重複追記を防止
+                                                    if _m5.index[-1] not in g_market_proxy.index:
+                                                        g_market_proxy = pd.concat(
+                                                            [g_market_proxy, new_proxy_df]
+                                                        )
 
                                         feature_engine.process_new_m05_bar(
                                             bar_dict, g_market_proxy
@@ -669,22 +683,35 @@ def main():
                 if new_m05_bar is None:
                     continue
 
-                # 市場プロキシの更新
-                if feature_engine and len(feature_engine.m1_dataframe) >= 25:
-                    current_close = new_m05_bar["close"]
-                    past_close = feature_engine.m1_dataframe[-25]["close"]
-                    if past_close > 0:
-                        new_proxy_val = (current_close - past_close) / past_close
+                # 市場プロキシの更新（M5の1バー前比リターン、学習側2Gと完全一致）
+                # m05_dataframeをM5にリサンプリングしてM5クローズ2本を取得
+                # M5が確定するのは5分に1回だが、ffillで参照するため問題なし
+                if feature_engine and len(feature_engine.m05_dataframe) >= 20:
+                    _recent = pd.DataFrame(
+                        list(feature_engine.m05_dataframe)[-20:]
+                    ).set_index("timestamp")
+                    _m5 = (
+                        _recent["close"]
+                        .resample("5min", closed="right", label="right")
+                        .last()
+                        .dropna()
+                    )
+                    if len(_m5) >= 2:
+                        new_proxy_val = (
+                            float(_m5.iloc[-1]) - float(_m5.iloc[-2])
+                        ) / (float(_m5.iloc[-2]) + 1e-10)
                         new_proxy_df = pd.DataFrame(
                             {"market_proxy": [new_proxy_val]},
                             index=pd.DatetimeIndex(
-                                [new_m05_bar["timestamp"]], tz="UTC"
+                                [_m5.index[-1]], tz="UTC"
                             ),
                         )
                         if g_market_proxy.empty:
                             g_market_proxy = new_proxy_df
                         else:
-                            g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
+                            # 同一タイムスタンプの重複を避けて追記
+                            if _m5.index[-1] not in g_market_proxy.index:
+                                g_market_proxy = pd.concat([g_market_proxy, new_proxy_df])
                         if len(g_market_proxy) > 10000:
                             g_market_proxy = g_market_proxy.iloc[-5000:]
 
@@ -983,7 +1010,7 @@ def main():
                     )
                     # ★追加確認: atr_ratioもmarket_infoから取得してrisk_engineに渡す
                     current_atr_ratio = signal.market_info.get("atr_ratio", 0.0)
-                    # ▼追加: M1バーから取得したリアルタイムスプレッド
+                    # ▼追加: M0.5バーから取得したリアルタイムスプレッド
                     current_spread = new_m05_bar.get("spread", 999.0)
 
                     # ▼▼▼ 修正: Long/Shortで独立したSL/PT倍率をコンフィグから取得 ▼▼▼

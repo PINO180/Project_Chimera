@@ -159,27 +159,19 @@ class ExtremeRiskEngineV5:
             # ▼修正: コンフィグを直接見に行くのではなく、引数として受け取った正確な倍率を使用する
             sl_mult = Decimal(str(sl_multiplier))
 
-            # ▼修正: リアルタイムスプレッドの甘い誘惑を無視し、常にコンフィグの最悪想定コスト（固定値）で計算する！
-            # これにより、損切り時のスプレッド拡大による予算（Risk%）のオーバーを完全に防ぎます。
-            spread_pips = Decimal(str(self.config.get("spread_pips", 36.0)))
-
-            val_per_pip = Decimal(str(self.config.get("value_per_pip", 1.0)))
-
             # 1. 最大許容損失額 = 現在の口座残高 × fixed_risk_percent
             max_loss_amount = eq_dec * fixed_risk_percent
 
             # 2. 1ロットあたりの値幅損失額 = ATR × SL_Multiplier × ContractSize
+            # [乖離②修正] バックテスト側と計算式を統一:
+            #   バックテスト: base_lot = max_loss / (sl_price_distance * contract_size)
+            #   旧本番: base_lot = max_loss / (sl_loss + spread_cost)  ← スプレッドを分母に含めていた
+            #   新本番: base_lot = max_loss / sl_loss  ← バックテストと一致
             sl_loss_per_lot = Decimal(str(atr_value)) * sl_mult * contract_dec
 
-            # 3. 1ロットあたりのスプレッドコスト = Spread_pips × Value_per_pip
-            spread_cost_per_lot = spread_pips * val_per_pip
-
-            # 4. 1ロットあたりのトータル最大損失額 = 値幅損失額 ＋ スプレッドコスト
-            total_risk_per_lot = sl_loss_per_lot + spread_cost_per_lot
-
-            # 5. base_lot = 最大許容損失額 / トータル最大損失額
-            if total_risk_per_lot > Decimal("0"):
-                base_lot = max_loss_amount / total_risk_per_lot
+            # 3. base_lot = 最大許容損失額 / 値幅損失額
+            if sl_loss_per_lot > Decimal("0"):
+                base_lot = max_loss_amount / sl_loss_per_lot
             else:
                 base_lot = Decimal("0")
         else:

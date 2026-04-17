@@ -51,8 +51,8 @@ TIMEFRAME_BARS_PER_DAY: Dict[str, int] = {
     "M5": 288,
     "M8": 180,
     "M15": 96,
-    "M30": 48,
-    "H1": 24,
+    # "M30": 48,
+    # "H1": 24,
     # "H4": 6, "H6": 4, "H12": 2, "D1": 1,  # [FIX] 使用されない時間足
 }
 
@@ -87,7 +87,7 @@ class Signal:
 class RealtimeFeatureEngine:
     """
     【Project Cimera V5: オーケストレーター】
-    15時間足の独立したNumpyバッファを保持し、M1バーを起点とした
+    15時間足の独立したNumpyバッファを保持し、M0.5バーを起点とした
     全時間足の同期・リサンプリング・OLS純化・ベクトル生成を司る司令塔。
     特徴量計算そのものは外部のNumbaモジュール(1A〜1F)へ委譲する。
     """
@@ -99,8 +99,8 @@ class RealtimeFeatureEngine:
         "M5": 5,
         "M8": 8,
         "M15": 15,
-        # "M30": 30,  # [V5] orthogonalリストに存在しないためスキップ
-        "H1": 60,
+        # "M30": 30,
+        # "H1": 60,
         # "H4": 240,
         # "H6": 360,   # [FIX] orthogonal全4ファイルで gain 0.006%以下・削除
         # "H12": 720,  # [FIX] orthogonal全4ファイルで gain 0.004%以下・削除
@@ -111,14 +111,14 @@ class RealtimeFeatureEngine:
     }
 
     TF_RESAMPLE_RULES = {
-        # [FIX] M0.5はpandasの"30s"でリサンプル（M1=60秒の半分=30秒足）
-        "M0.5": "30s",
+        # "M0.5": "30s",  # M0.5はm1_dataframeの起点のためスキップ
+        "M1": "1min",
         "M3": "3min",
         "M5": "5min",
         "M8": "8min",
         "M15": "15min",
-        # "M30": "30min", # [V5] orthogonalリストに存在しないためスキップ
-        "H1": "1h",
+        # "M30": "30min",
+        # "H1": "1h",
         # "H4": "4h",   # [FIX] orthogonalリストに存在しないためスキップ
         # "H6": "6h",   # [FIX] gain 0.006%以下・削除
         # "H12": "12h", # [FIX] gain 0.004%以下・削除
@@ -195,8 +195,8 @@ class RealtimeFeatureEngine:
         max_lookback_val = (
             max(self.lookbacks_by_tf.values()) if self.lookbacks_by_tf else 1000
         )
-        max_m1_bars_needed = max_lookback_val * 1440 + 1000
-        self.m1_dataframe: deque[Dict[str, Any]] = deque(maxlen=max_m1_bars_needed)
+        max_m05_bars_needed = max_lookback_val * 2880 + 1000
+        self.m05_dataframe: deque[Dict[str, Any]] = deque(maxlen=max_m05_bars_needed)
 
         # 5. 純化(OLS)用 状態保持バッファ
         self.proxy_feature_buffers: Dict[str, Dict[str, deque]] = {}
@@ -220,10 +220,28 @@ class RealtimeFeatureEngine:
             self.ols_state[tf_name] = {}
             # 各エントリは _update_incremental_ols で特徴量登場時に動的初期化される
 
-        self.logger.info(f"M1 Dequeバッファを初期化 (maxlen: {max_m1_bars_needed})")
+        self.logger.info(f"M0.5 Dequeバッファを初期化 (maxlen: {max_m05_bars_needed})")
 
         # 6. JITコンパイルのウォームアップ
         self._warmup_jit()
+
+        # 7. 各時間足・各モジュール(1A〜1F)のQAStateを初期化
+        # [乖離①修正] 学習側 apply_quality_assurance_to_group と等価のQA処理を有効化
+        # lookback_barsは時間足ごとの1日バー数（M3=480等）を使用
+        self.qa_states: Dict[str, Dict[str, Any]] = {}
+        for tf_name in self.ALL_TIMEFRAMES.keys():
+            if self.ALL_TIMEFRAMES[tf_name] is None:
+                continue
+            lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
+            self.qa_states[tf_name] = {
+                "1A": FeatureModule1A.QAState(lookback_bars=lb),
+                "1B": FeatureModule1B.QAState(lookback_bars=lb),
+                "1C": FeatureModule1C.QAState(lookback_bars=lb),
+                "1D": FeatureModule1D.QAState(lookback_bars=lb),
+                "1E": FeatureModule1E.QAState(lookback_bars=lb),
+                "1F": FeatureModule1F.QAState(lookback_bars=lb),
+            }
+        self.logger.info("✓ 全時間足のQAStateを初期化しました。")
 
     def _load_feature_list(self, path: str) -> List[str]:
         p = Path(path)
@@ -322,7 +340,7 @@ class RealtimeFeatureEngine:
             "M8": "8min",
             "M15": "15min",
             "M30": "30min",
-            "H1": "1h",
+            # "H1": "1h",
             # "H4": "4h",  # 未使用
             # "H6": "6h",  # [FIX] 削除済み
             # "H12": "12h", # [FIX] 削除済み
@@ -492,9 +510,9 @@ class RealtimeFeatureEngine:
         market_proxy_cache: pd.DataFrame,
     ) -> None:
         """
-        1. M1データのみを history_data_map から受け取る
-        2. M1バッファを充填
-        3. M1データから M3〜MN のすべてをリサンプリングして充填する
+        1. M0.5データのみを history_data_map から受け取る
+        2. M0.5バッファを充填
+        3. M0.5データから M1・M3〜MN のすべてをリサンプリングして充填する
         """
         self.logger.info(
             "全時間足の履歴データでNumpyバッファを一括充填中 (V12.0: M0.5起点)..."
@@ -513,7 +531,7 @@ class RealtimeFeatureEngine:
         self.logger.info(f"  -> M0.5 バッファをMT5データから充填中...")
         self._replace_buffer_from_dataframe("M0.5", m05_history_pd, market_proxy_cache)
 
-        # M1をM0.5からリサンプリングして生成し、m1_dataframeを構築
+        # M1をM0.5からリサンプリングして生成し、m05_dataframeを構築
         self.logger.info(f"  -> M1  をM0.5からリサンプリング中...")
         m1_history_pd = (
             m05_history_pd.resample("1min")
@@ -530,9 +548,9 @@ class RealtimeFeatureEngine:
         )
         self._replace_buffer_from_dataframe("M1", m1_history_pd, market_proxy_cache)
 
-        self.m1_dataframe.clear()
-        m1_records = m1_history_pd.reset_index().to_dict("records")
-        self.m1_dataframe.extend(m1_records)
+        self.m05_dataframe.clear()
+        m05_records = m05_history_pd.reset_index().to_dict("records")
+        self.m05_dataframe.extend(m05_records)
 
         for tf_name, rule in self.TF_RESAMPLE_RULES.items():
             if tf_name not in self.data_buffers or tf_name in ("M0.5", "M1"):
@@ -588,7 +606,7 @@ class RealtimeFeatureEngine:
                 self.data_buffers[tf_name][col].append(bar_dict[col])
             self.last_bar_timestamps[tf_name] = bar_timestamp
 
-            # ★ 2, 3 の古い限定的OLS更新処理を削除 (process_new_m1_bar内で全特徴量を一括更新するため)
+            # ★ 2, 3 の古い限定的OLS更新処理を削除 (process_new_m05_bar内で全特徴量を一括更新するため)
 
             # 4. 充填状態を更新
             if not self.is_buffer_filled[tf_name]:
@@ -604,7 +622,7 @@ class RealtimeFeatureEngine:
         self, tf_name: str, rule: str, market_proxy_cache: pd.DataFrame
     ) -> List[pd.Timestamp]:
         """
-        M1 DequeをDFに変換してリサンプリングし、新しいバーが生成されていたら
+        M0.5 DequeをDFに変換してリサンプリングし、新しいバーが生成されていたら
         対象のバッファに追加し、新バーのタイムスタンプを返す。
         """
         try:
@@ -618,31 +636,31 @@ class RealtimeFeatureEngine:
             # 1. Dequeから必要なデータ「だけ」を抽出 (メモリコピー地獄を回避)
             # [FIX-WARNING-5] off-by-one 修正: last_known_timestamp 以降のバーのみ収集し
             # リサンプリングのオーバーラップ用に1本前のバーを追加する
-            new_m1_bars_for_resampling = []
+            new_m05_bars_for_resampling = []
             found_anchor = False
-            for bar in reversed(self.m1_dataframe):
+            for bar in reversed(self.m05_dataframe):
                 bar_ts = bar["timestamp"]
                 if bar_ts >= last_known_timestamp:
-                    new_m1_bars_for_resampling.append(bar)
+                    new_m05_bars_for_resampling.append(bar)
                 else:
                     # 1本前のアンカーバーを追加してリサンプリングの境界を正確にする
                     if not found_anchor:
-                        new_m1_bars_for_resampling.append(bar)
+                        new_m05_bars_for_resampling.append(bar)
                         found_anchor = True
                     break
 
-            new_m1_bars_for_resampling.reverse()
+            new_m05_bars_for_resampling.reverse()
 
-            if len(new_m1_bars_for_resampling) < 2:
+            if len(new_m05_bars_for_resampling) < 2:
                 return []
 
-            new_m1_data = pd.DataFrame(new_m1_bars_for_resampling).set_index(
+            new_m05_data = pd.DataFrame(new_m05_bars_for_resampling).set_index(
                 "timestamp"
             )
 
             # 2. 抽出したDFのみをリサンプリング
             resampled_df = (
-                new_m1_data.resample(rule)
+                new_m05_data.resample(rule)
                 .agg(
                     {
                         "open": "first",
@@ -701,9 +719,8 @@ class RealtimeFeatureEngine:
             m05_timestamp = m05_bar["timestamp"]
 
             # 1. M0.5バッファに新しいバーを追加
-            # m1_dataframe はリサンプリング起点として引き続き使用するため
-            # M0.5バーをM1粒度に変換して追加する（2本に1回M1バーが確定）
-            self.m1_dataframe.append(m05_bar)
+            # m05_dataframe はリサンプリング起点として使用
+            self.m05_dataframe.append(m05_bar)
             m05_bar_df = pd.DataFrame([m05_bar]).set_index("timestamp")
             self._append_bar_to_buffer("M0.5", m05_bar_df, market_proxy_cache)
 
@@ -823,45 +840,41 @@ class RealtimeFeatureEngine:
                 ),
             }
 
-            # --- 外部エンジン依存を排除し、Numpyでローカル計算 ---
+            # [乖離③修正] 学習側(create_proxy_labels)と計算方式を統一:
+            #   学習側: TR.ewm_mean(alpha=1/ATR_PERIOD, adjust=False)  ← Wilder EWM
+            #   旧本番: np.mean(tr[-13:])  ← 単純平均
+            #   新本番: calculate_atr_wilder()  ← core_indicatorsのWilder EWM実装で統一
+            # ATR Ratioのbaselineも学習側に合わせ「ATR(EWM)のrolling mean」を使用
             high, low, close = data["high"], data["low"], data["close"]
             if len(close) > 1:
-                tr = np.maximum(
-                    high[1:] - low[1:],
-                    np.maximum(
-                        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
-                    ),
+                # Wilder EWM ATR（学習側と同一）
+                atr_arr = calculate_atr_wilder(
+                    high.astype(np.float64),
+                    low.astype(np.float64),
+                    close.astype(np.float64),
+                    self.ATR_CALC_PERIOD,
                 )
-                atr_value = (
-                    float(np.mean(tr[-self.ATR_CALC_PERIOD :]))
-                    if len(tr) >= self.ATR_CALC_PERIOD
-                    else float(np.mean(tr))
-                )
+                atr_value = float(atr_arr[-1]) if len(atr_arr) > 0 and np.isfinite(atr_arr[-1]) else 0.0
             else:
                 atr_value = 0.0
+                atr_arr = np.array([])
 
             current_price = data["close"][-1]
             if np.isnan(atr_value):
                 return {"is_V5": False, "reason": "atr_is_nan"}
 
             # ATR Ratioフィルター (risk_config.json で管理)
-            # ATR Ratio = 現在のATR / 過去ATR_BASELINE_DAYS日の平均ATR
+            # ATR Ratio = 現在のATR(EWM) / 過去ATR_BASELINE_DAYS日のATR(EWM)の平均
+            # 学習側: atr_ratio = ATR / ATR.rolling_mean(baseline_period)
             atr_threshold = self.risk_config.get("min_atr_threshold", 0.8)  # Ratio閾値
             baseline_period = (
                 TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440) * ATR_BASELINE_DAYS
             )
-            # バッファ全体のATR時系列を取得してベースラインを計算
-            if len(close) > 1:
-                tr_full = np.maximum(
-                    high[1:] - low[1:],
-                    np.maximum(
-                        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])
-                    ),
-                )
-                if len(tr_full) >= baseline_period:
-                    baseline_atr = np.mean(tr_full[-baseline_period:])
-                else:
-                    baseline_atr = np.mean(tr_full)
+            # ATR配列全体からbaselineを計算（ATRのrolling mean = 学習側と一致）
+            if len(atr_arr) >= baseline_period:
+                baseline_atr = float(np.mean(atr_arr[-baseline_period:]))
+            elif len(atr_arr) > 0:
+                baseline_atr = float(np.mean(atr_arr))
             else:
                 baseline_atr = atr_value
             atr_ratio = atr_value / (baseline_atr + 1e-10)
@@ -1083,14 +1096,18 @@ class RealtimeFeatureEngine:
         """
         features = {}
 
+        # [乖離①修正] qa_stateとlookback_barsを時間足に合わせて渡す
+        tf_qa = self.qa_states.get(tf_name, {})
+        lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
+
         # 1. 各カテゴリのクラスにデータを渡し、完成した辞書を受け取って結合
         try:
-            features.update(FeatureModule1A.calculate_features(data))
-            features.update(FeatureModule1B.calculate_features(data))
-            features.update(FeatureModule1C.calculate_features(data))
-            features.update(FeatureModule1D.calculate_features(data))
-            features.update(FeatureModule1E.calculate_features(data))
-            features.update(FeatureModule1F.calculate_features(data))
+            features.update(FeatureModule1A.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1A")))
+            features.update(FeatureModule1B.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1B")))
+            features.update(FeatureModule1C.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1C")))
+            features.update(FeatureModule1D.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1D")))
+            features.update(FeatureModule1E.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1E")))
+            features.update(FeatureModule1F.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1F")))
         except Exception as e:
             self.logger.error(
                 f"ベース特徴量の計算中にエラーが発生しました ({tf_name}): {e}",
@@ -1201,9 +1218,10 @@ class RealtimeFeatureEngine:
                 "is_buffer_filled": self.is_buffer_filled,
                 "last_bar_timestamps": self.last_bar_timestamps,
                 "latest_features_cache": self.latest_features_cache,
-                "m1_dataframe": self.m1_dataframe,
+                "m05_dataframe": self.m05_dataframe,
                 "proxy_feature_buffers": self.proxy_feature_buffers,
                 "ols_state": self.ols_state,
+                "qa_states": self.qa_states,  # [乖離①修正] QAStateをスナップショットに含める
             }
 
             # 1. まず一時ファイル (.tmp) に書き込む
@@ -1249,13 +1267,14 @@ class RealtimeFeatureEngine:
             self.is_buffer_filled = state_data["is_buffer_filled"]
             self.last_bar_timestamps = state_data["last_bar_timestamps"]
             self.latest_features_cache = state_data["latest_features_cache"]
-            self.m1_dataframe = state_data["m1_dataframe"]
+            self.m05_dataframe = state_data.get("m05_dataframe", self.m05_dataframe)
 
             # 後方互換性のため get() を使用
             self.proxy_feature_buffers = state_data.get(
                 "proxy_feature_buffers", self.proxy_feature_buffers
             )
             self.ols_state = state_data.get("ols_state", self.ols_state)
+            self.qa_states = state_data.get("qa_states", self.qa_states)  # [乖離①修正]
 
             self.logger.info(
                 f"✓ 特徴量エンジンの状態をスナップショットから復元しました: {filepath}"

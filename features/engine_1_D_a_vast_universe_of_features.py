@@ -1037,7 +1037,7 @@ class CalculationEngine:
         self.temp_dir = Path(tempfile.mkdtemp(prefix=f"features_{config.engine_id}_"))
         logger.info(f"一時ディレクトリ作成: {self.temp_dir}")
 
-    def _get_all_feature_expressions(self) -> Dict[str, pl.Expr]:
+    def _get_all_feature_expressions(self, timeframe: str = "M1") -> Dict[str, pl.Expr]:
         """
         全特徴量の名前とPolars Expressionの対応辞書を返すファクトリメソッド。
         これにより、必要な特徴量だけを効率的に計算できるようになる。
@@ -1045,6 +1045,7 @@ class CalculationEngine:
         """
         expressions = {}
         p = self.prefix
+        lookback_bars = self.config.timeframe_bars_per_day.get(timeframe, 1440)
 
         # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
@@ -1221,7 +1222,7 @@ class CalculationEngine:
             ).alias(f"{p}vwap_dist_{window}")
 
         # ▼▼ 修正後: 1440期間(1日)の平均出来高をベース(Relative Volume)とする
-        vol_ma1440 = pl.col("volume").rolling_mean(1440) + 1e-10
+        vol_ma1440 = pl.col("volume").rolling_mean(lookback_bars) + 1e-10
 
         # On Balance Volume（軽量UDF） - 修正: Relative Volume化
         obv_raw = pl.struct(["close", "volume"]).map_batches(
@@ -1466,7 +1467,7 @@ class CalculationEngine:
             if group_name == "volatility":
                 group_result_lf = self._create_volatility_features(lazy_frame)
             elif group_name == "volume":
-                group_result_lf = self._create_volume_features(lazy_frame)
+                group_result_lf = self._create_volume_features(lazy_frame, timeframe)
             elif group_name == "breakout":
                 group_result_lf = self._create_breakout_features(lazy_frame)
             elif group_name == "support_resistance":
@@ -1574,9 +1575,9 @@ class CalculationEngine:
         result = lazy_frame.with_columns(stabilization_exprs)
         return result
 
-    def _create_vertical_slices(self) -> Dict[str, Dict[str, pl.Expr]]:
+    def _create_vertical_slices(self, timeframe: str = "M1") -> Dict[str, Dict[str, pl.Expr]]:
         """物理的垂直分割: 特徴量を論理グループに分割"""
-        all_expressions = self._get_all_feature_expressions()
+        all_expressions = self._get_all_feature_expressions(timeframe)
 
         # メモリ使用量を考慮したグルーピング（英語キー使用）
         slices = {}
@@ -1885,10 +1886,11 @@ class CalculationEngine:
 
         return lazy_frame.with_columns(exprs)
 
-    def _create_volume_features(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    def _create_volume_features(self, lazy_frame: pl.LazyFrame, timeframe: str = "M1") -> pl.LazyFrame:
         """出来高系特徴量の計算（高速化対応）"""
         exprs = []
         p = self.prefix
+        lookback_bars = self.config.timeframe_bars_per_day.get(timeframe, 1440)
 
         # [Step 8] 内部正規化用 ATR13: calculate_atr_numba(SMA) → calculate_atr_wilder に統一
         atr_13_internal_expr = pl.struct(["high", "low", "close"]).map_batches(
@@ -1954,7 +1956,7 @@ class CalculationEngine:
             )
 
         # 1440期間(1日)の平均出来高をベース(Relative Volume)とする
-        vol_ma1440 = pl.col("volume").rolling_mean(1440) + 1e-10
+        vol_ma1440 = pl.col("volume").rolling_mean(lookback_bars) + 1e-10
 
         # On Balance Volume（軽量UDF） - Relative Volume化
         obv_raw = pl.struct(["close", "volume"]).map_batches(

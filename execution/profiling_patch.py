@@ -36,13 +36,13 @@ def process_new_m05_bar(self, m05_bar, market_proxy_cache):
         # STEP 1: M1バッファ更新
         # ------------------------------------------------------------------
         t0 = _t()
-        self.m1_dataframe.append(m05_bar)
+        self.m05_dataframe.append(m05_bar)
         m05_bar_df = __import__("pandas").DataFrame([m05_bar]).set_index("timestamp")
         self._append_bar_to_buffer("M0.5", m05_bar_df, market_proxy_cache)
         t1 = _t()
         if PROFILING_ENABLED:
             log.info(
-                f"[PERF] STEP1 M1バッファ更新:           {(t1 - t0) * 1000:7.1f} ms"
+                f"[PERF] STEP1 M0.5バッファ更新:         {(t1 - t0) * 1000:7.1f} ms"
             )
 
         # ------------------------------------------------------------------
@@ -194,7 +194,7 @@ def process_new_m05_bar(self, m05_bar, market_proxy_cache):
         return signal_list
 
     except Exception as e:
-        self.logger.error(f"process_new_m1_bar でエラー: {e}", exc_info=True)
+        self.logger.error(f"process_new_m05_bar でエラー: {e}", exc_info=True)
         return []
 
 
@@ -228,10 +228,16 @@ def _calculate_base_features(self, data, tf_name):
         ("1F", FeatureModule1F),
     ]
 
+    # [乖離①修正] qa_stateとlookback_barsを時間足に合わせて渡す
+    from execution.realtime_feature_engine import TIMEFRAME_BARS_PER_DAY
+    tf_qa = self.qa_states.get(tf_name, {})
+    lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
+    module_keys = ["1A", "1B", "1C", "1D", "1E", "1F"]
+
     for tag, module in MODULES:
         try:
             ta = _t()
-            result = module.calculate_features(data)
+            result = module.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get(tag))
             tb = _t()
             features.update(result)
             if PROFILING_ENABLED:

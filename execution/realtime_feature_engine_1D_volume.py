@@ -41,7 +41,7 @@ from core_indicators import (
 import numpy as np
 import numba as nb
 from numba import njit
-from typing import Dict
+from typing import Dict, Optional
 
 
 # ==================================================================
@@ -51,13 +51,19 @@ from typing import Dict
 
 @njit(fastmath=True, cache=True)
 def pct_change_numba(arr: np.ndarray) -> np.ndarray:
+    """Polars pct_change() と完全一致: (x[i] - x[i-1]) / x[i-1]
+    prev == 0 のとき inf（Polars準拠）、先頭は nan。
+    fastmath=True は engine_1_D 学習側の全 UDF と統一。"""
     n = len(arr)
     pct = np.full(n, np.nan, dtype=np.float64)
     if n < 2:
         return pct
     for i in range(1, n):
         prev = arr[i - 1]
-        pct[i] = (arr[i] - prev) / (prev + 1e-10)
+        if prev != 0.0:
+            pct[i] = (arr[i] - prev) / prev
+        else:
+            pct[i] = np.inf
     return pct
 
 
@@ -90,10 +96,12 @@ def cmf_udf(
                 and np.isfinite(close[j])
                 and np.isfinite(volume[j])
             ):
-                hl = high[j] - low[j]
-                clv = ((close[j] - low[j]) - (high[j] - close[j])) / (hl + 1e-10)
-                mf_vol_sum += clv * volume[j]
-                vol_sum += volume[j]
+                # 学習側と一致: hl==0 のときはスキップ（vol_sum に加算しない）
+                if high[j] != low[j]:
+                    hl_range = high[j] - low[j]
+                    clv = ((close[j] - low[j]) - (high[j] - close[j])) / (hl_range + 1e-10)
+                    mf_vol_sum += clv * volume[j]
+                    vol_sum += volume[j]
         if vol_sum > 0:
             result[i] = mf_vol_sum / vol_sum
 
@@ -228,9 +236,13 @@ def accumulation_distribution_udf(
             and np.isfinite(close[i])
             and np.isfinite(volume[i])
         ):
-            hl_range = high[i] - low[i]
-            clv = ((close[i] - low[i]) - (high[i] - close[i])) / (hl_range + 1e-10)
-            result[i] = prev_ad + (clv * volume[i])
+            # 学習側と一致: hl==0 のときは clv 計算をスキップし prev_ad を継続
+            if high[i] != low[i]:
+                hl_range = high[i] - low[i]
+                clv = ((close[i] - low[i]) - (high[i] - close[i])) / (hl_range + 1e-10)
+                result[i] = prev_ad + (clv * volume[i])
+            else:
+                result[i] = prev_ad
         else:
             result[i] = prev_ad
 
@@ -316,16 +328,13 @@ def mass_index_udf(high: np.ndarray, low: np.ndarray, window: int) -> np.ndarray
 
     for i in range(valid_start + 16 + window - 1, n):
         mi_sum = 0.0
-        count = 0
+        is_valid = True
         for j in range(i - window + 1, i + 1):
-            if (
-                np.isfinite(ema9[j])
-                and np.isfinite(ema_ema9[j])
-                and ema_ema9[j] > 1e-10
-            ):
-                mi_sum += ema9[j] / ema_ema9[j]
-                count += 1
-        if count > 0:
+            if not np.isfinite(ema9[j]) or not np.isfinite(ema_ema9[j]) or ema_ema9[j] <= 0:
+                is_valid = False
+                break
+            mi_sum += ema9[j] / ema_ema9[j]
+        if is_valid:
             result[i] = mi_sum
 
     return result
@@ -488,19 +497,111 @@ def candlestick_patterns_udf(
 
 
 # ==================================================================
+# QAState — 学習側 apply_quality_assurance_to_group の等価実装
+# ==================================================================
+
+
+class QAState:
+    """
+    学習側 apply_quality_assurance_to_group のリアルタイム等価実装。
+
+    学習側の処理（Polars LazyFrame 全系列一括）:
+        col_expr = when(col.is_infinite()).then(None).otherwise(col)
+        ewm_mean = col_expr.ewm_mean(half_life=HL, adjust=False, ignore_nulls=True)
+        ewm_std  = col_expr.ewm_std (half_life=HL, adjust=False, ignore_nulls=True)
+        result   = when(col==inf).then(upper).when(col==-inf).then(lower)
+                   .otherwise(col).clip(lower, upper).fill_null(0.0).fill_nan(0.0)
+
+    alpha = 1 - exp(-ln2 / half_life)
+    EWM_mean[t] = alpha * x[t] + (1-alpha) * EWM_mean[t-1]  (NaN/inf はスキップ)
+    EWM_var[t]  = (1-alpha) * (EWM_var[t-1] + alpha * (x[t] - EWM_mean[t-1])^2)
+
+    ⚠️ Polars ewm_std(adjust=False) のデフォルトは bias=False（不偏補正あり）。
+    bias_corr = 1 / sqrt(1 - (1-alpha)^(2n)) を乗算して Polars と一致させる。
+    n が大きくなると bias_corr → 1.0 に収束（ウォームアップ後は実質影響なし）。
+
+    使い方:
+        qa_state = FeatureModule1D.QAState(lookback_bars=1440)
+        for bar in live_stream:
+            features = FeatureModule1D.calculate_features(data_window, 1440, qa_state)
+    """
+
+    def __init__(self, lookback_bars: int = 1440):
+        self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
+        self._ewm_mean: Dict[str, float] = {}
+        self._ewm_var: Dict[str, float] = {}
+        # bias=False 補正用: Polars ewm_std は t バー目に sqrt(1/(1-(1-alpha)^(2t))) を乗じる。
+        self._ewm_n: Dict[str, int] = {}  # 有効値の累積更新回数（bias 補正に使用）
+
+    def update_and_clip(self, key: str, raw_val: float) -> float:
+        """1特徴量の raw_val に QA処理を適用して返す（学習側と完全一致）。"""
+        alpha = self.alpha
+
+        # 【inf処理修正】学習側の挙動を再現:
+        #   学習側: when(col==inf).then(upper).when(col==-inf).then(lower).otherwise(col).clip()
+        #   本番側旧: inf → NaN → 0.0（学習側と不一致）
+        #   本番側新: inf を先に記録し、clip時にupper/lower_boundで置き換える。
+        is_pos_inf = np.isposinf(raw_val)
+        is_neg_inf = np.isneginf(raw_val)
+        ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
+
+        # EWM 状態更新（ignore_nulls=True 相当）
+        if key not in self._ewm_mean:
+            if np.isnan(ewm_input):
+                return 0.0
+            self._ewm_mean[key] = ewm_input
+            self._ewm_var[key]  = 0.0
+            self._ewm_n[key]    = 1
+            return ewm_input
+        else:
+            if not np.isnan(ewm_input):
+                prev_mean = self._ewm_mean[key]
+                prev_var  = self._ewm_var[key]
+                new_mean  = alpha * ewm_input + (1.0 - alpha) * prev_mean
+                new_var   = (1.0 - alpha) * (prev_var + alpha * (ewm_input - prev_mean) ** 2)
+                self._ewm_mean[key] = new_mean
+                self._ewm_var[key]  = new_var
+                self._ewm_n[key]    = self._ewm_n.get(key, 0) + 1
+
+        # ±5σ クリップ
+        # Polars ewm_std(adjust=False, bias=False) の bias 補正を適用:
+        #   bias_corr = 1 / sqrt(1 - (1-alpha)^(2n))
+        ewm_mean  = self._ewm_mean[key]
+        n_updates = self._ewm_n.get(key, 1)
+        decay_2n  = (1.0 - alpha) ** (2 * n_updates)
+        denom     = 1.0 - decay_2n
+        bias_corr = 1.0 / np.sqrt(denom) if denom > 1e-15 else 1.0
+        ewm_std   = np.sqrt(max(self._ewm_var[key], 0.0)) * bias_corr
+        lower     = ewm_mean - 5.0 * ewm_std
+        upper     = ewm_mean + 5.0 * ewm_std
+
+        if np.isnan(ewm_input):
+            return 0.0
+        if is_pos_inf:
+            return float(upper) if np.isfinite(upper) else 0.0
+        if is_neg_inf:
+            return float(lower) if np.isfinite(lower) else 0.0
+
+        clipped = float(np.clip(raw_val, lower, upper))
+        return clipped if np.isfinite(clipped) else 0.0
+
+
+# ==================================================================
 # ヘルパー関数
 # ==================================================================
 
 
+@nb.njit(fastmath=False, cache=True)
 def _window(arr: np.ndarray, window: int) -> np.ndarray:
     """配列の末尾から `window` 個の要素を取得"""
     if window <= 0:
-        return np.array([], dtype=arr.dtype)
+        return np.empty(0, dtype=arr.dtype)
     if window > len(arr):
         return arr
     return arr[-window:]
 
 
+@nb.njit(fastmath=False, cache=True)
 def _last(arr: np.ndarray) -> float:
     if len(arr) == 0:
         return np.nan
@@ -513,8 +614,16 @@ def _last(arr: np.ndarray) -> float:
 
 
 class FeatureModule1D:
+
+    # 外部から FeatureModule1D.QAState としてアクセス可能にする
+    QAState = QAState
+
     @staticmethod
-    def calculate_features(data: Dict[str, np.ndarray]) -> Dict[str, float]:
+    def calculate_features(
+        data: Dict[str, np.ndarray],
+        lookback_bars: int = 1440,
+        qa_state: Optional[QAState] = None,
+    ) -> Dict[str, float]:
         features: Dict[str, float] = {}
 
         # ① KeyError ガード: 必須キーが存在しない場合は空dictを返す
@@ -556,17 +665,31 @@ class FeatureModule1D:
         # ---------------------------------------------------------
 
         # HV standard / robust: window=[10, 20, 30, 50]（学習側 volatility=[10,20,30,50] と統一）
+        # 【修正: 問題3】window未満データへのgateを追加。
+        # 学習側: rolling_map(..., window_size=w, min_samples=w) → w本未満はNaN。
+        # 旧: _window が w未満を返してもUDF内len<5チェックのみで非NaN値を返してしまう。
         for w in [10, 20, 30, 50]:
-            features[f"e1d_hv_standard_{w}"] = hv_standard_udf(_window(close_pct, w))
-            features[f"e1d_hv_robust_{w}"] = hv_robust_udf(_window(close_pct, w))
+            pct_w = _window(close_pct, w)
+            if len(pct_w) < w:
+                features[f"e1d_hv_standard_{w}"] = np.nan
+                features[f"e1d_hv_robust_{w}"]   = np.nan
+            else:
+                features[f"e1d_hv_standard_{w}"] = hv_standard_udf(pct_w)
+                features[f"e1d_hv_robust_{w}"]   = hv_robust_udf(pct_w)
 
         # 年率ボラティリティ (252本基準)
-        features["e1d_hv_annual_252"] = (
-            hv_standard_udf(_window(close_pct, 252)) * np.sqrt(252)
-        )
-        features["e1d_hv_robust_annual_252"] = (
-            hv_robust_udf(_window(close_pct, 252)) * np.sqrt(252)
-        )
+        # 【修正: 問題4】252本未満のgateを追加（rolling_std(252) min_periods=252 と一致）。
+        pct_252 = _window(close_pct, 252)
+        if len(pct_252) < 252:
+            features["e1d_hv_annual_252"]        = np.nan
+            features["e1d_hv_robust_annual_252"] = np.nan
+        else:
+            features["e1d_hv_annual_252"] = (
+                hv_standard_udf(pct_252) * np.sqrt(252)
+            )
+            features["e1d_hv_robust_annual_252"] = (
+                hv_robust_udf(pct_252) * np.sqrt(252)
+            )
 
         # ボラティリティレジーム: 直近HV50 vs 過去1440本の各時点HV50の分位数
         # 学習側: Polars rolling_quantile(0.8/0.6, window=1440) on rolling_std(50)
@@ -632,7 +755,7 @@ class FeatureModule1D:
 
         # 基準出来高 (1日 ≒ 1440本 MA)
         # [修正4] 定義では素のMAのみ保持し、使用箇所で + 1e-10 を明示する
-        vol_ma1440 = float(np.mean(_window(volume_arr, 1440)))
+        vol_ma1440 = float(np.mean(_window(volume_arr, lookback_bars)))
 
         # OBV relative: diff / vol_ma1440
         # [Step 9] 旧 e1d_obv（累積値そのまま）→ 学習側 e1d_obv_rel に統一
@@ -648,11 +771,14 @@ class FeatureModule1D:
         )
 
         # Force Index normalized: price_change * volume / (atr * vol_ma1440)
+        # 【修正: 問題2】分母を atr13_last * vol_ma1440 + 1e-10 に統一。
+        # 学習側: atr_13_internal_expr * vol_ma1440 + 1e-10（積の後にepsilon）。
+        # 旧本番側: atr13_last * (vol_ma1440 + 1e-10) + 1e-10（vol側に先にepsilon）→ 数値差。
         if _atr_valid and len(close_arr) >= 2:
             price_change = close_arr[-1] - close_arr[-2]
             force_raw = price_change * float(volume_arr[-1])
             features["e1d_force_index_norm"] = float(
-                force_raw / (atr13_last * (vol_ma1440 + 1e-10) + 1e-10)
+                force_raw / (atr13_last * vol_ma1440 + 1e-10)
             )
         else:
             features["e1d_force_index_norm"] = np.nan
@@ -668,9 +794,12 @@ class FeatureModule1D:
 
         # Volume Price Trend normalized: mean(close_pct * volume, 10) / vol_ma1440
         # [Step 9] 旧 e1d_volume_price_trend（絶対値） → 学習側 e1d_volume_price_trend_norm に統一
+        # 【修正】np.nanmean → np.mean に変更。
+        # 学習側: (pct_change * vol).rolling_mean(10) / vol_ma1440 → NaN/inf はそのまま伝播してQAでclip。
+        # 旧本番側: np.nanmean → NaN/infを除外してしまい学習側と不一致。
         vpt_window = _window(close_pct * volume_arr, 10)
         features["e1d_volume_price_trend_norm"] = float(
-            np.nanmean(vpt_window) / (vol_ma1440 + 1e-10)
+            np.mean(vpt_window) / (vol_ma1440 + 1e-10)
         )
 
         # ---------------------------------------------------------
@@ -810,5 +939,20 @@ class FeatureModule1D:
             )
         else:
             features["e1d_overnight_gap"] = 0.0
+
+        # ----------------------------------------------------------
+        # QA処理 — 学習側 apply_quality_assurance_to_group と等価
+        #   学習側: inf→null → EWM(half_life=lookback_bars)±5σクリップ → fill_null/nan(0.0)
+        #   qa_state=None の場合: inf/NaN → 0.0 のみ（後方互換）
+        # ----------------------------------------------------------
+        if qa_state is not None:
+            qa_result: Dict[str, float] = {}
+            for key, val in features.items():
+                qa_result[key] = qa_state.update_and_clip(key, val)
+            features = qa_result
+        else:
+            for key in list(features.keys()):
+                if not np.isfinite(features[key]):
+                    features[key] = 0.0
 
         return features

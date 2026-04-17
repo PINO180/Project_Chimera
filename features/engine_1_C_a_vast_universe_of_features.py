@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))  # /workspace をパスに追加
 import blueprint as config
+
 sys.path.append(str(config.CORE_DIR))
 from core_indicators import (
     calculate_atr_wilder,
@@ -213,6 +214,7 @@ class MemoryMonitor:
 # Numba UDF関数（モジュールレベル）
 # ========================================
 
+
 # calculate_adx (core_indicators) は ADX のみを返す。
 # DI+/DI- を同一の Wilder 平滑化アルゴリズムで計算するため、
 # ここに calculate_adx 内部と完全一致したローカルヘルパーを定義する。
@@ -283,9 +285,6 @@ def _calculate_di_wilder(
             di_minus_out[i] = dmm_w[i] / atr_w[i] * 100.0
 
     return di_plus_out, di_minus_out
-
-
-
 
 
 # ========================================
@@ -1321,7 +1320,9 @@ class CalculationEngine:
 
             # MACDライン（scale_by_atr: core_indicators の ATR割り統一関数）
             macd_line = (
-                pl.struct([macd_raw.alias("_macd"), atr_13_base.alias("_atr")]).map_batches(
+                pl.struct(
+                    [macd_raw.alias("_macd"), atr_13_base.alias("_atr")]
+                ).map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_macd").to_numpy(),
                         s.struct.field("_atr").to_numpy(),
@@ -1336,7 +1337,9 @@ class CalculationEngine:
 
             # シグナルライン（scale_by_atr: core_indicators の ATR割り統一関数）
             signal_line = (
-                pl.struct([signal_raw.alias("_sig"), atr_13_base.alias("_atr")]).map_batches(
+                pl.struct(
+                    [signal_raw.alias("_sig"), atr_13_base.alias("_atr")]
+                ).map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_sig").to_numpy(),
                         s.struct.field("_atr").to_numpy(),
@@ -1349,7 +1352,9 @@ class CalculationEngine:
             # ヒストグラム（scale_by_atr: core_indicators の ATR割り統一関数）
             hist_raw = macd_raw - signal_raw
             histogram = (
-                pl.struct([hist_raw.alias("_hist"), atr_13_base.alias("_atr")]).map_batches(
+                pl.struct(
+                    [hist_raw.alias("_hist"), atr_13_base.alias("_atr")]
+                ).map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_hist").to_numpy(),
                         s.struct.field("_atr").to_numpy(),
@@ -1401,7 +1406,12 @@ class CalculationEngine:
 
                 # scale_by_atr: core_indicators の ATR割り統一関数
                 upper = (
-                    pl.struct([(upper_raw - pl.col("close")).alias("_u"), atr_13_expr.alias("_atr")]).map_batches(
+                    pl.struct(
+                        [
+                            (upper_raw - pl.col("close")).alias("_u"),
+                            atr_13_expr.alias("_atr"),
+                        ]
+                    ).map_batches(
                         lambda s: scale_by_atr(
                             s.struct.field("_u").to_numpy(),
                             s.struct.field("_atr").to_numpy(),
@@ -1410,7 +1420,12 @@ class CalculationEngine:
                     )
                 ).alias(f"{self.prefix}bb_upper_{period}_{num_std}")
                 lower = (
-                    pl.struct([(pl.col("close") - lower_raw).alias("_l"), atr_13_expr.alias("_atr")]).map_batches(
+                    pl.struct(
+                        [
+                            (pl.col("close") - lower_raw).alias("_l"),
+                            atr_13_expr.alias("_atr"),
+                        ]
+                    ).map_batches(
                         lambda s: scale_by_atr(
                             s.struct.field("_l").to_numpy(),
                             s.struct.field("_atr").to_numpy(),
@@ -1429,7 +1444,9 @@ class CalculationEngine:
 
                 # BB幅 (scale_by_atr: core_indicators の ATR割り統一関数)
                 width = (
-                    pl.struct([(upper_raw - lower_raw).alias("_w"), atr_13_expr.alias("_atr")]).map_batches(
+                    pl.struct(
+                        [(upper_raw - lower_raw).alias("_w"), atr_13_expr.alias("_atr")]
+                    ).map_batches(
                         lambda s: scale_by_atr(
                             s.struct.field("_w").to_numpy(),
                             s.struct.field("_atr").to_numpy(),
@@ -1493,13 +1510,15 @@ class CalculationEngine:
 
             # ATR比率（ATR13で割ったスケール不変値）- scale_by_atr: core_indicators の ATR割り統一関数
             exprs.append(
-                pl.struct([atr_raw.alias("_atr_raw"), atr_13_base.alias("_atr13")]).map_batches(
+                pl.struct([atr_raw.alias("_atr_raw"), atr_13_base.alias("_atr13")])
+                .map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_atr_raw").to_numpy(),
                         s.struct.field("_atr13").to_numpy(),
                     ),
                     return_dtype=pl.Float64,
-                ).alias(f"{self.prefix}atr_{period}")
+                )
+                .alias(f"{self.prefix}atr_{period}")
             )
 
             # ATRパーセンテージ（closeに対する比率）はすでにスケール不変
@@ -1511,30 +1530,34 @@ class CalculationEngine:
 
             # ATRトレンド（ATRの変化分をATR13で割りスケール不変化）- scale_by_atr: core_indicators
             exprs.append(
-                pl.struct([atr_raw.diff().alias("_diff"), atr_13_base.alias("_atr13")]).map_batches(
+                pl.struct([atr_raw.diff().alias("_diff"), atr_13_base.alias("_atr13")])
+                .map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_diff").to_numpy(),
                         s.struct.field("_atr13").to_numpy(),
                     ),
                     return_dtype=pl.Float64,
-                ).alias(f"{self.prefix}atr_trend_{period}")
+                )
+                .alias(f"{self.prefix}atr_trend_{period}")
             )
 
             # ATRボラティリティ（ATR自体の標準偏差をATR13で割りスケール不変化）- scale_by_atr: core_indicators
-            # 【設計上の制約】リアルタイム側との差異を記録する:
-            #   学習側（ここ）: rolling_std(atr_{period}_arr, window=period)[i] / atr_13_arr[i]
-            #                  → 分母は各バー時点の atr_13（時系列配列・バーごとに変化）
-            #   リアルタイム側: std(_window(atr_{period}_arr, period)) / _last(atr_13_arr)
-            #                  → 分母は最新バーの atr_13 スカラー（時系列保持不可のため）
-            #   この差異はリアルタイム推論の構造的制約として許容する。
+            # 本番側も同様に atr_13 で除算（realtime_feature_engine_1C と完全一致）
             exprs.append(
-                pl.struct([atr_raw.rolling_std(period, ddof=1).alias("_std"), atr_13_base.alias("_atr13")]).map_batches(
+                pl.struct(
+                    [
+                        atr_raw.rolling_std(period, ddof=1).alias("_std"),
+                        atr_13_base.alias("_atr13"),
+                    ]
+                )
+                .map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_std").to_numpy(),
                         s.struct.field("_atr13").to_numpy(),
                     ),
                     return_dtype=pl.Float64,
-                ).alias(f"{self.prefix}atr_volatility_{period}")
+                )
+                .alias(f"{self.prefix}atr_volatility_{period}")
             )
 
             # ▼▼ 削除: ATRベースの絶対値バンド（atr_upper / atr_lower）のループ処理を丸ごと削除
@@ -1722,7 +1745,9 @@ class CalculationEngine:
             sma = pl.col("close").rolling_mean(period)
             dpo_raw = pl.col("close") - sma
             dpo = (
-                pl.struct([dpo_raw.alias("_dpo"), atr_13_expr.alias("_atr")]).map_batches(
+                pl.struct(
+                    [dpo_raw.alias("_dpo"), atr_13_expr.alias("_atr")]
+                ).map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_dpo").to_numpy(),
                         s.struct.field("_atr").to_numpy(),
@@ -1791,7 +1816,9 @@ class CalculationEngine:
         for period in momentum_periods:
             mom_raw = pl.col("close") - pl.col("close").shift(period)
             momentum = (
-                pl.struct([mom_raw.alias("_mom"), atr_13_expr.alias("_atr")]).map_batches(
+                pl.struct(
+                    [mom_raw.alias("_mom"), atr_13_expr.alias("_atr")]
+                ).map_batches(
                     lambda s: scale_by_atr(
                         s.struct.field("_mom").to_numpy(),
                         s.struct.field("_atr").to_numpy(),
@@ -1937,8 +1964,13 @@ class CalculationEngine:
             # SMA — scale_by_atr: core_indicators の ATR割り統一関数
             sma_raw = pl.col("close").rolling_mean(period)
             sma = (
-                pl.struct([(sma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                pl.struct(
+                    [(sma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]
+                ).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_d").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
                     return_dtype=pl.Float64,
                 )
             ).alias(f"{self.prefix}sma_{period}")
@@ -1953,8 +1985,13 @@ class CalculationEngine:
             # EMA — scale_by_atr: core_indicators の ATR割り統一関数
             ema_raw = pl.col("close").ewm_mean(span=period, adjust=False)
             ema = (
-                pl.struct([(ema_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                pl.struct(
+                    [(ema_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]
+                ).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_d").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
                     return_dtype=pl.Float64,
                 )
             ).alias(f"{self.prefix}ema_{period}")
@@ -1972,8 +2009,13 @@ class CalculationEngine:
                 return_dtype=pl.Float64,
             )
             wma = (
-                pl.struct([(wma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                pl.struct(
+                    [(wma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]
+                ).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_d").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
                     return_dtype=pl.Float64,
                 )
             ).alias(f"{self.prefix}wma_{period}")
@@ -1986,8 +2028,13 @@ class CalculationEngine:
                 return_dtype=pl.Float64,
             )
             hma = (
-                pl.struct([(hma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                pl.struct(
+                    [(hma_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]
+                ).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_d").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
                     return_dtype=pl.Float64,
                 )
             ).alias(f"{self.prefix}hma_{period}")
@@ -2000,8 +2047,16 @@ class CalculationEngine:
                 return_dtype=pl.Float64,
             )
             kama = (
-                pl.struct([(kama_raw - pl.col("close")).alias("_d"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_d").to_numpy(), s.struct.field("_atr").to_numpy()),
+                pl.struct(
+                    [
+                        (kama_raw - pl.col("close")).alias("_d"),
+                        atr_13_expr.alias("_atr"),
+                    ]
+                ).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_d").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
                     return_dtype=pl.Float64,
                 )
             ).alias(f"{self.prefix}kama_{period}")
@@ -2020,19 +2075,29 @@ class CalculationEngine:
             true_ols_slope = 6.0 * (wma_for_slope - sma_for_slope) / (period - 1.0)
 
             trend_slope = (
-                pl.struct([true_ols_slope.alias("_slope"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_slope").to_numpy(), s.struct.field("_atr").to_numpy()),
+                pl.struct(
+                    [true_ols_slope.alias("_slope"), atr_13_expr.alias("_atr")]
+                ).map_batches(
+                    lambda s: scale_by_atr(
+                        s.struct.field("_slope").to_numpy(),
+                        s.struct.field("_atr").to_numpy(),
+                    ),
                     return_dtype=pl.Float64,
                 )
             ).alias(f"{self.prefix}trend_slope_{period}")
             exprs.append(trend_slope)
 
             # トレンド強度 — scale_by_atr で無次元化した normalized_std を利用
-            normalized_std = (
-                pl.struct([pl.col("close").rolling_std(period, ddof=1).alias("_std"), atr_13_expr.alias("_atr")]).map_batches(
-                    lambda s: scale_by_atr(s.struct.field("_std").to_numpy(), s.struct.field("_atr").to_numpy()),
-                    return_dtype=pl.Float64,
-                )
+            normalized_std = pl.struct(
+                [
+                    pl.col("close").rolling_std(period, ddof=1).alias("_std"),
+                    atr_13_expr.alias("_atr"),
+                ]
+            ).map_batches(
+                lambda s: scale_by_atr(
+                    s.struct.field("_std").to_numpy(), s.struct.field("_atr").to_numpy()
+                ),
+                return_dtype=pl.Float64,
             )
             trend_strength = (
                 (1.0 / (normalized_std + 1e-10))
@@ -2068,14 +2133,16 @@ class CalculationEngine:
         # Polars 直書き式（atr_numba + z_score 計算）を廃止し、
         # core_indicators の calculate_sample_weight（Wilder ATR・|z| < 2.0 基準）に統一する。
         result = result.with_columns(
-            pl.struct(["high", "low", "close"]).map_batches(
+            pl.struct(["high", "low", "close"])
+            .map_batches(
                 lambda s: calculate_sample_weight(
                     s.struct.field("high").to_numpy(),
                     s.struct.field("low").to_numpy(),
                     s.struct.field("close").to_numpy(),
                 ),
                 return_dtype=pl.Float64,
-            ).alias("sample_weight")
+            )
+            .alias("sample_weight")
         )
 
         logger.info("基本データ処理特徴量計算完了")

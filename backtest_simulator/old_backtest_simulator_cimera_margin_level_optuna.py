@@ -235,11 +235,6 @@ class BacktestSimulator:
         self.high_water_mark = self._current_capital
         self.min_margin_level_pct = Decimal("inf")
         self.stop_out_count = 0
-        # 連続SL/Loss最大値（チャンク間で引き継ぎ）
-        self.max_consec_sl_long = 0
-        self.max_consec_sl_short = 0
-        self.max_consec_sl_total = 0
-        self.max_consec_loss_total = 0
 
         # tqdmのプログレスバーはOptuna側で大量に出力されると邪魔なので、
         # オンメモリ(preloaded_dataあり)の場合はバーを非表示(disable=True)にする
@@ -313,23 +308,13 @@ class BacktestSimulator:
         # ▼▼▼ 修正後 ▼▼▼
         report_data = self._analyze_and_report(final_results_df, final_trade_log_df)
 
-        # report_dataに追加統計をねじ込む（ここで初めてjson.dumpする）
+        # レポートデータに最低証拠金維持率とストップアウト回数をねじ込む
         report_data["min_margin_level_pct"] = (
             float(self.min_margin_level_pct)
             if self.min_margin_level_pct != Decimal("inf")
             else 9999.0
         )
-        report_data["max_consec_sl_long"] = self.max_consec_sl_long
-        report_data["max_consec_sl_short"] = self.max_consec_sl_short
-        report_data["max_consec_sl_total"] = self.max_consec_sl_total
-        report_data["max_consec_loss_total"] = self.max_consec_loss_total
-
-        try:
-            with open(FINAL_REPORT_PATH, "w") as f:
-                json.dump(report_data, f, indent=4, default=str)
-            logging.info(f"Performance report saved to {FINAL_REPORT_PATH}")
-        except Exception as e:
-            logging.error(f"Failed to save JSON performance report: {e}")
+        report_data["stop_out_count"] = self.stop_out_count
 
         logging.info("### Project Forge V5 Backtest Simulator: FINISHED ###")
         return report_data
@@ -529,17 +514,11 @@ class BacktestSimulator:
 
         # --- 証拠金トラッキング用 ---
         total_used_margin = DECIMAL_ZERO
+        # ▼▼▼ 以下の2行を【削除】してください ▼▼▼
+        # min_margin_level_pct = Decimal("inf")
+        # stop_out_count = 0
         active_exit_times = []
         MAX_POSITIONS = self.config.max_positions
-
-        # --- 連続SL/Loss・証拠金維持率トラッキング ---
-        consec_sl_long_cur = 0    # 現在のLong連続SL数
-        consec_sl_short_cur = 0   # 現在のShort連続SL数
-        consec_loss_cur = 0       # 現在の全体連続負け数（SL+TO）
-        max_consec_sl_long = 0    # Long最大連続SL
-        max_consec_sl_short = 0   # Short最大連続SL
-        max_consec_sl_total = 0   # 全体最大連続SL
-        max_consec_loss_total = 0 # 全体最大連続負け（SL+TO）
 
         # --- DataFrameからのデータ抽出 (高速化のためリスト/Numpy配列化) ---
         timestamps_chunk = df_chunk["timestamp"].to_list()
@@ -601,7 +580,8 @@ class BacktestSimulator:
             ]
             pending_exits = [p for p in pending_exits if p[0] > current_timestamp_int]
 
-            for exit_time, direction, is_sl, margin_used, log_entry in sorted(
+            # ★ 引数に margin_used を追加
+            for exit_time, direction, is_sl, margin_used in sorted(
                 finished_positions, key=lambda x: x[0]
             ):
                 # 証拠金の解放
@@ -612,49 +592,25 @@ class BacktestSimulator:
                 if direction == 1:
                     if is_sl:
                         consecutive_sl_long += 1
-                        consec_sl_long_cur += 1
-                        consec_sl_short_cur = 0
-                        consec_loss_cur += 1
                         if consecutive_sl_long >= self.config.max_consecutive_sl:
                             cooldown_until_long = exit_time + int(
                                 self.config.cooldown_minutes_after_sl * 60 * 1_000_000
                             )
                             consecutive_sl_long = 0
                             self.cb_cooldown_long += 1
-                    else:  # PT（勝ち）
+                    else:
                         consecutive_sl_long = 0
-                        consec_sl_long_cur = 0
-                        consec_sl_short_cur = 0
-                        consec_loss_cur = 0
                 else:
                     if is_sl:
                         consecutive_sl_short += 1
-                        consec_sl_short_cur += 1
-                        consec_sl_long_cur = 0
-                        consec_loss_cur += 1
                         if consecutive_sl_short >= self.config.max_consecutive_sl:
                             cooldown_until_short = exit_time + int(
                                 self.config.cooldown_minutes_after_sl * 60 * 1_000_000
                             )
                             consecutive_sl_short = 0
                             self.cb_cooldown_short += 1
-                    else:  # PT（勝ち）
+                    else:
                         consecutive_sl_short = 0
-                        consec_sl_long_cur = 0
-                        consec_sl_short_cur = 0
-                        consec_loss_cur = 0
-
-                # 最大値更新
-                max_consec_sl_long = max(max_consec_sl_long, consec_sl_long_cur)
-                max_consec_sl_short = max(max_consec_sl_short, consec_sl_short_cur)
-                max_consec_sl_total = max(max_consec_sl_total, consec_sl_long_cur + consec_sl_short_cur)
-                max_consec_loss_total = max(max_consec_loss_total, consec_loss_cur)
-
-                # 決済確定後の連続SL値をlog_entryに書き込んでからトレードログに追記
-                log_entry["csl_L"] = consec_sl_long_cur
-                log_entry["csl_S"] = consec_sl_short_cur
-                log_entry["closs"] = consec_loss_cur
-                trade_log_chunk.append(log_entry)
 
             # 決済時刻を過ぎたポジションをクリア
             active_exit_times = [
@@ -972,45 +928,7 @@ class BacktestSimulator:
                         #     active_exit_times.append(new_exit_time)
                         #     pending_exits.append((new_exit_time, direction_int, is_sl_hit))
 
-                        # ▼▼▼ 修正後: log_entryをpending_exitsに同梱し決済時にcsl/clossを書いてからログ追記 ▼▼▼
-                        traded_in_this_step = True
-
-                        current_active_longs = sum(
-                            1 for p in pending_exits if p[1] == 1
-                        )
-                        current_active_shorts = sum(
-                            1 for p in pending_exits if p[1] == -1
-                        )
-
-                        _mg_lv = float(
-                            (current_capital / total_used_margin * Decimal("100.0"))
-                            if total_used_margin > DECIMAL_ZERO
-                            else Decimal("9999.0")
-                        )
-                        _log_entry = {
-                            "timestamp": current_timestamp,
-                            "pnl": pnl,
-                            "balance": current_capital,
-                            "m2_proba": float(p_float),
-                            "direction": int(direction_int),
-                            "label": int(valid_label),
-                            "lot_size": float(final_lot_size_decimal),
-                            "atr_value": float(atr_value_float),
-                            "atr_ratio": float(atr_ratio_float),
-                            "leverage": float(effective_leverage_decimal),
-                            "margin": margin_required_decimal,
-                            "spread": spread_cost_decimal,
-                            "close_price": current_price_decimal,
-                            "aL": int(current_active_longs),
-                            "aS": int(current_active_shorts),
-                            "TD": float(duration_val),
-                            "DD(%)": float(current_dd_pct),
-                            "mg_lv%": _mg_lv,
-                            "csl_L": 0,   # 決済時に上書き
-                            "csl_S": 0,   # 決済時に上書き
-                            "closs": 0,   # 決済時に上書き
-                        }
-
+                        # ▼▼▼ 修正後 ▼▼▼
                         if duration_float is not None and np.isfinite(duration_float):
                             new_exit_time = current_timestamp_int + int(
                                 duration_float * 60 * 1_000_000
@@ -1022,22 +940,45 @@ class BacktestSimulator:
                                     direction_int,
                                     is_sl_hit,
                                     margin_required_decimal,
-                                    _log_entry,  # ← log_entryを同梱
                                 )
                             )
-                        else:
-                            # duration不明の場合はcsl=0のままログ追記
-                            trade_log_chunk.append(_log_entry)
+
+                        traded_in_this_step = True
+
+                        current_active_longs = sum(
+                            1 for p in pending_exits if p[1] == 1
+                        )
+                        current_active_shorts = sum(
+                            1 for p in pending_exits if p[1] == -1
+                        )
+
+                        # ログへの記録 (カラム名を短縮形に変更 & 新規データ追加)
+                        trade_log_chunk.append(
+                            {
+                                "timestamp": current_timestamp,
+                                "pnl": pnl,
+                                "balance": current_capital,  # ★変更
+                                "m2_proba": float(p_float),
+                                "direction": int(direction_int),
+                                "label": int(valid_label),
+                                "lot_size": float(final_lot_size_decimal),
+                                "atr_value": float(atr_value_float),
+                                "atr_ratio": float(atr_ratio_float),  # ★追加: 相対ATR
+                                "leverage": float(effective_leverage_decimal),  # ★変更
+                                "margin": margin_required_decimal,  # ★変更
+                                "spread": spread_cost_decimal,  # ★変更済のはずですが確認
+                                "close_price": current_price_decimal,
+                                "active(L)": int(current_active_longs),  # ★変更
+                                "active(S)": int(current_active_shorts),  # ★変更
+                                "TD": float(duration_val),
+                                "DD(%)": float(current_dd_pct),  # ★変更
+                            }
+                        )
 
             # 資本の時系列記録
             equity_values_chunk.append(current_capital)
 
         self._current_capital = current_capital
-        # チャンク内の最大値をselfに反映（複数チャンクをまたいで最大値を保持）
-        self.max_consec_sl_long = max(self.max_consec_sl_long, max_consec_sl_long)
-        self.max_consec_sl_short = max(self.max_consec_sl_short, max_consec_sl_short)
-        self.max_consec_sl_total = max(self.max_consec_sl_total, max_consec_sl_total)
-        self.max_consec_loss_total = max(self.max_consec_loss_total, max_consec_loss_total)
 
         results_chunk_df = pl.DataFrame(
             {
@@ -1046,29 +987,25 @@ class BacktestSimulator:
             }
         )
 
-        # V5仕様のトレードログスキーマ
+        # V5仕様のトレードログスキーマ (名前短縮版)
         trade_log_schema = {
             "timestamp": pl.Datetime,
             "pnl": pl.Object,
-            "balance": pl.Object,
+            "balance": pl.Object,  # ★変更
             "m2_proba": pl.Float64,
             "direction": pl.Int8,
             "label": pl.Int64,
             "lot_size": pl.Float64,
             "atr_value": pl.Float64,
-            "atr_ratio": pl.Float64,
-            "leverage": pl.Float32,
-            "margin": pl.Object,
-            "spread": pl.Object,
+            "atr_ratio": pl.Float64,  # ★追加: 相対ATR
+            "leverage": pl.Float32,  # ★変更
+            "margin": pl.Object,  # ★変更済のはずですが確認
+            "spread": pl.Object,  # ★変更済のはずですが確認
             "close_price": pl.Object,
-            "aL": pl.Int32,
-            "aS": pl.Int32,
+            "active(L)": pl.Int32,  # ★変更
+            "active(S)": pl.Int32,  # ★変更
             "TD": pl.Float64,
-            "DD(%)": pl.Float64,
-            "mg_lv%": pl.Float64,   # 証拠金維持率(%)
-            "csl_L": pl.Int32,      # Long連続SL（決済後）
-            "csl_S": pl.Int32,      # Short連続SL（決済後）
-            "closs": pl.Int32,      # 全体連続負け（SL+TO）
+            "DD(%)": pl.Float64,  # ★変更
         }
 
         if trade_log_chunk:
@@ -1340,6 +1277,12 @@ class BacktestSimulator:
         print("=" * 50)
 
         FINAL_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(FINAL_REPORT_PATH, "w") as f:
+                json.dump(report_data, f, indent=4, default=str)
+            logging.info(f"Performance report saved to {FINAL_REPORT_PATH}")
+        except Exception as e:
+            logging.error(f"Failed to save JSON performance report: {e}")
 
         logging.info("Generating equity curve and drawdown chart...")
         if results_df.is_empty() or drawdown.is_empty():
@@ -1456,11 +1399,10 @@ class BacktestSimulator:
                     "m2_proba": 4,
                     "lot_size": 2,
                     "atr_value": 4,
-                    "atr_ratio": 4,
+                    "atr_ratio": 4,  # ★追加: 相対ATR
                     "leverage": 0,
                     "TD": 1,
                     "DD(%)": 2,
-                    "mg_lv%": 1,
                 }
                 for col_name, digits in float_cols_round.items():
                     if col_name in temp_log_formatted.columns:
@@ -1481,20 +1423,16 @@ class BacktestSimulator:
                     "pnl",
                     "balance",
                     "lot_size",
-                    "aL",
-                    "aS",
+                    "active(L)",
+                    "active(S)",
                     "margin",
                     "leverage",
                     "spread",
                     "close_price",
                     "atr_value",
-                    "atr_ratio",
+                    "atr_ratio",  # ★追加: 相対ATR
                     "TD",
                     "DD(%)",
-                    "mg_lv%",
-                    "csl_L",
-                    "csl_S",
-                    "closs",
                 ]
 
                 available_columns_final = [
@@ -1528,9 +1466,9 @@ class BacktestSimulator:
         try:
             # ▼▼▼ 追加計算: 各種統計情報の取得 ▼▼▼
             if not trade_log.is_empty():
-                max_active_l = trade_log["aL"].max()
-                max_active_s = trade_log["aS"].max()
-                max_active_tot = (trade_log["aL"] + trade_log["aS"]).max()
+                max_active_l = trade_log["active(L)"].max()
+                max_active_s = trade_log["active(S)"].max()
+                max_active_tot = (trade_log["active(L)"] + trade_log["active(S)"]).max()
 
                 l_trades = trade_log.filter(pl.col("direction") == 1)
                 s_trades = trade_log.filter(pl.col("direction") == -1)
@@ -1538,33 +1476,6 @@ class BacktestSimulator:
                 count_s = len(s_trades)
                 avg_td_l = l_trades["TD"].mean() if count_l > 0 else 0.0
                 avg_td_s = s_trades["TD"].mean() if count_s > 0 else 0.0
-
-                # 方向別 勝率・PF
-                def _win_rate_pf(trades):
-                    if len(trades) == 0:
-                        return 0.0, 0.0
-                    pnls = [float(p) for p in trades["pnl"].to_list() if p is not None]
-                    wins = [p for p in pnls if p > 0]
-                    losses = [p for p in pnls if p < 0]
-                    wr = len(wins) / len(pnls) * 100 if pnls else 0.0
-                    pf = sum(wins) / abs(sum(losses)) if losses else float("inf")
-                    return wr, pf
-
-                wr_l, pf_l = _win_rate_pf(l_trades)
-                wr_s, pf_s = _win_rate_pf(s_trades)
-
-                # 連続SL最大値（selfから取得）
-                max_csl_long = self.max_consec_sl_long
-                max_csl_short = self.max_consec_sl_short
-                max_csl_total = self.max_consec_sl_total
-                max_closs_total = self.max_consec_loss_total
-
-                # 証拠金維持率最低値（selfから取得）
-                min_mg_lv = (
-                    float(self.min_margin_level_pct)
-                    if self.min_margin_level_pct != Decimal("inf")
-                    else None
-                )
 
                 # ▼▼▼ 修正前 ▼▼▼
                 # to_count = len(
@@ -1715,9 +1626,6 @@ class BacktestSimulator:
                     to_count
                 ) = 0
                 avg_td_l = avg_td_s = 0.0
-                wr_l = wr_s = pf_l = pf_s = 0.0
-                max_csl_long = max_csl_short = max_csl_total = max_closs_total = 0
-                min_mg_lv = None
                 m2_bins = atr_bins = {}
                 atr_band_stats = {}
                 atr_abs_band_stats = {}
@@ -1769,13 +1677,7 @@ class BacktestSimulator:
                 sortino = report_data.get("sortino_ratio_annual", 0.0)
                 f.write(f"Sortino Ratio (Ann.):\t{sortino:.2f}\n")
                 max_dd = report_data.get("max_drawdown_pct", 0.0)
-                f.write(f"Maximal Drawdown:\t{abs(max_dd):,.2f} %\n")
-                f.write(
-                    f"Min Margin Level:\t"
-                    f"{min_mg_lv:,.1f} %" if min_mg_lv is not None
-                    else "Min Margin Level:\tN/A (no open positions)"
-                )
-                f.write("\n\n")
+                f.write(f"Maximal Drawdown:\t{abs(max_dd):,.2f} %\n\n")
                 f.write("-" * 30 + " Trades " + "-" * 30 + "\n")
                 total_trades = report_data.get("total_trades", 0)
                 win_pct = report_data.get("win_rate_pct", 0.0)
@@ -1791,20 +1693,6 @@ class BacktestSimulator:
                 f.write(f"Average Loss:\t\t{avg_loss:,.3f}\n")
                 avg_bet_pct = report_data.get("average_effective_bet_fraction_pct", 0.0)
                 f.write(f"Avg Bet Size (% Cap):\t{avg_bet_pct:.2f} %\n\n")
-
-                f.write("-" * 25 + " Direction Analysis " + "-" * 25 + "\n")
-                f.write(f"{'':20}{'Long':>12}{'Short':>12}\n")
-                f.write(f"{'Trade Count':20}{count_l:>12}{count_s:>12}\n")
-                f.write(f"{'Win Rate (%)':20}{wr_l:>11.2f}%{wr_s:>11.2f}%\n")
-                pf_l_str = f"{pf_l:.2f}" if pf_l != float('inf') else "inf"
-                pf_s_str = f"{pf_s:.2f}" if pf_s != float('inf') else "inf"
-                f.write(f"{'Profit Factor':20}{pf_l_str:>12}{pf_s_str:>12}\n\n")
-
-                f.write("-" * 25 + " Consecutive Losses " + "-" * 25 + "\n")
-                f.write(f"Max Consec SL (Long):\t{max_csl_long}\n")
-                f.write(f"Max Consec SL (Short):\t{max_csl_short}\n")
-                f.write(f"Max Consec SL (Total):\t{max_csl_total}\n")
-                f.write(f"Max Consec Loss (SL+TO):\t{max_closs_total}\n\n")
 
                 # ▼▼▼ 追加出力: 詳細統計と分布 ▼▼▼
                 f.write("-" * 23 + " Positions & Durations " + "-" * 14 + "\n")
@@ -1919,95 +1807,7 @@ class BacktestSimulator:
         except Exception as e:
             logging.error(f"Failed to save text performance report: {e}", exc_info=True)
 
-        # --- 月別・年別リターン CSV 出力 ---
-        try:
-            if not trade_log.is_empty():
-                monthly_path = FINAL_REPORT_PATH.parent / (
-                    FINAL_REPORT_PATH.stem + "_monthly_breakdown.csv"
-                )
-                # pnl/balance はObject型のため先にFloat64へ変換
-                _tl = trade_log.with_columns([
-                    pl.col("pnl").map_elements(
-                        lambda x: float(x) if x is not None else None,
-                        return_dtype=pl.Float64
-                    ).alias("pnl_f"),
-                    pl.col("label").cast(pl.Int32).alias("label_i"),
-                    pl.col("timestamp").dt.year().alias("year"),
-                    pl.col("timestamp").dt.month().alias("month"),
-                ])
-
-                monthly_rows = []
-                for (yr, mo), grp in _tl.group_by(["year", "month"], maintain_order=False):
-                    pnls = grp["pnl_f"].to_list()
-                    labels = grp["label_i"].to_list()
-                    wins = [p for p in pnls if p > 0]
-                    losses = [p for p in pnls if p < 0]
-                    wr = len(wins) / len(pnls) * 100 if pnls else 0.0
-                    pf = sum(wins) / abs(sum(losses)) if losses else float("inf")
-                    tot_pnl = sum(pnls)
-                    dd_vals = grp["DD(%)"].to_list()
-                    max_dd = min(dd_vals) if dd_vals else 0.0
-                    monthly_rows.append({
-                        "year": yr, "month": mo,
-                        "trades": len(pnls),
-                        "win_rate_%": round(wr, 2),
-                        "profit_factor": round(pf, 3) if pf != float("inf") else None,
-                        "total_pnl": round(tot_pnl, 2),
-                        "max_dd_%": round(max_dd, 2),
-                    })
-
-                monthly_rows.sort(key=lambda r: (r["year"], r["month"]))
-
-                # 年計行を挿入
-                output_rows = []
-                cur_year = None
-                year_buf = []
-                for row in monthly_rows:
-                    if cur_year is not None and row["year"] != cur_year:
-                        # 年計
-                        yr_pnls_w = [r["total_pnl"] for r in year_buf if r["total_pnl"] > 0]
-                        yr_pnls_l = [r["total_pnl"] for r in year_buf if r["total_pnl"] < 0]
-                        yr_trades = sum(r["trades"] for r in year_buf)
-                        yr_pf = sum(yr_pnls_w) / abs(sum(yr_pnls_l)) if yr_pnls_l else None
-                        output_rows.append({
-                            "year": cur_year, "month": "TOTAL",
-                            "trades": yr_trades,
-                            "win_rate_%": "",
-                            "profit_factor": round(yr_pf, 3) if yr_pf else None,
-                            "total_pnl": round(sum(r["total_pnl"] for r in year_buf), 2),
-                            "max_dd_%": round(min(r["max_dd_%"] for r in year_buf), 2),
-                        })
-                        output_rows.append({})  # 空行
-                        year_buf = []
-                    cur_year = row["year"]
-                    year_buf.append(row)
-                    output_rows.append(row)
-
-                # 最終年の年計
-                if year_buf:
-                    yr_pnls_w = [r["total_pnl"] for r in year_buf if r["total_pnl"] > 0]
-                    yr_pnls_l = [r["total_pnl"] for r in year_buf if r["total_pnl"] < 0]
-                    yr_pf = sum(yr_pnls_w) / abs(sum(yr_pnls_l)) if yr_pnls_l else None
-                    output_rows.append({
-                        "year": cur_year, "month": "TOTAL",
-                        "trades": sum(r["trades"] for r in year_buf),
-                        "win_rate_%": "",
-                        "profit_factor": round(yr_pf, 3) if yr_pf else None,
-                        "total_pnl": round(sum(r["total_pnl"] for r in year_buf), 2),
-                        "max_dd_%": round(min(r["max_dd_%"] for r in year_buf), 2),
-                    })
-
-                import csv as _csv
-                fieldnames = ["year", "month", "trades", "win_rate_%", "profit_factor", "total_pnl", "max_dd_%"]
-                with open(monthly_path, "w", newline="", encoding="utf-8") as f:
-                    writer = _csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    for row in output_rows:
-                        writer.writerow({k: row.get(k, "") for k in fieldnames})
-                logging.info(f"Monthly breakdown CSV saved to {monthly_path}")
-        except Exception as e:
-            logging.error(f"Failed to save monthly breakdown CSV: {e}", exc_info=True)
-
+        # ▼▼▼ この行を末尾に追加！ ▼▼▼
         return report_data
 
 

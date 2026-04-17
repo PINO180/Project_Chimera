@@ -8,7 +8,7 @@ import os
 # 1. 設定
 # ==========================================
 # 読み込むCSVファイルの絶対パス
-CSV_FILE = "/workspace/data/XAUUSD/stratum_7_models/backtest_simulator_results/M2_20260416_113241_Th0.7_D0.3_R2/detailed_trade_log_v5_M2.csv"
+CSV_FILE = "/workspace/data/XAUUSD/stratum_7_models/backtest_simulator_results/M2_20260416_224456_Th0.7_D0.3_R2-H1M30/detailed_trade_log_v5_M2.csv"
 
 # 【期間指定】描画したい期間を設定してください (Noneにすると全期間)
 # 書式: "YYYY-MM-DD" または "YYYY-MM-DD HH:MM:SS"
