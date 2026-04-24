@@ -708,8 +708,9 @@ class FeatureModule1D:
             hv50_window = hv50_hist[-1440:]
             hv50_finite = hv50_window[np.isfinite(hv50_window)]
             if len(hv50_finite) >= 10:
-                q80 = float(np.percentile(hv50_finite, 80))
-                q60 = float(np.percentile(hv50_finite, 60))
+                # Polars rolling_quantile のデフォルトは interpolation="nearest"
+                q80 = float(np.percentile(hv50_finite, 80, method="nearest"))
+                q60 = float(np.percentile(hv50_finite, 60, method="nearest"))
                 features["e1d_hv_regime_50"] = float(
                     int(cur_hv50 > q80) + int(cur_hv50 > q60)
                 )

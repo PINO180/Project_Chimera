@@ -800,36 +800,46 @@ class FeatureModule1A:
         for window in [20, 50]:
             w_arr = _window(close_arr, window)
             if len(w_arr) >= max(4, window):
-                mean_w = float(np.mean(w_arr))
-                n_w    = len(w_arr)
+                # 【根本修正】kurtosis/momentの学習側Polarsとの完全一致
+                #
+                # 学習側(Polars)の計算:
+                #   各バーiで z_i = (close[i] - rolling_mean_i) / rolling_std_ddof0_i
+                #   最終値 = rolling_mean(z^moment, window)[-1]
+                #          = mean(z_{N-window}^m, ..., z_{N-1}^m)
+                #
+                # 旧実装は w_arr全体を一括でzスコア化していたため不一致だった。
+                # 正しくは「各バーがそのバーのrollingウィンドウに基づくzスコア」を使う。
+                n = len(close_arr)
+                # z_per_bar[idx] = (close[bar_i] - mean_i) / std_ddof0_i
+                # k_num[idx]     = (close[bar_i] - mean_i)^4  ← 分子のみ（分母は最終バーで共通）
+                z_per_bar = np.empty(window, dtype=np.float64)
+                k_num_per_bar = np.empty(window, dtype=np.float64)
+                for idx in range(window):
+                    bar_i = n - window + idx
+                    if bar_i - window + 1 < 0:
+                        z_per_bar[idx] = np.nan
+                        k_num_per_bar[idx] = np.nan
+                        continue
+                    sub = close_arr[bar_i - window + 1: bar_i + 1]
+                    sub_mean = np.mean(sub)
+                    sub_var0 = np.var(sub, ddof=1) * (window - 1.0) / window
+                    sub_std0 = np.sqrt(sub_var0 + 1e-10)
+                    z_per_bar[idx] = (close_arr[bar_i] - sub_mean) / sub_std0
+                    k_num_per_bar[idx] = (close_arr[bar_i] - sub_mean) ** 4
 
-                # var_ddof0: 学習側の rolling_var(window, ddof=1) * (window-1)/window と等価。
-                # Polars rolling_var は最後の `window` 要素を使い ddof=1 で計算する。
-                # n_w は常に window と一致する（_window が末尾 window 要素を返すため）。
-                var_ddof1 = float(np.var(w_arr, ddof=1))
-                var_ddof0 = var_ddof1 * (n_w - 1.0) / n_w
-                std_ddof0 = np.sqrt(var_ddof0 + 1e-10)
-                std_ddof0_pow4 = var_ddof0 ** 2
-                deviations = w_arr - mean_w
-
-                # 【修正1】bias=True（Polars rolling_skew デフォルト）に完全一致
+                # kurtosis: 分子はrolling_mean((close-mean_i)^4)、分母は最終バーのvar_ddof0^2
+                last_var0 = np.var(w_arr, ddof=1) * (window - 1.0) / window
+                valid_kn = k_num_per_bar[np.isfinite(k_num_per_bar)]
                 features[f"e1a_statistical_skewness_{window}"] = _skewness_bias_true(w_arr)
-
-                # kurtosis: 学習側と同定義（ddof=0 分散^2 で正規化、-3）
                 features[f"e1a_statistical_kurtosis_{window}"] = (
-                    float(np.mean(deviations ** 4)) / (std_ddof0_pow4 + 1e-10) - 3.0
+                    float(np.mean(valid_kn)) / (last_var0 ** 2 + 1e-10) - 3.0
+                    if len(valid_kn) > 0 else np.nan
                 )
 
-                # 高次モーメント（Zスコアベース ddof=0 + 1e-10）
-                # 【修正2】全モーメントをこのブロックで確定させ、_rolling_moment() で上書きしない。
-                # 学習側の Polars 式:
-                #   std_ddof0 = (var_ddof0 + 1e-10).sqrt()
-                #   ((close - mean_col) / std_ddof0).pow(moment).rolling_mean(window)
-                # と完全等価。
-                z_scores = deviations / std_ddof0
+                valid_z = z_per_bar[np.isfinite(z_per_bar)]
                 for moment in [5, 6, 7, 8]:
                     features[f"e1a_statistical_moment_{moment}_{window}"] = (
-                        float(np.mean(z_scores ** moment))
+                        float(np.mean(valid_z ** moment)) if len(valid_z) > 0 else np.nan
                     )
             else:
                 features[f"e1a_statistical_skewness_{window}"] = np.nan
@@ -854,8 +864,9 @@ class FeatureModule1A:
             w_arr = _window(close_arr, window)
             if len(w_arr) >= window:
                 median_w = float(np.median(w_arr))
-                q25_w    = float(np.percentile(w_arr, 25))
-                q75_w    = float(np.percentile(w_arr, 75))
+                # Polars rolling_quantile のデフォルトは interpolation="nearest"
+                q25_w    = float(np.percentile(w_arr, 25, method="nearest"))
+                q75_w    = float(np.percentile(w_arr, 75, method="nearest"))
                 trim_w   = _trim_mean(w_arr, 0.1)
                 features[f"e1a_robust_median_{window}"]       = (close_last - median_w) / atr_last_safe
                 features[f"e1a_robust_q25_{window}"]          = (close_last - q25_w) / atr_last_safe

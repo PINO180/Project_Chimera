@@ -5,69 +5,66 @@ import duckdb
 import logging
 from pathlib import Path
 
-# プロジェクトのルートディレクトリをPythonの検索パスに追加
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-# blueprintから一元管理された設定を読み込む
 from blueprint import S6_LABELED_DATASET, S6_LABELED_DATASET_MONTHLY
 
-# --- ロギング設定 ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
 def main():
-    """
-    日次でパーティション化されたParquetデータを、月次パーティションに集約するスクリプト。
-    DuckDBのOut-of-Core能力を最大限に活用し、メモリ安全性を保証する。
-    """
     logging.info("### Stage 0: Intermediate Aggregation Script ###")
     logging.info("Aggregating daily partitioned data into monthly partitions...")
 
-    # blueprintから入出力パスを取得
-    input_path_glob = str(S6_LABELED_DATASET / "*/*/*/*.parquet")
-    output_path = str(S6_LABELED_DATASET_MONTHLY)
+    input_base  = S6_LABELED_DATASET
+    output_path = Path(str(S6_LABELED_DATASET_MONTHLY))
 
-    logging.info(f"Input data glob: {input_path_glob}")
+    logging.info(f"Input base: {input_base}")
     logging.info(f"Output directory: {output_path}")
 
-    # この単一のSQLコマンドが、全ての魔法を実行する
-    # DuckDBが裏側でファイルの読み込み、データの再編成、書き出し、メモリ管理を全て行う
-    query = f"""
-    -- COPYコマンドは、SELECTクエリの結果を別の場所に書き出すための強力な命令
-    COPY (
-        -- read_parquet関数で、Hive形式で分割された全ファイルを一つの論理テーブルとして読み込む
-        SELECT *
-        FROM read_parquet(
-            '{input_path_glob}',
-            hive_partitioning=true
-        )
-    ) TO '{output_path}' (
-        -- 出力形式はParquet
-        FORMAT PARQUET,
-        -- yearとmonth列の値に基づいて、新しいパーティション・ディレクトリを作成
-        PARTITION_BY (year, month),
-        -- もし出力先に同名のパーティションが存在する場合、上書きする
-        OVERWRITE_OR_IGNORE true
-    );
-    """
+    # 存在するyear/monthの組み合わせを列挙
+    year_dirs = sorted([p for p in input_base.iterdir()
+                        if p.is_dir() and p.name.startswith("year=")])
+    ym_list = []
+    for year_dir in year_dirs:
+        year = int(year_dir.name.split("=")[1])
+        month_dirs = sorted([p for p in year_dir.iterdir()
+                             if p.is_dir() and p.name.startswith("month=")])
+        for month_dir in month_dirs:
+            month = int(month_dir.name.split("=")[1])
+            ym_list.append((year, month))
+
+    logging.info(f"Processing {len(ym_list)} months one by one to avoid OOM...")
 
     try:
-        # DuckDBに接続（ファイルパスを指定しない場合、インメモリデータベースとして動作）
         con = duckdb.connect()
 
-        logging.info("Executing aggregation query with DuckDB...")
-        # クエリを実行。DuckDBが数分かけて、数百GBのデータを安全に処理します。
-        con.execute(query)
+        for year, month in ym_list:
+            month_glob = str(input_base / f"year={year}/month={month}/day=*/*.parquet")
+            out_dir  = output_path / f"year={year}" / f"month={month}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = str(out_dir / "data.parquet")
 
-        logging.info("Aggregation query executed successfully.")
+            query = f"""
+            COPY (
+                SELECT *
+                FROM read_parquet('{month_glob}', hive_partitioning=false)
+            ) TO '{out_file}' (FORMAT PARQUET);
+            """
+            try:
+                con.execute(query)
+                logging.info(f"  -> Done: {year}-{month:02d}")
+            except Exception as e:
+                logging.warning(f"  -> Skipped {year}-{month:02d}: {e}")
+
+        logging.info("All months processed successfully.")
 
     except Exception as e:
-        logging.error(f"An error occurred during DuckDB execution: {e}", exc_info=True)
+        logging.error(f"An error occurred: {e}", exc_info=True)
         raise
     finally:
-        # 接続を閉じる
         con.close()
         logging.info("DuckDB connection closed.")
 

@@ -59,6 +59,7 @@ logging.basicConfig(
 warnings.filterwarnings("ignore", category=UserWarning)
 try:
     from polars.exceptions import PolarsInefficientMapWarning
+
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     warnings.filterwarnings("ignore", category=PolarsInefficientMapWarning)
 except ImportError:
@@ -141,7 +142,9 @@ class FinalTrainingConfig:
 class PartitionPurgedKFold(BaseCrossValidator):
     def __init__(self, n_splits: int = 5, purge_days: int = 3, embargo_days: int = 2):
         self.n_splits, self.purge_days, self.embargo_days = (
-            n_splits, purge_days, embargo_days,
+            n_splits,
+            purge_days,
+            embargo_days,
         )
 
     def split(
@@ -175,8 +178,12 @@ class FinalAssembler:
         self.direction = self.config.direction
 
         # M1とM2それぞれの専用特徴量リストを直交分割版から読み込む
-        m1_feature_path = S3_SELECTED_FEATURES_ORTHOGONAL_DIR / f"m1_{self.direction}_features.txt"
-        m2_feature_path = S3_SELECTED_FEATURES_ORTHOGONAL_DIR / f"m2_{self.direction}_features.txt"
+        m1_feature_path = (
+            S3_SELECTED_FEATURES_ORTHOGONAL_DIR / f"m1_{self.direction}_features.txt"
+        )
+        m2_feature_path = (
+            S3_SELECTED_FEATURES_ORTHOGONAL_DIR / f"m2_{self.direction}_features.txt"
+        )
 
         self.features_base: List[str] = self._load_features(m1_feature_path)
         self.features_m2: List[str] = self._load_features(m2_feature_path)
@@ -292,7 +299,7 @@ class FinalAssembler:
             if df.schema["timeframe"] in [pl.Utf8, pl.String]:
                 df = df.with_columns(
                     pl.col("timeframe")
-                    .replace({"M1": 0, "M3": 1, "M5": 2, "M8": 3, "M15": 4})
+                    .replace({"M0.5": 0, "M1": 1, "M3": 2, "M5": 3, "M8": 4, "M15": 5})
                     .cast(pl.Int32)
                 )
             else:
@@ -565,7 +572,7 @@ class FinalAssembler:
                 )
 
                 # timeframeをInt32→文字列に復元（下流のシミュレーター向け）
-                reverse_map = {0: "M1", 1: "M3", 2: "M5", 3: "M8", 4: "M15"}
+                reverse_map = {0: "M0.5", 1: "M1", 2: "M3", 3: "M5", 4: "M8", 5: "M15"}
                 oof_df = oof_df.with_columns(
                     pl.col("timeframe")
                     .replace_strict(reverse_map, default=None)
@@ -618,7 +625,11 @@ class FinalAssembler:
         )
         if calib_partitions_m1:
             self._manual_calibrate(
-                "M1", m1_model, self.config.m1_calibrated, calib_partitions_m1, is_m2=False,
+                "M1",
+                m1_model,
+                self.config.m1_calibrated,
+                calib_partitions_m1,
+                is_m2=False,
             )
         else:
             logging.warning(
@@ -627,7 +638,11 @@ class FinalAssembler:
 
         if calib_partitions_m2:
             self._manual_calibrate(
-                "M2", m2_model, self.config.m2_calibrated, calib_partitions_m2, is_m2=True,
+                "M2",
+                m2_model,
+                self.config.m2_calibrated,
+                calib_partitions_m2,
+                is_m2=True,
             )
         else:
             logging.warning(
@@ -951,9 +966,13 @@ class FinalAssembler:
                             report["m1_performance"] = {"auc": float("nan")}
                         else:
                             report["m1_performance"] = {
-                                "auc": roc_auc_score(y_true_m1, y_pred_m1, sample_weight=w_m1)
+                                "auc": roc_auc_score(
+                                    y_true_m1, y_pred_m1, sample_weight=w_m1
+                                )
                             }
-                            logging.info(f"[{self.direction.upper()}]   -> M1 AUC calculated.")
+                            logging.info(
+                                f"[{self.direction.upper()}]   -> M1 AUC calculated."
+                            )
             except Exception as e:
                 logging.error(
                     f"[{self.direction.upper()}] Could not process M1 OOF predictions: {e}"
@@ -983,9 +1002,13 @@ class FinalAssembler:
                             report["m2_performance"] = {"auc": float("nan")}
                         else:
                             report["m2_performance"] = {
-                                "auc": roc_auc_score(y_true_m2, y_pred_m2, sample_weight=w_m2)
+                                "auc": roc_auc_score(
+                                    y_true_m2, y_pred_m2, sample_weight=w_m2
+                                )
                             }
-                            logging.info(f"[{self.direction.upper()}]   -> M2 AUC calculated.")
+                            logging.info(
+                                f"[{self.direction.upper()}]   -> M2 AUC calculated."
+                            )
             except Exception as e:
                 logging.error(
                     f"[{self.direction.upper()}] Could not process aggregated M2 OOF predictions: {e}"
@@ -1025,7 +1048,8 @@ if __name__ == "__main__":
         assembler.run()
 
     logging.info(
-        "\n" + "=" * 60
+        "\n"
+        + "=" * 60
         + "\n### ALL STAGES (LONG & SHORT) COMPLETED! (直交分割版) ###\n"
         + "=" * 60
     )

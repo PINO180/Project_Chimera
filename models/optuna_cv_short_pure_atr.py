@@ -64,19 +64,20 @@ RESULTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 # ★テストしたいスプレッドをリストで複数指定
 SPREAD_COSTS = [
     # 0.16,
-    0.36,
+    # 0.36,
     0.50,
-    0.80,
+    # 0.80,
 ]
 COOL_DOWN_MINUTES = 1
 
 # --- 探索空間 (Search Space) ---
 TIMEFRAMES = [
-    "M1",
+    # "M0.5",
+    # "M1",
     "M3",
     "M5",
-    "M8",
-    "M15",
+    # "M8",
+    # "M15",
     # "H1",
     # "H4",
     # "H6",
@@ -93,44 +94,70 @@ ATR_PERIODS = [
 # 修正②：ATR_THRESHOLDSをRatio閾値に変更
 # ATR Ratio閾値（現在のATR / 過去ATR_BASELINE_DAYS日の平均ATR）
 # Ratio >= 閾値 なら「現在のボラティリティが過去平均のN%以上ある正常相場」としてエントリー許可
-ATR_THRESHOLDS = [0.5, 0.8, 1.0, 1.2, 1.5]
+ATR_THRESHOLDS = [
+    0.8,
+    #   1.0, 1.2, 1.5, 1.8, 3.0
+]
 
 PT_MULTS = [
     # 0.5,
     1.0,
+    2.0,
     2.5,
-    5.0,
+    3.0,
+    # 5.0,
+    # 8.0,
+    # 10.0,
 ]
 SL_MULTS = [
     # 0.5,
-    1.0,
-    2.5,
+    # 1.0,
+    2.0,
+    # 2.5,
+    3.0,
+    4.0,
     5.0,
+    # 8.0,
+    # 10.0,
 ]
 TD_MINS = [
-    5,
+    # 5,
+    # 10,
     15,
     30,
-    60,
-    120,
-    180,
-    # 360, 720, 1080, 1200
+    # 60,
+    # 120,
+    # 180,
+    # 360,
+    # 720,
+    # 1080,
 ]
 
 # --- CV・最適化設定 ---
 K_FOLDS = 5
 PURGE_DAYS = 3
 EMBARGO_DAYS = 2
-N_TRIALS = 1000
+N_TRIALS = 200
 MIN_TOTAL_BETS_PER_FOLD = 100
 
-SEARCH_TIMEFRAMES = TIMEFRAMES + ["mixed"]
+SEARCH_TIMEFRAMES = TIMEFRAMES  # + ["mixed"]
 
 # 修正④：timeframe_bars_per_day（ATR Ratio計算用・全スクリプト共通定数）
 timeframe_bars_per_day = {
-    "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
-    "M8": 180, "M15": 96, "M30": 48, "H1": 24,
-    "H4": 6, "H6": 4, "H12": 2, "D1": 1, "W1": 1, "MN": 1,
+    "M0.5": 2880,
+    "M1": 1440,
+    "M3": 480,
+    "M5": 288,
+    "M8": 180,
+    "M15": 96,
+    "M30": 48,
+    "H1": 24,
+    "H4": 6,
+    "H6": 4,
+    "H12": 2,
+    "D1": 1,
+    "W1": 1,
+    "MN": 1,
 }
 
 
@@ -147,42 +174,60 @@ def _numba_find_hits_fast(
     ticks_high,
     ticks_low,
 ):
+    """
+    厳密版（Short）: TO時は t1_max 直後の tick 価格（mid_price）で決済。
+    戻り値: (exit_time, exit_price, reason)
+      reason: 1=PT, -1=SL, 0=TO
+    ticks_low == ticks_high == mid_price（tickデータのため）
+    """
     n_bets = len(bets_t0)
     n_ticks = len(ticks_ts)
-    out_first_pt_time = np.zeros(n_bets, dtype=np.int64)
-    out_first_sl_time = np.zeros(n_bets, dtype=np.int64)
+    out_exit_time = np.zeros(n_bets, dtype=np.int64)
+    out_exit_price = np.zeros(n_bets, dtype=np.float64)
+    out_reason = np.zeros(n_bets, dtype=np.int8)
 
     for i in prange(n_bets):
         t0 = bets_t0[i]
-        t1_max = bets_t1_max[i]
+        t1max = bets_t1_max[i]
         pt = bets_pt_barrier[i]
         sl = bets_sl_barrier[i]
 
         start_idx = np.searchsorted(ticks_ts, t0, side="right")
-        first_pt_found = np.int64(0)
-        first_sl_found = np.int64(0)
+
+        exit_time = np.int64(0)
+        exit_price = np.float64(0.0)
+        reason = np.int8(0)
 
         for j in range(start_idx, n_ticks):
             tick_time = ticks_ts[j]
-            if tick_time > t1_max:
-                break
-            tick_high = ticks_high[j]
-            tick_low = ticks_low[j]
+            tick_mid = ticks_low[j]  # mid_price（high==low==mid）
 
-            # ショート利確: LowがPT(目標価格)以下になったら
-            if first_pt_found == 0 and tick_low <= pt:
-                first_pt_found = tick_time
-            # ショート損切: HighがSL(撤退価格)以上になったら
-            if first_sl_found == 0 and tick_high >= sl:
-                first_sl_found = tick_time
-
-            if first_pt_found != 0 and first_sl_found != 0:
+            if tick_time > t1max:
+                # タイムアウト: t1_max直後のtick価格で決済
+                exit_time = tick_time
+                exit_price = tick_mid
+                reason = np.int8(0)
                 break
 
-        out_first_pt_time[i] = first_pt_found
-        out_first_sl_time[i] = first_sl_found
+            # ショート利確: mid_priceがPT（目標価格）以下
+            if tick_mid <= pt:
+                exit_time = tick_time
+                exit_price = pt
+                reason = np.int8(1)
+                break
 
-    return out_first_pt_time, out_first_sl_time
+            # ショート損切: mid_priceがSL（撤退価格）以上
+            if tick_mid >= sl:
+                exit_time = tick_time
+                exit_price = sl
+                reason = np.int8(-1)
+                break
+
+        out_exit_time[i] = exit_time
+        out_exit_price[i] = exit_price
+        out_reason[i] = reason
+
+    return out_exit_time, out_exit_price, out_reason
 
 
 # ====================================================================
@@ -260,9 +305,9 @@ class FoldDataLoader:
                 )
                 .sort("timestamp")
             )
-            df_tick = lf_tick.select(
-                ["timestamp", "mid_price"]
-            ).collect(engine="streaming")
+            df_tick = lf_tick.select(["timestamp", "mid_price"]).collect(
+                engine="streaming"
+            )
 
             if df_tick.is_empty():
                 self.tick_np_cache[fold_key] = None
@@ -273,9 +318,9 @@ class FoldDataLoader:
                     ["timestamp", pl.col("mid_price").alias("close")]
                 )
                 ts_np = np.ascontiguousarray(
-                    df_tick.with_columns(
-                        pl.col("timestamp").dt.timestamp("us")
-                    )["timestamp"].to_numpy()
+                    df_tick.with_columns(pl.col("timestamp").dt.timestamp("us"))[
+                        "timestamp"
+                    ].to_numpy()
                 )
                 mid_np = np.ascontiguousarray(df_tick["mid_price"].to_numpy())
                 self.tick_np_cache[fold_key] = (
@@ -335,15 +380,17 @@ class FoldDataLoader:
                         & (pl.col("timestamp") < end_date)
                     )
                     .sort("timestamp")
-                    .with_columns([
-                        pl.max_horizontal(
-                            pl.col("high") - pl.col("low"),
-                            (pl.col("high") - pl.col("close").shift(1)).abs(),
-                            (pl.col("low") - pl.col("close").shift(1)).abs(),
-                        )
-                        .ewm_mean(alpha=1 / atr_p, adjust=False)
-                        .alias(f"atr_{atr_p}")
-                    ])
+                    .with_columns(
+                        [
+                            pl.max_horizontal(
+                                pl.col("high") - pl.col("low"),
+                                (pl.col("high") - pl.col("close").shift(1)).abs(),
+                                (pl.col("low") - pl.col("close").shift(1)).abs(),
+                            )
+                            .ewm_mean(alpha=1 / atr_p, adjust=False)
+                            .alias(f"atr_{atr_p}")
+                        ]
+                    )
                     .select(["timestamp", f"atr_{atr_p}"])
                 )
 
@@ -404,6 +451,8 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
         total_sum_atr_all = 0.0
         total_net_profit_all = 0.0
         total_timeout_np_all = 0.0
+        fold_timeout_np_list = []  # Fold別TO_NP（トレンドバイアス分析用）
+        fold_apf_list = []  # Fold別APF（時系列安定性分析用）
 
         for fold_idx, (_, test_dates) in enumerate(cv_folds):
             if tf_choice == "mixed":
@@ -446,9 +495,13 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
             # ATR_BASELINE_DAYS日分のバー数でベースラインATRを計算
             # NOTE: tf_choice="mixed" は辞書に存在しないため default=1440（M1粒度）をベースラインとする
             #       mixed は M1〜M15 の混在データであり、最も細かい時間足 M1 を基準にするのが合理的
-            baseline_period = timeframe_bars_per_day.get(tf_choice, 1440) * ATR_BASELINE_DAYS
+            baseline_period = (
+                timeframe_bars_per_day.get(tf_choice, 1440) * ATR_BASELINE_DAYS
+            )
             atr_series = pd.Series(sig_atr)
-            baseline_atr = atr_series.rolling(window=baseline_period, min_periods=1).mean().values
+            baseline_atr = (
+                atr_series.rolling(window=baseline_period, min_periods=1).mean().values
+            )
             atr_ratio = sig_atr / (baseline_atr + 1e-10)
             mask = atr_ratio >= atr_threshold
 
@@ -482,7 +535,7 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                     bets_close + bets_atr * sl_mult - spread_cost
                 )
 
-                out_pt, out_sl = _numba_find_hits_fast(
+                out_exit_time, out_exit_price, out_reason = _numba_find_hits_fast(
                     bets_t0,
                     bets_t1_max,
                     bets_pt,
@@ -492,21 +545,26 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                     ticks_low,
                 )
 
-                # 勝敗判定と利益計算は到達タイミング（timestamp）に依存するため、
-                # Numba関数内の到達判定を反転させたことで既存のロジックがそのまま機能する
-                is_win = (out_pt > 0) & ((out_sl == 0) | (out_pt < out_sl))
-                is_loss = (out_sl > 0) & ((out_pt == 0) | (out_sl <= out_pt))
-                timeouts = int(np.sum(~(is_win | is_loss)))
+                # exit_price==0はtickが見つからなかったケース→エントリー価格で代替
+                safe_exit_price = np.where(
+                    out_exit_price == 0.0, bets_close, out_exit_price
+                )
+                net_pnl = bets_close - safe_exit_price - spread_cost
 
-                wins = int(np.sum(is_win))
-                losses = int(np.sum(is_loss))
-                total_profit = float(
-                    np.sum(bets_atr[is_win].astype(np.float64)) * pt_mult
-                )
-                total_loss_base = float(
-                    np.sum(bets_atr[is_loss].astype(np.float64)) * sl_mult
-                )
-                total_loss_adj = total_loss_base + (timeouts * spread_cost)
+                # 1. レポート用件数集計（バリア到達理由ベース）
+                is_pt = out_reason == np.int8(1)
+                is_sl = out_reason == np.int8(-1)
+                is_timeout = out_reason == np.int8(0)
+                wins = int(np.sum(is_pt))
+                losses = int(np.sum(is_sl))
+                timeouts = int(np.sum(is_timeout))
+
+                # 2. オプティマイザ評価用損益集計（金銭ベース・TO含む）
+                financial_is_win = net_pnl > 0
+                financial_is_loss = net_pnl <= 0
+                total_profit = float(np.sum(net_pnl[financial_is_win]))
+                total_loss_adj = float(np.sum(np.abs(net_pnl[financial_is_loss])))
+                timeout_np = float(np.sum(net_pnl[is_timeout]))
 
                 adj_pf = (
                     total_profit / total_loss_adj
@@ -520,8 +578,10 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                 total_losses_all += losses
                 total_timeouts_all += timeouts
                 total_sum_atr_all += float(np.sum(bets_atr))
-                total_net_profit_all += total_profit - total_loss_adj
-                total_timeout_np_all += -(timeouts * spread_cost)
+                total_net_profit_all += float(np.sum(net_pnl))
+                total_timeout_np_all += timeout_np
+                fold_timeout_np_list.append(round(timeout_np * 100 * 150, 0))
+                fold_apf_list.append(round(adj_pf, 6))
 
             current_mean_score = np.mean(fold_scores)
             trial.report(current_mean_score, step=fold_idx)
@@ -539,12 +599,19 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
         trial.set_user_attr(
             "Avg_Payoff", round(pt_mult / sl_mult, 4) if sl_mult > 0 else 0
         )
-        trial.set_user_attr(
-            "Total_NP", round(total_net_profit_all * 100 * 150, 0)
-        )
-        trial.set_user_attr(
-            "Timeout_NP", round(total_timeout_np_all * 100 * 150, 0)
-        )
+        trial.set_user_attr("Total_NP", round(total_net_profit_all * 100 * 150, 0))
+        trial.set_user_attr("Timeout_NP", round(total_timeout_np_all * 100 * 150, 0))
+        # Fold別TO_NPとAPF（トレンドバイアス・時系列安定性の分析用）
+        for fi, (f_tonp, f_apf) in enumerate(zip(fold_timeout_np_list, fold_apf_list)):
+            trial.set_user_attr(f"Fold{fi + 1}_TO_NP", f_tonp)
+            trial.set_user_attr(f"Fold{fi + 1}_APF", f_apf)
+        # TO_NPのFold間標準偏差（小さいほどトレンドバイアスが少ない）
+        if len(fold_timeout_np_list) > 1:
+            import statistics
+
+            trial.set_user_attr(
+                "TO_NP_Fold_Std", round(statistics.stdev(fold_timeout_np_list), 0)
+            )
 
         return np.mean(fold_scores)
 
@@ -596,6 +663,12 @@ def run_optimization():
         "Total_NP",
         "Timeout_NP",
         "Adjusted_PF",
+        "TO_NP_Fold_Std",
+        "Fold1_TO_NP",
+        "Fold2_TO_NP",
+        "Fold3_TO_NP",
+        "Fold4_TO_NP",
+        "Fold5_TO_NP",
     ]
 
     # ★スプレッドのループを一番外側に追加

@@ -13,7 +13,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-PROFILING_ENABLED = True  # False にすれば無音・ほぼゼロオーバーヘッド
+PROFILING_ENABLED = False  # False にすれば無音・ほぼゼロオーバーヘッド
 
 # ======================================================================
 # ① process_new_m1_bar  （RealtimeFeatureEngine のメソッドとして貼り替え）

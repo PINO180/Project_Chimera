@@ -291,8 +291,9 @@ class FeatureModule1E:
             features[f"e1e_spectral_rolloff_{window}"] = _last(
                 spectral_rolloff_udf(_window(close_pct, window), window)
             )
+            # spectral_flux_udf は隣接2フレーム分（window*2本）が必要
             features[f"e1e_spectral_flux_{window}"] = _last(
-                spectral_flux_udf(_window(close_pct, window), window)
+                spectral_flux_udf(_window(close_pct, window * 2), window)
             )
             features[f"e1e_spectral_flatness_{window}"] = _last(
                 spectral_flatness_udf(_window(close_pct, window), window)
@@ -427,22 +428,22 @@ class FeatureModule1E:
             float(np.sqrt(np.mean(w_rms_50 ** 2))) if len(w_rms_50) >= 50 else np.nan
         )
 
-        # signal_peak_to_peak_100: (max - min) / (atr_100 + 1e-10)
+        # signal_peak_to_peak_100: (rolling_max(close,100) - rolling_min(close,100)) / atr_wilder(100)
+        # 学習側と一致: atr_wilder(100) は全系列から計算した最終値を使う（末尾100本で再計算しない）
         w_sig_100 = _window(close_arr, 100)
-        w_hi_100  = _window(high_arr,  100)
-        w_lo_100  = _window(low_arr,   100)
         if len(w_sig_100) >= 100:
-            atr_100 = calculate_atr_wilder(
-                w_hi_100.astype(np.float64),
-                w_lo_100.astype(np.float64),
-                w_sig_100.astype(np.float64),
+            atr_100_full = calculate_atr_wilder(
+                high_arr.astype(np.float64),
+                low_arr.astype(np.float64),
+                close_arr.astype(np.float64),
                 100,
             )
-            atr_last_val = atr_100[-1] if len(atr_100) > 0 else np.nan
-            if np.isfinite(atr_last_val):
-                raw_range = np.array([np.max(w_sig_100) - np.min(w_sig_100)], dtype=np.float64)
-                atr_last  = np.array([atr_last_val], dtype=np.float64)
-                features["e1e_signal_peak_to_peak_100"] = float(scale_by_atr(raw_range, atr_last)[0])
+            atr_last_val = float(atr_100_full[-1]) if len(atr_100_full) > 0 else np.nan
+            if np.isfinite(atr_last_val) and atr_last_val > 0:
+                features["e1e_signal_peak_to_peak_100"] = (
+                    (float(np.max(w_sig_100)) - float(np.min(w_sig_100)))
+                    / (atr_last_val + 1e-10)
+                )
             else:
                 features["e1e_signal_peak_to_peak_100"] = np.nan
         else:

@@ -124,11 +124,13 @@ S3_SURVIVED_HF_FEATURES = S3_ARTIFACTS / "survived_hf_features.txt"
 S3_FEATURES_FOR_ALPHA_DECAY = S3_ARTIFACTS / "final_feature_set.txt"
 S3_FEATURES_FOR_TRAINING = S3_ARTIFACTS / "final_feature_set_v3.txt"
 S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / "final_feature_set_v5.txt"
+S3_FEATURES_FOR_TRAINING_XV = S3_ARTIFACTS / "final_feature_set_xv.txt"  # ★XV追加
 S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / "selected_features_v5"
 S3_SELECTED_FEATURES_PURIFIED_DIR = S3_ARTIFACTS / "selected_features_purified_v5"
 S3_SELECTED_FEATURES_ORTHOGONAL_DIR = (
     S3_ARTIFACTS / "selected_features_orthogonal_v5"
 )  # ★追加: M1/M2直交分割版
+
 S3_FILTERED_LF_FEATURES = S3_ARTIFACTS / "filtered_lf_features.txt"
 S3_FILTERED_HF_FEATURES = S3_ARTIFACTS / "filtered_hf_features.txt"
 S3_LF_ENVIRONMENT_SCORES = S3_ARTIFACTS / "lf_environment_scores.parquet"
@@ -200,6 +202,14 @@ S7_M1_MODEL_SHORT_PKL = S7_MODELS / "m1_model_v2_short.pkl"
 
 S7_M2_MODEL_LONG_PKL = S7_MODELS / "m2_model_v2_long.pkl"
 S7_M2_MODEL_SHORT_PKL = S7_MODELS / "m2_model_v2_short.pkl"
+
+# --- M3 Confidence Layer ---
+M3_TRAINING_DATA_DIR  = DATA_DIR / "diagnostics/m3_training"
+M3_MODEL_LONG_PKL     = S7_MODELS / "m3_model_long.pkl"
+M3_MODEL_SHORT_PKL    = S7_MODELS / "m3_model_short.pkl"
+M3_OOF_SCORES_LONG    = S7_MODELS / "m3_oof_scores_long.parquet"
+M3_OOF_SCORES_SHORT   = S7_MODELS / "m3_oof_scores_short.parquet"
+M3_EVALUATION_DIR     = DATA_DIR / "diagnostics/m3_evaluation"
 
 # --- Script C / Cx_purified 出力: 較正済み(Calibrated)モデル ---
 S7_M1_CALIBRATED_LONG = S7_MODELS / "m1_calibrated_v2_long.pkl"

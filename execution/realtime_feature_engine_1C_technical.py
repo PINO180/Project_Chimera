@@ -653,8 +653,49 @@ class FeatureModule1C:
             features[f"e1c_aroon_down_{period}"]         = aroon_down
             features[f"e1c_aroon_oscillator_{period}"]   = aroon_up - aroon_down
 
+        # =====================================================================
+        # 【既知バグ・意図的な非修正】williams_r の全 period が period=56 固定
+        #
+        # 【原因】
+        #   学習側 engine_1_C_a_vast_universe_of_features.py の
+        #   create_oscillator_features() 内で以下のコードが使われている:
+        #
+        #     williams_periods = [14, 28, 56]
+        #     for period in williams_periods:
+        #         pl.struct(...).map_batches(
+        #             lambda s: calculate_williams_r_numba(..., period, ...),  # ← バグ
+        #             ...
+        #         )
+        #
+        #   Python の lambda は変数をデフォルト引数でキャプチャしない限り
+        #   「late binding」になる。map_batches の lambda が実際に評価される
+        #   タイミングでは for ループが終了しており、period=56 に固定されている。
+        #   正しくは `lambda s, p=period: ...(p)` と書く必要がある。
+        #
+        # 【影響範囲】
+        #   e1c_williams_r_14, e1c_williams_r_28, e1c_williams_r_56 の全てが
+        #   学習時に period=56 の値で計算・学習されている。
+        #   特徴量リストに含まれる e1c_williams_r_14 は M1/M0.5/M3/M5/M15 で
+        #   M1_long・M1_short モデルに使用されている。
+        #
+        # 【対処方針】
+        #   学習済みモデルはこのバグ込みの値で学習済みのため、再学習なしに
+        #   学習側のバグだけ直すと本番の予測値が変化してしまう。
+        #   → 本番側も意図的に period=56 固定とし、学習時の挙動に合わせる。
+        #
+        # 【将来の修正手順】
+        #   1. engine_1_C の lambda を `lambda s, p=period: ...(p)` に修正
+        #   2. 特徴量を再生成（Stratum2→S5→S6）
+        #   3. モデルを再学習
+        #   4. 本番側のこのコメントブロックを削除し、下記に戻す:
+        #      for period in [14, 28, 56]:
+        #          features[f"e1c_williams_r_{period}"] = _last(
+        #              calculate_williams_r_numba(high_arr, low_arr, close_arr, period)
+        #          )
+        # =====================================================================
+        wr_56 = _last(calculate_williams_r_numba(high_arr, low_arr, close_arr, 56))
         for period in [14, 28, 56]:
-            features[f"e1c_williams_r_{period}"] = _last(calculate_williams_r_numba(high_arr, low_arr, close_arr, period))
+            features[f"e1c_williams_r_{period}"] = wr_56
 
         # Stochastic (14,3,3), (21,5,5), (9,3,3)
         for k_period, d_period, slow_period in [(14, 3, 3), (21, 5, 5), (9, 3, 3)]:
@@ -712,14 +753,15 @@ class FeatureModule1C:
             # kst_signal: rolling_mean(kst_arr, 9)
             # 2116本の配列から過去9バー分のKST値を計算して平均を取る
             kst_arr = np.full(len(close_arr), np.nan)
+            # 学習側に合わせてROCは小数のまま（* 100 なし）→ kst = / 10 * 100 で1回だけ変換
             for idx in range(30, len(close_arr)):
                 c = close_arr[idx]
                 d10 = close_arr[idx - 10]; d15 = close_arr[idx - 15]
                 d20 = close_arr[idx - 20]; d30 = close_arr[idx - 30]
-                r10 = (c - d10) / d10 * 100 if d10 != 0.0 else np.nan
-                r15 = (c - d15) / d15 * 100 if d15 != 0.0 else np.nan
-                r20 = (c - d20) / d20 * 100 if d20 != 0.0 else np.nan
-                r30 = (c - d30) / d30 * 100 if d30 != 0.0 else np.nan
+                r10 = (c - d10) / d10 if d10 != 0.0 else np.nan
+                r15 = (c - d15) / d15 if d15 != 0.0 else np.nan
+                r20 = (c - d20) / d20 if d20 != 0.0 else np.nan
+                r30 = (c - d30) / d30 if d30 != 0.0 else np.nan
                 if np.isfinite(r10) and np.isfinite(r15) and np.isfinite(r20) and np.isfinite(r30):
                     kst_arr[idx] = (r10 * 1 + r15 * 2 + r20 * 3 + r30 * 4) / 10 * 100
             # kst_signal: rolling_mean(9)準拠 — 末尾9バーが揃っている場合のみ計算

@@ -92,8 +92,8 @@ def process_file(input_path: Path):
     if "Timeout_NP" in df.columns:
         df["Timeout_NP"] = pd.to_numeric(df["Timeout_NP"], errors="coerce").fillna(0.0)
 
-    # TNP > 0 のtimeframeのみ対象
-    valid_tf = df.groupby("timeframe").filter(lambda x: x["Total_Net_Profit"].max() > 0).copy()
+    # TNP > 0フィルタを削除（全件対象）
+    valid_tf = df.copy()
     valid_tf["tf_order"] = valid_tf["timeframe"].apply(
         lambda x: TIMEFRAME_ORDER.index(x) if x in TIMEFRAME_ORDER else 999
     )
@@ -106,7 +106,7 @@ def process_file(input_path: Path):
         if subset.empty:
             continue
         top5_frames.append(subset.nlargest(5, "Total_Net_Profit"))
-    df_top5 = pd.concat(top5_frames).drop(columns=["tf_order"])
+    df_top5 = pd.concat(top5_frames).drop(columns=["tf_order"]) if top5_frames else pd.DataFrame()
 
     # 出力2: 各timeframeのTNP1位・APF1位
     out2_rows = []
@@ -120,7 +120,7 @@ def process_file(input_path: Path):
         apf1["timeframe"] = f"{tf}_APF1"
         out2_rows.append(tnp1)
         out2_rows.append(apf1)
-    df_out2 = pd.concat(out2_rows).drop(columns=["tf_order"])
+    df_out2 = pd.concat(out2_rows).drop(columns=["tf_order"]) if out2_rows else pd.DataFrame()
 
     # 出力3-A: 各timeframeのTNP1位一覧
     tnp1_rows = []
@@ -129,7 +129,7 @@ def process_file(input_path: Path):
         if subset.empty:
             continue
         tnp1_rows.append(subset.nlargest(1, "Total_Net_Profit"))
-    df_tnp1 = pd.concat(tnp1_rows).drop(columns=["tf_order"])
+    df_tnp1 = pd.concat(tnp1_rows).drop(columns=["tf_order"]) if tnp1_rows else pd.DataFrame()
 
     # 出力3-B: 各timeframeのAPF1位一覧
     apf1_rows = []
@@ -138,7 +138,7 @@ def process_file(input_path: Path):
         if subset.empty:
             continue
         apf1_rows.append(subset.nlargest(1, "Adjusted_PF"))
-    df_apf1 = pd.concat(apf1_rows).drop(columns=["tf_order"])
+    df_apf1 = pd.concat(apf1_rows).drop(columns=["tf_order"]) if apf1_rows else pd.DataFrame()
 
     # CSV書き出し
     with open(output_path, "w", encoding="utf-8", newline="") as f:

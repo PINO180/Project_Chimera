@@ -763,7 +763,7 @@ def main():
                     # --------------------------------------------------
                     # 1. M1モデル (生の予測値のみ)
                     X_long_m1 = np.array(
-                        [[feature_dict.get(f, 0.0) for f in feature_lists["long_m1"]]]
+                        [[feature_dict.get(f, 0.0) or 0.0 for f in feature_lists["long_m1"]]]
                     )
                     p_long_m1_raw = models["long_m1"].predict(X_long_m1)[0]
 
@@ -781,7 +781,7 @@ def main():
                         X_long_m2 = np.array(
                             [
                                 [
-                                    feature_dict_long.get(f, 0.0)
+                                    feature_dict_long.get(f, 0.0) or 0.0
                                     for f in feature_lists["long_m2"]
                                 ]
                             ]
@@ -795,7 +795,7 @@ def main():
                     # --------------------------------------------------
                     # 1. M1モデル (生の予測値のみ)
                     X_short_m1 = np.array(
-                        [[feature_dict.get(f, 0.0) for f in feature_lists["short_m1"]]]
+                        [[feature_dict.get(f, 0.0) or 0.0 for f in feature_lists["short_m1"]]]
                     )
                     p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
 
@@ -813,7 +813,7 @@ def main():
                         X_short_m2 = np.array(
                             [
                                 [
-                                    feature_dict_short.get(f, 0.0)
+                                    feature_dict_short.get(f, 0.0) or 0.0
                                     for f in feature_lists["short_m2"]
                                 ]
                             ]
@@ -953,7 +953,7 @@ def main():
                                 # ▲▲▲ ここまで修正 ▲▲▲
 
                             logger.info(
-                                f"💾 エントリー時の全特徴量(110個)をCSVに記録しました: {dump_csv_path.name}"
+                                f"💾 エントリー時の全特徴量({len(feature_keys)}個)をCSVに記録しました: {dump_csv_path.name}"
                             )
                         except Exception as e:
                             logger.warning(f"特徴量CSVの保存に失敗: {e}")
@@ -1074,7 +1074,9 @@ def main():
                     # --- 発注 ---
                     if command["action"] != "HOLD":
                         logger.info(
-                            f"-> 発注コマンドを送信: {command['action']} {command['lots']} lots (SL:{command.get('stop_loss')}, TP:{command.get('take_profit')})"
+                            f"-> 発注コマンドを送信: {command['action']} {command['lots']} lots"
+                            f" (SL:{command.get('stop_loss')}, TP:{command.get('take_profit')})"
+                            f" [Spread: {current_spread:.1f}pips]"
                         )
                         success = bridge.send_trade_command(command)
                         if success:

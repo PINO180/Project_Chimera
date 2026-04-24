@@ -397,8 +397,10 @@ class MQL5BridgePublisherV3:
             try:
                 reply_data = json.loads(reply)
                 if reply_data.get("status") == "ACK":
+                    ack_spread = reply_data.get("spread", None)
+                    spread_str = f" [約定時Spread: {ack_spread:.1f}pips]" if ack_spread is not None else ""
                     logger.info(
-                        f"✓ Trade Command Accepted by MT5: Ticket={reply_data.get('ticket', 'N/A')}"
+                        f"✓ Trade Command Accepted by MT5: Ticket={reply_data.get('ticket', 'N/A')}{spread_str}"
                     )
                     return True
                 else:

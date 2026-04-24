@@ -170,8 +170,14 @@ class BacktestSimulator:
         Optuna超高速化用: 全パーティションのデータを1回だけ読み込み、
         メモリ上の辞書(Dict)にキャッシュして返す。
         """
-        logging.info("Pre-loading all data into memory for ultra-fast simulation...")
+        logging.info("Pre-loading all data into memory (Optimized Single Scan)...")
         lf, partitions_df = self._prepare_data()
+
+        # 1回のcollect()で全件メモリに乗せる（1382回のディスクスキャンを回避）
+        logging.info("Executing single collect() pass on dataset. Please wait...")
+        df_all = lf.with_columns(
+            pl.col("timestamp").dt.date().alias("date")
+        ).collect()
 
         preloaded_dict = {}
         partitions_to_process = partitions_df
@@ -181,21 +187,19 @@ class BacktestSimulator:
                 self.config.test_limit_partitions
             )
 
-        # 全日数をループして、LazyFrame(lf) を DataFrame としてメモリに collect() する
+        # メモリ上のDataFrameから日付ごとに切り出す（超高速）
         for row in tqdm(
             partitions_to_process.iter_rows(named=True),
             total=len(partitions_to_process),
-            desc="Preloading Partitions to Memory",
+            desc="Splitting to Dictionary",
         ):
             current_date = row["date"]
-            try:
-                df_chunk = lf.filter(
-                    pl.col("timestamp").dt.date() == current_date
-                ).collect()
-                if not df_chunk.is_empty():
-                    preloaded_dict[current_date] = df_chunk
-            except Exception as e:
-                logging.error(f"Error preloading partition {current_date}: {e}")
+            df_chunk = df_all.filter(pl.col("date") == current_date)
+            if not df_chunk.is_empty():
+                preloaded_dict[current_date] = df_chunk
+
+        del df_all
+        gc.collect()
 
         logging.info(
             f"Successfully preloaded {len(preloaded_dict)} partitions into memory."

@@ -1181,6 +1181,22 @@ class CalculationEngine:
         }
 
     # ▼ 引数に timeframe を追加
+    def _get_all_feature_expressions(
+        self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
+    ) -> pl.LazyFrame:
+        """QAなし・raw値の全特徴量を計算して返す（unit test用）。
+        
+        calculate_all_features と同じ計算ステップを踏むが、
+        最後の apply_quality_assurance を適用しない。
+        学習パイプライン・本番パイプラインでは使用しないこと。
+        """
+        result = self.create_rsi_features(lazy_frame)
+        result = self.create_macd_features(result)
+        result = self.create_bollinger_features(result)
+        result = self.create_atr_features(result)
+        result = self.create_basic_processing_features(result)
+        return result
+
     def calculate_all_features(
         self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
     ) -> pl.LazyFrame:
@@ -1699,13 +1715,44 @@ class CalculationEngine:
             )
             exprs.append(aroon_osc)
 
+        # =====================================================================
+        # 【既知バグ・意図的な非修正】williams_r の lambda に late binding バグあり
+        #
+        # 【バグの内容】
+        #   以下の lambda は `period` をデフォルト引数でキャプチャしていないため、
+        #   Python の late binding により map_batches が評価されるタイミング
+        #   （with_columns 実行時）には for ループが終了しており、
+        #   williams_r_14 / williams_r_28 / williams_r_56 の全てが
+        #   最後の値である period=56 で計算される。
+        #
+        #   正しい書き方: lambda s, p=period: calculate_williams_r_numba(..., p)
+        #
+        # 【影響範囲】
+        #   e1c_williams_r_14, e1c_williams_r_28, e1c_williams_r_56 の全てが
+        #   period=56 の値で Stratum2/S5/S6 に保存されており、
+        #   モデルもこの値で学習済み。
+        #   特徴量リスト（m1_long/m1_short）に含まれる e1c_williams_r_14 は
+        #   M1/M0.5/M3/M5/M15 の各時間足で使用されている。
+        #
+        # 【なぜ修正しないか】
+        #   学習済みモデルが period=56 の値を前提としているため、
+        #   ここだけ修正すると本番の予測値が変化し整合性が崩れる。
+        #   本番側（realtime_feature_engine_1C_technical.py）も
+        #   意図的に period=56 固定で実装済み。
+        #
+        # 【将来の修正手順】
+        #   1. 下記 lambda を `lambda s, p=period: ...(p)` に修正
+        #   2. 特徴量を再生成（Stratum2→S5→S6）
+        #   3. モデルを再学習
+        #   4. 本番側の williams_r も個別 period に戻す
+        # =====================================================================
         # Williams %R
         williams_periods = [14, 28, 56]
         for period in williams_periods:
             williams_r = (
                 pl.struct(["high", "low", "close"])
                 .map_batches(
-                    lambda s: calculate_williams_r_numba(
+                    lambda s: calculate_williams_r_numba(  # ← late binding バグ: 常に period=56
                         s.struct.field("high").to_numpy(),
                         s.struct.field("low").to_numpy(),
                         s.struct.field("close").to_numpy(),
