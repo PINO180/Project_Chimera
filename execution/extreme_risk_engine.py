@@ -299,12 +299,26 @@ class ExtremeRiskEngineV5:
             tp_multiplier=tp_mult,  # 修正反映
         )
 
+        # [SL/TP-FIX] MQL5側でOrderSend直前のAsk/Bid基準にSL/TPを再計算するため、
+        # ドル幅(sl_width/tp_width)・ATR・乗数をコマンドに追加する。
+        # Python送信時とMT5約定時の価格差(スリッページ)があっても、
+        # ポジションから見たSL/TP幅は常に意図通り(atr*sl_mult / atr*tp_mult)となる。
+        # MQL5側ではキー不在時に0.0が返るため、フォールバックでstop_loss/take_profitの絶対価格を使用する。
+        sl_width = float(atr) * float(sl_mult)
+        tp_width = float(atr) * float(tp_mult)
+
         trade_command = {
             "action": action,
             "lots": lots,
             "entry_price": current_price,
             "stop_loss": sl_tp["stop_loss"],
             "take_profit": sl_tp["take_profit"],
+            # [SL/TP-FIX] MQL5側でAsk/Bid基準のSL/TP再計算に使用
+            "sl_width": sl_width,
+            "tp_width": tp_width,
+            "atr": float(atr),
+            "sl_multiplier": float(sl_mult),
+            "tp_multiplier": float(tp_mult),
             "p_long": p_long,
             "p_short": p_short,
             "reason": f"TwoBrain Signal: {action} (p_long={p_long:.2f}, p_short={p_short:.2f})",

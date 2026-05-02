@@ -757,35 +757,73 @@ class FeatureModule1B:
 
         # volume_ma20, volume_price_trend
         # 学習側:
-        #   rel_volume = volume / (rolling_mean(volume, 1440) + 1e-10)  ← 各バーで分母が変わる
-        #   volume_ma20 = rel_volume.rolling_mean(20)
-        #   volume_price_trend = (pct_change * rel_volume).rolling_mean(10)
-        # 本番側: 末尾1440バー平均を固定分母として使用（1440バー平均は20バー以内で実質不変）
-        # 【修正1】vol_base / vol_base_20 の二重計算を vol_mean_1440 に統一
-        # 【修正3】volume_price_trend: 10バー揃っている場合のみ計算（min_periods=10 と一致）
+        #   rel_volume[i] = volume[i] / (rolling_mean_1440[i] + 1e-10)  ← 各バーで分母再計算
+        #     ※ Polars rolling_mean のデフォルト min_samples = window_size のため、
+        #        i < lookback_bars - 1 のバーでは rolling_mean_1440[i] = NaN
+        #        → rel_volume[i] = volume[i] / NaN = NaN
+        #   volume_ma20[t] = rel_volume.rolling_mean(20)[t]
+        #     = (1/20) * Σ_{i=t-19}^{t} rel_volume[i]
+        #     ※ ウィンドウ内に NaN が1つでもあれば結果は NaN
+        #   volume_price_trend[t] = (pct_change * rel_volume).rolling_mean(10)[t]
+        #     = (1/10) * Σ_{i=t-9}^{t} (pct_change[i] * rel_volume[i])
+        # [TRAIN-SERVE-FIX] 旧本番側は「最終バー時点の rolling_mean_1440 を分母として
+        # 固定使用」していたため、学習側と微小乖離（1〜3%）が発生していた。
+        # 新本番側では各バーごとに rel_volume を計算し、学習側と完全一致させる。
         if len(volume_arr) > 0:
-            vol_mean_1440 = float(np.mean(_window(volume_arr, lookback_bars)))
+            n_vol = len(volume_arr)
 
-            # volume_ma20
-            vol_w20 = _window(volume_arr, 20)
-            if len(vol_w20) >= 20:
-                rel_vol_w20 = vol_w20 / (vol_mean_1440 + 1e-10)
-                features["e1b_volume_ma20"] = float(np.mean(rel_vol_w20))
+            # 各バーごとの rel_volume を計算（学習側と完全同等）
+            # rel_volume[i] = volume[i] / (rolling_mean_1440[i] + 1e-10)
+            # i < lookback_bars - 1 のバーは rolling_mean_1440[i] = NaN → rel_volume[i] = NaN
+            #
+            # volume_ma20 計算には直近20バー、volume_price_trend には直近10バーの rel_volume が必要。
+            # 効率化のため、必要な末尾20バーのみ rel_volume を計算する。
+            # 各バー i について: mean(volume[max(0, i-1439):i+1])
+            # ただし学習側 Polars rolling_mean(1440) は i < 1439 で NaN を返すため、
+            # i < lookback_bars - 1 のバーは NaN を割り当てる。
+
+            def _rolling_mean_1440_at(i: int) -> float:
+                """学習側 Polars rolling_mean(lookback_bars) と同等。
+                i < lookback_bars - 1 のバーは NaN を返す。"""
+                if i < lookback_bars - 1:
+                    return np.nan
+                return float(np.mean(volume_arr[i - lookback_bars + 1: i + 1]))
+
+            # 直近20バー分の rel_volume を計算
+            # rel_vol_recent[k] (k=0..N-1) は配列末尾から (N-1-k) バー前に対応
+            # つまり rel_vol_recent[-1] が現バー、rel_vol_recent[-2] が1バー前... の順
+            n_compute = min(20, n_vol)
+            rel_vol_recent = np.full(n_compute, np.nan, dtype=np.float64)
+            for k in range(n_compute):
+                # i は配列末尾から (n_compute - 1 - k) バー前
+                i = n_vol - 1 - (n_compute - 1 - k)
+                rolling_mean_at_i = _rolling_mean_1440_at(i)
+                if np.isnan(rolling_mean_at_i):
+                    rel_vol_recent[k] = np.nan
+                else:
+                    rel_vol_recent[k] = volume_arr[i] / (rolling_mean_at_i + 1e-10)
+
+            # volume_ma20: 直近20バーが揃っており、かつ全バーで rel_volume が有効であれば計算
+            # （Polars rolling_mean(20) は min_samples=20 デフォルトで、ウィンドウ内に NaN が
+            #  1つでも含まれると NaN を返す）
+            if n_vol >= 20 and not np.any(np.isnan(rel_vol_recent)):
+                features["e1b_volume_ma20"] = float(np.mean(rel_vol_recent))
             else:
                 features["e1b_volume_ma20"] = np.nan
 
-            # volume_price_trend
-            pct_w10 = _window(close_pct, 10)
-            vol_w10 = _window(volume_arr, 10)
-            if len(pct_w10) >= 10 and len(vol_w10) >= 10:
-                rel_v_w10 = vol_w10 / (vol_mean_1440 + 1e-10)
-                vpt = pct_w10 * rel_v_w10
-                # 【修正済み Step7→8: 問題2】finite フィルタを廃止。
-                # 学習側: (pct_change * rel_volume).rolling_mean(10) は
-                # inf をそのまま伝播させ QA でクリップする。
-                # 旧: finite_vpt フィルタで inf を除外 → 学習側と不一致。
-                # 新: inf を除外せず mean に通し、QA でクリップさせる。
-                features["e1b_volume_price_trend"] = float(np.mean(vpt))
+            # volume_price_trend: 直近10バーの (pct_change * rel_volume) の平均
+            # rel_vol_recent の末尾10要素が直近10バーに対応（n_compute >= 10 のとき）
+            if n_vol >= 10 and len(close_pct) >= 10 and n_compute >= 10:
+                pct_w10 = close_pct[-10:]
+                rel_v_w10 = rel_vol_recent[-10:]
+                if not np.any(np.isnan(rel_v_w10)) and not np.any(np.isnan(pct_w10)):
+                    # 学習側: (pct_change * rel_volume).rolling_mean(10) は
+                    # inf をそのまま伝播させ QA でクリップする。
+                    # finite フィルタは適用せず、infも mean に通して QA に任せる。
+                    vpt = pct_w10 * rel_v_w10
+                    features["e1b_volume_price_trend"] = float(np.mean(vpt))
+                else:
+                    features["e1b_volume_price_trend"] = np.nan
             else:
                 features["e1b_volume_price_trend"] = np.nan
         else:

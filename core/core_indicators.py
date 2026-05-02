@@ -108,6 +108,72 @@ def calculate_atr_wilder(
     return atr
 
 
+def calculate_barrier_atr(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    disc: np.ndarray,
+    period: int = 13,
+) -> float:
+    """
+    [SL/TP専用] 堅牢なATR計算関数 — バリア幅（SL/TP）計算にのみ使用する。
+
+    既存の calculate_atr_wilder() とは独立した関数であり、
+    AIモデルの入力特徴量（e1c_atr_13等）には一切使用しない。
+    学習側との乖離リスクを回避するために責務を分離している。
+
+    calculate_atr_wilder() との違い:
+    1. SMAシード: 最初のperiod本はSMA（単純平均）でシードを作成（TA-Lib仕様）
+       → シード1点から始まる脆弱性を排除
+    2. discフラグ対応: disc=Trueの足は前Closeを使わずH-LのみでTR計算
+       → resample().dropna()廃止後のギャップ越境TR防止
+    3. NaNウォームアップ: period本未満のバッファではNaNを返す
+       → 不安定な初期値がSL/TPに使われるのを防ぐ
+
+    Args:
+        high, low, close: OHLCバッファ（np.ndarray）
+        disc: 不連続フラグ配列（True=ギャップあり、前Closeを使わない）
+        period: ATR期間（デフォルト13）
+
+    Returns:
+        float: 最新のATR値。バッファがperiod本未満の場合はnp.nan。
+    """
+    n = len(high)
+    if n < period:
+        return np.nan
+
+    # 配列長の整合性チェック（discがcloseと異なる長さの場合に備える）
+    n_disc = len(disc)
+    if n_disc < n:
+        # 先頭をFalse（連続）でパディング
+        disc = np.concatenate([np.zeros(n - n_disc, dtype=np.bool_), disc])
+    elif n_disc > n:
+        disc = disc[-n:]
+
+    # True Range 計算（discフラグ対応）
+    tr = np.zeros(n, dtype=np.float64)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        if disc[i]:
+            # [DISC-FLAG] 不連続点: 前Closeを使わずH-Lのみ
+            tr[i] = hl
+        else:
+            hc = abs(high[i] - close[i - 1])
+            lc = abs(low[i] - close[i - 1])
+            tr[i] = max(hl, hc, lc)
+
+    # SMAシードでATRを初期化（最初のperiod本の平均）
+    atr_seed = float(np.mean(tr[:period]))
+    atr = atr_seed
+
+    # period本目以降はWilder平滑化
+    for i in range(period, n):
+        atr = atr * (period - 1.0) / period + tr[i] / period
+
+    return atr
+
+
 @njit(fastmath=False, cache=True)
 def scale_by_atr(
     target_arr: np.ndarray,

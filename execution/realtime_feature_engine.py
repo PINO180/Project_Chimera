@@ -37,7 +37,7 @@ from blueprint import ATR_BASELINE_DAYS  # noqa: E402
 
 # --- core_indicators: Single Source of Truth ---
 sys.path.append(str(config.CORE_DIR))
-from core_indicators import calculate_atr_wilder, neutralize_ols  # noqa: E402
+from core_indicators import calculate_atr_wilder, calculate_barrier_atr, neutralize_ols  # noqa: E402
 
 # ==================================================================
 # 外部モジュール (完全カプセル化クラス群) のインポート
@@ -168,6 +168,12 @@ class RealtimeFeatureEngine:
         self.last_bar_timestamps: Dict[str, Optional[pd.Timestamp]] = {}
         self.latest_features_cache: Dict[str, Dict[str, float]] = {}
 
+        # [発見#D対応] calculate_feature_vector で「純化済み('_neutralized_'を含む)
+        # でもなく、許可リスト(NON_NEUTRALIZED_BASE_NAMES)にも該当しない」特徴量を
+        # 検知した際に警告ログを出すが、毎バー出力されるとスパムになるため
+        # 一度警告した名前は記録して再警告しない。
+        self._warned_unknown_features: set = set()
+
         for tf_name in self.ALL_TIMEFRAMES.keys():
             if self.ALL_TIMEFRAMES[tf_name] is None:
                 continue
@@ -187,6 +193,9 @@ class RealtimeFeatureEngine:
             self.data_buffers[tf_name] = {
                 col: deque(maxlen=lookback) for col in self.OHLCV_COLS
             }
+            # [DISC-FLAG] 不連続フラグバッファ: resampleでNaNになった足はTrue
+            # discフラグがTrueの足ではTR計算時に前Closeを使わず H-L のみで計算する
+            self.data_buffers[tf_name]["disc"] = deque(maxlen=lookback)
             self.is_buffer_filled[tf_name] = False
             self.last_bar_timestamps[tf_name] = None
             self.latest_features_cache[tf_name] = {}
@@ -604,6 +613,9 @@ class RealtimeFeatureEngine:
             # 1. OHLCVバッファを更新
             for col in self.OHLCV_COLS:
                 self.data_buffers[tf_name][col].append(bar_dict[col])
+            # [DISC-FLAG] 不連続フラグを書き込む（デフォルトはFalse=連続）
+            disc_flag = bool(bar_dict.get("disc", False))
+            self.data_buffers[tf_name]["disc"].append(disc_flag)
             self.last_bar_timestamps[tf_name] = bar_timestamp
 
             # ★ 2, 3 の古い限定的OLS更新処理を削除 (process_new_m05_bar内で全特徴量を一括更新するため)
@@ -670,8 +682,19 @@ class RealtimeFeatureEngine:
                         "volume": "sum",
                     }
                 )
-                .dropna()
             )
+            # [DISC-FLAG] dropna()を廃止し、NaN行を不連続フラグで管理する。
+            # dropna()はNaN行を削除することで時系列を不連続にし、
+            # ギャップ越境TR（数時間分の価格差が1本のTRになる）を引き起こす。
+            # NaN行はforward fillで補完しつつdiscフラグをTrueにして後段でTR計算を制限する。
+            disc_mask = resampled_df["close"].isna()
+            resampled_df = resampled_df.ffill()
+            # ffill後もNaNが残る場合（バッファ先頭等）はbfillで補完
+            resampled_df = resampled_df.bfill()
+            # 完全に補完できない行のみ除外（ffill/bfill両方で補完不能=全NaN）
+            resampled_df = resampled_df.dropna()
+            # discフラグを付与
+            resampled_df["disc"] = disc_mask.reindex(resampled_df.index).fillna(False)
 
             if len(resampled_df) < 2:
                 return []
@@ -707,11 +730,20 @@ class RealtimeFeatureEngine:
             return []
 
     def process_new_m05_bar(
-        self, m05_bar: Dict[str, Any], market_proxy_cache: pd.DataFrame
+        self,
+        m05_bar: Dict[str, Any],
+        market_proxy_cache: pd.DataFrame,
+        warmup_only: bool = False,
     ) -> List[Signal]:
         """
         [メインループ] main.py から M0.5 バーを受け取り、全バッファを更新し、
         M3確定時のみシグナルをチェックして返す。
+
+        Args:
+            warmup_only: Trueのとき、バッファ更新・OLS更新・特徴量キャッシュ更新のみ行い、
+                         シグナルチェックと Signal 生成を完全にスキップする。
+                         差分追いつきループ（スナップショット復帰時）で使用し、
+                         追いつき期間中の意図しない発注を根本から防ぐ。
         """
         signal_list: List[Signal] = []
 
@@ -790,6 +822,10 @@ class RealtimeFeatureEngine:
                     self.logger.warning(f"{tf_name} 特徴量キャッシュ更新失敗: {e}")
 
             # シグナルチェックはM3のみ
+            # [STALE-GUARD] warmup_only=True（差分追いつき中）はシグナル生成を根本からスキップ
+            if warmup_only:
+                return signal_list
+
             V5_check_result = self._check_for_signal("M3", m3_timestamp)
 
             if V5_check_result["is_V5"]:
@@ -887,10 +923,51 @@ class RealtimeFeatureEngine:
                 self.latest_features_cache[tf_name]["atr_ratio"] = atr_ratio
 
             if atr_ratio >= atr_threshold:
-                # ▼▼▼ 修正: 古い unified キーの取得と payoff_ratio を廃止し、Long/Short 分割キーを取得 ▼▼▼
+                # [DEBUG] バッファ診断情報を計算
+                atr_buffer_len = len(atr_arr)
+                if len(high) >= 2 and len(low) >= 2 and len(close) >= 2:
+                    last_tr = float(max(
+                        high[-1] - low[-1],
+                        abs(high[-1] - close[-2]),
+                        abs(low[-1] - close[-2]),
+                    ))
+                else:
+                    last_tr = float(high[-1] - low[-1]) if len(high) >= 1 else 0.0
+
+                # [フェーズ3] SL/TP計算専用ATR（calculate_barrier_atr）に切り替え
+                # AIモデル入力特徴量用のcalculate_atr_wilder()は一切触らない。
+                # discフラグを渡すことでギャップ越境TRを防止し、SMAシードで安定化する。
+                disc_raw = np.array(
+                    self.data_buffers[tf_name]["disc"], dtype=np.bool_
+                )
+                # disc_arrはcloseと同じ長さに揃える。
+                # 初期充填時はdiscが書き込まれていないバーがあるためFalseでパディング。
+                n_close = len(close)
+                n_disc = len(disc_raw)
+                if n_disc >= n_close:
+                    disc_arr = disc_raw[-n_close:]
+                else:
+                    # 先頭をFalse（連続）でパディング
+                    disc_arr = np.concatenate([
+                        np.zeros(n_close - n_disc, dtype=np.bool_),
+                        disc_raw
+                    ])
+                barrier_atr = calculate_barrier_atr(
+                    high.astype(np.float64),
+                    low.astype(np.float64),
+                    close.astype(np.float64),
+                    disc_arr,
+                    self.ATR_CALC_PERIOD,
+                )
+                # barrier_atrがNaN（バッファ不足）の場合はフォールバックとしてatr_valueを使用
+                barrier_atr_value = (
+                    float(barrier_atr) if np.isfinite(barrier_atr) else atr_value
+                )
+
                 market_info = {
-                    "atr_value": atr_value,
-                    "atr_ratio": atr_ratio,  # ★追加：リスクエンジンに渡す
+                    "atr_value": barrier_atr_value,  # SL/TP計算用（堅牢版）
+                    "atr_value_raw": atr_value,       # 参考値（学習側と同一のWilder EWM）
+                    "atr_ratio": atr_ratio,
                     "current_price": current_price,
                     "sl_multiplier_long": self.risk_config.get(
                         "sl_multiplier_long", 5.0
@@ -904,9 +981,11 @@ class RealtimeFeatureEngine:
                     "pt_multiplier_short": self.risk_config.get(
                         "pt_multiplier_short", 1.0
                     ),
-                    "direction": None,  # Two-Brain推論前のため未確定とする
+                    "direction": None,
+                    # [DEBUG] 原因特定用診断情報
+                    "atr_buffer_len": atr_buffer_len,
+                    "last_tr": last_tr,
                 }
-                # ▲▲▲ ここまで修正 ▲▲▲
 
                 self.logger.info(
                     f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
@@ -1122,18 +1201,19 @@ class RealtimeFeatureEngine:
             )
 
         # 2. 純化用プロキシ (必須) の計算
-        # 司令塔側で最低限必要なプロキシ値を計算して追加する
+        # [TRAIN-SERVE-FIX] 学習側 s1_1_C_enrich.py と完全一致させる:
+        #   VOLATILITY_WINDOW = 20, VOLUME_WINDOW = 50, MOMENTUM_WINDOW = 5
+        #   log_return         = np.log(close[t] / close[t-1])
+        #   rolling_volatility = log_return.rolling(20, min_periods=1).std(ddof=1)
+        #   price_momentum     = close[t] / close[t-5] - 1   (5本前比リターン)
+        #   rolling_avg_volume = volume.rolling(50, min_periods=1).mean()
+        #   volume_ratio       = volume / rolling_avg_volume
+        VOLATILITY_WINDOW = 20
+        VOLUME_WINDOW = 50
+        MOMENTUM_WINDOW = 5
+
         def _window(arr: np.ndarray, window: int) -> np.ndarray:
             return arr[-window:] if len(arr) >= window else arr
-
-        def _pct(arr: np.ndarray) -> np.ndarray:
-            if len(arr) < 2:
-                return np.full_like(arr, np.nan)
-            arr_safe = arr[:-1].copy()
-            arr_safe[arr_safe == 0] = 1e-10
-            return np.concatenate(([np.nan], np.diff(arr) / arr_safe))
-
-        close_pct = _pct(data["close"])
 
         # atr の計算 (e1c_atr_13は相対値のため使用禁止 → core_indicators.calculate_atr_wilderで統一)
         high, low, close = data["high"], data["low"], data["close"]
@@ -1150,32 +1230,76 @@ class RealtimeFeatureEngine:
         else:
             features["atr"] = 0.0
 
-        features["log_return"] = (
-            np.log((data["close"][-1] + 1e-10) / (data["close"][-2] + 1e-10))
-            if len(data["close"]) > 1
-            else 0.0
-        )
-        features["price_momentum"] = (
-            data["close"][-1] - data["close"][-11]
-            if len(data["close"]) > 10
-            else np.nan
-        )
-        features["rolling_volatility"] = (
-            np.std(_window(close_pct, 20)) if len(close_pct) >= 20 else np.nan
-        )
-        features["volume_ratio"] = (
-            data["volume"][-1] / (np.mean(_window(data["volume"], 20)) + 1e-10)
-            if len(data["volume"]) > 0
-            else np.nan
-        )
+        # [TRAIN-SERVE-FIX] log_return: np.log(close[t] / close[t-1])
+        # 学習側: close_shifted = close.shift(1).replace(0, 1e-12)
+        #         log_return = np.log((close / close_shifted).fillna(1.0))
+        if len(close) > 1:
+            prev_close = close[-2] if close[-2] != 0 else 1e-12
+            features["log_return"] = float(np.log(close[-1] / prev_close))
+        else:
+            features["log_return"] = 0.0
+
+        # [TRAIN-SERVE-FIX] price_momentum: close[t] / close[t-5] - 1（5本前比リターン）
+        # 学習側: close_shifted_momentum = close.shift(5).replace(0, 1e-12)
+        #         price_momentum = close / close_shifted_momentum - 1
+        if len(close) > MOMENTUM_WINDOW:
+            prev_close_mom = close[-1 - MOMENTUM_WINDOW] if close[-1 - MOMENTUM_WINDOW] != 0 else 1e-12
+            features["price_momentum"] = float(close[-1] / prev_close_mom - 1.0)
+        else:
+            features["price_momentum"] = np.nan
+
+        # [TRAIN-SERVE-FIX] rolling_volatility: log_returnのrolling(20).std(ddof=1)
+        # 学習側: log_return.rolling(VOLATILITY_WINDOW, min_periods=1).std(ddof=1)
+        # 本番では直近(VOLATILITY_WINDOW)バー分のlog_returnを計算してstd(ddof=1)
+        if len(close) >= 2:
+            # 直近 VOLATILITY_WINDOW + 1 本のcloseから VOLATILITY_WINDOW 個のlog_returnを生成
+            n_window = min(VOLATILITY_WINDOW + 1, len(close))
+            close_window = close[-n_window:]
+            # ゼロ保護
+            close_safe = np.where(close_window[:-1] == 0, 1e-12, close_window[:-1])
+            log_returns_window = np.log(close_window[1:] / close_safe)
+            # ddof=1で不偏推定（最低2サンプル必要）
+            if len(log_returns_window) >= 2:
+                features["rolling_volatility"] = float(np.std(log_returns_window, ddof=1))
+            else:
+                features["rolling_volatility"] = 0.0
+        else:
+            features["rolling_volatility"] = np.nan
+
+        # [TRAIN-SERVE-FIX] volume_ratio: volume / rolling_avg_volume(window=50)
+        # 学習側: rolling_avg_volume = volume.rolling(50, min_periods=1).mean()
+        #         volume_ratio = volume / rolling_avg_volume.replace(0, 1.0)
+        if len(data["volume"]) > 0:
+            vol_window = _window(data["volume"], VOLUME_WINDOW)
+            avg_vol = float(np.mean(vol_window))
+            if avg_vol == 0:
+                avg_vol = 1.0  # 学習側のreplace(0, 1.0)を再現
+            features["volume_ratio"] = float(data["volume"][-1] / avg_vol)
+        else:
+            features["volume_ratio"] = np.nan
 
         return features
+
+    # [発見#D対応] 純化対象外として明示的に許可するベース名のセット。
+    # create_proxy_labels が S6 出力に追加する非純化カラムが該当する。
+    # 学習側 (create_proxy_labels.py L902, L947) で `pl.col("atr_ratio")` として
+    # S6 に書き込まれ、特徴量名簿に `atr_ratio_M3` の形で含まれる。
+    # ここに無いベース名で `_neutralized_` も含まない名前は、学習側に存在しない
+    # カラム名である可能性が高いため、警告ログを出す。
+    NON_NEUTRALIZED_BASE_NAMES = frozenset({
+        "atr_ratio",
+    })
 
     def calculate_feature_vector(
         self, tf_name: str, timestamp: datetime, market_proxy_cache: pd.DataFrame
     ) -> Optional[np.ndarray]:
         """
         [ベクトル生成] 304個の精鋭リストに厳密準拠したベクトルを構築。
+
+        [発見#D対応] base_name 抽出ロジックを厳密化:
+          - 特徴量名に '_neutralized_' を含む場合: 純化済み特徴量として cache から取得
+          - 含まない場合: NON_NEUTRALIZED_BASE_NAMES に含まれる場合のみ非純化値として取得。
+            それ以外の名前は学習側との数値不一致リスクがあるため、初回のみ警告ログを出す。
         """
         if not self.is_buffer_filled[tf_name]:
             return None
@@ -1191,11 +1315,28 @@ class RealtimeFeatureEngine:
                     vector.append(0.0)
                     continue
 
-                base_name = (
-                    feat_name.split("_neutralized_")[0]
-                    if "_neutralized_" in feat_name
-                    else feat_name.rsplit("_", 1)[0]  # ← ここがデッドコード
-                )
+                # [発見#D対応] base_name 抽出を厳密化
+                if "_neutralized_" in feat_name:
+                    # 純化済み: 例 "e1c_atr_13_neutralized_M3" → "e1c_atr_13"
+                    base_name = feat_name.split("_neutralized_")[0]
+                else:
+                    # 非純化: 例 "atr_ratio_M3" → "atr_ratio"
+                    # 末尾の _<TF> を剥がして base_name を得る
+                    base_name = feat_name[: m.start()] if m else feat_name
+                    # 学習側に存在しない可能性のある名前を検知して警告 (初回のみ)
+                    if (
+                        base_name not in self.NON_NEUTRALIZED_BASE_NAMES
+                        and feat_name not in self._warned_unknown_features
+                    ):
+                        self.logger.warning(
+                            f"⚠️ 特徴量 '{feat_name}' は純化済み('_neutralized_'を含まず)、"
+                            f"かつ非純化許可リスト{set(self.NON_NEUTRALIZED_BASE_NAMES)}に"
+                            f"も該当しません。cache から '{base_name}' を取得しますが、"
+                            f"学習側 S6 にこのカラムが存在しないため数値が一致しない可能性があります。"
+                            f"特徴量名簿の生成元 (split_features_first_orthogonal.py 等) を確認してください。"
+                        )
+                        self._warned_unknown_features.add(feat_name)
+
                 val = self.latest_features_cache[target_tf].get(base_name, 0.0)
                 vector.append(val)
 
@@ -1294,10 +1435,35 @@ class RealtimeFeatureEngine:
     # ▲▲▲ ここまで追加 ▲▲▲
 
 
-# ファイル末尾に追加
-from execution import profiling_patch
-
-RealtimeFeatureEngine.process_new_m05_bar = profiling_patch.process_new_m05_bar
-RealtimeFeatureEngine._calculate_base_features = (
-    profiling_patch._calculate_base_features
-)
+# =====================================================================
+# [Phase4: profiling_patch 撤廃] (2026-04-30 final fix)
+# =====================================================================
+# 旧コードはここで profiling_patch.process_new_m05_bar / _calculate_base_features
+# をモンキーパッチで上書きしていた。しかし profiling_patch.py の中身は古いコピーで:
+#
+#   1. process_new_m05_bar に warmup_only 引数がない
+#      → STALE-GUARD 復帰時に TypeError → 「スナップショット破損」と誤検知され
+#         毎回フルウォームアップが走っていた
+#
+#   2. _calculate_base_features のプロキシ特徴量4つが旧実装のまま
+#      → 学習側 s1_1_C_enrich.py と完全に異なる値を返していた:
+#         - price_momentum: close[-1]-close[-11] (差分・ドル単位)
+#                          ← 学習側は close[t]/close[t-5]-1 (5本前比リターン)
+#         - rolling_volatility: pct_change[-20:].std(ddof=0)
+#                               ← 学習側は log_return.rolling(20).std(ddof=1)
+#         - volume_ratio: window=20
+#                        ← 学習側は window=50
+#         - log_return: 微小な ε 保護差 (影響軽微)
+#      → 監査乖離#5 の修正が本番では効いていなかった (本体側は正しいが上書きされていた)
+#
+# このパッチの本来の目的は処理時間計測のみ (PROFILING_ENABLED フラグでログ抑制可能)
+# だったが、PROFILING_ENABLED に関わらずメソッド本体が無条件に上書きされる実装ミス。
+# 今後パフォーマンス計測が必要な場合は、本体クラスに @timer デコレータや
+# logger.debug のタイマーを直接仕込む方式に切り替えること。
+#
+# from execution import profiling_patch
+#
+# RealtimeFeatureEngine.process_new_m05_bar = profiling_patch.process_new_m05_bar
+# RealtimeFeatureEngine._calculate_base_features = (
+#     profiling_patch._calculate_base_features
+# )

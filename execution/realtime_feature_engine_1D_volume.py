@@ -52,8 +52,11 @@ from typing import Dict, Optional
 @njit(fastmath=True, cache=True)
 def pct_change_numba(arr: np.ndarray) -> np.ndarray:
     """Polars pct_change() と完全一致: (x[i] - x[i-1]) / x[i-1]
-    prev == 0 のとき inf（Polars準拠）、先頭は nan。
-    fastmath=True は engine_1_D 学習側の全 UDF と統一。"""
+    prev == 0 のとき: x[i] > 0 → +inf, x[i] < 0 → -inf, x[i] == 0 → NaN
+    （Polars/numpy 準拠: 符号を保持し、0/0 のみ NaN）
+    先頭は nan。fastmath=True は engine_1_D 学習側の全 UDF と統一。
+    [TRAIN-SERVE-FIX] 旧版は prev==0 のとき常に np.inf を返していたが、
+    arr[i] が負の場合に学習側 Polars では -inf になるため、符号判定を追加。"""
     n = len(arr)
     pct = np.full(n, np.nan, dtype=np.float64)
     if n < 2:
@@ -63,7 +66,14 @@ def pct_change_numba(arr: np.ndarray) -> np.ndarray:
         if prev != 0.0:
             pct[i] = (arr[i] - prev) / prev
         else:
-            pct[i] = np.inf
+            # prev == 0: 学習側 Polars / numpy と同じく、x[i] の符号で inf を返す
+            cur = arr[i]
+            if cur > 0.0:
+                pct[i] = np.inf
+            elif cur < 0.0:
+                pct[i] = -np.inf
+            else:
+                pct[i] = np.nan  # 0 / 0
     return pct
 
 
@@ -678,33 +688,62 @@ class FeatureModule1D:
                 features[f"e1d_hv_robust_{w}"]   = hv_robust_udf(pct_w)
 
         # 年率ボラティリティ (252本基準)
-        # 【修正: 問題4】252本未満のgateを追加（rolling_std(252) min_periods=252 と一致）。
+        # [TRAIN-SERVE-FIX] 学習側 Polars rolling_std(252, ddof=1) と完全一致させる:
+        #   学習側: pct_change().rolling_std(252, ddof=1) * sqrt(252)
+        #     → Polars rolling_std はウィンドウ内に NaN が1本でも含まれると NaN を返す
+        #   旧本番側: hv_standard_udf(pct_252) * sqrt(252)
+        #     → UDF は finite フィルタで NaN を除外して計算 → 学習側と挙動が異なる
+        #   新本番側: ウィンドウ内全要素が有限値の場合のみ ddof=1 で std を計算
+        # 注: hv_robust_annual_252 は学習側でも UDF (hv_robust_udf * sqrt(252)) を使用しているため
+        #     本番側も hv_robust_udf を維持する（NaN 除外挙動は学習側と同一）。
         pct_252 = _window(close_pct, 252)
         if len(pct_252) < 252:
             features["e1d_hv_annual_252"]        = np.nan
             features["e1d_hv_robust_annual_252"] = np.nan
         else:
-            features["e1d_hv_annual_252"] = (
-                hv_standard_udf(pct_252) * np.sqrt(252)
-            )
+            # hv_annual_252: 学習側 rolling_std(252, ddof=1) と完全一致
+            # ウィンドウ内に1本でも NaN/inf があれば NaN（Polars 挙動）
+            if np.all(np.isfinite(pct_252)):
+                features["e1d_hv_annual_252"] = float(np.std(pct_252, ddof=1)) * np.sqrt(252)
+            else:
+                features["e1d_hv_annual_252"] = np.nan
+            # hv_robust_annual_252: 学習側 UDF と一致（finite 除外挙動）
             features["e1d_hv_robust_annual_252"] = (
                 hv_robust_udf(pct_252) * np.sqrt(252)
             )
 
         # ボラティリティレジーム: 直近HV50 vs 過去1440本の各時点HV50の分位数
-        # 学習側: Polars rolling_quantile(0.8/0.6, window=1440) on rolling_std(50)
-        # realtime側: 過去(1440+50)本の close_pct から各時点の HV50 を計算し
-        #             そのうち直近1440本の 80/60 パーセンタイルと比較する
-        cur_hv50 = hv_standard_udf(_window(close_pct, 50))
+        # 学習側: Polars rolling_quantile(0.8/0.6, window=1440) on rolling_std(50, ddof=1)
+        #   hv_50[t] = std(pct_change[t-49:t+1], ddof=1)  ← Polars rolling_std はウィンドウ内NaNあれば NaN
+        #   q80_roll[t] = quantile(hv_50[t-1439:t+1], 0.8)  ← Polars rolling_quantile は NaN を除外
+        #   結果 = (hv_50[t] > q80_roll[t]) + (hv_50[t] > q60_roll[t])
+        #
+        # [TRAIN-SERVE-FIX] 旧本番側は cur_hv50 / hv50_hist 計算に hv_standard_udf を使っていたが、
+        # hv_standard_udf は finite フィルタで NaN を除外して計算する一方、
+        # 学習側 Polars rolling_std はウィンドウ内に NaN が1本でもあれば NaN を返すため
+        # 挙動が異なる。本番側を rolling_std(50, ddof=1) と完全一致させる。
+        # （rolling_quantile は両者とも NaN を除外する点で挙動一致）
+
+        def _rolling_std_50_at(pct_arr: np.ndarray) -> float:
+            """学習側 Polars rolling_std(50, ddof=1) と等価。
+            ウィンドウ内に NaN/inf が1本でもあれば NaN を返す。"""
+            if len(pct_arr) < 50:
+                return np.nan
+            if not np.all(np.isfinite(pct_arr)):
+                return np.nan
+            return float(np.std(pct_arr, ddof=1))
+
+        cur_hv50 = _rolling_std_50_at(_window(close_pct, 50))
         n_needed = 1440 + 50
         if len(close_pct) >= n_needed and np.isfinite(cur_hv50):
             # 過去 (1440+50) 本の close_pct を取得
             hist_pct = close_pct[-n_needed:]
-            # 各時点の HV50 をローリング計算（window=50 が確保できる点のみ）
+            # 各時点の HV50 をローリング計算（学習側 rolling_std(50, ddof=1) と完全一致）
             hv50_hist = np.full(n_needed, np.nan, dtype=np.float64)
             for _i in range(50 - 1, n_needed):
-                hv50_hist[_i] = hv_standard_udf(hist_pct[_i - 49 : _i + 1])
+                hv50_hist[_i] = _rolling_std_50_at(hist_pct[_i - 49 : _i + 1])
             # 有効な直近1440本の HV50 から分位数を計算
+            # Polars rolling_quantile は NaN を除外する挙動のため、本番側も同じく除外
             hv50_window = hv50_hist[-1440:]
             hv50_finite = hv50_window[np.isfinite(hv50_window)]
             if len(hv50_finite) >= 10:
@@ -771,15 +810,21 @@ class FeatureModule1D:
             ad_diff[-1] / (vol_ma1440 + 1e-10)
         )
 
-        # Force Index normalized: price_change * volume / (atr * vol_ma1440)
-        # 【修正: 問題2】分母を atr13_last * vol_ma1440 + 1e-10 に統一。
-        # 学習側: atr_13_internal_expr * vol_ma1440 + 1e-10（積の後にepsilon）。
-        # 旧本番側: atr13_last * (vol_ma1440 + 1e-10) + 1e-10（vol側に先にepsilon）→ 数値差。
+        # Force Index normalized: price_change * volume / (atr * (vol_ma1440 + 1e-10) + 1e-10)
+        # [TRAIN-SERVE-FIX] 学習側 Polars 式と完全一致させる:
+        #   学習側: vol_ma1440 = pl.col("volume").rolling_mean(1440) + 1e-10  ← 既に +1e-10
+        #           force_raw / (atr_13_internal_expr * vol_ma1440 + 1e-10)
+        #         = force_raw / (atr * (mean(vol_1440) + 1e-10) + 1e-10)
+        #         = force_raw / (atr * mean(vol_1440) + atr * 1e-10 + 1e-10)
+        #   旧本番側: vol_ma1440 = np.mean(volume[-1440:])  ← +1e-10 なし
+        #             force_raw / (atr13_last * vol_ma1440 + 1e-10)
+        #           = force_raw / (atr * mean(vol_1440) + 1e-10)  ← atr*1e-10 が抜けている
+        #   新本番側: 学習側と同じく vol_ma1440 に + 1e-10 を加えて計算
         if _atr_valid and len(close_arr) >= 2:
             price_change = close_arr[-1] - close_arr[-2]
             force_raw = price_change * float(volume_arr[-1])
             features["e1d_force_index_norm"] = float(
-                force_raw / (atr13_last * vol_ma1440 + 1e-10)
+                force_raw / (atr13_last * (vol_ma1440 + 1e-10) + 1e-10)
             )
         else:
             features["e1d_force_index_norm"] = np.nan
@@ -791,7 +836,21 @@ class FeatureModule1D:
         features["e1d_volume_ma20_rel"] = float(vol_ma20 / (vol_ma1440 + 1e-10))
 
         # Volume ratio: vol[-1] / ma20
-        features["e1d_volume_ratio"] = float(float(volume_arr[-1]) / (vol_ma20 + 1e-10))
+        # [TRAIN-SERVE-FIX] 学習側 Polars 式は volume / rolling_mean(volume, 20) で
+        # ゼロ保護なし（vol_ma20=0 のとき inf を伝播させて QA でクリップ）。
+        # 旧本番側: volume[-1] / (vol_ma20 + 1e-10)  ← +1e-10 で学習側より値が微小に小さくなる
+        # 新本番側: 学習側と同じくゼロ保護なし。vol_ma20=0 の場合のみ +inf を返す。
+        if vol_ma20 != 0.0:
+            features["e1d_volume_ratio"] = float(float(volume_arr[-1]) / vol_ma20)
+        else:
+            # vol_ma20=0 → 学習側 Polars は inf を返す（数値の符号を保持）
+            v_last = float(volume_arr[-1])
+            if v_last > 0.0:
+                features["e1d_volume_ratio"] = np.inf
+            elif v_last < 0.0:
+                features["e1d_volume_ratio"] = -np.inf
+            else:
+                features["e1d_volume_ratio"] = np.nan
 
         # Volume Price Trend normalized: mean(close_pct * volume, 10) / vol_ma1440
         # [Step 9] 旧 e1d_volume_price_trend（絶対値） → 学習側 e1d_volume_price_trend_norm に統一

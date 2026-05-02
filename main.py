@@ -205,9 +205,24 @@ def initialize_data_buffer(
         #   学習側: close / close.shift(1) - 1  ← M5の1バー前比リターン
         #   旧本番: m5_close.pct_change(5)  ← 5バー前比リターン（OLSのX分布が異なっていた）
         #   新本番: m5_close.pct_change(1)  ← 1バー前比リターン（学習側と一致）
+        #
+        # [乖離⑥修正 V2] M5バー境界を学習側 s1_1_B_build_ohlcv.py と完全一致させる:
+        #   学習側 (s1_1_B_build_ohlcv.py L152-153):
+        #     bucket_size_ns = pd.to_timedelta(freq).total_seconds() * 1e9
+        #     ddf["group_key"] = (ddf_int_ts // bucket_size_ns) * bucket_size_ns
+        #     → 整数除算によるfloor → label="left", closed="left" と完全等価
+        #     → tick 12:30:00〜12:34:59 → group 12:30
+        #     → tick 12:35:00〜12:39:59 → group 12:35
+        #
+        #   旧本番側: closed="right", label="right"
+        #     → tick 12:30:00.001〜12:35:00 → group 12:35  (12:35:00 ちょうども含む)
+        #     → market_proxyのX変数値が学習側と完全に違う
+        #     → OLS純化のbeta/alphaが歪み、純化済み特徴量も全部歪む
+        #
+        #   新本番側: closed="left", label="left" に統一
         m5_close = (
             temp_df["close"]
-            .resample("5min", label="right", closed="right")
+            .resample("5min", label="left", closed="left")
             .last()
             .dropna()
         )
@@ -365,13 +380,68 @@ def main():
             }
 
             # 2. 専用特徴量リストの読み込み関数
+            # [発見#B対応] 学習側 model_training_metalabeling_Cx2._load_features の
+            # exclude_exact と完全に同一の除外セットを適用することで、将来の特徴量
+            # 名簿の編集で誤ってメタデータ列が混入した場合でも、本番側が学習側と
+            # 同じ列順序で LightGBM に入力ベクトルを渡せるようにする堅牢化。
+            #
+            # 注: m1_pred_proba は除外対象に含まれる。Bx2 がjoin時に追加するカラムであり
+            # 特徴量名簿には書かれないが、もし誤って書かれていたとしても以下の
+            # 「m1_pred_proba を末尾に強制配置」ロジックで適切に末尾に再配置される。
+            _FEATURE_EXCLUDE_EXACT = {
+                "timestamp",
+                "timeframe",
+                "t1",
+                "label",
+                "label_long",
+                "label_short",
+                "uniqueness",
+                "uniqueness_long",
+                "uniqueness_short",
+                "payoff_ratio",
+                "payoff_ratio_long",
+                "payoff_ratio_short",
+                "pt_multiplier",
+                "sl_multiplier",
+                "direction",
+                "exit_type",
+                "first_ex_reason_int",
+                "atr_value",
+                "calculated_body_ratio",
+                "fallback_vol",
+                "open",
+                "high",
+                "low",
+                "close",
+                "meta_label",
+                "m1_pred_proba",
+                "is_trigger",
+            }
+
             def load_feature_list(filepath: Path) -> list:
+                """学習側 Cx2._load_features と同等のフィルタリング。
+
+                除外対象:
+                  - exclude_exact セット (timestamp/label_*/atr_value/open/high/low/close 等)
+                  - is_trigger プレフィックスを持つ列 (is_trigger_on_M1 等)
+                """
                 with open(filepath, "r") as f:
-                    return [
-                        line.strip()
-                        for line in f
-                        if line.strip() and not line.startswith("is_trigger")
-                    ]
+                    raw = [line.strip() for line in f if line.strip()]
+                cleaned = []
+                dropped: list[str] = []
+                for col in raw:
+                    if col in _FEATURE_EXCLUDE_EXACT:
+                        dropped.append(col)
+                        continue
+                    if col.startswith("is_trigger"):
+                        dropped.append(col)
+                        continue
+                    cleaned.append(col)
+                if dropped:
+                    logger.warning(
+                        f"⚠️ {filepath.name}: 学習側で除外される列が混入していたため除外: {dropped}"
+                    )
+                return cleaned
 
             feature_lists = {
                 "long_m1": load_feature_list(
@@ -493,13 +563,16 @@ def main():
                                         }
                                         # [乖離④修正] M5の1バー前比リターン（学習側2Gと完全一致）
                                         # m05_dataframeをリサンプリングしてM5クローズ2本を取得
+                                        # [乖離⑥修正 V2] 学習側 s1_1_B_build_ohlcv.py の整数除算と一致させる:
+                                        #   学習側: (ts_int // bucket_size_ns) * bucket_size_ns でfloor集約
+                                        #   学習側相当: closed="left", label="left"
                                         if len(feature_engine.m05_dataframe) >= 20:
                                             _recent = pd.DataFrame(
                                                 list(feature_engine.m05_dataframe)[-20:]
                                             ).set_index("timestamp")
                                             _m5 = (
                                                 _recent["close"]
-                                                .resample("5min", closed="right", label="right")
+                                                .resample("5min", closed="left", label="left")
                                                 .last()
                                                 .dropna()
                                             )
@@ -522,8 +595,12 @@ def main():
                                                             [g_market_proxy, new_proxy_df]
                                                         )
 
+                                        # [STALE-GUARD] warmup_only=True を渡すことで
+                                        # シグナルチェック・Signal生成をエンジン内部で
+                                        # 根本からスキップ。バッファ更新・OLS更新・
+                                        # 特徴量キャッシュ更新のみ実行される。
                                         feature_engine.process_new_m05_bar(
-                                            bar_dict, g_market_proxy
+                                            bar_dict, g_market_proxy, warmup_only=True
                                         )
                                         g_last_processed_bar_time = int(
                                             row["timestamp"].timestamp()
@@ -562,6 +639,14 @@ def main():
                 raise RuntimeError("特徴量エンジンのマルチバッファ充填に失敗しました。")
         # ▲▲▲ ここまで修正 ▲▲▲
 
+        # [STALE-GUARD] 両ルート（スナップショット復帰・フルウォームアップ）共通:
+        # ウォームアップ・差分追いつきが完全に完了した時点でis_python_readyフラグをセット。
+        # 以降のHeartbeat送信（最大heartbeat_interval秒）でEAにPING:READYが届き、
+        # EA側のg_python_readyが自動的にtrueになる。
+        # EA再起動・瞬断後も次のHeartbeatで自動同期されるため一発コマンドへの依存がない。
+        logger.info("[STALE-GUARD] Python準備完了フラグをセット。次のHeartbeatでEAのM3通知が解禁されます。")
+        bridge.notify_python_ready()
+
         # --- 7. リアルタイム取引ループ開始 (M3イベント駆動ループ) ---
         logger.info("=" * 60)
         logger.info(f"🚀 リアルタイム取引ループ開始 ")
@@ -579,6 +664,16 @@ def main():
 
                 # 毎秒実行される定期処理
                 current_time_sec = time.time()
+
+                # [STALE-GUARD] EA再起動検知 → notify_python_ready()再送
+                # Heartbeatスレッドがタイムアウトを検知するとneeds_notifyをセットする。
+                # メインループがここで検知してnotify_python_ready()（needs_notifyクリア）を呼ぶ。
+                # これによりHeartbeatが次のサイクルでPING:READYを送信しEA側のM3通知が解禁される。
+                if bridge.needs_notify.is_set():
+                    logger.warning(
+                        "⚠️ [STALE-GUARD] EA再起動を検知。notify_python_ready()を再送します..."
+                    )
+                    bridge.notify_python_ready()
 
                 # 15分間隔でスナップショットを強制保存
                 if current_time_sec - last_snapshot_time > 900:
@@ -691,16 +786,36 @@ def main():
                 if new_m05_bar is None:
                     continue
 
+                # [STALE-GUARD] ウォームアップ中にキューに溜まった古いバーを破棄する。
+                # ウォームアップ（JIT+OLS初期化）に最大30分かかる場合がある。
+                # そのままシグナル処理すると同一秒に大量のオーダーが一斉発射される事故につながる。
+                # M0.5(30秒)足なので、120秒より古ければ確実に「溜まりもの」と判断して読み飛ばす。
+                _bar_ts = new_m05_bar.get("timestamp")
+                if _bar_ts is not None:
+                    _now_utc = datetime.now(timezone.utc)
+                    if _bar_ts.tzinfo is None:
+                        _bar_ts = _bar_ts.replace(tzinfo=timezone.utc)
+                    _age_sec = (_now_utc - _bar_ts).total_seconds()
+                    if _age_sec > 120:
+                        logger.warning(
+                            f"⚠️ [STALE-GUARD] 古いM0.5バーを破棄 "
+                            f"(age={_age_sec:.0f}秒 / ts={_bar_ts})"
+                        )
+                        continue
+
                 # 市場プロキシの更新（M5の1バー前比リターン、学習側2Gと完全一致）
                 # m05_dataframeをM5にリサンプリングしてM5クローズ2本を取得
                 # M5が確定するのは5分に1回だが、ffillで参照するため問題なし
+                # [乖離⑥修正 V2] 学習側 s1_1_B_build_ohlcv.py の整数除算と一致させる:
+                #   学習側: (ts_int // bucket_size_ns) * bucket_size_ns でfloor集約
+                #   学習側相当: closed="left", label="left"
                 if feature_engine and len(feature_engine.m05_dataframe) >= 20:
                     _recent = pd.DataFrame(
                         list(feature_engine.m05_dataframe)[-20:]
                     ).set_index("timestamp")
                     _m5 = (
                         _recent["close"]
-                        .resample("5min", closed="right", label="right")
+                        .resample("5min", closed="left", label="left")
                         .last()
                         .dropna()
                     )
@@ -1063,6 +1178,44 @@ def main():
                         current_spread_pips=current_spread,
                         atr_ratio=current_atr_ratio,  # ★追加: ATR Ratio をリスクエンジンに渡す
                     )
+
+                    # [DEBUG-BARRIER] 発注直前の診断ログ — バリア幅異常の原因特定用
+                    # extreme_risk_engine.py が生成した sl_width/tp_width を直接読む（責務分離）。
+                    # HOLDコマンドの場合はこれらキーが無いためフォールバックを用意。
+                    _entry_price = signal.market_info["current_price"]
+                    _sl_dollar   = float(command.get("sl_width", 0.0))
+                    _tp_dollar   = float(command.get("tp_width", 0.0))
+                    _buf_len     = signal.market_info.get("atr_buffer_len", -1)
+                    _last_tr     = signal.market_info.get("last_tr", -1.0)
+                    if command["action"] != "HOLD":
+                        logger.info(
+                            f"[DEBUG-BARRIER] direction={direction}"
+                            f" | entry={_entry_price:.3f}"
+                            f" | ATR={current_atr:.4f}"
+                            f" | last_TR={_last_tr:.4f}"
+                            f" | buf_len={_buf_len}"
+                            f" | SL幅=${_sl_dollar:.3f}"
+                            f" | TP幅=${_tp_dollar:.3f}"
+                            f" | SL_mult={current_sl_mult}"
+                            f" | TP_mult={current_tp_mult}"
+                        )
+
+                    # [BARRIER-GUARD] 最低ドル幅フィルター
+                    # 閑散相場でATRが極端に小さくなりスプレッド負けするのを防ぐ。
+                    # SLまたはTPのいずれかが閾値を下回る場合はHOLDに強制変換する。
+                    _min_barrier = risk_engine.config.get("min_barrier_dollar_width", 1.5)
+                    if command["action"] != "HOLD" and (
+                        _sl_dollar < _min_barrier or _tp_dollar < _min_barrier
+                    ):
+                        logger.warning(
+                            f"⚠️ [BARRIER-GUARD] バリア幅が最低閾値(${_min_barrier})未満のためHOLDに変換。"
+                            f" SL幅=${_sl_dollar:.3f} / TP幅=${_tp_dollar:.3f}"
+                        )
+                        command["action"] = "HOLD"
+                        command["reason"] = (
+                            f"BARRIER-GUARD: SL=${_sl_dollar:.3f} TP=${_tp_dollar:.3f}"
+                            f" < min=${_min_barrier}"
+                        )
 
                     # V5エンジンは独立したため、ここでイベントログを記録する
                     # [FIX-8] use_event_sourcing フラグは append_event 内でチェック済みのため直接呼ぶ

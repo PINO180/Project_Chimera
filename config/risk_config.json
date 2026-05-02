@@ -26,5 +26,7 @@
   "fixed_risk_percent": 0.02,
   "max_allowed_spread": 50.0,
   "margin_call_percent": 0.0,
-  "stop_out_percent": 0.0
+  "stop_out_percent": 0.0,
+  "_min_barrier_dollar_width_note": "SL/TPいずれかがこの値(ドル)未満の場合はエントリーをHOLDに変換する閑散相場フィルター",
+  "min_barrier_dollar_width": 1.5
 }

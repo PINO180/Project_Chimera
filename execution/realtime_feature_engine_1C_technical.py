@@ -533,22 +533,21 @@ class FeatureModule1C:
         # ---------------------------------------------------------
         # 1. ATR系
         # ---------------------------------------------------------
-        features["e1c_atr_pct_13"] = (
-            (atr_13 / current_close) * 100
-            if (atr_ok and np.isfinite(current_close) and current_close != 0.0) else np.nan
-        )
-        atr_21 = _last(atr_21_arr)
-        features["e1c_atr_pct_21"] = (
-            (atr_21 / current_close) * 100
-            if (np.isfinite(atr_21) and np.isfinite(current_close) and current_close != 0.0) else np.nan
-        )
+        # [TRAIN-SERVE-FIX] atr_pct のゼロ保護を学習側と完全一致させる:
+        #   学習側: atr_raw / (close + 1e-10) * 100  ← + 1e-10 ゼロ保護
+        #   旧本番: if current_close != 0.0 else np.nan  ← 条件分岐式の保護
+        #   新本番: atr_raw / (close + 1e-10) * 100  ← 学習側と完全同一
+        # XAU/USDのcloseは事実上ゼロにならないが、思想として完全に揃える。
+        # 以下、最初のatr_pct_13/21の二重計算ブロックは削除し、後段ループで一括処理する。
         # atr_13/21/34/55 = atr_period / atr_13（比率）
+        # atr_pct_period = atr_period / (close + 1e-10) * 100  （学習側完全一致）
         for period, arr in [(13, atr_13_arr), (21, atr_21_arr), (34, atr_34_arr), (55, atr_55_arr)]:
             atr_val = _last(arr)
             features[f"e1c_atr_{period}"] = (atr_val / atr_denom) if (np.isfinite(atr_val) and atr_ok) else np.nan
+            # atr_pct: 学習側 atr_raw / (close + 1e-10) * 100 と完全一致
             features[f"e1c_atr_pct_{period}"] = (
-                (atr_val / current_close) * 100
-                if (np.isfinite(atr_val) and np.isfinite(current_close) and current_close != 0.0) else np.nan
+                (atr_val / (current_close + 1e-10)) * 100
+                if (np.isfinite(atr_val) and np.isfinite(current_close)) else np.nan
             )
             # atr_trend: diff / atr_13
             if len(arr) >= 2 and np.isfinite(atr_val) and atr_ok:
@@ -784,9 +783,16 @@ class FeatureModule1C:
                 features[f"e1c_trend_strength_{period}"] = np.nan
 
         # Trend Consistency: 方向変化の頻度
+        # [TRAIN-SERVE-FIX] 学習側 Polars rolling_mean(period) はデフォルト
+        # min_samples=period のため、period 本未満では NaN を返す。
+        # close.diff().sign().diff().abs() は先頭2バーが NaN になるため、
+        # 有効な direction_changes が period 本揃うには close が period + 2 本必要。
+        #
+        # 旧: if len(w) >= 3:  → period=20 でも 3本あれば計算してしまい学習側と不一致
+        # 新: if len(w) >= period + 2:  → period 本の direction_changes が揃ってから計算
         for period in [20, 50, 100]:
             w = _window(close_arr, period + 2)
-            if len(w) >= 3:
+            if len(w) >= period + 2:
                 diff1 = np.diff(w)
                 sign1 = np.sign(diff1)
                 direction_changes = np.abs(np.diff(sign1))

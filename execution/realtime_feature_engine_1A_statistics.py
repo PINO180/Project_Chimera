@@ -225,6 +225,39 @@ class QAState:
         対策: 事前に十分なウォームアップバー（lookback_bars * 3 本が目安）を
               qa_state に流してから本番バーを処理することを強く推奨する。
 
+    📝 [将来の選択肢: EWMスナップショット方式 — 現時点では未実装]
+        起動時のシード差を完全にゼロにするには、学習側で訓練時のEWM最終状態
+        （mean / var / n）を pickle 等で保存し、本番初回起動時にロードして
+        QAState を初期化する方式がある。
+
+        実装イメージ:
+            # 学習側（2_G_alpha_neutralizer等の前段に追加）:
+            ewm_snapshot = {
+                "e1a_statistical_mean_10_M3": {"mean": ..., "var": ..., "n": ...},
+                ...
+            }
+            pickle.dump(ewm_snapshot, "ewm_snapshot.pkl")
+
+            # 本番側:
+            qa_state = QAState(lookback_bars=2880)
+            qa_state.load_snapshot("ewm_snapshot.pkl")  # 数千個のEWM状態を一気に復元
+
+        このアプローチを採用すれば理論的には学習・本番のEWM軌跡が完全に一致するが、
+        以下の理由から現時点では実装していない:
+          1. EWM QAは ±5σ という非常に広いバンドの外れ値クリッピングであり、
+             通常時の特徴量値はクリップされず raw_val がそのまま通過する
+          2. ウォームアップを十分行えば EWM は学習時の値に指数収束する
+             （4132本ウォームアップで起動時シード差の影響は数十%まで減衰、
+              その後さらに指数的に減衰）
+          3. LightGBMは決定木ベースで、特徴量値の小数点以下の微小な差には頑健
+          4. 実装コスト（学習側改修・スナップショット運用・全特徴量×時間足×Long/Short
+             の状態管理）が、得られる効果に対して大きすぎる
+
+        将来、以下のいずれかが該当した場合に再検討する価値がある:
+          - クリップが頻発する特徴量が新規追加された場合
+          - ウォームアップを大幅に短縮したい場合
+          - 規制当局・監査法人に「学習・本番の完全数値一致」を証明する必要が出た場合
+
     使い方:
         qa_state = FeatureModule1A.QAState(lookback_bars=1440)
         # ウォームアップ（強く推奨）
@@ -764,7 +797,13 @@ class FeatureModule1A:
             atr_last_raw = np.nan
 
         atr_valid = np.isfinite(atr_last_raw)
-        atr_last_safe = atr_last_raw + 1e-10 if atr_valid else np.nan
+        # [TRAIN-SERVE-FIX] 学習側 _create_basic_stats_features 等は __temp_atr_13 を
+        # 生値のまま分母に使用する（ゼロ保護なし）。本番側も学習側と完全一致させる。
+        # 旧: atr_last_safe = atr_last_raw + 1e-10  （実害は10^-11オーダーで観測不能だが、
+        #     思想として揃えるため削除）
+        # 新: atr_last_safe = atr_last_raw          （学習側と完全同一）
+        # XAU/USDのATRは事実上ゼロにならないため、ゼロ除算リスクは存在しない。
+        atr_last_safe = atr_last_raw if atr_valid else np.nan
 
         close_last = float(close_arr[-1])
 

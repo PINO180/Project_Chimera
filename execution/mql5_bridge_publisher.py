@@ -59,8 +59,8 @@ class BridgeConfig:
 
     request_timeout: int = 45000  # 45秒
     heartbeat_timeout: int = config.ZMQ.get(
-        "heartbeat_timeout", 9000
-    )  # ハートビート用タイムアウト
+        "heartbeat_timeout", 3000
+    )  # ハートビート用タイムアウト (EA再起動検知を3秒以内にするため9000→3000)
     request_retries: int = 3
     heartbeat_interval: int = 10
     log_dir: str = str(config.LOGS_ZMQ_BRIDGE)
@@ -144,6 +144,14 @@ class MQL5BridgePublisherV3:
         self.is_connected = False
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.heartbeat_running = False
+
+        # [STALE-GUARD] EA側のg_python_readyがfalseになったことをHeartbeatスレッドが検知し、
+        # メインスレッドにnotify_python_ready()の再送を要求するためのスレッドセーフなフラグ
+        self.needs_notify = threading.Event()
+        # [STALE-GUARD] Python側の準備完了状態。
+        # HeartbeatにPING:READY/PING:NOT_READYとして乗せてEAに毎回通知する。
+        # EA再起動・瞬断後も次のHeartbeat(最大10秒)で自動的に状態が同期される。
+        self.is_python_ready = False
 
         # 統計
         self.messages_sent = 0
@@ -416,6 +424,47 @@ class MQL5BridgePublisherV3:
             logger.error(f"Exception in send_trade_command: {e}", exc_info=True)
             return False
 
+    @staticmethod
+    def _validate_bar(bar: Dict[str, Any], prev_close: Optional[float] = None) -> bool:
+        """
+        [SPIKE-GUARD] 受信バーの価格異常を検出して破棄するバリデーター。
+
+        チェック項目:
+        1. OHLC整合性: High >= Low, High >= Open/Close, Low <= Open/Close
+        2. 価格範囲: XAU/USDの合理的範囲（500〜15000ドル）外は破棄
+        3. 前バー比変化: 前Closeから10%超の変動は桁落ち等のスパイクとして破棄
+        """
+        try:
+            o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+
+            # 1. OHLC整合性チェック
+            if not (h >= l and h >= o and h >= c and l <= o and l <= c):
+                logger.warning(
+                    f"[SPIKE-GUARD] OHLC不整合を検出して破棄: O={o} H={h} L={l} C={c}"
+                )
+                return False
+
+            # 2. 価格範囲チェック（XAU/USD合理的範囲）
+            if not (500.0 <= c <= 15000.0):
+                logger.warning(
+                    f"[SPIKE-GUARD] 価格範囲外を検出して破棄: close={c}"
+                )
+                return False
+
+            # 3. 前バー比変化チェック（10%超は桁落ち等のスパイク）
+            if prev_close is not None and prev_close > 0:
+                change_ratio = abs(c - prev_close) / prev_close
+                if change_ratio > 0.10:
+                    logger.warning(
+                        f"[SPIKE-GUARD] 前バー比{change_ratio*100:.1f}%変化を検出して破棄: "
+                        f"prev_close={prev_close:.3f} close={c:.3f}"
+                    )
+                    return False
+
+            return True
+        except (KeyError, TypeError):
+            return False
+
     def poll_m3_bar(self, timeout_ms: int = 1000) -> Optional[Dict[str, Any]]:
         """
         M3確定通知をPULLソケットで受け取る。
@@ -428,11 +477,26 @@ class MQL5BridgePublisherV3:
                 msg = self.m3_notify_socket.recv_string()
                 bar = json.loads(msg)
                 bar["timestamp"] = datetime.fromtimestamp(bar["time"], tz=timezone.utc)
+                # [SPIKE-GUARD] 受信バーのバリデーション
+                if not self._validate_bar(bar):
+                    return None
                 return bar
             return None
         except Exception as e:
             logger.error(f"M3通知受信エラー: {e}")
             return None
+
+    def notify_python_ready(self) -> bool:
+        """
+        [STALE-GUARD] Python側の準備完了をEAに通知し、M3通知の送信を解禁させる。
+
+        needs_notifyフラグをクリアすることで、次のHeartbeatから
+        PING:READYが送信されるようになりEA側のg_python_readyがtrueになる。
+        EA再起動・瞬断後も自動的に状態が同期される。
+        """
+        self.needs_notify.clear()
+        logger.info("[STALE-GUARD] needs_notifyをクリア。次のHeartbeatでPING:READYをEAに送信します。")
+        return True
 
     def request_broker_state(self) -> Optional[Dict[str, Any]]:
         """
@@ -524,8 +588,16 @@ class MQL5BridgePublisherV3:
             self.heartbeat_thread.join(timeout=2.0)
 
     def _heartbeat_loop(self):
-        """ハートビートループ (Simple Text PING/PONG)"""
-        # ▼▼▼ 修正: 別スレッド内で専用ソケットを作成 ▼▼▼
+        """ハートビートループ (PING:READY / PING:NOT_READY)
+
+        [STALE-GUARD] 単純なPING/PONGからPython準備状態通知に拡張。
+        - needs_notify未セット（通常時）: PING:READY を送信
+          → EA側はg_python_ready=trueを維持。EA再起動後もこれを受けて即解禁。
+        - needs_notify セット中: PING:NOT_READY を送信
+          → EA側はg_python_ready=falseをセット（ウォームアップ中の誤発注を防ぐ）
+        - Heartbeatタイムアウト: EA再起動の可能性 → needs_notifyをセット＋即再接続
+          → メインスレッドがnotify_python_ready()を再送後にneeds_notifyをクリア
+        """
         self.heartbeat_socket = self.context.socket(zmq.REQ)
         self.heartbeat_socket.connect(self.config.heartbeat_endpoint)
         logger.info(f"  Heartbeat Endpoint (Thread): {self.config.heartbeat_endpoint}")
@@ -534,8 +606,10 @@ class MQL5BridgePublisherV3:
             while self.heartbeat_running:
                 try:
                     if self.heartbeat_socket:
-                        # PING送信
-                        self.heartbeat_socket.send_string("PING")
+                        # [STALE-GUARD] 準備状態をPINGメッセージに乗せて送信
+                        # needs_notifyがセット中 = まだnotify_python_ready()再送が済んでいない
+                        ping_msg = "PING:NOT_READY" if self.needs_notify.is_set() else "PING:READY"
+                        self.heartbeat_socket.send_string(ping_msg)
                         self.last_heartbeat_sent = datetime.now()
                         self.heartbeats_sent += 1
 
@@ -546,13 +620,17 @@ class MQL5BridgePublisherV3:
                                 self.last_heartbeat_received = datetime.now()
                                 self.heartbeats_received += 1
                         else:
+                            # タイムアウト = EA再起動中または切断中
                             logger.warning("Heartbeat timeout")
-                            # ソケット再作成
+                            # [STALE-GUARD] EA再起動の可能性 → 復帰後にnotify_python_ready()再送が必要
+                            self.needs_notify.set()
+                            # ソケット再作成後即PINGを送るためsleepをスキップ
                             self.heartbeat_socket.close(linger=0)
                             self.heartbeat_socket = self.context.socket(zmq.REQ)
                             self.heartbeat_socket.connect(
                                 self.config.heartbeat_endpoint
                             )
+                            continue  # sleep不要・即次のPINGへ
 
                     time.sleep(self.config.heartbeat_interval)
                 except Exception as e:
@@ -562,7 +640,6 @@ class MQL5BridgePublisherV3:
             if self.heartbeat_socket:
                 self.heartbeat_socket.close(linger=0)
                 self.heartbeat_socket = None
-        # ▲▲▲ ここまで修正 ▲▲▲
 
     def _log_message(
         self, trade_command: Dict[str, Any], status: str, error: Optional[str] = None
