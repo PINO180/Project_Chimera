@@ -1,0 +1,12 @@
+2026-05-04 10:52:20,539 - INFO - ### Final Battle Stage 1 (V5): Calculating Dual Concurrency with Window Functions ###
+2026-05-04 10:52:20,547 - INFO - Input data path: /workspace/data/XAUUSD/stratum_6_training/labeled_dataset_monthly_v2
+2026-05-04 10:52:20,547 - INFO - Temporary directory: /duckdb_temp
+2026-05-04 10:52:20,547 - INFO - Output path for results: /workspace/data/XAUUSD/stratum_3_artifacts/concurrency_results.parquet_v2
+2026-05-04 10:52:20,566 - INFO - Executing the V5 optimized query for dual concurrency...
+2026-05-04 10:52:22,129 - INFO - The V5 query executed successfully.
+2026-05-04 10:52:22,156 - INFO - DuckDB connection closed.
+2026-05-04 10:52:22,156 - INFO - 
+============================================================
+2026-05-04 10:52:22,156 - INFO - ### VICTORY! V5 Stage 1 COMPLETED! ###
+2026-05-04 10:52:22,156 - INFO - The dual concurrency results are safely written to: /workspace/data/XAUUSD/stratum_3_artifacts/concurrency_results.parquet_v2
+2026-05-04 10:52:22,156 - INFO - ============================================================

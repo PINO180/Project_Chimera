@@ -1,0 +1,17 @@
+============================================================
+  split_features_first_orthogonal.py
+  M1/M2 直交分割 (1周目)
+============================================================
+
+📄 入力特徴量数: 1984
+🚫 除外 (上位足・sample_weight): 640 件
+✅ M1 特徴量数: 711
+✅ M2 特徴量数: 633
+   (M1+M2+除外 = 1984 / 入力 1984)
+💾 m1_long_features.txt (711 件)
+💾 m1_short_features.txt (711 件)
+💾 m2_long_features.txt (633 件)
+💾 m2_short_features.txt (633 件)
+
+✅ 直交分割完了
+   -> /workspace/data/XAUUSD/stratum_3_artifacts/selected_features_orthogonal_v5

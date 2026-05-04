@@ -119,8 +119,41 @@ def scan_source(source: Path) -> pl.LazyFrame:
 # =================================================================
 
 BASE_COLS = frozenset(
-    ["timestamp", "open", "high", "low", "close", "volume", "timeframe", "year", "month", "day"]
+    [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "timeframe",
+        "year",
+        "month",
+        "day",
+        "disc",  # 【Phase 5 修正 (#35)】 学習対象外メタデータ (週末跨ぎギャップ判定)
+    ]
 )
+
+
+def _is_excluded_at_source(col: str) -> bool:
+    """
+    2_B の入力段階で除外すべきカラムを判定する。
+
+    【Phase 6 修正】sample_weight 系を 2_B 段階で完全除外する。
+    - 過去 (Phase 5 以前): variance フィルタで自動的に除外されていたため顕在化せず
+    - Phase 6: volume = tick_count 補完によって sample_weight も有意な分散を持ち
+              統計フィルタを通過するようになった
+    - 結果: S3_FILTERED_HF_FEATURES と S3_FILTERED_LF_FEATURES に sample_weight 系が
+            残り、下流 (2_C/2_E) で「特徴量」として誤って使われる
+    - 対応: 2_B 段階で BASE_COLS 完全一致 + sample_weight 部分一致で除外する
+            (engine_1_A/C/F 出力の prefix なし `sample_weight` と、
+             engine_1_D/E 出力の prefix 付き `e1d_sample_weight` 両方を除外)
+    """
+    if col in BASE_COLS:
+        return True
+    if "sample_weight" in col:
+        return True
+    return False
 
 
 def collect_all_feature_columns(sources: list[Path]) -> dict[str, Path]:
@@ -129,6 +162,7 @@ def collect_all_feature_columns(sources: list[Path]) -> dict[str, Path]:
     {サフィックス付き特徴量名: ソースパス} の辞書を返す。
     """
     feature_to_source: dict[str, Path] = {}
+    excluded_sw_count = 0
     for src in sources:
         try:
             if src.is_dir():
@@ -145,11 +179,18 @@ def collect_all_feature_columns(sources: list[Path]) -> dict[str, Path]:
         # ファイル名末尾から時間足を推定してサフィックスとして付与
         tf = _infer_timeframe_from_path(src)
         for col in schema:
-            if col in BASE_COLS:
+            if _is_excluded_at_source(col):
+                if "sample_weight" in col:
+                    excluded_sw_count += 1
                 continue
             suffixed = f"{col}_{tf}" if tf else col
             if suffixed not in feature_to_source:
                 feature_to_source[suffixed] = src
+
+    if excluded_sw_count > 0:
+        logger.info(
+            f"[Phase 6 Filter] 入力段階で sample_weight 系を {excluded_sw_count} 件除外しました"
+        )
 
     return feature_to_source
 

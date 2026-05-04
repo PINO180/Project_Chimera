@@ -1,0 +1,52 @@
+2026-05-03 18:12:01,931 - INFO - ============================================================
+2026-05-03 18:12:01,931 - INFO - 2_C_lf_wf_signal_generator.py 開始
+2026-05-03 18:12:01,931 - INFO - ============================================================
+2026-05-03 18:12:01,939 - INFO - LF特徴量読み込み: 184 件
+2026-05-03 18:12:01,939 - INFO -   lf_short: 89 特徴量
+2026-05-03 18:12:01,939 - INFO -   lf_mid: 36 特徴量
+2026-05-03 18:12:01,939 - INFO -   lf_long: 59 特徴量
+2026-05-03 18:12:01,939 - INFO - 
+データ読み込み中: /workspace/data/XAUUSD/stratum_2_features_validated
+2026-05-03 18:12:04,323 - INFO - データをcollect中（streaming）...
+2026-05-03 18:12:08,923 - INFO -   行数: 1,699,402 | カラム数: 186
+2026-05-03 18:12:08,924 - INFO - 
+────────────────────────────────────────
+2026-05-03 18:12:08,924 - INFO - グループ処理: lf_short  (89 特徴量)
+2026-05-03 18:12:10,054 - INFO -   [lf_short] folds=13, train_months=18, val_months=3, purge_days=5, embargo_days=2
+2026-05-03 18:12:16,067 - INFO -   [lf_short] fold 1/13 done | train=528791, val=86585
+2026-05-03 18:12:21,741 - INFO -   [lf_short] fold 2/13 done | train=525892, val=88838
+2026-05-03 18:12:26,447 - INFO -   [lf_short] fold 3/13 done | train=524600, val=90600
+2026-05-03 18:12:29,563 - INFO -   [lf_short] fold 4/13 done | train=527316, val=87404
+2026-05-03 18:12:32,695 - INFO -   [lf_short] fold 5/13 done | train=526152, val=87846
+2026-05-03 18:12:35,197 - INFO -   [lf_short] fold 6/13 done | train=523191, val=88764
+2026-05-03 18:12:38,032 - INFO -   [lf_short] fold 7/13 done | train=524266, val=90497
+2026-05-03 18:12:43,668 - INFO -   [lf_short] fold 8/13 done | train=527183, val=85961
+2026-05-03 18:12:48,330 - INFO -   [lf_short] fold 9/13 done | train=525635, val=87683
+2026-05-03 18:12:50,920 - INFO -   [lf_short] fold 10/13 done | train=522795, val=88757
+2026-05-03 18:12:54,036 - INFO -   [lf_short] fold 11/13 done | train=522587, val=89071
+2026-05-03 18:12:57,955 - INFO -   [lf_short] fold 12/13 done | train=525504, val=86197
+2026-05-03 18:13:00,948 - INFO -   [lf_short] fold 13/13 done | train=524043, val=87718
+2026-05-03 18:13:01,025 - INFO -   [lf_short] OOFカバレッジ: 1,145,921 / 1,699,402 行
+2026-05-03 18:13:01,025 - INFO - 
+────────────────────────────────────────
+2026-05-03 18:13:01,025 - INFO - グループ処理: lf_mid  (36 特徴量)
+2026-05-03 18:13:01,950 - INFO -   [lf_mid] folds=5, train_months=24, val_months=6, purge_days=12, embargo_days=3
+2026-05-03 18:13:05,667 - INFO -   [lf_mid] fold 1/5 done | train=697409, val=177937
+2026-05-03 18:13:11,695 - INFO -   [lf_mid] fold 2/5 done | train=695828, val=176558
+2026-05-03 18:13:15,022 - INFO -   [lf_mid] fold 3/5 done | train=695885, val=175082
+2026-05-03 18:13:17,885 - INFO -   [lf_mid] fold 4/5 done | train=695476, val=176554
+2026-05-03 18:13:20,741 - INFO -   [lf_mid] fold 5/5 done | train=694130, val=176503
+2026-05-03 18:13:20,786 - INFO -   [lf_mid] OOFカバレッジ: 882,634 / 1,699,402 行
+2026-05-03 18:13:20,786 - INFO - 
+────────────────────────────────────────
+2026-05-03 18:13:20,786 - INFO - グループ処理: lf_long  (59 特徴量)
+2026-05-03 18:13:21,548 - INFO -   [lf_long] folds=1, train_months=36, val_months=12, purge_days=30, embargo_days=5
+2026-05-03 18:13:23,429 - INFO -   [lf_long] fold 1/1 done | train=1033042, val=352882
+2026-05-03 18:13:23,446 - INFO -   [lf_long] OOFカバレッジ: 352,882 / 1,699,402 行
+2026-05-03 18:13:23,612 - INFO - 
+LF環境スコア保存: /workspace/data/XAUUSD/stratum_3_artifacts/lf_environment_scores.parquet
+2026-05-03 18:13:23,612 - INFO -   カラム: ['timestamp', 'lf_short_score', 'lf_mid_score', 'lf_long_score']
+2026-05-03 18:13:23,612 - INFO -   行数  : 1,699,402
+2026-05-03 18:13:23,616 - INFO - 最終LF特徴量チーム保存: /workspace/data/XAUUSD/stratum_3_artifacts/final_feature_team.txt (184 件)
+2026-05-03 18:13:23,616 - INFO - 
+2_C_lf_wf_signal_generator.py 正常終了。

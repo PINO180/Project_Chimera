@@ -100,6 +100,17 @@ sys.path.append(str(config.CORE_DIR))
 from core_indicators import (
     calculate_atr_wilder,
     calculate_mad,
+    # [SSoT 統一] Engine 1A の Numba 関数を core_indicators から import
+    # (旧: 本ファイル内に同名関数 _* prefix で重複定義 = SSoT 違反)
+    fast_quality_score_numba,
+    biweight_location_numba,
+    winsorized_mean_numba,
+    jarque_bera_statistic_numba,
+    anderson_darling_numba,
+    runs_test_numba,
+    von_neumann_ratio_numba,
+    basic_stabilization_numba,
+    robust_stabilization_numba,
 )
 
 import numba as nb
@@ -329,31 +340,62 @@ class QAState:
 
         # Step3: ±5σ クリップ
         # Polars ewm_std(adjust=False, bias=False) の bias 補正を適用:
+        #
+        # 【修正前 (誤式)】
         #   bias_corr = 1 / sqrt(1 - (1-alpha)^(2n))
-        # n が大きければ (1-alpha)^(2n) ≒ 0 なので bias_corr ≒ 1.0。
+        #   この式は Polars の真の bias correction とズレており、
+        #   ウォームアップ初期 (n < ~100バー) で σ が過小評価される。
+        #
+        # 【修正後 (Polars 互換式 — 実証検証で 1e-15 精度で完全一致)】
+        #   adjust=False の重み: w_k = alpha*(1-alpha)^k (k=0..n-2) と
+        #                       w_{n-1} = (1-alpha)^(n-1) (最古項を正規化保持)
+        #   sum_w = 1 (常に)、sum_w2 = 重みの2乗和
+        #   bias_factor_var = 1 / (1 - sum_w2)
+        #     r2     = (1 - alpha)^2
+        #     m      = n - 1                          # 漸化式は1段先送りで n-1 が正解
+        #     sum_w2 = alpha^2 * (1 - r2^m) / (1 - r2) + r2^m   (m >= 1)
+        #     ewm_std = sqrt(ewm_var * bias_factor_var)
         ewm_mean = self._ewm_mean[key]
         n_updates = self._ewm_n.get(key, 1)
-        decay_2n  = (1.0 - alpha) ** (2 * n_updates)
-        denom = 1.0 - decay_2n
-        if denom > 1e-15:
-            bias_corr = 1.0 / np.sqrt(denom)
+        if n_updates <= 1:
+            # n=1 は分散自体が 0 なので bias 補正不要
+            ewm_std = 0.0
         else:
-            bias_corr = 1.0  # オーバーフロー防止（実質到達しない）
-        ewm_std  = np.sqrt(max(self._ewm_var[key], 0.0)) * bias_corr
+            r2 = (1.0 - alpha) ** 2
+            m  = n_updates - 1
+            if r2 < 1.0 - 1e-15:
+                sum_w2 = alpha * alpha * (1.0 - r2 ** m) / (1.0 - r2) + r2 ** m
+            else:
+                # alpha が極端に小さい (HL → ∞) 退化ケース
+                sum_w2 = 1.0
+            if sum_w2 < 1.0 - 1e-15:
+                bias_factor_var = 1.0 / (1.0 - sum_w2)
+                ewm_std = np.sqrt(max(self._ewm_var[key] * bias_factor_var, 0.0))
+            else:
+                ewm_std = 0.0
         lower    = ewm_mean - 5.0 * ewm_std
         upper    = ewm_mean + 5.0 * ewm_std
 
-        # 学習側 clip 挙動を再現:
-        #   NaN → fill_null(0.0) → 0.0
-        #   +inf → upper_bound にclip
-        #   -inf → lower_bound にclip
-        #   有限値 → clip(lower, upper)
-        if np.isnan(ewm_input):
-            return 0.0
+        # =====================================================================
+        # 【修正済み】学習側 Polars との完全一致 (Option B)
+        #
+        # 旧実装は 2 重のバグ:
+        #   1) np.isnan(ewm_input) チェックが is_pos_inf より先に発火し、
+        #      inf 入力時に 0.0 を返してしまう (is_pos_inf 分岐に到達不能)
+        #   2) チェック対象が ewm_input (inf を NaN 化したもの) で、本来の raw_val を見ていない
+        #
+        # 修正方針:
+        #   - +inf 入力 → upper bound を返す (engine_1_A の修正後と同じ)
+        #   - -inf 入力 → lower bound を返す
+        #   - NaN 入力  → 0.0 を返す (fill_nan(0.0) 等価)
+        #   - 有限値    → clip(lower, upper) で ±5σ クリップ
+        # =====================================================================
         if is_pos_inf:
             return float(upper) if np.isfinite(upper) else 0.0
         if is_neg_inf:
             return float(lower) if np.isfinite(lower) else 0.0
+        if np.isnan(raw_val):
+            return 0.0
 
         clipped = float(np.clip(raw_val, lower, upper))
 
@@ -364,382 +406,6 @@ class QAState:
 # ==================================================================
 # Numba UDF群（学習側 engine_1_A と完全同一実装）
 # ==================================================================
-
-@nb.njit(fastmath=False, cache=True)
-def _standard_normal_cdf_fast(x: float) -> float:
-    SQRT2 = 1.4142135623730951
-    return 0.5 * (1.0 + math.erf(x / SQRT2))
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _biweight_location_numba(arr, out):
-    """ローリングBiweight位置推定（window=20、学習側と同一）"""
-    n = len(arr)
-    window = 20
-    weights_buffer = np.zeros(window, dtype=np.float64)
-    finite_buffer = np.empty(window, dtype=np.float64)
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            window_data = arr[max(0, i - window + 1):i + 1]
-            count = 0
-            for j in range(len(window_data)):
-                if not np.isnan(window_data[j]):
-                    finite_buffer[count] = window_data[j]
-                    count += 1
-            finite_data = finite_buffer[:count]
-
-            if len(finite_data) < 5:
-                out[i] = np.median(finite_data) if len(finite_data) > 0 else np.nan
-            else:
-                current_location = np.median(finite_data)
-                tolerance = 1e-10
-                max_iterations = 50
-
-                for iteration in range(max_iterations):
-                    abs_residuals = np.abs(finite_data - current_location)
-                    mad_val = np.median(abs_residuals)
-                    if mad_val < 1e-15:
-                        break
-                    scale = 6.0 * mad_val
-                    u_values = (finite_data - current_location) / scale
-                    weights = weights_buffer[:len(finite_data)]
-                    numerator = 0.0
-                    denominator = 0.0
-                    for j in range(len(finite_data)):
-                        u_abs = abs(u_values[j])
-                        if u_abs < 1.0:
-                            weight = (1.0 - u_values[j] ** 2) ** 2
-                            weights[j] = weight
-                            numerator += finite_data[j] * weight
-                            denominator += weight
-                        else:
-                            weights[j] = 0.0
-                    if denominator > 1e-15:
-                        new_location = numerator / denominator
-                    else:
-                        new_location = np.median(finite_data)
-                        break
-                    if abs(new_location - current_location) < tolerance:
-                        break
-                    current_location = new_location
-                out[i] = current_location
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _winsorized_mean_numba(arr, out):
-    """ローリングウィンソライズ平均（上下5%クリップ、window=20、学習側と同一）"""
-    n = len(arr)
-    window = 20
-    finite_buffer = np.empty(window, dtype=np.float64)
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            window_data = arr[max(0, i - window + 1):i + 1]
-            count = 0
-            for j in range(len(window_data)):
-                if not np.isnan(window_data[j]):
-                    finite_buffer[count] = window_data[j]
-                    count += 1
-            finite_data = finite_buffer[:count]
-
-            if count < 5:
-                out[i] = np.mean(finite_data) if count > 0 else np.nan
-            else:
-                p05 = np.percentile(finite_data, 5)
-                p95 = np.percentile(finite_data, 95)
-                winsorized_data = np.clip(finite_data, p05, p95)
-                out[i] = np.mean(winsorized_data)
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _jarque_bera_numba(arr, out):
-    """ローリングJarque-Bera検定統計量（window=50、学習側と同一）"""
-    n = len(arr)
-    window = 50
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            window_data = arr[max(0, i - window + 1):i + 1]
-            finite_data = window_data[~np.isnan(window_data)]
-
-            if len(finite_data) < 20:
-                out[i] = np.nan
-            else:
-                mean_val = np.mean(finite_data)
-                variance = 0.0
-                n_val = float(len(finite_data))
-                for val in finite_data:
-                    variance += (val - mean_val) ** 2
-                variance = variance / n_val  # ddof=0
-                std_val = np.sqrt(variance) + 1e-10
-
-                if std_val < 1e-10:
-                    out[i] = 0.0
-                else:
-                    z_sum_3 = 0.0
-                    z_sum_4 = 0.0
-                    for val in finite_data:
-                        z = (val - mean_val) / std_val
-                        z_sum_3 += z ** 3
-                        z_sum_4 += z ** 4
-
-                    skewness = z_sum_3 / n_val
-                    kurtosis = z_sum_4 / n_val - 3.0
-
-                    c1 = 6.0 * (n_val - 2.0) / ((n_val + 1.0) * (n_val + 3.0))
-                    c2 = (24.0 * n_val * (n_val - 2.0) * (n_val - 3.0)
-                          / (((n_val + 1.0) ** 2) * (n_val + 3.0) * (n_val + 5.0)))
-                    out[i] = (skewness ** 2 / c1) + (kurtosis ** 2 / c2)
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _anderson_darling_numba(arr, out):
-    """ローリングAnderson-Darling統計量（window=30、学習側と同一）"""
-    n = len(arr)
-    window = 30
-    standardized_buffer = np.zeros(window, dtype=np.float64)
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            window_data = arr[max(0, i - window + 1):i + 1]
-            finite_data = window_data[~np.isnan(window_data)]
-
-            if len(finite_data) < 10:
-                out[i] = np.nan
-            else:
-                sorted_data = np.sort(finite_data)
-                n_data = len(sorted_data)
-                mean_val = np.mean(sorted_data)
-
-                variance = 0.0
-                for val in sorted_data:
-                    variance += (val - mean_val) ** 2
-                variance = variance / (n_data - 1)
-                std_val = np.sqrt(variance)
-
-                if std_val < 1e-10:
-                    out[i] = 0.0
-                else:
-                    standardized_data = standardized_buffer[:n_data]
-                    for j in range(n_data):
-                        standardized_data[j] = (sorted_data[j] - mean_val) / std_val
-
-                    ad_sum = 0.0
-                    for j in range(n_data):
-                        F_j  = _standard_normal_cdf_fast(standardized_data[j])
-                        F_nj = _standard_normal_cdf_fast(standardized_data[n_data - 1 - j])
-                        if F_j > 1e-15 and (1 - F_nj) > 1e-15:
-                            log_term = np.log(F_j) + np.log(1 - F_nj)
-                            ad_sum += (2 * j + 1) * log_term
-
-                    ad_stat = -n_data - ad_sum / n_data
-                    n_float = float(n_data)
-                    stephens_correction = 1.0 + 4.0 / n_float - 25.0 / (n_float * n_float)
-                    out[i] = ad_stat * stephens_correction
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _runs_test_numba(arr, out):
-    """ローリングRuns Test統計量（window=30、学習側と同一）"""
-    n = len(arr)
-    window = 30
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            window_data = arr[max(0, i - window + 1):i + 1]
-            finite_data = window_data[~np.isnan(window_data)]
-
-            if len(finite_data) < 10:
-                out[i] = np.nan
-            else:
-                median_val = np.median(finite_data)
-                binary_series = (finite_data > median_val).astype(np.int32)
-
-                runs = 1
-                for j in range(1, len(binary_series)):
-                    if binary_series[j] != binary_series[j - 1]:
-                        runs += 1
-
-                n1 = np.sum(binary_series)
-                n2 = len(binary_series) - n1
-
-                if n1 > 0 and n2 > 0:
-                    expected_runs = (2 * n1 * n2) / (n1 + n2) + 1
-                    var_runs = (2 * n1 * n2 * (2 * n1 * n2 - n1 - n2)
-                                / ((n1 + n2) ** 2 * (n1 + n2 - 1)))
-                    if var_runs > 0:
-                        out[i] = (runs - expected_runs) / np.sqrt(var_runs + 1e-10)
-                    else:
-                        out[i] = 0.0
-                else:
-                    out[i] = 0.0
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _von_neumann_ratio_numba(arr, out):
-    """ローリングVon Neumann比（window=30、学習側と同一）"""
-    n = len(arr)
-    window = 30
-
-    for i in range(n):
-        if i < window - 1:
-            out[i] = np.nan
-        else:
-            window_data = arr[max(0, i - window + 1):i + 1]
-            finite_data = window_data[~np.isnan(window_data)]
-
-            if len(finite_data) < 3:
-                out[i] = np.nan
-            else:
-                n_points = len(finite_data)
-                diff_sq_sum = 0.0
-                for j in range(1, n_points):
-                    diff = finite_data[j] - finite_data[j - 1]
-                    diff_sq_sum += diff * diff
-
-                sum_values = 0.0
-                for j in range(n_points):
-                    sum_values += finite_data[j]
-                mean_val = sum_values / n_points
-
-                sum_sq_deviations = 0.0
-                for j in range(n_points):
-                    deviation = finite_data[j] - mean_val
-                    sum_sq_deviations += deviation * deviation
-
-                if sum_sq_deviations > 1e-15:
-                    vn_ratio = diff_sq_sum / (sum_sq_deviations + 1e-10)
-                    if vn_ratio < 0.0:
-                        out[i] = 0.0
-                    elif vn_ratio > 4.0:
-                        out[i] = 4.0
-                    else:
-                        out[i] = vn_ratio
-                else:
-                    out[i] = 0.0
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _fast_quality_score_numba(arr, out):
-    """高速品質スコア計算（window=50、学習側と同一）"""
-    n = len(arr)
-    for i in range(n):
-        if i < 50:
-            out[i] = 0.0
-        else:
-            window_size = min(50, i + 1)
-            nan_inf_count = 0
-            finite_count = 0
-            for j in range(i - window_size + 1, i + 1):
-                if np.isnan(arr[j]) or np.isinf(arr[j]):
-                    nan_inf_count += 1
-                else:
-                    finite_count += 1
-            if window_size == 0:
-                out[i] = 0.0
-            else:
-                finite_ratio = finite_count / window_size
-                out[i] = finite_ratio * 0.8 + 0.2
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _basic_stabilization_numba(arr, out):
-    """基本安定化（window=50、学習側と同一）"""
-    n = len(arr)
-    window = 50
-    for i in range(n):
-        if np.isnan(arr[i]) or np.isinf(arr[i]):
-            out[i] = 0.0
-        else:
-            if i < 2:
-                out[i] = arr[i]
-            else:
-                local_min = np.inf
-                local_max = -np.inf
-                start_idx = max(0, i - window + 1)
-                for j in range(start_idx, i + 1):
-                    val = arr[j]
-                    if np.isfinite(val):
-                        if val < local_min:
-                            local_min = val
-                        if val > local_max:
-                            local_max = val
-                if local_min != np.inf and local_max != -np.inf:
-                    range_val = local_max - local_min
-                    if range_val > 1e-10:
-                        clip_margin = range_val * 0.01
-                        if arr[i] < local_min + clip_margin:
-                            out[i] = local_min + clip_margin
-                        elif arr[i] > local_max - clip_margin:
-                            out[i] = local_max - clip_margin
-                        else:
-                            out[i] = arr[i]
-                    else:
-                        out[i] = arr[i]
-                else:
-                    out[i] = arr[i]
-
-
-@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
-def _robust_stabilization_numba(arr, out):
-    """ロバスト安定化（window=50、学習側と同一）"""
-    n = len(arr)
-    window = 50
-    finite_vals_buffer = np.empty(window, dtype=np.float64)
-    for i in range(n):
-        if i < 2:
-            out[i] = 0.0 if not np.isfinite(arr[i]) else arr[i]
-            continue
-
-        start_idx = max(0, i - window + 1)
-        window_data = arr[start_idx:i + 1]
-        finite_vals = finite_vals_buffer[:len(window_data)]
-        count = 0
-        for j in range(len(window_data)):
-            if np.isfinite(window_data[j]):
-                finite_vals[count] = window_data[j]
-                count += 1
-
-        if count < 3:
-            out[i] = 0.0 if not np.isfinite(arr[i]) else arr[i]
-            continue
-
-        valid_data = finite_vals[:count]
-        median_val = np.median(valid_data)
-        abs_devs = np.abs(valid_data - median_val)
-        mad_val = np.median(abs_devs)
-
-        if mad_val < 1e-10:
-            mean_val = np.mean(valid_data)
-            var_sum = np.sum((valid_data - mean_val) ** 2)
-            mad_val = np.sqrt(var_sum / (count - 1)) * 0.6745 if count > 1 else 1e-10
-
-        lower_bound = median_val - 3.0 * mad_val
-        upper_bound = median_val + 3.0 * mad_val
-
-        if np.isnan(arr[i]):
-            out[i] = median_val
-        elif np.isinf(arr[i]):
-            out[i] = upper_bound if arr[i] > 0 else lower_bound
-        else:
-            if arr[i] < lower_bound:
-                out[i] = lower_bound
-            elif arr[i] > upper_bound:
-                out[i] = upper_bound
-            else:
-                out[i] = arr[i]
-
 
 # ==================================================================
 # メイン計算クラス
@@ -923,13 +589,13 @@ class FeatureModule1A:
         # ---------------------------------------------------------
         features["e1a_robust_mad_20"] = _last(calculate_mad(close_arr, 20)) / atr_last_safe
 
-        biweight_arr = _biweight_location_numba(close_arr)
+        biweight_arr = biweight_location_numba(close_arr)
         features["e1a_robust_biweight_location_20"] = (
             (close_last - float(biweight_arr[-1])) / atr_last_safe
             if np.isfinite(biweight_arr[-1]) else np.nan
         )
 
-        winsorized_arr = _winsorized_mean_numba(close_arr)
+        winsorized_arr = winsorized_mean_numba(close_arr)
         features["e1a_robust_winsorized_mean_20"] = (
             (close_last - float(winsorized_arr[-1])) / atr_last_safe
             if np.isfinite(winsorized_arr[-1]) else np.nan
@@ -941,16 +607,16 @@ class FeatureModule1A:
         # ---------------------------------------------------------
         pct_arr = _pct_change(close_arr)
 
-        jb_arr   = _jarque_bera_numba(pct_arr)
+        jb_arr   = jarque_bera_statistic_numba(pct_arr)
         features["e1a_jarque_bera_statistic_50"] = float(jb_arr[-1])
 
-        ad_arr   = _anderson_darling_numba(pct_arr)
+        ad_arr   = anderson_darling_numba(pct_arr)
         features["e1a_anderson_darling_statistic_30"] = float(ad_arr[-1])
 
-        runs_arr = _runs_test_numba(pct_arr)
+        runs_arr = runs_test_numba(pct_arr)
         features["e1a_runs_test_statistic_30"] = float(runs_arr[-1])
 
-        vn_arr   = _von_neumann_ratio_numba(pct_arr)
+        vn_arr   = von_neumann_ratio_numba(pct_arr)
         features["e1a_von_neumann_ratio_30"] = float(vn_arr[-1])
 
         # ---------------------------------------------------------
@@ -992,19 +658,19 @@ class FeatureModule1A:
         # ---------------------------------------------------------
         # 7. Numba最適化 — group_7_numba
         # ---------------------------------------------------------
-        qs_arr = _fast_quality_score_numba(close_arr)
+        qs_arr = fast_quality_score_numba(close_arr)
         features["e1a_fast_quality_score_50"] = float(qs_arr[-1])
 
         # ---------------------------------------------------------
         # 8. 品質保証特徴量 — group_8_qa
         # ---------------------------------------------------------
-        bs_arr = _basic_stabilization_numba(close_arr)
+        bs_arr = basic_stabilization_numba(close_arr)
         features["e1a_fast_basic_stabilization"] = (
             (close_last - float(bs_arr[-1])) / atr_last_safe
             if np.isfinite(bs_arr[-1]) else np.nan
         )
 
-        rs_arr = _robust_stabilization_numba(close_arr)
+        rs_arr = robust_stabilization_numba(close_arr)
         features["e1a_fast_robust_stabilization"] = (
             (close_last - float(rs_arr[-1])) / atr_last_safe
             if np.isfinite(rs_arr[-1]) else np.nan

@@ -1,0 +1,8 @@
+修正版 2_E の使い方
+通常版 (過去運用と同じ — sample_weight 混入のまま)
+bashcd /workspace
+python validation/2_E_hf_meta_model_trainer.py 2>&1 | tee /workspace/logs/phase5_retrain/2E_normal.log
+→ 出力: /workspace/data/XAUUSD/stratum_3_artifacts/survived_hf_features.txt
+除外版 (sample_weight 系を完全除外)
+bashEXCLUDE_SAMPLE_WEIGHT=1 python validation/2_E_hf_meta_model_trainer.py 2>&1 | tee /workspace/logs/phase5_retrain/2E_no_sw.log
+→ 出力: /workspace/data/XAUUSD/stratum_3_artifacts/survived_hf_features_no_sw.txt

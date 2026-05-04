@@ -39,6 +39,19 @@ from core_indicators import (
     calculate_rsi_wilder,
     calculate_adx,
     calculate_sample_weight,
+    # [SSoT 統一] Engine 1C の Numba 関数を core_indicators から import
+    # (旧: 本ファイル内で定義 → 本番側 rfe_1C と二重定義 = SSoT 違反)
+    calculate_wma_numba,
+    calculate_hma_numba,
+    calculate_kama_numba,
+    calculate_stochastic_numba,
+    calculate_williams_r_numba,
+    calculate_trix_numba,
+    calculate_ultimate_oscillator_numba,
+    calculate_aroon_up_numba,
+    calculate_aroon_down_numba,
+    calculate_tsi_numba,
+    _calculate_di_wilder,
 )
 
 # 外部ライブラリ（バージョン固定）
@@ -220,512 +233,26 @@ class MemoryMonitor:
 # ここに calculate_adx 内部と完全一致したローカルヘルパーを定義する。
 # ※ 将来 core_indicators に calculate_adx_full(returns ADX+DI+DI-) が追加された際は
 #    このローカル関数を削除して移行すること。
-@nb.njit(fastmath=False, cache=True)
-def _calculate_di_wilder(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    period: int,
-) -> tuple:
-    """
-    DI+ / DI- — calculate_adx (core_indicators) の内部ロジックと完全同一の
-    Wilder 平滑化実装。ADX と DI が同一の ATR 平滑化を参照することを保証する。
-
-    Returns:
-        (di_plus_arr, di_minus_arr): 各 shape=(n,) の ndarray
-    """
-    n = len(high)
-    di_plus_out = np.full(n, np.nan, dtype=np.float64)
-    di_minus_out = np.full(n, np.nan, dtype=np.float64)
-    if n <= period:
-        return di_plus_out, di_minus_out
-
-    # TR, DM+, DM- — calculate_adx 内部と同一
-    tr = np.zeros(n, dtype=np.float64)
-    dm_plus = np.zeros(n, dtype=np.float64)
-    dm_minus = np.zeros(n, dtype=np.float64)
-
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        hl = high[i] - low[i]
-        hc = abs(high[i] - close[i - 1])
-        lc = abs(low[i] - close[i - 1])
-        tr[i] = max(hl, hc, lc)
-        up_move = high[i] - high[i - 1]
-        down_move = low[i - 1] - low[i]
-        dm_plus[i] = up_move if (up_move > down_move and up_move > 0.0) else 0.0
-        dm_minus[i] = down_move if (down_move > up_move and down_move > 0.0) else 0.0
-
-    # Wilder 平滑化 — calculate_adx 内部と同一（単純合計シード）
-    atr_w = np.zeros(n, dtype=np.float64)
-    dmp_w = np.zeros(n, dtype=np.float64)
-    dmm_w = np.zeros(n, dtype=np.float64)
-
-    init_tr = 0.0
-    init_dmp = 0.0
-    init_dmm = 0.0
-    for j in range(period):
-        init_tr += tr[j]
-        init_dmp += dm_plus[j]
-        init_dmm += dm_minus[j]
-
-    atr_w[period - 1] = init_tr
-    dmp_w[period - 1] = init_dmp
-    dmm_w[period - 1] = init_dmm
-
-    for i in range(period, n):
-        atr_w[i] = atr_w[i - 1] - atr_w[i - 1] / period + tr[i]
-        dmp_w[i] = dmp_w[i - 1] - dmp_w[i - 1] / period + dm_plus[i]
-        dmm_w[i] = dmm_w[i - 1] - dmm_w[i - 1] / period + dm_minus[i]
-
-    # DI+ / DI- 計算
-    for i in range(period - 1, n):
-        if atr_w[i] > 1e-10:
-            di_plus_out[i] = dmp_w[i] / atr_w[i] * 100.0
-            di_minus_out[i] = dmm_w[i] / atr_w[i] * 100.0
-
-    return di_plus_out, di_minus_out
-
-
 # ========================================
 # Numba UDF関数（続き）
 # ========================================
 
 
-# ▼▼ 追加: 真のWMA（加重移動平均）を計算するNumba UDF
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_wma_numba(prices, period, out):
-    """WMA (Weighted Moving Average) 計算 (完全版)"""
-    n = len(prices)
-    if n < period:
-        for i in range(n):
-            out[i] = np.nan
-        return
+# ========================================
+# 【Phase 5 修正 (#37)】SSoT 統一作業の残骸を削除
+# B 群の SSoT 統一作業 (engine_1_C → core_indicators への関数移植) で、
+# 関数本体は core_indicators に移したが、@nb.guvectorize デコレータだけが
+# 残ってしまっていた。これらが直後の class DataEngine に適用されてしまい、
+# `TypeError: The decorated object is not a function (got type <class 'type'>)`
+# でクラッシュしていた。該当の浮いたデコレータ 11 個をすべて削除する。
+#
+# 対応する関数 (すでに core_indicators にて定義済み):
+#   - calculate_wma_numba, calculate_hma_numba, calculate_kama_numba,
+#     calculate_stochastic_numba, calculate_williams_r_numba, calculate_trix_numba,
+#     calculate_ultimate_oscillator_numba, calculate_aroon_up_numba,
+#     calculate_aroon_down_numba, calculate_tsi_numba, _calculate_di_wilder
+# ========================================
 
-    weight_sum = period * (period + 1) / 2.0
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            val_sum = 0.0
-            for j in range(period):
-                weight = period - j
-                val_sum += prices[i - j] * weight
-            out[i] = val_sum / weight_sum
-
-
-# ▲▲ 追加ここまで
-
-
-# 修正後
-@nb.njit(cache=True)
-def _wma_helper(data, start, length):
-    if start + length > len(data):
-        return np.nan
-    weight_sum = 0.0
-    value_sum = 0.0
-    for i in range(length):
-        weight = length - i
-        value_sum += data[start + i] * weight
-        weight_sum += weight
-    if weight_sum > 0:
-        return value_sum / weight_sum
-    return np.nan
-
-
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_hma_numba(prices, period, out):
-    """Hull Moving Average計算 (Numba最適化版)"""
-    n = len(prices)
-    half_period = period // 2
-    sqrt_period = int(np.sqrt(period))
-
-    # 中間配列
-    wma_half = np.zeros(n)
-    wma_full = np.zeros(n)
-    raw_hma = np.zeros(n)
-
-    # 計算
-    for i in range(n):
-        if i >= half_period - 1:
-            wma_half[i] = _wma_helper(prices, i - half_period + 1, half_period)
-        else:
-            wma_half[i] = np.nan
-
-        if i >= period - 1:
-            wma_full[i] = _wma_helper(prices, i - period + 1, period)
-        else:
-            wma_full[i] = np.nan
-
-        if not np.isnan(wma_half[i]) and not np.isnan(wma_full[i]):
-            raw_hma[i] = 2 * wma_half[i] - wma_full[i]
-        else:
-            raw_hma[i] = np.nan
-
-    # 最終HMA計算
-    for i in range(n):
-        if i >= sqrt_period - 1:
-            out[i] = _wma_helper(raw_hma, i - sqrt_period + 1, sqrt_period)
-        else:
-            out[i] = np.nan
-
-
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_kama_numba(prices, period, out):
-    """Kaufman Adaptive Moving Average計算 (Numba最適化版)"""
-    n = len(prices)
-    fast_ema = 2
-    slow_ema = 30
-
-    for i in range(n):
-        if i < period:
-            out[i] = np.nan
-        else:
-            # Efficiency Ratio計算
-            direction = abs(prices[i] - prices[i - period])
-            volatility = 0.0
-            for j in range(i - period + 1, i + 1):
-                volatility += abs(prices[j] - prices[j - 1])
-
-            if volatility == 0:
-                er = 0.0
-            else:
-                er = direction / volatility
-
-            # Smoothing Constant計算
-            fast_sc = 2.0 / (fast_ema + 1.0)
-            slow_sc = 2.0 / (slow_ema + 1.0)
-            sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
-
-            # KAMA計算
-            if i == period:
-                out[i] = prices[i]
-            else:
-                if not np.isnan(out[i - 1]):
-                    out[i] = out[i - 1] + sc * (prices[i] - out[i - 1])
-                else:
-                    out[i] = prices[i]
-
-
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], int64, int64, int64, float64[:])"],
-    "(n),(n),(n),(),(),()->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_stochastic_numba(high, low, close, k_period, d_period, slow_period, out):
-    """Stochastic Oscillator計算 (Numba最適化版)"""
-    n = len(high)
-
-    # %K計算
-    k_values = np.zeros(n)
-    for i in range(n):
-        if i < k_period - 1:
-            k_values[i] = np.nan
-        else:
-            highest = high[i]
-            lowest = low[i]
-            for j in range(i - k_period + 1, i):
-                if high[j] > highest:
-                    highest = high[j]
-                if low[j] < lowest:
-                    lowest = low[j]
-
-            if highest - lowest > 0:
-                k_values[i] = 100 * (close[i] - lowest) / (highest - lowest)
-            else:
-                k_values[i] = 50.0
-
-    # %D計算 (Simple MA of %K)
-    for i in range(n):
-        if i < k_period + d_period - 2:
-            out[i] = np.nan
-        else:
-            sum_k = 0.0
-            # ▼▼ 修正前: count = 0
-            # ▼▼ 修正後: ルール8（型の厳格化）に基づき、float の 0.0 で初期化
-            count = 0.0
-            for j in range(i - d_period + 1, i + 1):
-                if not np.isnan(k_values[j]):
-                    sum_k += k_values[j]
-                    # ▼▼ 修正前: count += 1
-                    # ▼▼ 修正後: 型の厳格化
-                    count += 1.0
-
-            # ▼▼ 修正前: if count > 0:
-            # ▼▼ 修正前:     out[i] = sum_k / count
-            # ▼▼ 修正後: 型の厳格化（0.0）と、ルール5（ゼロ除算の鉄壁防衛）のための + 1e-10 の追加
-            # 修正後
-            if count > 0.0:
-                out[i] = sum_k / count
-            else:
-                out[i] = np.nan
-
-
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], int64, float64[:])"],
-    "(n),(n),(n),()->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_williams_r_numba(high, low, close, period, out):
-    """Williams %R計算 (Numba最適化版)"""
-    n = len(high)
-
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            highest = high[i]
-            lowest = low[i]
-
-            for j in range(i - period + 1, i):
-                if high[j] > highest:
-                    highest = high[j]
-                if low[j] < lowest:
-                    lowest = low[j]
-
-            if highest - lowest > 0:
-                out[i] = -100 * (highest - close[i]) / (highest - lowest)
-            else:
-                out[i] = -50.0
-
-
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_trix_numba(prices, period, out):
-    """TRIX指標計算 (Numba最適化版)"""
-    n = len(prices)
-
-    # 三重指数移動平均
-    ema1 = np.zeros(n)
-    ema2 = np.zeros(n)
-    ema3 = np.zeros(n)
-
-    alpha = 2.0 / (period + 1.0)
-
-    # 1st EMA
-    for i in range(n):
-        if i == 0:
-            ema1[i] = prices[i]
-        else:
-            ema1[i] = alpha * prices[i] + (1 - alpha) * ema1[i - 1]
-
-    # 2nd EMA
-    for i in range(n):
-        if i == 0:
-            ema2[i] = ema1[i]
-        else:
-            ema2[i] = alpha * ema1[i] + (1 - alpha) * ema2[i - 1]
-
-    # 3rd EMA
-    for i in range(n):
-        if i == 0:
-            ema3[i] = ema2[i]
-        else:
-            ema3[i] = alpha * ema2[i] + (1 - alpha) * ema3[i - 1]
-
-    # TRIX計算
-    for i in range(n):
-        if i < period * 3:
-            out[i] = np.nan
-        elif ema3[i - 1] == 0:
-            out[i] = 0.0
-        else:
-            out[i] = 10000 * (ema3[i] - ema3[i - 1]) / ema3[i - 1]
-
-
-@nb.guvectorize(
-    ["void(float64[:], float64[:], float64[:], float64[:], float64[:])"],
-    "(n),(n),(n),(n)->(n)",
-    nopython=True,
-    cache=True,
-)
-def calculate_ultimate_oscillator_numba(high, low, close, volume, out):
-    """Ultimate Oscillator計算 (Numba最適化版)"""
-    n = len(high)
-    period_7 = 7
-    period_14 = 14
-    period_28 = 28
-    weight_0 = 4.0
-    weight_1 = 2.0
-    weight_2 = 1.0
-    weight_total = 7.0
-    max_period = 28
-
-    # Buying Pressure and True Range計算
-    bp = np.zeros(n)
-    tr = np.zeros(n)
-
-    for i in range(n):
-        if i == 0:
-            bp[i] = close[i] - low[i]
-            tr[i] = high[i] - low[i]
-        else:
-            lc = close[i - 1]
-            bp[i] = close[i] - (low[i] if low[i] < lc else lc)
-            h_l = high[i] - low[i]
-            h_pc = abs(high[i] - close[i - 1])
-            l_pc = abs(low[i] - close[i - 1])
-            tr[i] = max(h_l, h_pc, l_pc)
-
-    # Ultimate Oscillator計算
-    for i in range(n):
-        if i < max_period:
-            out[i] = np.nan
-        else:
-            weighted_sum = 0.0
-
-            for j in range(3):
-                if j == 0:
-                    period = period_7
-                    w = weight_0
-                elif j == 1:
-                    period = period_14
-                    w = weight_1
-                else:
-                    period = period_28
-                    w = weight_2
-                bp_sum = 0.0
-                tr_sum = 0.0
-
-                for k in range(i - period + 1, i + 1):
-                    bp_sum += bp[k]
-                    tr_sum += tr[k]
-
-                if tr_sum > 0:
-                    avg = bp_sum / tr_sum
-                else:
-                    avg = 0.0
-
-                # 修正後
-                weighted_sum += avg * w
-
-            out[i] = 100 * weighted_sum / weight_total
-
-
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_aroon_up_numba(high, period, out):
-    """Aroon Up計算 (Numba最適化版)"""
-    n = len(high)
-
-    for i in range(n):
-        if i < period - 1:  # 修正箇所: period から period - 1 へ変更
-            out[i] = np.nan
-        else:
-            # Find highest high in period
-            highest_idx = i
-            highest_val = high[i]
-
-            # ループ範囲は i - period + 1 から i (iを含まない) まで
-            # (例: i=13, period=14 -> range(0, 13) -> j=0...12)
-            for j in range(i - period + 1, i):
-                if high[j] > highest_val:
-                    highest_val = high[j]
-                    highest_idx = j
-
-            # Calculate periods since highest
-            periods_since = i - highest_idx
-            out[i] = 100.0 * (period - periods_since) / period
-
-
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_aroon_down_numba(low, period, out):
-    """Aroon Down計算 (Numba最適化版)"""
-    n = len(low)
-
-    for i in range(n):
-        if i < period - 1:  # 修正箇所: period から period - 1 へ変更
-            out[i] = np.nan
-        else:
-            # Find lowest low in period
-            lowest_idx = i
-            lowest_val = low[i]
-
-            # ループ範囲は i - period + 1 から i (iを含まない) まで
-            for j in range(i - period + 1, i):
-                if low[j] < lowest_val:
-                    lowest_val = low[j]
-                    lowest_idx = j
-
-            # Calculate periods since lowest
-            periods_since = i - lowest_idx
-            out[i] = 100.0 * (period - periods_since) / period
-
-
-@nb.guvectorize(
-    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
-)
-def calculate_tsi_numba(prices, period, out):
-    """True Strength Index計算 (Numba最適化版)"""
-    n = len(prices)
-    long_period = period
-    short_period = period // 2
-
-    # Price momentum
-    momentum = np.zeros(n)
-    for i in range(1, n):
-        momentum[i] = prices[i] - prices[i - 1]
-    momentum[0] = 0.0
-
-    # Double smoothed momentum
-    alpha_long = 2.0 / (long_period + 1.0)
-    alpha_short = 2.0 / (short_period + 1.0)
-
-    # First EMA of momentum
-    ema1_mom = np.zeros(n)
-    ema1_abs = np.zeros(n)
-
-    for i in range(n):
-        if i == 0:
-            ema1_mom[i] = momentum[i]
-            ema1_abs[i] = abs(momentum[i])
-        else:
-            ema1_mom[i] = alpha_long * momentum[i] + (1 - alpha_long) * ema1_mom[i - 1]
-            ema1_abs[i] = (
-                alpha_long * abs(momentum[i]) + (1 - alpha_long) * ema1_abs[i - 1]
-            )
-
-    # Second EMA
-    ema2_mom = np.zeros(n)
-    ema2_abs = np.zeros(n)
-
-    for i in range(n):
-        if i == 0:
-            ema2_mom[i] = ema1_mom[i]
-            ema2_abs[i] = ema1_abs[i]
-        else:
-            ema2_mom[i] = (
-                alpha_short * ema1_mom[i] + (1 - alpha_short) * ema2_mom[i - 1]
-            )
-            ema2_abs[i] = (
-                alpha_short * ema1_abs[i] + (1 - alpha_short) * ema2_abs[i - 1]
-            )
-
-    # TSI計算
-    for i in range(n):
-        if i < long_period + short_period:
-            out[i] = np.nan
-        elif ema2_abs[i] == 0:
-            out[i] = 0.0
-        else:
-            out[i] = 100 * ema2_mom[i] / ema2_abs[i]
-
-
-# ===== ブロック2完了 =====
-
-# ===== ブロック3開始 =====
 
 # ========================================
 # DataEngine - データ基盤クラス
@@ -927,29 +454,56 @@ class OutputEngine:
             raise
 
     def apply_nan_filling(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
-        """NaN埋め処理"""
+        """NaN埋め処理 (ホワイトリスト方式)
+
+        【Phase 5 修正 (#35)】
+        旧実装は `with_columns` 方式で、入力 LazyFrame の不要なカラム (disc 等) を
+        そのまま保持していた。S1_PROCESSED に追加された disc 列が下流の 2_A KS
+        フィルタや 2_E HF メタモデル等に「特徴量」として誤認される問題があったため、
+        他 engine (1_A/B/D/E/F) と同じ select 方式に統一する。
+
+        ホワイトリスト方式:
+          - KEEP_BASIC で明示した基本カラムのみ保持
+          - 数値型の特徴量カラム (e1c_*) のみ保持
+          - それ以外 (disc 等) は select で自動除外
+
+        将来 S1_PROCESSED に新たなメタデータ列が追加されても、自動で除外される。
+        """
         try:
-            # スキーマ取得
             schema = lazy_frame.collect_schema()
 
-            # 数値列の取得
-            numeric_columns = [
+            # 明示ホワイトリスト (他 engine と整合)
+            KEEP_BASIC = [
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "timeframe",
+                "sample_weight",
+            ]
+
+            # 数値型の特徴量カラム (基本カラムを除く)
+            numeric_feature_columns = [
                 col
                 for col, dtype in schema.items()
                 if dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]
-                # 修正後
-                and col not in ["timestamp", "timeframe", "sample_weight"]
+                and col not in KEEP_BASIC
             ]
 
-            # NaN埋め処理
-            exprs = [pl.col(col).fill_null(0.0).alias(col) for col in numeric_columns]
+            # 基本カラムは存在するもののみ保持 (entity の有無に依存)
+            basic_exprs = [pl.col(c) for c in KEEP_BASIC if c in schema.names()]
+            # 特徴量は NaN を 0.0 で埋める
+            feature_exprs = [
+                pl.col(c).fill_null(0.0).alias(c) for c in numeric_feature_columns
+            ]
 
-            if exprs:
-                result = lazy_frame.with_columns(exprs)
-                logger.info(f"NaN埋め処理完了: {len(exprs)}列")
-            else:
-                result = lazy_frame
-
+            result = lazy_frame.select(basic_exprs + feature_exprs)
+            logger.info(
+                f"NaN埋め処理完了: {len(numeric_feature_columns)}個の特徴量 "
+                f"(basic={len(basic_exprs)}, ホワイトリスト方式)"
+            )
             return result
 
         except Exception as e:
@@ -1070,7 +624,17 @@ class CalculationEngine:
         logger.info(f"CalculationEngine初期化: {self.prefix}")
 
     def get_feature_groups(self) -> Dict[str, List[str]]:
-        """特徴量グループ定義（tickデータ対応：16グループに細分化）"""
+        """特徴量グループ定義 (Phase 6 拡張版: 18 グループ・全特徴量網羅対応)
+
+        [Phase 6 修正] 旧 16 グループでは create_advanced_features と
+        create_moving_average_features 内で計算される schaff/kst/coppock/rvi/
+        price_oscillator/wma/deviation/trend_* 系が一切 group に登録されておらず、
+        実装はあるのに実機 S2 出力に含まれない状態だった。
+        本修正で `group_8_advanced` と `group_9_moving_extended` を追加し、
+        既存 group の不足分も補完する。
+        本番側 (rfe_1C) には全特徴量の実装が既に存在するため、
+        学習側のみの修正で train-serve 整合性は保たれる。
+        """
         return {
             # RSI系を4分割
             "group_1a_rsi_basic": [
@@ -1086,7 +650,14 @@ class CalculationEngine:
                 "rsi_momentum_50",
             ],
             "group_1c_rsi_stochastic": ["stochastic_rsi_14", "stochastic_rsi_21"],
-            "group_1d_rsi_divergence": ["rsi_divergence_14", "rsi_divergence_21"],
+            "group_1d_rsi_divergence": [
+                "rsi_divergence_14",
+                "rsi_divergence_21",
+                # [Phase 6 追加] window_sizes["rsi_divergence"] = [14, 21] のため
+                # 元々 30, 50 は学習側にも実装されていない可能性あり (要確認)。
+                # rfe_1C 側の f"e1c_rsi_divergence_{period}" は period 引数のため
+                # 任意の値で動くが、ここでは learn-side 既定の 14, 21 のみ維持。
+            ],
             # MACD系を2分割
             "group_2a_macd_standard": [
                 "macd_12_26",
@@ -1109,6 +680,11 @@ class CalculationEngine:
                 "bb_width_20_2",
                 "bb_width_pct_20_2",
                 "bb_position_20_2",
+                # [Phase 6 追加] 20_2.5 / 20_3 の position・width_pct
+                "bb_position_20_2.5",
+                "bb_position_20_3",
+                "bb_width_pct_20_2.5",
+                "bb_width_pct_20_3",
             ],
             "group_3b_bb_30_50": [
                 "bb_upper_30_2",
@@ -1119,6 +695,25 @@ class CalculationEngine:
                 "bb_lower_50_2",
                 "bb_percent_50_2",
                 "bb_width_50_2",
+                # [Phase 6 追加] 30_2.5 / 30_3 / 50_2.5 / 50_3 系
+                "bb_upper_30_2.5",
+                "bb_upper_30_3",
+                "bb_upper_50_2.5",
+                "bb_upper_50_3",
+                "bb_lower_30_2.5",
+                "bb_lower_30_3",
+                "bb_lower_50_2.5",
+                "bb_lower_50_3",
+                "bb_percent_30_2.5",
+                "bb_percent_30_3",
+                "bb_percent_50_2.5",
+                "bb_percent_50_3",
+                "bb_width_30_2.5",
+                "bb_width_50_2.5",
+                "bb_position_30_2",
+                "bb_position_50_2",
+                "bb_width_pct_30_2",
+                "bb_width_pct_50_2",
             ],
             "group_3c_bb_variants": [
                 "bb_upper_20_2.5",
@@ -1137,6 +732,13 @@ class CalculationEngine:
                 "atr_trend_21",
                 "atr_volatility_13",
                 "atr_volatility_21",
+                # [Phase 6 追加] window_sizes["atr"] = [13, 21, 34, 55] の 34, 55 系
+                "atr_pct_34",
+                "atr_pct_55",
+                "atr_trend_34",
+                "atr_trend_55",
+                "atr_volatility_34",
+                "atr_volatility_55",
             ],
             # オシレーター系を2分割
             "group_5a_oscillators_basic": [
@@ -1146,6 +748,10 @@ class CalculationEngine:
                 "di_plus_21",
                 "di_minus_13",
                 "di_minus_21",
+                # [Phase 6 追加] window_sizes["adx"] = [13, 21, 34] の 34 系
+                "adx_34",
+                "di_plus_34",
+                "di_minus_34",
             ],
             "group_5b_oscillators_extended": [
                 "stoch_k_14",
@@ -1153,6 +759,23 @@ class CalculationEngine:
                 "aroon_up_14",
                 "aroon_down_14",
                 "williams_r_14",
+                # [Phase 6 追加] stochastic / aroon / williams_r の不足分
+                "stoch_k_21",
+                "stoch_k_9",
+                "stoch_d_21_5",
+                "stoch_d_9_3",
+                "stoch_slow_d_14_3_3",
+                "stoch_slow_d_21_5_5",
+                "stoch_slow_d_9_3_3",
+                "aroon_up_25",
+                "aroon_up_50",
+                "aroon_down_25",
+                "aroon_down_50",
+                "aroon_oscillator_14",
+                "aroon_oscillator_25",
+                "aroon_oscillator_50",
+                "williams_r_28",
+                "williams_r_56",
             ],
             # モメンタム系を2分割
             "group_6a_momentum_basic": [
@@ -1160,12 +783,23 @@ class CalculationEngine:
                 "trix_14",
                 "momentum_10",
                 "momentum_20",
+                # [Phase 6 追加] dpo / trix の不足分
+                "dpo_30",
+                "dpo_50",
+                "trix_20",
+                "trix_30",
             ],
             "group_6b_momentum_extended": [
                 "ultimate_oscillator",
                 "tsi_25",
                 "rate_of_change_10",
                 "rate_of_change_20",
+                # [Phase 6 追加] tsi / momentum / rate_of_change の不足分
+                "tsi_13",
+                "rate_of_change_30",
+                "rate_of_change_50",
+                "momentum_30",
+                "momentum_50",
             ],
             # 移動平均線系を2分割に統合
             "group_7_moving_averages": [
@@ -1177,6 +811,67 @@ class CalculationEngine:
                 "ema_50",
                 "hma_21",
                 "kama_21",
+                # [Phase 6 追加] sma/ema/hma/kama の不足分
+                "sma_100",
+                "sma_200",
+                "ema_100",
+                "ema_200",
+                "hma_34",
+                "hma_55",
+                "kama_34",
+            ],
+            # ▼▼▼ [Phase 6 新規追加] 高度なテクニカル指標グループ ▼▼▼
+            # group_name に "advanced" を含むため calculate_feature_group の
+            # 分岐 (line ~1875) で create_advanced_features() が呼ばれる。
+            # rfe_1C に対応実装あり: schaff (line 574), kst (line 434/452),
+            # coppock (line 500), rvi (line 588/591), price_oscillator (line 582)
+            "group_8_advanced": [
+                "schaff_trend_cycle_23_50_10",
+                "schaff_trend_cycle_12_26_9",
+                "kst",
+                "kst_signal",
+                "coppock_curve",
+                "price_oscillator_12_26",
+                "price_oscillator_5_35",
+                "price_oscillator_10_20",
+                "relative_vigor_index_10",
+                "relative_vigor_index_14",
+                "relative_vigor_index_20",
+                "rvi_signal_10",
+                "rvi_signal_14",
+                "rvi_signal_20",
+            ],
+            # ▼▼▼ [Phase 6 新規追加] 移動平均拡張グループ (wma + deviation + trend_*) ▼▼▼
+            # group_name に "moving" を含むため calculate_feature_group の
+            # 分岐で create_moving_average_features() が呼ばれる。
+            # rfe_1C に対応実装あり: wma (line 611), sma_deviation (line 604),
+            # ema_deviation (line 608), trend_slope (line 631),
+            # trend_strength (line 464), trend_consistency (line 482)
+            "group_9_moving_extended": [
+                "wma_10",
+                "wma_20",
+                "wma_50",
+                "wma_100",
+                "wma_200",
+                "sma_deviation_10",
+                "sma_deviation_20",
+                "sma_deviation_50",
+                "sma_deviation_100",
+                "sma_deviation_200",
+                "ema_deviation_10",
+                "ema_deviation_20",
+                "ema_deviation_50",
+                "ema_deviation_100",
+                "ema_deviation_200",
+                "trend_slope_20",
+                "trend_slope_50",
+                "trend_slope_100",
+                "trend_strength_20",
+                "trend_strength_50",
+                "trend_strength_100",
+                "trend_consistency_20",
+                "trend_consistency_50",
+                "trend_consistency_100",
             ],
         }
 
@@ -1185,7 +880,7 @@ class CalculationEngine:
         self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
     ) -> pl.LazyFrame:
         """QAなし・raw値の全特徴量を計算して返す（unit test用）。
-        
+
         calculate_all_features と同じ計算ステップを踏むが、
         最後の apply_quality_assurance を適用しない。
         学習パイプライン・本番パイプラインでは使用しないこと。
@@ -1201,7 +896,7 @@ class CalculationEngine:
         self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
     ) -> pl.LazyFrame:
         """全特徴量計算（6段階処理）"""
-        logger.info(f"=== カテゴリ1B: 全特徴量計算開始 ===")
+        logger.info(f"=== カテゴリ1C: 全特徴量計算開始 ===")
 
         # メモリ安全性チェック
         is_safe, message = self.memory_monitor.check_memory_safety()
@@ -1229,7 +924,7 @@ class CalculationEngine:
             # ▼ timeframe を渡す
             result = self.apply_quality_assurance(result, timeframe=timeframe)
 
-            logger.info(f"=== カテゴリ1B: 全特徴量計算完了 ===")
+            logger.info(f"=== カテゴリ1C: 全特徴量計算完了 ===")
             return result
 
         except Exception as e:
@@ -1716,35 +1411,21 @@ class CalculationEngine:
             exprs.append(aroon_osc)
 
         # =====================================================================
-        # 【既知バグ・意図的な非修正】williams_r の lambda に late binding バグあり
+        # 【修正済み】williams_r の late binding バグ (今回の再学習機会で解消)
         #
-        # 【バグの内容】
-        #   以下の lambda は `period` をデフォルト引数でキャプチャしていないため、
-        #   Python の late binding により map_batches が評価されるタイミング
-        #   （with_columns 実行時）には for ループが終了しており、
-        #   williams_r_14 / williams_r_28 / williams_r_56 の全てが
-        #   最後の値である period=56 で計算される。
+        # 【旧バグ】
+        #   lambda s: calculate_williams_r_numba(..., period, ...)
+        #   ↑ Python の late binding により全 period が常に 56 で計算されていた。
+        #   結果として e1c_williams_r_14, e1c_williams_r_28, e1c_williams_r_56 の
+        #   3カラムすべてが period=56 の同一値で保存・学習されていた。
         #
-        #   正しい書き方: lambda s, p=period: calculate_williams_r_numba(..., p)
+        # 【今回の修正】
+        #   lambda s, p=period: calculate_williams_r_numba(..., p, ...)
+        #   ↑ デフォルト引数 p=period でキャプチャすることで各 period が独立して評価される。
+        #   再学習機会の今回、本来の period=14/28/56 の独立した値が初めてモデルに反映される。
         #
-        # 【影響範囲】
-        #   e1c_williams_r_14, e1c_williams_r_28, e1c_williams_r_56 の全てが
-        #   period=56 の値で Stratum2/S5/S6 に保存されており、
-        #   モデルもこの値で学習済み。
-        #   特徴量リスト（m1_long/m1_short）に含まれる e1c_williams_r_14 は
-        #   M1/M0.5/M3/M5/M15 の各時間足で使用されている。
-        #
-        # 【なぜ修正しないか】
-        #   学習済みモデルが period=56 の値を前提としているため、
-        #   ここだけ修正すると本番の予測値が変化し整合性が崩れる。
-        #   本番側（realtime_feature_engine_1C_technical.py）も
-        #   意図的に period=56 固定で実装済み。
-        #
-        # 【将来の修正手順】
-        #   1. 下記 lambda を `lambda s, p=period: ...(p)` に修正
-        #   2. 特徴量を再生成（Stratum2→S5→S6）
-        #   3. モデルを再学習
-        #   4. 本番側の williams_r も個別 period に戻す
+        # 【本番側 (rfe_1C) 対応】
+        #   rfe_1C 側の period=56 固定実装も同時に解除し、3 period 個別計算に戻す。
         # =====================================================================
         # Williams %R
         williams_periods = [14, 28, 56]
@@ -1752,11 +1433,13 @@ class CalculationEngine:
             williams_r = (
                 pl.struct(["high", "low", "close"])
                 .map_batches(
-                    lambda s: calculate_williams_r_numba(  # ← late binding バグ: 常に period=56
-                        s.struct.field("high").to_numpy(),
-                        s.struct.field("low").to_numpy(),
-                        s.struct.field("close").to_numpy(),
-                        period,
+                    lambda s, p=period: (
+                        calculate_williams_r_numba(  # ★ 修正: p=period でキャプチャ
+                            s.struct.field("high").to_numpy(),
+                            s.struct.field("low").to_numpy(),
+                            s.struct.field("close").to_numpy(),
+                            p,
+                        )
                     ),
                     return_dtype=pl.Float64,
                 )
@@ -2199,15 +1882,94 @@ class CalculationEngine:
     # ▼▼ 修正前: def _apply_qa_to_series(self, values: np.ndarray) -> np.ndarray: (削除)
     # ▼▼ 修正後: EWMベースの動的±5σクリッピングへ完全一本化（未来情報の混入を防止）
     # ▼ 引数に timeframe を追加
+    # ▼▼ Phase 5 修正: inf null化 + NaN null化 + forward_fill による状態汚染防止
+    # ▼▼ Phase 5 F群 (#34) 修正: API 均質化 — canonical な実装を _to_group に移し、
+    #    apply_quality_assurance は auto-discovery 後に _to_group へ委譲する後方互換ラッパーへ
+    def apply_quality_assurance_to_group(
+        self,
+        lazy_frame: pl.LazyFrame,
+        feature_columns: List[str],
+        timeframe: str = "M1",
+    ) -> pl.LazyFrame:
+        """単一グループに対する品質保証システムの適用 (canonical 実装)。
+
+        engine_1_A/B/D/E/F の apply_quality_assurance_to_group と同じ意味を持つ
+        faithful 実装。feature_columns で指定された列のみに QA を適用する。
+
+        【Phase 5 F群 (#34)】API 均質化のために導入されたメソッド。
+        engine_1_C は歴史的経緯で apply_quality_assurance (auto-discovery 方式) を
+        持っていたが、本メソッドの追加により他 engine と統一されたインターフェースを
+        提供する。
+
+        【Phase 5 D群】1A-1B-1D-1E-1F と同じ正しい QA パターン:
+          - inf を null 化する `pl.when(is_infinite).then(None)` を適用
+          - .fill_nan(None) で NaN も null 化 (Polars EWM 状態汚染防止)
+          - .forward_fill() を ewm_mean/std に適用 (inf/NaN 位置でも有効 bounds 維持)
+          - clip 適用は pl.col(col) (元の値) に対して行い、inf 位置は
+            pl.when(col==inf).then(upper).when(col==-inf).then(lower) で置換
+        """
+        if not feature_columns:
+            return lazy_frame
+
+        half_life = self.config.timeframe_bars_per_day.get(timeframe, 1440)
+        logger.info(
+            f"品質保証適用: {len(feature_columns)}個の特徴量 (timeframe={timeframe})"
+        )
+
+        qa_exprs = []
+        for col in feature_columns:
+            safe_col = (
+                pl.when(pl.col(col).is_infinite())
+                .then(None)
+                .otherwise(pl.col(col))
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
+            )
+
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
+            ewm_mean = safe_col.ewm_mean(
+                half_life=half_life, adjust=False, ignore_nulls=True
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
+            ewm_std = safe_col.ewm_std(
+                half_life=half_life, adjust=False, ignore_nulls=True
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
+
+            upper_bound = ewm_mean + 5.0 * ewm_std
+            lower_bound = ewm_mean - 5.0 * ewm_std
+
+            # Inf値を動的境界値で置換し、全体をクリッピング (engine_1_B/D と同型)
+            clipped_expr = (
+                pl.when(pl.col(col) == float("inf"))
+                .then(upper_bound)
+                .when(pl.col(col) == float("-inf"))
+                .then(lower_bound)
+                .otherwise(pl.col(col))
+                .clip(lower_bound, upper_bound)
+                .fill_null(0.0)
+                .fill_nan(0.0)
+                .alias(col)
+            )
+            qa_exprs.append(clipped_expr)
+
+        return lazy_frame.with_columns(qa_exprs)
+
     def apply_quality_assurance(
         self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
     ) -> pl.LazyFrame:
-        """品質保証システム適用 (EWM動的クリッピング)"""
+        """品質保証システム適用 (旧 API)。
+
+        【Phase 5 F群 (#34) リファクタ】
+        本メソッドは Polars LazyFrame の schema から prefix マッチする特徴量カラムを
+        auto-discovery で取得し、apply_quality_assurance_to_group に委譲する
+        後方互換ラッパーへリファクタされた。
+
+        既存の呼び出し元 (engine_1_C 内 L789, L1893) のシグネチャを保つため、
+        内部実装変更による数値結果への影響は無し (差 0)。
+
+        新規コードは可能な限り apply_quality_assurance_to_group を直接使うべき。
+        """
         logger.info(f"品質保証システム適用開始 (EWMベース, timeframe={timeframe})")
 
         try:
-            half_life = self.config.timeframe_bars_per_day.get(timeframe, 1440)
-
             schema = lazy_frame.collect_schema()
             feature_columns = [
                 col
@@ -2216,34 +1978,12 @@ class CalculationEngine:
                 and schema[col] in [pl.Float32, pl.Float64]
             ]
 
-            qa_exprs = []
-            for col in feature_columns:
-                # ▼▼ 修正: adjust=False と ignore_nulls=True を両方明示的に指定し、因果律と減衰の正確性を完全担保
-                # 修正後
-                ewm_mean = pl.col(col).ewm_mean(
-                    half_life=half_life, adjust=False, ignore_nulls=True
-                )
-                ewm_std = pl.col(col).ewm_std(
-                    half_life=half_life, adjust=False, ignore_nulls=True
-                )
+            result = self.apply_quality_assurance_to_group(
+                lazy_frame, feature_columns, timeframe=timeframe
+            )
 
-                upper_bound = ewm_mean + 5.0 * ewm_std
-                lower_bound = ewm_mean - 5.0 * ewm_std
-
-                clipped_expr = (
-                    pl.col(col)
-                    .fill_nan(0.0)
-                    .fill_null(0.0)
-                    .clip(lower_bound, upper_bound)
-                    .alias(col)
-                )
-                qa_exprs.append(clipped_expr)
-
-            if qa_exprs:
-                result = lazy_frame.with_columns(qa_exprs)
-                logger.info(f"品質保証適用完了: {len(qa_exprs)}列")
-            else:
-                result = lazy_frame
+            if feature_columns:
+                logger.info(f"品質保証適用完了: {len(feature_columns)}列")
 
             return result
 
@@ -2607,7 +2347,7 @@ def process_single_timeframe(config: ProcessingConfig, timeframe: str):
 def get_user_confirmation(config: ProcessingConfig) -> bool:
     """ユーザー確認"""
     print("\n" + "=" * 60)
-    print("Engine 1B - テクニカル指標・トレンド分析エンジン")
+    print("Engine 1C - テクニカル指標・トレンド分析エンジン")
     print("=" * 60)
     print(f"入力パス: {config.input_base_path}")
     print(f"出力パス: {config.output_base_path}")
@@ -2675,7 +2415,7 @@ def select_timeframes(config: ProcessingConfig) -> List[str]:
 def main():
     """設定を行い、処理モードを分岐させるメイン関数"""
     print("\n" + "=" * 70)
-    print(" Engine 1B - Technical Indicators and Trend Analysis Engine ")
+    print(" Engine 1C - Technical Indicators and Trend Analysis Engine ")
     print(" テクニカル指標・トレンド分析特徴量生成エンジン ")
     print("=" * 70)
 

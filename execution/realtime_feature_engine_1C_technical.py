@@ -26,6 +26,20 @@ from core_indicators import (
     calculate_atr_wilder,
     calculate_rsi_wilder,
     calculate_adx,
+    # [SSoT 統一] Engine 1C の Numba 関数 (案3: 案-3完全SSoT)
+    # core_indicators の guvectorize 版を import → out 引数省略で配列を返す形式で利用可
+    # (旧: 本ファイル内で _arr サフィックス付き等で重複定義 = SSoT 違反)
+    calculate_wma_numba,
+    calculate_hma_numba,
+    calculate_kama_numba,
+    calculate_stochastic_numba,
+    calculate_williams_r_numba,
+    calculate_trix_numba,
+    calculate_ultimate_oscillator_numba,
+    calculate_aroon_up_numba,
+    calculate_aroon_down_numba,
+    calculate_tsi_numba,
+    _calculate_di_wilder,
 )
 
 
@@ -154,21 +168,34 @@ class QAState:
                 self._ewm_n[key]    = self._ewm_n.get(key, 0) + 1
 
         # ±5σ クリップ（bias補正付き）
+        # Polars ewm_std(adjust=False, bias=False) と完全一致させる:
+        #   m = n - 1, sum_w2 = α²(1-r2^m)/(1-r2) + r2^m, bias_factor_var = 1/(1-sum_w2)
         ewm_mean  = self._ewm_mean[key]
         n_updates = self._ewm_n.get(key, 1)
-        decay_2n  = (1.0 - alpha) ** (2 * n_updates)
-        denom     = 1.0 - decay_2n
-        bias_corr = 1.0 / np.sqrt(denom) if denom > 1e-15 else 1.0
-        ewm_std   = np.sqrt(max(self._ewm_var[key], 0.0)) * bias_corr
+        if n_updates <= 1:
+            ewm_std = 0.0
+        else:
+            r2 = (1.0 - alpha) ** 2
+            m  = n_updates - 1
+            if r2 < 1.0 - 1e-15:
+                sum_w2 = alpha * alpha * (1.0 - r2 ** m) / (1.0 - r2) + r2 ** m
+            else:
+                sum_w2 = 1.0
+            if sum_w2 < 1.0 - 1e-15:
+                bias_factor_var = 1.0 / (1.0 - sum_w2)
+                ewm_std = np.sqrt(max(self._ewm_var[key] * bias_factor_var, 0.0))
+            else:
+                ewm_std = 0.0
         lower     = ewm_mean - 5.0 * ewm_std
         upper     = ewm_mean + 5.0 * ewm_std
 
-        if np.isnan(ewm_input):
-            return 0.0
+        # 【修正済み】Option B: チェック順序入れ替え
         if is_pos_inf:
             return float(upper) if np.isfinite(upper) else 0.0
         if is_neg_inf:
             return float(lower) if np.isfinite(lower) else 0.0
+        if np.isnan(raw_val):
+            return 0.0
 
         clipped  = float(np.clip(raw_val, lower, upper))
         return clipped if np.isfinite(clipped) else 0.0
@@ -177,319 +204,6 @@ class QAState:
 # ==================================================================
 # Numba UDF群（学習側と完全同一）
 # ==================================================================
-
-@njit(fastmath=False, cache=True)
-def _calculate_di_plus_scalar(high, low, close, period):
-    """DI+ スカラー値（学習側 _calculate_di_wilder と同一アルゴリズム）"""
-    n = len(high)
-    if n <= period:
-        return np.nan
-    tr = np.zeros(n, dtype=np.float64)
-    dm_plus = np.zeros(n, dtype=np.float64)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        hl = high[i] - low[i]
-        hc = abs(high[i] - close[i - 1])
-        lc = abs(low[i] - close[i - 1])
-        tr[i] = max(hl, hc, lc)
-        up_move = high[i] - high[i - 1]
-        down_move = low[i - 1] - low[i]
-        dm_plus[i] = up_move if (up_move > down_move and up_move > 0.0) else 0.0
-    atr_w = 0.0
-    dmp_w = 0.0
-    for j in range(period):
-        atr_w += tr[j]
-        dmp_w += dm_plus[j]
-    for i in range(period, n):
-        atr_w = atr_w - atr_w / period + tr[i]
-        dmp_w = dmp_w - dmp_w / period + dm_plus[i]
-    if atr_w > 1e-10:
-        return dmp_w / atr_w * 100.0
-    return np.nan
-
-@njit(fastmath=False, cache=True)
-def _calculate_di_minus_scalar(high, low, close, period):
-    """DI- スカラー値（学習側 _calculate_di_wilder と同一アルゴリズム）"""
-    n = len(high)
-    if n <= period:
-        return np.nan
-    tr = np.zeros(n, dtype=np.float64)
-    dm_minus = np.zeros(n, dtype=np.float64)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        hl = high[i] - low[i]
-        hc = abs(high[i] - close[i - 1])
-        lc = abs(low[i] - close[i - 1])
-        tr[i] = max(hl, hc, lc)
-        up_move = high[i] - high[i - 1]
-        down_move = low[i - 1] - low[i]
-        dm_minus[i] = down_move if (down_move > up_move and down_move > 0.0) else 0.0
-    atr_w = 0.0
-    dmm_w = 0.0
-    for j in range(period):
-        atr_w += tr[j]
-        dmm_w += dm_minus[j]
-    for i in range(period, n):
-        atr_w = atr_w - atr_w / period + tr[i]
-        dmm_w = dmm_w - dmm_w / period + dm_minus[i]
-    if atr_w > 1e-10:
-        return dmm_w / atr_w * 100.0
-    return np.nan
-
-@njit(fastmath=False, cache=True)
-def calculate_aroon_up_numba(high: np.ndarray, period: int) -> np.ndarray:
-    n = len(high)
-    out = np.full(n, np.nan, dtype=np.float64)
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            highest_idx = i
-            highest_val = high[i]
-            for j in range(i - period + 1, i):
-                if high[j] > highest_val:
-                    highest_val = high[j]
-                    highest_idx = j
-            out[i] = 100.0 * (period - (i - highest_idx)) / period
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_aroon_down_numba(low: np.ndarray, period: int) -> np.ndarray:
-    n = len(low)
-    out = np.full(n, np.nan, dtype=np.float64)
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            lowest_idx = i
-            lowest_val = low[i]
-            for j in range(i - period + 1, i):
-                if low[j] < lowest_val:
-                    lowest_val = low[j]
-                    lowest_idx = j
-            out[i] = 100.0 * (period - (i - lowest_idx)) / period
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_stochastic_numba(high, low, close, k_period, d_period, slow_period):
-    n = len(high)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < k_period:
-        return out
-    k_values = np.zeros(n)
-    for i in range(n):
-        if i < k_period - 1:
-            k_values[i] = np.nan
-        else:
-            highest = high[i]
-            lowest = low[i]
-            for j in range(i - k_period + 1, i):
-                if high[j] > highest:
-                    highest = high[j]
-                if low[j] < lowest:
-                    lowest = low[j]
-            if highest - lowest > 0:
-                k_values[i] = 100 * (close[i] - lowest) / (highest - lowest)
-            else:
-                k_values[i] = 50.0
-    for i in range(n):
-        if i < k_period + d_period - 2:
-            out[i] = np.nan
-        else:
-            sum_k = 0.0
-            count = 0.0
-            for j in range(i - d_period + 1, i + 1):
-                if not np.isnan(k_values[j]):
-                    sum_k += k_values[j]
-                    count += 1.0
-            if count > 0.0:
-                out[i] = sum_k / count
-            else:
-                out[i] = np.nan
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_williams_r_numba(high, low, close, period):
-    n = len(high)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < period:
-        return out
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            highest = high[i]
-            lowest = low[i]
-            for j in range(i - period + 1, i):
-                if high[j] > highest:
-                    highest = high[j]
-                if low[j] < lowest:
-                    lowest = low[j]
-            if highest - lowest > 0:
-                out[i] = -100 * (highest - close[i]) / (highest - lowest)
-            else:
-                out[i] = -50.0
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_trix_numba(prices: np.ndarray, period: int) -> np.ndarray:
-    n = len(prices)
-    out = np.full(n, np.nan, dtype=np.float64)
-    ema1 = np.zeros(n, dtype=np.float64)
-    ema2 = np.zeros(n, dtype=np.float64)
-    ema3 = np.zeros(n, dtype=np.float64)
-    alpha = 2.0 / (period + 1.0)
-    for i in range(n):
-        ema1[i] = prices[i] if i == 0 else alpha * prices[i] + (1 - alpha) * ema1[i - 1]
-    for i in range(n):
-        ema2[i] = ema1[i] if i == 0 else alpha * ema1[i] + (1 - alpha) * ema2[i - 1]
-    for i in range(n):
-        ema3[i] = ema2[i] if i == 0 else alpha * ema2[i] + (1 - alpha) * ema3[i - 1]
-    for i in range(n):
-        if i < period * 3:
-            out[i] = np.nan
-        elif ema3[i - 1] == 0:
-            out[i] = 0.0
-        else:
-            out[i] = 10000 * (ema3[i] - ema3[i - 1]) / ema3[i - 1]
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_ultimate_oscillator_numba(high, low, close, volume):
-    n = len(high)
-    out = np.full(n, np.nan, dtype=np.float64)
-    bp = np.zeros(n, dtype=np.float64)
-    tr = np.zeros(n, dtype=np.float64)
-    for i in range(n):
-        if i == 0:
-            bp[i] = close[i] - low[i]
-            tr[i] = high[i] - low[i]
-        else:
-            bp[i] = close[i] - min(low[i], close[i - 1])
-            tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-    periods = [7, 14, 28]
-    weights = [4.0, 2.0, 1.0]
-    weight_total = 7.0
-    for i in range(n):
-        if i < 28:
-            out[i] = np.nan
-        else:
-            ws = 0.0
-            for j in range(3):
-                p = periods[j]
-                bp_sum = 0.0
-                tr_sum = 0.0
-                for k in range(i - p + 1, i + 1):
-                    bp_sum += bp[k]
-                    tr_sum += tr[k]
-                ws += (bp_sum / tr_sum if tr_sum > 0 else 0.0) * weights[j]
-            out[i] = 100 * ws / weight_total
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_tsi_numba(prices: np.ndarray, period: int) -> np.ndarray:
-    n = len(prices)
-    out = np.full(n, np.nan, dtype=np.float64)
-    long_period = period
-    short_period = period // 2
-    momentum = np.zeros(n)
-    for i in range(1, n):
-        momentum[i] = prices[i] - prices[i - 1]
-    alpha_long = 2.0 / (long_period + 1.0)
-    alpha_short = 2.0 / (short_period + 1.0)
-    ema1_mom = np.zeros(n)
-    ema1_abs = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            ema1_mom[i] = momentum[i]
-            ema1_abs[i] = abs(momentum[i])
-        else:
-            ema1_mom[i] = alpha_long * momentum[i] + (1 - alpha_long) * ema1_mom[i - 1]
-            ema1_abs[i] = alpha_long * abs(momentum[i]) + (1 - alpha_long) * ema1_abs[i - 1]
-    ema2_mom = np.zeros(n)
-    ema2_abs = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            ema2_mom[i] = ema1_mom[i]
-            ema2_abs[i] = ema1_abs[i]
-        else:
-            ema2_mom[i] = alpha_short * ema1_mom[i] + (1 - alpha_short) * ema2_mom[i - 1]
-            ema2_abs[i] = alpha_short * ema1_abs[i] + (1 - alpha_short) * ema2_abs[i - 1]
-    for i in range(n):
-        if i < long_period + short_period:
-            out[i] = np.nan
-        elif ema2_abs[i] == 0:
-            out[i] = 0.0
-        else:
-            out[i] = 100 * ema2_mom[i] / ema2_abs[i]
-    return out
-
-@njit(fastmath=False, cache=True)
-def _wma_helper(data, start, length):
-    if start + length > len(data):
-        return np.nan
-    weight_sum = 0.0
-    value_sum = 0.0
-    for i in range(length):
-        weight = length - i
-        value_sum += data[start + i] * weight
-        weight_sum += weight
-    return value_sum / weight_sum if weight_sum > 0 else np.nan
-
-@njit(fastmath=False, cache=True)
-def calculate_wma_numba_arr(prices: np.ndarray, period: int) -> np.ndarray:
-    n = len(prices)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < period:
-        return out
-    weight_sum = period * (period + 1) / 2.0
-    for i in range(period - 1, n):
-        val_sum = 0.0
-        for j in range(period):
-            val_sum += prices[i - j] * (period - j)
-        out[i] = val_sum / weight_sum
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_hma_numba_arr(prices: np.ndarray, period: int) -> np.ndarray:
-    n = len(prices)
-    out = np.full(n, np.nan, dtype=np.float64)
-    half_period = period // 2
-    sqrt_period = int(np.sqrt(period))
-    wma_half = np.full(n, np.nan, dtype=np.float64)
-    wma_full = np.full(n, np.nan, dtype=np.float64)
-    raw_hma = np.full(n, np.nan, dtype=np.float64)
-    for i in range(half_period - 1, n):
-        wma_half[i] = _wma_helper(prices, i - half_period + 1, half_period)
-    for i in range(period - 1, n):
-        wma_full[i] = _wma_helper(prices, i - period + 1, period)
-    for i in range(n):
-        if not np.isnan(wma_half[i]) and not np.isnan(wma_full[i]):
-            raw_hma[i] = 2 * wma_half[i] - wma_full[i]
-    for i in range(sqrt_period - 1, n):
-        out[i] = _wma_helper(raw_hma, i - sqrt_period + 1, sqrt_period)
-    return out
-
-@njit(fastmath=False, cache=True)
-def calculate_kama_numba_arr(prices: np.ndarray, period: int) -> np.ndarray:
-    n = len(prices)
-    out = np.full(n, np.nan, dtype=np.float64)
-    fast_sc = 2.0 / (2 + 1.0)
-    slow_sc = 2.0 / (30 + 1.0)
-    for i in range(period, n):
-        direction = abs(prices[i] - prices[i - period])
-        volatility = 0.0
-        for j in range(i - period + 1, i + 1):
-            volatility += abs(prices[j] - prices[j - 1])
-        er = direction / volatility if volatility != 0 else 0.0
-        sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
-        if i == period:
-            out[i] = prices[i]
-        else:
-            prev = out[i - 1] if not np.isnan(out[i - 1]) else prices[i]
-            out[i] = prev + sc * (prices[i] - prev)
-    return out
-
 
 # ==================================================================
 # メイン計算クラス
@@ -642,8 +356,11 @@ class FeatureModule1C:
         for period in [13, 21, 34]:
             adx_arr = calculate_adx(high_arr, low_arr, close_arr, period)
             features[f"e1c_adx_{period}"]      = _last(adx_arr)
-            features[f"e1c_di_plus_{period}"]  = _calculate_di_plus_scalar(high_arr, low_arr, close_arr, period)
-            features[f"e1c_di_minus_{period}"] = _calculate_di_minus_scalar(high_arr, low_arr, close_arr, period)
+            _di_p_arr, _di_m_arr = _calculate_di_wilder(high_arr, low_arr, close_arr, period)
+
+            features[f"e1c_di_plus_{period}"]  = float(_di_p_arr[-1]) if np.isfinite(_di_p_arr[-1]) else np.nan
+
+            features[f"e1c_di_minus_{period}"] = float(_di_m_arr[-1]) if np.isfinite(_di_m_arr[-1]) else np.nan
 
         for period in [14, 25, 50]:
             aroon_up   = _last(calculate_aroon_up_numba(high_arr, period))
@@ -653,48 +370,14 @@ class FeatureModule1C:
             features[f"e1c_aroon_oscillator_{period}"]   = aroon_up - aroon_down
 
         # =====================================================================
-        # 【既知バグ・意図的な非修正】williams_r の全 period が period=56 固定
-        #
-        # 【原因】
-        #   学習側 engine_1_C_a_vast_universe_of_features.py の
-        #   create_oscillator_features() 内で以下のコードが使われている:
-        #
-        #     williams_periods = [14, 28, 56]
-        #     for period in williams_periods:
-        #         pl.struct(...).map_batches(
-        #             lambda s: calculate_williams_r_numba(..., period, ...),  # ← バグ
-        #             ...
-        #         )
-        #
-        #   Python の lambda は変数をデフォルト引数でキャプチャしない限り
-        #   「late binding」になる。map_batches の lambda が実際に評価される
-        #   タイミングでは for ループが終了しており、period=56 に固定されている。
-        #   正しくは `lambda s, p=period: ...(p)` と書く必要がある。
-        #
-        # 【影響範囲】
-        #   e1c_williams_r_14, e1c_williams_r_28, e1c_williams_r_56 の全てが
-        #   学習時に period=56 の値で計算・学習されている。
-        #   特徴量リストに含まれる e1c_williams_r_14 は M1/M0.5/M3/M5/M15 で
-        #   M1_long・M1_short モデルに使用されている。
-        #
-        # 【対処方針】
-        #   学習済みモデルはこのバグ込みの値で学習済みのため、再学習なしに
-        #   学習側のバグだけ直すと本番の予測値が変化してしまう。
-        #   → 本番側も意図的に period=56 固定とし、学習時の挙動に合わせる。
-        #
-        # 【将来の修正手順】
-        #   1. engine_1_C の lambda を `lambda s, p=period: ...(p)` に修正
-        #   2. 特徴量を再生成（Stratum2→S5→S6）
-        #   3. モデルを再学習
-        #   4. 本番側のこのコメントブロックを削除し、下記に戻す:
-        #      for period in [14, 28, 56]:
-        #          features[f"e1c_williams_r_{period}"] = _last(
-        #              calculate_williams_r_numba(high_arr, low_arr, close_arr, period)
-        #          )
+        # 【修正済み】Williams %R の period=56 固定実装は今回の再学習で解消。
+        # 学習側 engine_1_C の late binding バグ修正と同期して、本番側も
+        # period=14, 28, 56 を個別に計算する正しい挙動に戻す。
         # =====================================================================
-        wr_56 = _last(calculate_williams_r_numba(high_arr, low_arr, close_arr, 56))
         for period in [14, 28, 56]:
-            features[f"e1c_williams_r_{period}"] = wr_56
+            features[f"e1c_williams_r_{period}"] = _last(
+                calculate_williams_r_numba(high_arr, low_arr, close_arr, period)
+            )
 
         # Stochastic (14,3,3), (21,5,5), (9,3,3)
         for k_period, d_period, slow_period in [(14, 3, 3), (21, 5, 5), (9, 3, 3)]:
@@ -924,17 +607,17 @@ class FeatureModule1C:
             features[f"e1c_ema_{period}"] = (ema_val - current_close) / atr_denom if (np.isfinite(ema_val) and atr_ok) else np.nan
             features[f"e1c_ema_deviation_{period}"] = (current_close - ema_val) / (ema_val + 1e-10) * 100 if np.isfinite(ema_val) else np.nan
             # WMA
-            wma_val = _last(calculate_wma_numba_arr(close_arr, period))
+            wma_val = _last(calculate_wma_numba(close_arr, period))
             features[f"e1c_wma_{period}"] = (wma_val - current_close) / atr_denom if (np.isfinite(wma_val) and atr_ok) else np.nan
 
         # HMA
         for period in [21, 34, 55]:
-            hma_val = _last(calculate_hma_numba_arr(close_arr, period))
+            hma_val = _last(calculate_hma_numba(close_arr, period))
             features[f"e1c_hma_{period}"] = (hma_val - current_close) / atr_denom if (np.isfinite(hma_val) and atr_ok) else np.nan
 
         # KAMA
         for period in [21, 34]:
-            kama_val = _last(calculate_kama_numba_arr(close_arr, period))
+            kama_val = _last(calculate_kama_numba(close_arr, period))
             features[f"e1c_kama_{period}"] = (kama_val - current_close) / atr_denom if (np.isfinite(kama_val) and atr_ok) else np.nan
 
         # Trend Slope: OLS slope = 6*(WMA - SMA)/(period-1) / atr13
@@ -942,7 +625,7 @@ class FeatureModule1C:
             w = _window(close_arr, period)
             if len(w) >= period and atr_ok:
                 sma_w = float(np.mean(w))
-                wma_w = _last(calculate_wma_numba_arr(w, period))
+                wma_w = _last(calculate_wma_numba(w, period))
                 if np.isfinite(wma_w):
                     slope = 6.0 * (wma_w - sma_w) / (period - 1.0)
                     features[f"e1c_trend_slope_{period}"] = slope / atr_denom

@@ -75,6 +75,8 @@ GOLDEN_SCHEMA = {
     "price_momentum": "float64",
     "volume_ratio": "float64",
     "timeframe": "string",
+    # [DISC-FLAG] s1_1_B が出力する不連続フラグを下流(create_proxy_labels等)へ伝搬
+    "disc": "bool",
 }
 
 
@@ -256,6 +258,7 @@ def main():
             "bid",
             "ask",
             "spread",
+            "disc",  # [DISC-FLAG] s1_1_B から伝搬
         ]
         meta_df = get_meta(base_columns)
 
@@ -314,7 +317,12 @@ def main():
         gc.collect()
 
         # --- 5. 品質検証とサマリー出力 ---
-        summary_counts = verify_data()
+        # [Phase 6] verify_data() は全タイムフレーム×全カラム×全行を Dask で再スキャンするため
+        # 時間がかかる (数十分級)。Phase 6 では値域チェックを別スクリプトで実施するためスキップ。
+        # 復元する場合は次の 1 行を有効化:
+        #   summary_counts = verify_data()
+        summary_counts = {}
+        logger.info("[Phase 6] verify_data() スキップ (時短のため)")
 
         total_duration = time.time() - start_time
 

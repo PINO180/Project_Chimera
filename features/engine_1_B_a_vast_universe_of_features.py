@@ -25,7 +25,23 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))  # /workspace をパスに追加
 import blueprint as config
 sys.path.append(str(config.CORE_DIR))
-from core_indicators import calculate_atr_wilder
+from core_indicators import (
+    calculate_atr_wilder,
+    # [SSoT 統一] Engine 1B の UDF を core_indicators から import
+    # (旧: 本ファイル内で定義 → 本番側 rfe_1B と二重定義 = SSoT 違反)
+    adf_統計量_udf,
+    phillips_perron_統計量_udf,
+    kpss_統計量_udf,
+    t分布_自由度_udf,
+    t分布_尺度_udf,
+    gev_形状_udf,
+    holt_winters_レベル_udf,
+    holt_winters_トレンド_udf,
+    arima_残差分散_udf,
+    kalman_状態推定_udf,
+    lowess_適合値_udf,
+    theil_sen_傾き_udf,
+)
 
 import time, warnings, json, logging, math, tempfile, datetime
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -381,292 +397,9 @@ class DataEngine:
 # =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True)
-def adf_統計量_udf(prices: np.ndarray) -> float:
-    """
-    真の拡張ディッキー・フラー（ADF）検定統計量計算
-    ラグ差分項（Δy_{t-1}）を追加し、系列の自己相関をパラメトリックに吸収する
-    帰無仮説：系列が単位根を持つ（非定常）
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    # NaN値除去
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    # 1次差分計算
-    diff_prices = np.diff(finite_prices)
-
-    # ▼▼ 修正前: 差分ラグ項のない単なるDF検定
-    # lagged_prices = finite_prices[:-1]
-    # n = len(diff_prices)
-    # X = np.column_stack((np.ones(n, dtype=np.float64), lagged_prices))
-    # y = diff_prices
-
-    # ▼▼ 修正後: 差分ラグ項（Δy_{t-1}）を追加した真のADF検定
-    if len(diff_prices) < 5:
-        return np.nan
-
-    # ADF回帰: Δy_t = α + β*y_{t-1} + γ*Δy_{t-1} + ε_t
-    y = diff_prices[1:]  # Δy_t
-    lagged_y = finite_prices[1:-1]  # y_{t-1}
-    lagged_diff = diff_prices[:-1]  # Δy_{t-1}
-
-    n = len(y)
-    if n < 3:
-        return np.nan
-
-    # 設計行列: [定数項, ラグレベル, 差分ラグ]
-    X = np.empty((n, 3), dtype=np.float64)
-    X[:, 0] = 1.0
-    X[:, 1] = lagged_y
-    X[:, 2] = lagged_diff
-
-    # OLS計算: β = (X'X)^(-1)X'y
-    try:
-        XtX = X.T @ X
-        XtX_inv = np.linalg.inv(XtX)
-        XtY = X.T @ y
-        beta = XtX_inv @ XtY
-
-        # 残差と標準誤差計算
-        residuals = y - X @ beta
-
-        # 自由度はパラメータ数(3)を消費するため n-3
-        sse = np.sum(residuals**2)
-        mse = sse / (n - 3.0)
-
-        # β係数（ラグレベル：インデックス1）の標準誤差
-        se_beta = np.sqrt(mse * XtX_inv[1, 1])
-
-        # ADF t統計量
-        if se_beta > 1e-10:
-            adf_stat = beta[1] / se_beta
-        else:
-            adf_stat = np.nan
-
-    except:
-        adf_stat = np.nan
-
-    return adf_stat
-
-
-@nb.njit(fastmath=True, cache=True)
-def phillips_perron_統計量_udf(prices: np.ndarray) -> float:
-    """
-    真のフィリップス・ペロン検定統計量計算（Newey-West長期的分散補正付き）
-    異分散性と自己相関をノンパラメトリックに修正したZ_t統計量を算出
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    # 1次差分とラグレベル計算
-    diff_prices = np.diff(finite_prices)
-    lagged_prices = finite_prices[:-1]
-
-    if len(diff_prices) < 5:
-        return np.nan
-
-    n = len(diff_prices)
-
-    # OLS回帰: Δy_t = α + βy_{t-1} + ε_t
-    X = np.empty((n, 2), dtype=np.float64)
-    X[:, 0] = 1.0
-    X[:, 1] = lagged_prices
-    y = diff_prices
-
-    try:
-        # OLS推定
-        XtX_inv = np.linalg.inv(X.T @ X)
-        beta = XtX_inv @ X.T @ y
-
-        # 残差
-        residuals = y - X @ beta
-
-        # ▼▼ 修正前: sigma2 = np.var(residuals) ... (簡略版)
-        # ▼▼ 修正後: 真のPhillips-Perron検定（Newey-West長期的分散補正）
-
-        # 1. 残差の標本分散 (gamma_0)
-        gamma_0 = np.sum(residuals**2) / n
-
-        # 2. BartlettカーネルによるNewey-West長期的分散 (lambda_sq)
-        # ラグ数の経験則: 4 * (T/100)^(2/9)
-        lag_max = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
-        if lag_max < 1:
-            lag_max = 1
-
-        lambda_sq = gamma_0
-        for j in range(1, lag_max + 1):
-            # 自己共分散 (gamma_j)
-            gamma_j = np.sum(residuals[j:] * residuals[:-j]) / n
-            # Bartlett重み
-            weight = 1.0 - (j / (lag_max + 1.0))
-            lambda_sq += 2.0 * weight * gamma_j
-
-        # 3. 標準誤差とt統計量
-        # 不偏分散（s^2）による回帰の標準誤差
-        s2 = np.sum(residuals**2) / (n - 2.0)
-        s = np.sqrt(s2)
-
-        se_beta = np.sqrt(s2 * XtX_inv[1, 1])
-        if se_beta <= 1e-10 or lambda_sq <= 1e-10:
-            return np.nan
-
-        t_stat = beta[1] / se_beta
-
-        # 4. Phillips-Perron Z_t 統計量の算出
-        term1 = np.sqrt(gamma_0 / lambda_sq) * t_stat
-        term2 = 0.5 * ((lambda_sq - gamma_0) / np.sqrt(lambda_sq)) * (n * se_beta / s)
-        pp_stat = term1 - term2
-
-    except:
-        pp_stat = np.nan
-
-    return pp_stat
-
-
-@nb.njit(fastmath=True, cache=True)
-def kpss_統計量_udf(prices: np.ndarray) -> float:
-    """
-    真のKPSS検定統計量計算（Newey-West長期的分散補正付き）
-    帰無仮説：系列がトレンド周りで定常
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    n = len(finite_prices)
-    t = np.arange(n, dtype=np.float64)
-
-    try:
-        # OLS: y = α + βt + ε
-        sum_t = np.sum(t)
-        sum_t2 = np.sum(t**2)
-        sum_y = np.sum(finite_prices)
-        sum_ty = np.sum(t * finite_prices)
-
-        beta = (n * sum_ty - sum_t * sum_y) / (n * sum_t2 - sum_t**2 + 1e-10)
-        alpha = (sum_y - beta * sum_t) / n
-
-        # デトレンドされた系列 (残差)
-        detrended = finite_prices - (alpha + beta * t)
-        cumsum = np.cumsum(detrended)
-
-        # ▼▼ 修正前: 単なる短期分散 (sse = np.sum(detrended**2) / n)
-        # ▼▼ 修正後: Bartlettカーネルによる真の長期的分散 (long_run_var)
-        gamma_0 = np.sum(detrended**2) / n
-
-        # ラグ数の経験則: 4 * (T/100)^(2/9)  ※Schwert (1989) 基準
-        lag_max = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
-        if lag_max < 1:
-            lag_max = 1
-
-        long_run_var = gamma_0
-        for j in range(1, lag_max + 1):
-            gamma_j = np.sum(detrended[j:] * detrended[:-j]) / n
-            weight = 1.0 - (j / (lag_max + 1.0))
-            long_run_var += 2.0 * weight * gamma_j
-
-        # KPSS統計量の算出
-        if long_run_var > 1e-10:
-            kpss_stat = np.sum(cumsum**2) / (n**2 * long_run_var)
-        else:
-            kpss_stat = np.nan
-
-    except:
-        kpss_stat = np.nan
-
-    return kpss_stat
-
-
 # =============================================================================
 # 分布パラメータ: t分布 (Numba UDF集)
 # =============================================================================
-
-
-@nb.njit(fastmath=True, cache=True)
-def t分布_自由度_udf(returns: np.ndarray) -> float:
-    """
-    t分布の自由度パラメータ推定
-    尖度ベース推定によるモーメント法使用
-    """
-    if len(returns) < 10:
-        return np.nan
-
-    finite_returns = returns[np.isfinite(returns)]
-    if len(finite_returns) < 10:
-        return np.nan
-
-    # リターン標準化
-    mean_ret = np.mean(finite_returns)
-    # ▼▼ 修正前: std_ret = np.std(finite_returns) または np.std(finite_returns, ddof=1)
-    # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当) に置換
-    n_ret = len(finite_returns)
-    std_ret = np.std(finite_returns) * np.sqrt(n_ret / (n_ret - 1.0))
-
-    if std_ret <= 0:
-        return np.nan
-
-    standardized = (finite_returns - mean_ret) / std_ret
-
-    # サンプル尖度計算
-    fourth_moment = np.mean(standardized**4)
-
-    # t分布用: E[X^4] = 3*ν/(ν-4) for ν > 4
-    # ν解: ν = 4*(3 + kurtosis)/(kurtosis - 3)
-    excess_kurtosis = fourth_moment - 3.0
-
-    if excess_kurtosis > 0:
-        dof = 4.0 * (3.0 + fourth_moment) / excess_kurtosis
-        # 合理的範囲への制約
-        dof = max(2.1, min(dof, 100.0))
-    else:
-        dof = 100.0  # 非常に高いDOF（概正規近似）
-
-    return dof
-
-
-@nb.njit(fastmath=True, cache=True)
-def t分布_尺度_udf(returns: np.ndarray) -> float:
-    """
-    t分布の尺度パラメータ推定
-    尺度パラメータは分布のスプレッドを表す
-    """
-    if len(returns) < 5:
-        return np.nan
-
-    finite_returns = returns[np.isfinite(returns)]
-    if len(finite_returns) < 5:
-        return np.nan
-
-    # 最初に自由度推定
-    dof = t分布_自由度_udf(returns)
-
-    if np.isnan(dof) or dof <= 2:
-        # サンプル標準偏差へのフォールバック
-        # ▼▼ 修正前: return np.std(finite_returns)
-        # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当)
-        n_ret = len(finite_returns)
-        return np.std(finite_returns) * np.sqrt(n_ret / (n_ret - 1.0))
-
-    # 既知νを持つt分布用、尺度パラメータσ推定可能:
-    # σ² = sample_variance * (ν-2)/ν
-    # ▼▼ 修正前: sample_var = np.var(finite_returns)
-    # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当)
-    n_ret = len(finite_returns)
-    sample_var = np.var(finite_returns) * (n_ret / (n_ret - 1.0))
-    scale_squared = sample_var * (dof - 2.0) / dof
-
-    return np.sqrt(max(scale_squared, 1e-8))
 
 
 # =============================================================================
@@ -674,112 +407,9 @@ def t分布_尺度_udf(returns: np.ndarray) -> float:
 # =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True)
-def gev_形状_udf(extremes: np.ndarray) -> float:
-    """
-    GEV分布形状パラメータ（ξ）推定
-    ξ > 0: フレシェ（重い尾）、ξ = 0: ガンベル、ξ < 0: ワイブル（有界）
-    """
-    if len(extremes) < 10:
-        return np.nan
-
-    finite_extremes = extremes[np.isfinite(extremes)]
-    if len(finite_extremes) < 10:
-        return np.nan
-
-    # 頑健推定のためのL-モーメント法
-    sorted_data = np.sort(finite_extremes)
-    n = len(sorted_data)
-
-    # L-モーメント計算
-    l1 = np.mean(sorted_data)  # L1 = 平均
-
-    # L2（L-スケール）
-    sum_l2 = 0.0
-    for i in range(n):
-        weight = (2.0 * i - n + 1.0) / n
-        sum_l2 += weight * sorted_data[i]
-    l2 = sum_l2 / 2.0
-
-    # L3（L-歪度）
-    sum_l3 = 0.0
-    for i in range(n):
-        weight = ((i * (i - 1.0)) - 2.0 * i * (n - 1.0) + (n - 1.0) * (n - 2.0)) / (
-            n * (n - 1.0)
-        )
-        sum_l3 += weight * sorted_data[i]
-    l3 = sum_l3 / 3.0
-
-    # L-歪度比
-    if abs(l2) > 1e-8:
-        tau3 = l3 / l2
-        # GEV形状パラメータ関係（Hosking et al. 1985）
-        # ξ ≈ 7.859*τ3 + 2.9554*τ3^2
-        shape = 7.859 * tau3 + 2.9554 * tau3**2
-        # 合理的範囲への制約
-        shape = max(-0.5, min(shape, 0.5))
-    else:
-        shape = 0.0  # ガンベル分布
-
-    return shape
-
-
 # =============================================================================
 # 指数平滑: ホルト・ウィンターズ成分
 # =============================================================================
-
-
-@nb.njit(fastmath=True, cache=True)
-def holt_winters_レベル_udf(prices: np.ndarray) -> float:
-    """
-    ホルト・ウィンターズ指数平滑からレベル成分を抽出
-    レベルは時系列の平滑化された局所平均を表す
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    # レベル用適切指数平滑（α = 0.3）
-    alpha = 0.3
-    level = finite_prices[0]  # 最初の観測値で初期化
-
-    for i in range(1, len(finite_prices)):
-        level = alpha * finite_prices[i] + (1 - alpha) * level
-
-    return level
-
-
-@nb.njit(fastmath=True, cache=True)
-def holt_winters_トレンド_udf(prices: np.ndarray) -> float:
-    """
-    ホルト・ウィンターズ指数平滑からトレンド成分を抽出
-    トレンドは時系列の平滑化された局所傾きを表す
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    # 適切二重指数平滑（ホルト法）
-    alpha = 0.3  # レベル平滑
-    beta = 0.1  # トレンド平滑
-
-    # 初期化
-    level = finite_prices[0]
-    trend = finite_prices[1] - finite_prices[0] if len(finite_prices) > 1 else 0.0
-
-    for i in range(1, len(finite_prices)):
-        new_level = alpha * finite_prices[i] + (1 - alpha) * (level + trend)
-        new_trend = beta * (new_level - level) + (1 - beta) * trend
-        level = new_level
-        trend = new_trend
-
-    return trend
 
 
 # =============================================================================
@@ -787,247 +417,14 @@ def holt_winters_トレンド_udf(prices: np.ndarray) -> float:
 # =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True)
-def arima_残差分散_udf(prices: np.ndarray) -> float:
-    """
-    ARIMA(1,1,0) モデルからの残差分散計算
-    ※高速化のためMA(1)成分の非線形推定は行わず、1次差分に対するAR(1)をOLS推定する
-    """
-    if len(prices) < 15:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 15:
-        return np.nan
-
-    # 定常性のための1次差分
-    diff_prices = np.diff(finite_prices)
-
-    if len(diff_prices) < 10:
-        return np.nan
-
-    # 差分にAR(1)モデル適合: Δy_t = φ*Δy_{t-1} + ε_t
-    y = diff_prices[1:]
-    x = diff_prices[:-1]
-
-    # 適切分散計算付OLS推定
-    n = len(y)
-    if n < 5:
-        return np.nan
-
-    sum_x = np.sum(x)
-    sum_y = np.sum(y)
-    sum_xy = np.sum(x * y)
-    sum_x2 = np.sum(x * x)
-
-    # AR係数計算
-    # ▼▼ 修正前: if n * sum_x2 - sum_x**2 != 0: ブランチ
-    # ▼▼ 修正後: if 分岐を廃止し + 1e-10 で保護
-    phi = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x**2 + 1e-10)
-
-    # 残差計算
-    intercept = (sum_y - phi * sum_x) / n
-    residuals = y - (intercept + phi * x)
-
-    # 残差分散（不偏推定量）
-    # ▼▼ 修正後: なぜ n-2 なのかの根拠コメント（ddof=2）を追加
-    # AR(1)+定数項でパラメータ2つ分の自由度を消費するため (ddof=2)
-    residual_variance = np.sum(residuals**2) / (n - 2)
-
-    return residual_variance
-
-
 # =============================================================================
 # カルマンフィルタ成分
 # =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True)
-def kalman_状態推定_udf(prices: np.ndarray) -> float:
-    """
-    価格レベル用カルマンフィルタ状態推定
-    ノイズ低減による基礎となる真の価格レベル推定
-    """
-    if len(prices) < 5:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 5:
-        return np.nan
-
-    # 局所レベルモデル用適切カルマンフィルタ
-    # 状態: x_t = x_{t-1} + w_t (ランダムウォーク)
-    # 観測: y_t = x_t + v_t (観測ノイズ)
-
-    # 初期化
-    x = finite_prices[0]  # 初期状態推定
-    P = 1.0  # 初期状態分散
-
-    # プロセスと観測ノイズ分散推定
-    if len(finite_prices) > 1:
-        # ▼▼ 修正前: diff_var = np.var(np.diff(finite_prices)) / obs_var = np.var(finite_prices)
-        # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当) に置換
-        diff_vals = np.diff(finite_prices)
-        n_diff = len(diff_vals)
-        n_prices = len(finite_prices)
-
-        diff_var = np.var(diff_vals) * (n_diff / (n_diff - 1.0)) if n_diff > 1 else 0.0
-        obs_var = (
-            np.var(finite_prices) * (n_prices / (n_prices - 1.0))
-            if n_prices > 1
-            else 0.0
-        )
-
-        Q = max(diff_var, obs_var * 0.01)  # プロセスノイズ
-        R = obs_var * 0.1  # 観測ノイズ（信号の10%）
-    else:
-        Q = 1.0
-        R = 0.1
-
-    # カルマンフィルタ再帰
-    for i in range(1, len(finite_prices)):
-        # 予測ステップ
-        x_pred = x  # x_{t|t-1} = x_{t-1|t-1} (ランダムウォーク)
-        P_pred = P + Q  # P_{t|t-1} = P_{t-1|t-1} + Q
-
-        # 更新ステップ
-        K = P_pred / (P_pred + R)  # カルマンゲイン
-        x = x_pred + K * (finite_prices[i] - x_pred)  # 更新状態推定
-        P = (1 - K) * P_pred  # 更新状態分散
-
-    return x
-
-
 # =============================================================================
 # 局所回帰（LOWESS）と頑健回帰
 # =============================================================================
-
-
-@nb.njit(fastmath=True, cache=True)
-def lowess_適合値_udf(prices: np.ndarray) -> float:
-    """
-    LOWESS（局所重み付け散布図平滑）適合値
-    トレンド推定のための局所回帰
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    n = len(finite_prices)
-    bandwidth = 0.3  # 30%帯域幅
-    h = max(3, int(bandwidth * n))
-
-    # ターゲット点は最後の観測値
-    target_idx = n - 1
-
-    # ターゲット点への距離計算
-    distances = np.abs(np.arange(n) - target_idx)
-
-    # k近傍探索
-    sorted_indices = np.argsort(distances)
-    neighbor_indices = sorted_indices[:h]
-
-    # 近傍抽出
-    x_neighbors = neighbor_indices.astype(np.float64)
-    y_neighbors = finite_prices[neighbor_indices]
-
-    # 三次重み計算
-    max_dist = np.max(distances[neighbor_indices])
-    # ▼▼ 修正前: if max_dist > 0: / weights = np.zeros(h)
-    # ▼▼ 修正後: 1e-10によるゼロ除算保護と dtype=np.float64 の明記（ルール5, 8）
-    if max_dist > 1e-10:
-        weights = np.zeros(h, dtype=np.float64)
-        for i in range(h):
-            u = distances[neighbor_indices[i]] / max_dist
-            if u < 1.0:
-                # 三次重み関数（1.0でfloat明記）
-                weights[i] = (1.0 - u**3) ** 3
-            else:
-                weights[i] = 0.0
-    else:
-        weights = np.ones(h, dtype=np.float64)
-
-    # 重み付き最小二乗回帰
-    if len(x_neighbors) >= 2:
-        # 重み付き平均
-        sum_w = np.sum(weights)
-        # ▼▼ 修正前: if sum_w > 0: ... else: fitted_value = np.mean(y_neighbors)
-        # ▼▼ 修正後: ロジック整理（微小値保護とelseブランチの明示化）
-        if sum_w > 1e-10:
-            x_mean = np.sum(weights * x_neighbors) / sum_w
-            y_mean = np.sum(weights * y_neighbors) / sum_w
-
-            # 重み付き回帰係数
-            numerator = np.sum(
-                weights * (x_neighbors - x_mean) * (y_neighbors - y_mean)
-            )
-            denominator = np.sum(weights * (x_neighbors - x_mean) ** 2)
-
-            if denominator > 1e-10:
-                slope = numerator / denominator
-                intercept = y_mean - slope * x_mean
-                fitted_value = intercept + slope * target_idx
-            else:
-                fitted_value = y_mean
-        else:
-            fitted_value = np.mean(y_neighbors)
-    else:
-        fitted_value = finite_prices[-1]
-
-    return fitted_value
-
-
-@nb.njit(fastmath=True, cache=True)
-def theil_sen_傾き_udf(prices: np.ndarray) -> float:
-    """
-    頑健傾き推定のためのタイル・セン推定量
-    外れ値に耐性のある全ペアワイズ傾きの中央値
-    """
-    if len(prices) < 10:
-        return np.nan
-
-    finite_prices = prices[np.isfinite(prices)]
-    n = len(finite_prices)
-    if n < 10:
-        return np.nan
-
-    # ▼▼ 修正前: slopes = [] ... slopes.append(slope)
-    # ▼▼ 修正後: Numpy配列の事前確保（Pre-allocation）による超高速化（ルール6）
-    max_pairs = min(1000, (n * (n - 1)) // 2)  # 効率用制限
-    slopes = np.zeros(max_pairs, dtype=np.float64)
-    slope_idx = 0
-
-    if max_pairs < (n * (n - 1)) // 2:
-        # ペア一様サンプリング
-        step = max(1, ((n * (n - 1)) // 2) // max_pairs)
-        count = 0
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                if count % step == 0 and slope_idx < max_pairs:
-                    if j != i:  # ゼロ除算回避
-                        slopes[slope_idx] = (
-                            finite_prices[j] - finite_prices[i]
-                        ) / float(j - i)
-                        slope_idx += 1
-                count += 1
-    else:
-        # 全ペア計算
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                if slope_idx < max_pairs:
-                    slopes[slope_idx] = (finite_prices[j] - finite_prices[i]) / float(
-                        j - i
-                    )
-                    slope_idx += 1
-
-    if slope_idx > 0:
-        # 実際に計算された部分のみで中央値を計算
-        return np.median(slopes[:slope_idx])
-    else:
-        return np.nan
 
 
 class CalculationEngine:
@@ -1313,7 +710,7 @@ class CalculationEngine:
             if group_name == "basic_stats":
                 group_result_lf = self._create_basic_stats_features(lazy_frame, timeframe)
             elif group_name == "composite":
-                group_result_lf = self._create_composite_features(lazy_frame)
+                group_result_lf = self._create_composite_features(lazy_frame, timeframe)
             elif group_name == "timeseries":
                 group_result_lf = self._create_timeseries_features(lazy_frame)
             elif group_name == "exponential_arima":
@@ -1391,19 +788,37 @@ class CalculationEngine:
         stabilization_exprs = []
 
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【修正 (Phase 5)】EWM 状態汚染防止と inf 入力時の bounds 維持
+            #
+            # 旧実装の問題:
+            #   1) safe_col = pl.when(is_infinite).then(None).otherwise(col)
+            #      で inf は null 化していたが、NaN はそのまま残していた。
+            #      Polars の ewm_mean(ignore_nulls=True) は null だけ無視するが
+            #      NaN は値として扱い、後続を全部 NaN 化する (状態汚染)。
+            #   2) inf 位置でも ewm_mean / ewm_std の出力が null になるため、
+            #      その時点での bounds が null となり、pl.when(col==inf).then(upper_bound)
+            #      が機能せず inf がそのまま流れていた。
+            #
+            # 修正:
+            #   - safe_col に .fill_nan(None) を追加 → NaN も null 化 (状態汚染防止)
+            #   - ewm_mean / ewm_std に .forward_fill() を追加 → inf 位置でも有効 bounds
+            # ─────────────────────────────────────────────────────────────
             safe_col = (
                 pl.when(pl.col(col_name).is_infinite())
                 .then(None)
                 .otherwise(pl.col(col_name))
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
             )
 
             # ▼▼ 修正後: ハードコードを排除し、half_life変数を使用
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = safe_col.ewm_mean(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = safe_col.ewm_std(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
 
             upper_bound = ewm_mean + 5 * ewm_std
             lower_bound = ewm_mean - 5 * ewm_std
@@ -1545,19 +960,25 @@ class CalculationEngine:
         stabilization_exprs = []
 
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【修正 (Phase 5)】EWM 状態汚染防止と inf 入力時の bounds 維持
+            # 詳細は apply_quality_assurance_to_group のコメント参照。
+            # ─────────────────────────────────────────────────────────────
             safe_col = (
                 pl.when(pl.col(col_name).is_infinite())
                 .then(None)
                 .otherwise(pl.col(col_name))
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
             )
 
             # ▼▼ 修正後: ハードコードを排除し、half_life変数を使用
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = safe_col.ewm_mean(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = safe_col.ewm_std(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
 
             upper_bound = ewm_mean + 5 * ewm_std
             lower_bound = ewm_mean - 5 * ewm_std
@@ -1626,11 +1047,24 @@ class CalculationEngine:
 
         return lazy_frame.with_columns(exprs)
 
-    def _create_composite_features(self, lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
-        """複合計算系特徴量の計算（高速化対応）"""
+    def _create_composite_features(
+        self, lazy_frame: pl.LazyFrame, timeframe: str = "M1"
+    ) -> pl.LazyFrame:
+        """複合計算系特徴量の計算（高速化対応）
+
+        【Phase 5 修正 (#36)】既存バグ修正:
+            旧実装は `lookback_bars` 変数を未定義のまま L1089 で参照しており、
+            composite グループの計算で NameError を発生させていた。
+            timeframe 引数を追加し、メソッド内で lookback_bars を計算するよう修正。
+            (他 engine の同型メソッドと同じパターン)
+        """
         exprs = []
         p = self.prefix
         atr_safe = self._get_atr_safe_expr()
+
+        # 【Phase 5 修正】timeframe に応じた lookback_bars (1日分のバー数) を計算
+        # M0.5: 2880, M1: 1440, M3: 480, ..., D1: 1 等
+        lookback_bars = self.config.timeframe_bars_per_day.get(timeframe, 1440)
 
         # 複合計算系 - ゼロ除算防止(1e-10)とATRスケール不変性の適用
         for window in [20, 50]:

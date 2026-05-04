@@ -859,15 +859,41 @@ class CalculationEngine:
         stabilization_exprs = []
         for col_name in feature_columns:
             col_expr = pl.col(col_name)
-            safe_col = pl.when(col_expr.is_infinite()).then(None).otherwise(col_expr)
+            # ─────────────────────────────────────────────────────────────
+            # 【修正】EWM 状態汚染防止と inf 入力時の bounds 維持
+            #
+            # 旧実装の問題:
+            #   1) safe_col = pl.when(is_infinite).then(None).otherwise(col)
+            #      で inf は null 化していたが、NaN はそのまま残していた。
+            #      Polars の ewm_mean(ignore_nulls=True) は null だけ無視するが
+            #      NaN は値として扱い、後続を全部 NaN 化する (状態汚染)。
+            #      → 一度 NaN が入った特徴量は以降ずっと NaN bounds で動作。
+            #
+            #   2) inf 位置でも ewm_mean / ewm_std の出力が null になるため、
+            #      その時点での p01/p99 が null となり、
+            #      pl.when(col==inf).then(p99) が機能せず inf がそのまま流れていた。
+            #      検証で「engine_1_E 出力に inf が 4/5 件で残る」を確認済。
+            #
+            # 修正:
+            #   - safe_col で NaN も null 化する (.fill_nan(None)) → EWM 状態汚染防止
+            #   - ewm_mean / ewm_std に .forward_fill() を適用 → inf 位置でも
+            #     直前の有効 bounds が引き継がれて inf を正しく clip できる
+            # ─────────────────────────────────────────────────────────────
+            safe_col = (
+                pl.when(col_expr.is_infinite())
+                .then(None)
+                .otherwise(col_expr)
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
+            )
 
             # ▼▼ 修正後: ハードコード(1440)を half_life に置換
+            #          + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = safe_col.ewm_mean(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = safe_col.ewm_std(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
 
             p01 = ewm_mean - 5.0 * ewm_std
             p99 = ewm_mean + 5.0 * ewm_std
@@ -1016,16 +1042,29 @@ class CalculationEngine:
 
         stabilization_exprs = []
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【Phase 5 F群: dead code 同期 (#33)】
+            # この旧 apply_quality_assurance は L1904 のコメントアウト呼び出し以外
+            # 誰からも呼ばれていない dead code だが、apply_quality_assurance_to_group
+            # と一貫性を保つため Phase 5 D群と同じ修正を適用 (将来コメント解除時の
+            # ハザード防止)。
+            # ─────────────────────────────────────────────────────────────
             col_expr = pl.col(col_name)
-            safe_col = pl.when(col_expr.is_infinite()).then(None).otherwise(col_expr)
+            safe_col = (
+                pl.when(col_expr.is_infinite())
+                .then(None)
+                .otherwise(col_expr)
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
+            )
 
             # ▼▼ 修正後: ハードコード(1440)を half_life に置換
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = safe_col.ewm_mean(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = safe_col.ewm_std(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
 
             p01 = ewm_mean - 5.0 * ewm_std
             p99 = ewm_mean + 5.0 * ewm_std

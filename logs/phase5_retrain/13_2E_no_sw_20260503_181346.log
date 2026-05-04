@@ -1,0 +1,55 @@
+2026-05-03 18:13:48,908 - INFO - ======================================================================
+2026-05-03 18:13:48,908 - INFO - ⚠️  EXCLUDE_SAMPLE_WEIGHT=1: sample_weight 系を特徴量から除外して実行
+2026-05-03 18:13:48,908 - INFO -     除外する sample_weight 系の数: 27
+2026-05-03 18:13:48,908 - INFO - ======================================================================
+2026-05-03 18:13:48,909 - INFO - ======================================================================
+2026-05-03 18:13:48,909 - INFO - 2_E_hf_meta_model_trainer: HF メタモデル学習開始
+2026-05-03 18:13:48,909 - INFO - ======================================================================
+2026-05-03 18:13:48,909 - INFO - 
+[Step 0] ラベル生成パラメータ読み込み中...
+2026-05-03 18:13:48,909 - INFO -   PT 倍率: 1.0 / SL 倍率: 5.0
+2026-05-03 18:13:48,909 - INFO -   最大保有分数: 60 / ATR 閾値: 0.8
+2026-05-03 18:13:48,909 - INFO - 
+[Step 1] HF 特徴量ファイル読み込み中...
+2026-05-03 18:13:48,916 - INFO -   フィルタ済み HF 特徴量数: 1967
+2026-05-03 18:13:49,255 - INFO -   発見した HF parquet ファイル数: 48
+2026-05-03 18:13:49,256 - INFO -   ベースファイル: /workspace/data/XAUUSD/stratum_2_features_validated/feature_value_a_vast_universeA/features_e1a_H1.parquet (tf=H1)
+2026-05-03 18:13:49,275 - INFO - 
+[Step 1.5] OHLCV 結合中...
+2026-05-03 18:13:49,279 - INFO -   OHLCV 結合完了 (source: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=H1, disc-aware)
+2026-05-03 18:13:49,279 - INFO - 
+[Step 2] LF スコア結合中...
+2026-05-03 18:13:49,282 - INFO -   LF スコア (['lf_short_score', 'lf_mid_score', 'lf_long_score']) を backward join で結合完了
+2026-05-03 18:13:49,282 - INFO - 
+[Step 3] ATR 算出中 (period=13, Wilder RMA, disc-aware)...
+2026-05-03 18:13:49,283 - INFO - 
+[Step 4] 追加 HF 特徴量を join_asof で結合中...
+2026-05-03 18:13:49,982 - INFO - 
+[Step 5] データを collect 中...
+2026-05-03 18:14:35,877 - INFO -   collect 完了: 28433 行 × 3986 カラム
+2026-05-03 18:14:35,878 - INFO - 
+[Step 6] トリプルバリアラベル生成中...
+  Triple-Barrier labeling:   0%|          | 0/28433 [00:00<?, ?it/s]  Triple-Barrier labeling:  67%|██████▋   | 19013/28433 [00:00<00:00, 190109.33it/s]                                                                                    2026-05-03 18:14:36,154 - INFO -   ATR 収縮フィルター: 1021 行除外 → 27412 行残存
+2026-05-03 18:14:36,155 - INFO -   ポジティブレート: 0.1185
+2026-05-03 18:14:36,155 - INFO - 
+[Step 7] 特徴量カラム選定中...
+2026-05-03 18:14:36,170 - INFO -   【比較実験モード】 EXCLUDE_SAMPLE_WEIGHT=1: sample_weight 系 0 個を候補から除外
+2026-05-03 18:14:36,190 - INFO -   使用特徴量数: 1970
+2026-05-03 18:14:36,944 - INFO - 
+[Step 8] Purged & Embargoed KFold CV で LightGBM 学習中...
+2026-05-03 18:14:37,126 - INFO -   Fold 1/5: train=21884, val=5482
+2026-05-03 18:15:29,509 - INFO -   Fold 2/5: train=21852, val=5482
+2026-05-03 18:16:18,528 - INFO -   Fold 3/5: train=21829, val=5482
+2026-05-03 18:17:02,954 - INFO -   Fold 4/5: train=21894, val=5482
+2026-05-03 18:17:39,532 - INFO -   Fold 5/5: train=21859, val=5484
+2026-05-03 18:18:45,953 - INFO - 
+  ★ OOF AUC (Purged & Embargoed KFold): 0.7314
+2026-05-03 18:18:45,953 - INFO - 
+[Step 9] Gain > 0 の特徴量を保存中...
+2026-05-03 18:18:45,953 - INFO -   生き残り特徴量数: 1801 / 1970
+2026-05-03 18:18:45,954 - INFO -   (sample_weight 系は候補に含まれていません — EXCLUDE_SAMPLE_WEIGHT=1 モード)
+
+2026-05-03 18:18:45,965 - INFO -   保存完了: /workspace/data/XAUUSD/stratum_3_artifacts/survived_hf_features_no_sw.txt
+2026-05-03 18:18:45,966 - INFO -   (通常版と比較: diff /workspace/data/XAUUSD/stratum_3_artifacts/survived_hf_features.txt /workspace/data/XAUUSD/stratum_3_artifacts/survived_hf_features_no_sw.txt)
+2026-05-03 18:18:45,966 - INFO - 
+2_E_hf_meta_model_trainer: 処理完了

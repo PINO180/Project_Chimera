@@ -18,6 +18,7 @@ LF環境スコア生成器（旧: 02_M1_walk_forward_validator.py の後継）
 import sys
 import warnings
 import argparse
+import logging
 from pathlib import Path
 from datetime import timedelta, datetime
 
@@ -41,6 +42,12 @@ from blueprint import (
     WF_TARGET_SHIFT,
     WF_CONFIG,
 )
+
+# [Phase 6 修正] ログ統一: 2_A/2_B と同じ logging 形式に揃える
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # 定数
@@ -188,7 +195,7 @@ def run_wf_for_group(
     if test_mode:
         splits = splits[:2]
 
-    print(
+    logger.info(
         f"  [{group}] folds={len(splits)}, "
         f"train_months={train_months}, val_months={val_months}, "
         f"purge_days={purge_days}, embargo_days={embargo_days}"
@@ -205,7 +212,7 @@ def run_wf_for_group(
         # ターゲットが欠損する末尾行を除外（shiftによるNaN）
         valid_train = y_train.notna()
         if valid_train.sum() < LGP_PARAMS["min_data_in_leaf"] * 2:
-            print(f"  [{group}] fold {fold_i + 1}: 訓練データ不足。スキップ。")
+            logger.info(f"  [{group}] fold {fold_i + 1}: 訓練データ不足。スキップ。")
             continue
 
         X_train = X_train[valid_train]
@@ -219,7 +226,7 @@ def run_wf_for_group(
             preds = model.predict_proba(X_val)[:, 1].astype(np.float32)
             oof_scores.loc[val_idx] = preds
 
-        print(
+        logger.info(
             f"  [{group}] fold {fold_i + 1}/{len(splits)} done | "
             f"train={len(X_train)}, val={len(X_val)}"
         )
@@ -232,9 +239,9 @@ def run_wf_for_group(
 # ─────────────────────────────────────────────
 
 def main(test_mode: bool) -> None:
-    print("=" * 60)
-    print("2_C_lf_wf_signal_generator.py 開始")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("2_C_lf_wf_signal_generator.py 開始")
+    logger.info("=" * 60)
 
     S3_ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
@@ -248,19 +255,19 @@ def main(test_mode: bool) -> None:
     with open(S3_FILTERED_LF_FEATURES, "r") as f:
         lf_features = [line.strip() for line in f if line.strip()]
 
-    print(f"LF特徴量読み込み: {len(lf_features)} 件")
+    logger.info(f"LF特徴量読み込み: {len(lf_features)} 件")
 
     # ── 2. LF特徴量をグループに分類 ────────────────────────────
     groups = classify_features_by_group(lf_features)
     for g, cols in groups.items():
-        print(f"  {g}: {len(cols)} 特徴量")
+        logger.info(f"  {g}: {len(cols)} 特徴量")
 
     all_lf_features = [f for cols in groups.values() for f in cols]
     if not all_lf_features:
         raise ValueError("グループに分類できるLF特徴量がゼロです。タイムフレームサフィックスを確認してください。")
 
     # ── 3. バリデート済みデータの読み込み ──────────────────────
-    print(f"\nデータ読み込み中: {S2_FEATURES_VALIDATED}")
+    logger.info(f"\nデータ読み込み中: {S2_FEATURES_VALIDATED}")
 
     # M1価格データ（closeカラム）とLF特徴量を結合
     # 全特徴量はM1粒度であることを前提とする（join_asof不要）
@@ -288,7 +295,7 @@ def main(test_mode: bool) -> None:
             schema = pl.read_parquet_schema(p)
             available_cols.update(schema.keys())
         except Exception as e:
-            print(f"Warning: スキーマ読み込み失敗 {p}: {e}")
+            logger.info(f"Warning: スキーマ読み込み失敗 {p}: {e}")
 
     # ── サフィックス付き特徴量名 → parquetベース名 のマッピングを構築 ──
     # 2_Bはテキストにタイムフレームサフィックスを付与して保存しているが、
@@ -310,7 +317,7 @@ def main(test_mode: bool) -> None:
     valid_lf_features = [f for f in all_lf_features if suffixed_to_base[f] in available_cols]
     missing = set(all_lf_features) - set(valid_lf_features)
     if missing:
-        print(f"Warning: {len(missing)} 特徴量がデータ内に見つかりませんでした。スキップします。")
+        logger.info(f"Warning: {len(missing)} 特徴量がデータ内に見つかりませんでした。スキップします。")
 
     if not valid_lf_features:
         raise ValueError("有効なLF特徴量がゼロです。")
@@ -334,7 +341,7 @@ def main(test_mode: bool) -> None:
         try:
             schema = pl.read_parquet_schema(p)
         except Exception as e:
-            print(f"Warning: スキーマ読み込み失敗 {p}: {e}")
+            logger.info(f"Warning: スキーマ読み込み失敗 {p}: {e}")
             continue
 
         # ファイル名末尾からタイムフレームを推測（例: features_e1a_D1 → D1）
@@ -383,12 +390,12 @@ def main(test_mode: bool) -> None:
     # priceとfeatureをtimestampで結合
     data_lf = price_lf.join(feat_lf, on="timestamp", how="left")
 
-    print("データをcollect中（streaming）...")
+    logger.info("データをcollect中（streaming）...")
     # ルール5: collect(engine="streaming")
     base_df = data_lf.collect(engine="streaming").to_pandas()
     base_df["timestamp"] = pd.to_datetime(base_df["timestamp"])
     base_df = base_df.sort_values("timestamp").reset_index(drop=True)
-    print(f"  行数: {len(base_df):,} | カラム数: {len(base_df.columns)}")
+    logger.info(f"  行数: {len(base_df):,} | カラム数: {len(base_df.columns)}")
 
     # ── 4. グループ別ターゲット生成 + OOFスコア生成 ───────────
     all_oof: dict[str, pd.Series] = {}
@@ -398,14 +405,14 @@ def main(test_mode: bool) -> None:
         valid_suffixed = [c for c in cols if c in loaded_suffixed_cols]
 
         if not valid_suffixed:
-            print(f"\n[{group}] 有効な特徴量がないためスキップ。")
+            logger.info(f"\n[{group}] 有効な特徴量がないためスキップ。")
             all_oof[f"{group}_score"] = pd.Series(
                 np.nan, index=base_df.index, dtype=np.float32
             )
             continue
 
-        print(f"\n{'─'*40}")
-        print(f"グループ処理: {group}  ({len(valid_suffixed)} 特徴量)")
+        logger.info(f"\n{'─'*40}")
+        logger.info(f"グループ処理: {group}  ({len(valid_suffixed)} 特徴量)")
 
         # M1粒度shiftでターゲット生成
         target_shift = WF_TARGET_SHIFT[group]
@@ -422,7 +429,7 @@ def main(test_mode: bool) -> None:
         )
         all_oof[f"{group}_score"] = oof.astype(np.float32)
         covered = oof.notna().sum()
-        print(f"  [{group}] OOFカバレッジ: {covered:,} / {len(oof):,} 行")
+        logger.info(f"  [{group}] OOFカバレッジ: {covered:,} / {len(oof):,} 行")
 
     # ── 5. 結果DataFrameの構築 ─────────────────────────────────
     result_df = base_df[["timestamp"]].copy()
@@ -437,19 +444,33 @@ def main(test_mode: bool) -> None:
     )
 
     result_pl.write_parquet(S3_LF_ENVIRONMENT_SCORES)
-    print(f"\nLF環境スコア保存: {S3_LF_ENVIRONMENT_SCORES}")
-    print(f"  カラム: {result_pl.columns}")
-    print(f"  行数  : {len(result_pl):,}")
+    logger.info(f"\nLF環境スコア保存: {S3_LF_ENVIRONMENT_SCORES}")
+    logger.info(f"  カラム: {result_pl.columns}")
+    logger.info(f"  行数  : {len(result_pl):,}")
 
     # ── 7. S3_FINAL_FEATURE_TEAM への保存 ─────────────────────
     # 実際にparquetから読み込んで学習に使えたサフィックス付き特徴量のみを保存
     final_features = sorted(list(loaded_suffixed_cols))
+
+    # [Phase 6 修正] sample_weight 系を LF 最終特徴量から除外
+    # HF 側 (2_E) では EXCLUDE_SAMPLE_WEIGHT=1 採用済だが LF 側は除外漏れがあった。
+    # 過去 (Phase 5 以前) は volume=0 で variance フィルタ自動除外されていたため
+    # 顕在化しなかったが、Phase 6 で volume = tick_count 補完によって sample_weight も
+    # 有意な分散を持ち通過するようになった。LF 側でも明示的に除外する (2_F の二重防御と整合)。
+    sw_features_lf = [f for f in final_features if "sample_weight" in f]
+    if sw_features_lf:
+        logger.info(f"\n[Phase 6 Filter] LF から sample_weight 系 {len(sw_features_lf)} 件を除外:")
+        for f in sw_features_lf:
+            logger.info(f"    - {f}")
+        final_features = [f for f in final_features if "sample_weight" not in f]
+        logger.info(f"  -> Filtered LF features: {len(final_features)}")
+
     with open(S3_FINAL_FEATURE_TEAM, "w") as f:
         for feat in final_features:
             f.write(feat + "\n")
 
-    print(f"最終LF特徴量チーム保存: {S3_FINAL_FEATURE_TEAM} ({len(final_features)} 件)")
-    print("\n2_C_lf_wf_signal_generator.py 正常終了。")
+    logger.info(f"最終LF特徴量チーム保存: {S3_FINAL_FEATURE_TEAM} ({len(final_features)} 件)")
+    logger.info("\n2_C_lf_wf_signal_generator.py 正常終了。")
 
 
 if __name__ == "__main__":

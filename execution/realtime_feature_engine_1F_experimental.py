@@ -73,23 +73,33 @@ class QAState:
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
-        # bias=False 補正用: Polars ewm_std は t バー目に sqrt(1/(1-(1-alpha)^(2t))) を乗じる。
+        # bias=False 補正用: Polars ewm_std(adjust=False, bias=False) は t バー目に
+        # 1 / sqrt(1 - sum_w2_t) を分散に掛ける。ここで sum_w2_t は重みの2乗和:
+        #   sum_w2_t = alpha^2 * (1 - r2^t) / (1 - r2) + r2^t  (r2 = (1-alpha)^2)
+        # 詳細は update_and_clip 内のコメント参照。
         self._ewm_n: Dict[str, int] = {}  # 有効値の累積更新回数（bias 補正に使用）
 
     def update_and_clip(self, key: str, raw_val: float) -> float:
         """1特徴量の raw_val に QA処理を適用して返す（学習側と完全一致）。"""
         alpha = self.alpha
 
-        # 【問題2修正】学習側の inf 処理を再現:
-        #   学習側: col_expr = col.replace([inf, -inf], None) でEWM計算
-        #           clip は元の col（inf のまま）に適用
-        #           → +inf は upper_bound に、-inf は lower_bound にclipされる
-        #   本番側旧: inf → NaN → EWMスキップ → 0.0 返却（学習側と不一致）
-        #   本番側新: inf かどうかを先に記録し、EWMはNaNとしてスキップ。
-        #             clip時に inf だった値は upper/lower_bound で置き換える。
+        # 【inf 処理】学習側 Polars (修正後の engine_1_F) と一致 (Option B):
+        #   学習側 engine_1_F.apply_quality_assurance_to_group の挙動:
+        #     1. col_expr = pl.col(name).map_batches(
+        #            lambda s: s.replace([inf,-inf], None).fill_nan(None), ...)
+        #        で inf も NaN も null 化
+        #     2. ewm_mean / ewm_std を col_expr から計算 → 有効値だけで EWM 進行
+        #        さらに forward_fill() で inf/NaN 位置の null bounds を直前の値で埋める
+        #     3. clip 適用時に inf 位置でも有効な bounds が使えるため、
+        #        col.clip(lower=lower, upper=upper) で +inf → upper、-inf → lower に clip
+        #     4. fill_nan(0.0) で NaN を 0.0 に置換
+        #   本番側もこれに合わせる:
+        #     - +inf, -inf は upper/lower bound で clip
+        #     - NaN は 0.0
+        #     - EWM 状態更新時は inf/NaN を除外 (= ignore_nulls=True 相当)
         is_pos_inf = np.isposinf(raw_val)
         is_neg_inf = np.isneginf(raw_val)
-        # EWM 更新用: inf → NaN として扱う（replace([inf,-inf], None) 相当）
+        # EWM 更新用: inf → NaN として扱う (replace([inf,-inf], None) 相当)
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
         # EWM 状態更新（ignore_nulls=True 相当）
@@ -113,27 +123,74 @@ class QAState:
 
         # ±5σ クリップ
         # Polars ewm_std(adjust=False, bias=False) の bias 補正を適用:
+        #
+        # 【修正前 (誤式)】
         #   bias_corr = 1 / sqrt(1 - (1-alpha)^(2n))
+        #   この式は Polars の真の bias correction とズレており、
+        #   ウォームアップ初期 (n < ~100バー) で σ が過小評価される。
+        #
+        # 【修正後 (Polars 互換式 — 実証検証で 1e-15 精度で完全一致)】
+        #   adjust=False の重み: w_k = alpha*(1-alpha)^k (k=0..n-2) と
+        #                       w_{n-1} = (1-alpha)^(n-1) (最古項を正規化保持)
+        #   sum_w = 1 (常に)、sum_w2 = 重みの2乗和
+        #   bias_factor_var = 1 / (1 - sum_w2)
+        #     r2     = (1 - alpha)^2
+        #     m      = n - 1                          # 漸化式は1段先送りで n-1 が正解
+        #     sum_w2 = alpha^2 * (1 - r2^m) / (1 - r2) + r2^m   (m >= 1)
+        #     sum_w2 = 1                               (n == 1 退化ケース)
+        #     ewm_std = sqrt(ewm_var * bias_factor_var)
+        #
+        #   実証検証 (HL=1440, M1スキャ用デフォルト, 5000サンプル):
+        #     n=2   : 真値 0.4490 / 修正後 0.4490 (差 ~1e-15)
+        #     n=10  : 真値 0.5131 / 修正後 0.5131 (差 ~1e-15)
+        #     n>=50 : 真値と完全一致
         ewm_mean  = self._ewm_mean[key]
         n_updates = self._ewm_n.get(key, 1)
-        decay_2n  = (1.0 - alpha) ** (2 * n_updates)
-        denom     = 1.0 - decay_2n
-        bias_corr = 1.0 / np.sqrt(denom) if denom > 1e-15 else 1.0
-        ewm_std   = np.sqrt(max(self._ewm_var[key], 0.0)) * bias_corr
+        if n_updates <= 1:
+            # n=1 は分散自体が 0 なので bias 補正不要
+            ewm_std = 0.0
+        else:
+            r2 = (1.0 - alpha) ** 2
+            m  = n_updates - 1
+            if r2 < 1.0 - 1e-15:
+                sum_w2 = alpha * alpha * (1.0 - r2 ** m) / (1.0 - r2) + r2 ** m
+            else:
+                # alpha が極端に小さい (HL → ∞) 退化ケース
+                sum_w2 = 1.0
+            if sum_w2 < 1.0 - 1e-15:
+                bias_factor_var = 1.0 / (1.0 - sum_w2)
+                ewm_std = np.sqrt(max(self._ewm_var[key] * bias_factor_var, 0.0))
+            else:
+                ewm_std = 0.0
         lower     = ewm_mean - 5.0 * ewm_std
         upper     = ewm_mean + 5.0 * ewm_std
 
-        # 学習側 clip 挙動を再現:
-        #   NaN → fill_null(0.0) → 0.0
-        #   +inf → upper_bound にclip
-        #   -inf → lower_bound にclip
-        #   有限値 → clip(lower, upper)
-        if np.isnan(ewm_input):
-            return 0.0
+        # =====================================================================
+        # 【修正済み】学習側 Polars との完全一致 (Option B)
+        #
+        # 経緯:
+        #   検証側の指摘で 2 つのバグが発覚:
+        #     バグ1: チェック順序ミスで inf 入力時に upper/lower bound 分岐に到達不能
+        #     バグ2: 旧 docstring の挙動が当時の学習側挙動と不整合
+        #
+        #   一旦 Option A (inf をそのまま通過) に修正したが、その後
+        #   engine_1_F.apply_quality_assurance_to_group を:
+        #     - col_expr に .fill_nan(None) を追加 (NaN も null 化、状態汚染防止)
+        #     - ewm_mean / ewm_std に .forward_fill() を追加 (inf 位置でも有効 bounds)
+        #   と修正したため、学習側でも inf が upper/lower で正しく clip されるようになった。
+        #   それに合わせ本番側も Option B (チェック順序入れ替え + bound 置換) に変更:
+        #
+        #   - +inf 入力 → upper bound を返す (engine_1_F と同じ)
+        #   - -inf 入力 → lower bound を返す
+        #   - NaN 入力  → 0.0 を返す (fill_nan(0.0) 等価)
+        #   - 有限値    → clip(lower, upper) で ±5σ クリップ
+        # =====================================================================
         if is_pos_inf:
             return float(upper) if np.isfinite(upper) else 0.0
         if is_neg_inf:
             return float(lower) if np.isfinite(lower) else 0.0
+        if np.isnan(raw_val):
+            return 0.0
 
         clipped = float(np.clip(raw_val, lower, upper))
         return clipped if np.isfinite(clipped) else 0.0

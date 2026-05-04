@@ -1,0 +1,67 @@
+2026-05-03 13:31:11,757 - INFO - === 第3工程: S1_1_C_ENRICH パイプライン開始 ===
+2026-05-03 13:31:11,814 - INFO - --- 時間軸 'D1' の処理を開始します ---
+2026-05-03 13:31:11,875 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:11,886 - INFO - 'D1' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=D1
+2026-05-03 13:31:12,250 - INFO - 'D1' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:12,295 - INFO - --- 時間軸 'H1' の処理を開始します ---
+2026-05-03 13:31:12,333 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:12,339 - INFO - 'H1' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=H1
+2026-05-03 13:31:12,455 - INFO - 'H1' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:12,496 - INFO - --- 時間軸 'H12' の処理を開始します ---
+2026-05-03 13:31:12,534 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:12,540 - INFO - 'H12' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=H12
+2026-05-03 13:31:12,602 - INFO - 'H12' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:12,647 - INFO - --- 時間軸 'H4' の処理を開始します ---
+2026-05-03 13:31:12,684 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:12,689 - INFO - 'H4' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=H4
+2026-05-03 13:31:12,756 - INFO - 'H4' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:12,803 - INFO - --- 時間軸 'H6' の処理を開始します ---
+2026-05-03 13:31:12,837 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:12,842 - INFO - 'H6' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=H6
+2026-05-03 13:31:12,905 - INFO - 'H6' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:12,955 - INFO - --- 時間軸 'M0.5' の処理を開始します ---
+2026-05-03 13:31:12,995 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:13,001 - INFO - 'M0.5' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M0.5
+2026-05-03 13:31:19,004 - INFO - 'M0.5' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:19,053 - INFO - --- 時間軸 'M1' の処理を開始します ---
+2026-05-03 13:31:19,104 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:19,111 - INFO - 'M1' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M1
+2026-05-03 13:31:21,905 - INFO - 'M1' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:21,948 - INFO - --- 時間軸 'M15' の処理を開始します ---
+2026-05-03 13:31:21,984 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:21,990 - INFO - 'M15' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M15
+2026-05-03 13:31:22,287 - INFO - 'M15' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:22,329 - INFO - --- 時間軸 'M3' の処理を開始します ---
+2026-05-03 13:31:22,365 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:22,371 - INFO - 'M3' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M3
+2026-05-03 13:31:23,377 - INFO - 'M3' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:23,420 - INFO - --- 時間軸 'M30' の処理を開始します ---
+2026-05-03 13:31:23,459 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:23,467 - INFO - 'M30' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M30
+2026-05-03 13:31:23,658 - INFO - 'M30' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:23,704 - INFO - --- 時間軸 'M5' の処理を開始します ---
+2026-05-03 13:31:23,744 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:23,751 - INFO - 'M5' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M5
+2026-05-03 13:31:24,604 - INFO - 'M5' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:24,649 - INFO - --- 時間軸 'M8' の処理を開始します ---
+2026-05-03 13:31:24,685 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:24,690 - INFO - 'M8' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=M8
+2026-05-03 13:31:25,188 - INFO - 'M8' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:25,233 - INFO - --- 時間軸 'MN' の処理を開始します ---
+2026-05-03 13:31:25,268 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:25,274 - INFO - 'MN' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=MN
+2026-05-03 13:31:25,322 - INFO - 'MN' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:31:25,366 - INFO - --- 時間軸 'tick' の処理を開始します ---
+2026-05-03 13:31:25,423 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:31:29,730 - INFO - 'tick' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=tick
+2026-05-03 13:37:28,609 - INFO - 'tick' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:37:28,783 - INFO - --- 時間軸 'W1' の処理を開始します ---
+2026-05-03 13:37:28,823 - INFO - 不要なカラムを削除しました: ['tick_count', 'bid', 'ask', 'spread']
+2026-05-03 13:37:28,829 - INFO - 'W1' を保存中: /workspace/data/XAUUSD/stratum_1_base/master_processed/timeframe=W1
+2026-05-03 13:37:28,879 - INFO - 'W1' の処理と保存が完了しました。メモリを開放します。
+2026-05-03 13:37:28,920 - INFO - ✅ 全時間軸のデータの保存が完了しました。
+2026-05-03 13:37:28,960 - INFO - [Phase 6] verify_data() スキップ (時短のため)
+2026-05-03 13:37:28,960 - INFO - ============================================================
+2026-05-03 13:37:28,960 - INFO - ✅ パイプラインが正常に完了しました。総処理時間: 6.3 分
+2026-05-03 13:37:28,960 - INFO - --- 【時間足別 行数サマリー】 ---
+2026-05-03 13:37:28,960 - INFO - ============================================================

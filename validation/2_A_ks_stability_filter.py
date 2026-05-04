@@ -58,6 +58,13 @@ KS_P_VALUE_THRESHOLD = 0.05
 # 必ず保持するメタカラム（プロンプト仕様）
 META_COLS = {"timestamp", "timeframe", "year", "month", "day"}
 
+# 【Phase 5 修正 (#35)】 学習対象から完全に除外するメタデータ列
+# disc 列は s1_1_B_build_ohlcv で追加された週末跨ぎギャップ判定 bool 列であり、
+# ATR 計算や OLS バッファ充填判定に使われるが、学習対象の特徴量ではない。
+# 万が一 engine 出力に disc が混入しても KS 検定対象から確実に除外し、
+# S2_FEATURES_VALIDATED への物理コピーでも除外する (HF パスでも保持しない)。
+EXCLUDE_FROM_TRAINING = {"disc"}
+
 # 旧スクリプトで除外していたOHLCVカラム群
 OHLCV_COLS = {"open", "high", "low", "close", "volume"}
 
@@ -294,8 +301,9 @@ def run_ks_filter() -> None:
         is_lf = tf in LF_ALL_TIMEFRAMES
         is_hf = tf in HF_TIMEFRAMES
 
-        # 特徴量カラム = 全カラム - meta/OHLCV
-        skip_cols = META_COLS | OHLCV_COLS
+        # 特徴量カラム = 全カラム - meta/OHLCV/学習除外
+        # 【Phase 5 修正】disc 等の学習除外メタデータも除外
+        skip_cols = META_COLS | OHLCV_COLS | EXCLUDE_FROM_TRAINING
         feature_cols = [c for c in schema.names if c not in skip_cols]
 
         path_str = str(path)
@@ -440,7 +448,8 @@ def run_ks_filter() -> None:
                 schema = pq.read_schema(first_file)
             else:
                 schema = pq.read_schema(path)
-            all_cols = schema.names  # 全カラムを保持
+            # 【Phase 5 修正 (#35)】 EXCLUDE_FROM_TRAINING (disc 等) は HF コピーでも除外
+            all_cols = [c for c in schema.names if c not in EXCLUDE_FROM_TRAINING]
             _save_filtered(path, all_cols)
         except Exception as e:
             logger.error(f"HFコピー失敗: {path.name} - {e}")

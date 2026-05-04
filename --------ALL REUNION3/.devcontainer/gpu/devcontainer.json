@@ -1,0 +1,62 @@
+{
+    "name": "GPU Hermes Talaria",
+    // Dockerfileからビルド
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "../.."
+    },
+    // ワークスペースのマウント設定
+    "workspaceFolder": "/workspace",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+    ],
+    // time zoneの変更
+    "containerEnv": {
+        "TZ": "Asia/Tokyo"
+    },
+    // GPUを割り当てるための引数を追加
+    "remoteUser": "hermes_talaria",
+    "runArgs": [
+        "--name=hermes_talaria",
+        "--gpus=all",
+        "--memory=64g",
+        "--memory-swap=64g",
+        "--shm-size=2g"
+    ],
+    // VS Codeの便利な設定
+    "customizations": {
+        "vscode": {
+            // コンテナの「デフォルト値」となる設定
+            "settings": {
+                // Pythonインタプリタのパス指定 (これは正しいです)
+                "python.defaultInterpreterPath": "/opt/conda/bin/python",
+                // ターミナル起動時にconda環境を有効化
+                "python.terminal.activateEnvironment": true
+            },
+            // コンテナ起動時に自動インストールする拡張機能リスト
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter",
+                "charliermarsh.ruff" 
+            ]
+        }
+    },
+
+    // コンテナ作成後に実行されるコマンドを、所有権問題の解決策に書き換える
+    "postCreateCommand": "git config --global --add safe.directory /workspace",
+    
+    // コンテナ内のポートを手元のPCに転送
+    "forwardPorts": [
+        8888,
+        8787
+    ],
+    "portsAttributes": {
+        "8888": {
+            "label": "JupyterLab"
+        },
+        "8787": {
+            "label": "Dask Dashboard"
+        }
+    }
+}

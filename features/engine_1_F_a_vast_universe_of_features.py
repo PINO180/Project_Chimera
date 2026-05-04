@@ -752,19 +752,37 @@ class CalculationEngine:
         stabilization_exprs = []
 
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【修正】EWM 状態汚染防止と inf 入力時の bounds 維持
+            #
+            # 旧実装の問題:
+            #   1) col_expr = ... .replace([inf,-inf], None) で inf は null 化していたが、
+            #      NaN はそのまま残していた。Polars の ewm(ignore_nulls=True) は
+            #      null だけ無視するが NaN は値として扱い、後続を全部 NaN 化する (状態汚染)。
+            #
+            #   2) inf 位置でも ewm_mean / ewm_std の出力が null になるため、
+            #      その時点での lower/upper bound が null となり、
+            #      pl.col(col_name).clip(null, null) は no-op で inf がそのまま流れていた。
+            #      検証で「engine_1_F 出力に inf が 4/5 件で残る」を確認済。
+            #
+            # 修正:
+            #   - .fill_nan(None) を追加 → NaN も null 化して EWM 状態汚染を防ぐ
+            #   - .forward_fill() を ewm_mean/std 末尾に追加 → inf/NaN 位置でも
+            #     直前の有効 bounds が引き継がれて inf を正しく clip できる
+            # ─────────────────────────────────────────────────────────────
             col_expr = pl.col(col_name).map_batches(
-                lambda s: s.replace([np.inf, -np.inf], None),
+                lambda s: s.replace([np.inf, -np.inf], None).fill_nan(None),  # ★ NaN も null 化
                 return_dtype=pl.Float64,
             )
 
             # ▼▼ 修正: half_life=half_life に置き換え
-            # 修正後
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = col_expr.ewm_mean(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = col_expr.ewm_std(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
 
             lower_bound = ewm_mean - 5.0 * ewm_std
             upper_bound = ewm_mean + 5.0 * ewm_std
@@ -891,19 +909,25 @@ class CalculationEngine:
 
         stabilization_exprs = []
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【Phase 5 F群: dead code 同期 (#33)】
+            # この旧 apply_quality_assurance は呼び出し元なし dead code だが、
+            # apply_quality_assurance_to_group と一貫性を保つため Phase 5 D群と
+            # 同じ修正を適用 (将来うっかり呼び戻された時のハザード防止)。
+            # ─────────────────────────────────────────────────────────────
             col_expr = pl.col(col_name).map_batches(
-                lambda s: s.replace([np.inf, -np.inf], None),
+                lambda s: s.replace([np.inf, -np.inf], None).fill_nan(None),  # ★ NaN も null 化
                 return_dtype=pl.Float64,
             )
 
             # ▼▼ 修正: half_life=half_life に置き換え
-            # 修正後
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = col_expr.ewm_mean(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = col_expr.ewm_std(
                 half_life=half_life, ignore_nulls=True, adjust=False
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
             lower_bound = ewm_mean - 5.0 * ewm_std
             upper_bound = ewm_mean + 5.0 * ewm_std
 

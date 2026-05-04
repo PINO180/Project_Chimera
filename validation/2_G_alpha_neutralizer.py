@@ -294,10 +294,28 @@ def main(test_mode: bool) -> None:
 
     # 出力ディレクトリの準備
     blueprint.S5_ALPHA.mkdir(parents=True, exist_ok=True)
+    # [Phase 6] 起動時の全削除を resume モードに変更
+    # 既存の有効な出力 (size > 0) はスキップ、0KB / 不在のみ処理する
+    # ★ 完全に最初からやり直したい場合は --clean フラグを付ける
+    clean_flag = getattr(main, "_clean_flag", False)
     if blueprint.S5_NEUTRALIZED_ALPHA_SET.exists():
-        print(f"[INFO] Removing existing output: {blueprint.S5_NEUTRALIZED_ALPHA_SET}")
-        shutil.rmtree(blueprint.S5_NEUTRALIZED_ALPHA_SET)
-    blueprint.S5_NEUTRALIZED_ALPHA_SET.mkdir(parents=True, exist_ok=True)
+        if clean_flag:
+            print(f"[INFO] --clean: Removing existing output: {blueprint.S5_NEUTRALIZED_ALPHA_SET}")
+            shutil.rmtree(blueprint.S5_NEUTRALIZED_ALPHA_SET)
+            blueprint.S5_NEUTRALIZED_ALPHA_SET.mkdir(parents=True, exist_ok=True)
+        else:
+            print(f"[INFO] Resume mode: existing output kept at {blueprint.S5_NEUTRALIZED_ALPHA_SET}")
+            print(f"[INFO] 0-byte (failed) files will be removed and reprocessed")
+            # 0 KB の失敗ファイルだけは削除
+            for p in blueprint.S5_NEUTRALIZED_ALPHA_SET.rglob("*.parquet"):
+                try:
+                    if p.stat().st_size == 0:
+                        print(f"  [INFO] Removing 0-byte file: {p}")
+                        p.unlink()
+                except Exception:
+                    pass
+    else:
+        blueprint.S5_NEUTRALIZED_ALPHA_SET.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------------------------------------------
     # 1. 特徴量リストの読み込み（S3_FEATURES_FOR_ALPHA_DECAY）
@@ -345,6 +363,22 @@ def main(test_mode: bool) -> None:
     for i, input_path in enumerate(source_files_to_process):
         features_in_file = features_by_source_file[input_path]
         print(f"--- [{i + 1}/{total}] {input_path.name} ({len(features_in_file)} features) ---")
+
+        # [Phase 6] resume サポート: 既に有効な出力 (size > 0) があればスキップ
+        skip_output_path = get_output_path(input_path)
+        if (
+            skip_output_path.exists()
+            and not skip_output_path.is_dir()
+            and skip_output_path.stat().st_size > 0
+        ):
+            print(f"  [SKIP] Already exists: {skip_output_path} ({skip_output_path.stat().st_size:,} bytes)")
+            continue
+        # tick データ (Hive ディレクトリ) の場合は中身があるか確認
+        if skip_output_path.exists() and skip_output_path.is_dir():
+            existing_files = list(skip_output_path.rglob("*.parquet"))
+            if existing_files and all(p.stat().st_size > 0 for p in existing_files):
+                print(f"  [SKIP] Already exists (Hive): {skip_output_path} ({len(existing_files)} files)")
+                continue
 
         # 4-a. 特徴量をグループ別に分類
         groups_in_file: dict[str, list[str]] = {}
@@ -495,7 +529,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Run in test mode (process only first 2 source files).",
     )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="[Phase 6] Remove all existing output and start from scratch (default: resume).",
+    )
     args = parser.parse_args()
+
+    # [Phase 6] --clean フラグを main 経由で参照可能にする
+    main._clean_flag = args.clean
 
     warnings.filterwarnings("ignore", category=UserWarning)
     try:

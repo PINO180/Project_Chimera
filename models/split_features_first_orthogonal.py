@@ -44,8 +44,18 @@ M2_EXACT = {"atr_ratio_M3"}
 
 
 def should_exclude(col: str) -> bool:
-    """上位足・sample_weight系を除外する"""
+    """上位足・sample_weight系・volume/tick_count系を除外する"""
     if "sample_weight" in col:
+        return True
+    # [Phase 6 修正] volume / tick_count 系を除外
+    # Phase 6 で volume = tick_count 補完が学習側 s1_1_B に入ったため、
+    # 過去には variance フィルタで自動除外されていた volume カラムが
+    # 有意な値で 2_B を通過し下流に流れる可能性がある。
+    # 学習特徴量としての volume / tick_count は除外し、engine_1_D が
+    # 計算する e1d_volume_ratio / e1d_cmf_* / e1d_vwap_dist_* 等の
+    # 派生特徴量を使う設計にする。
+    base_name = col.split("_M")[0].split("_H")[0].split("_D")[0].split("_W")[0]
+    if base_name in ("volume", "tick_count"):
         return True
     for suffix in EXCLUDE_TIMEFRAME_SUFFIXES:
         if suffix in col:

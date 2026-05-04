@@ -87,6 +87,8 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
             "lf_short_score",
             "lf_mid_score",
             "lf_long_score",
+            # --- 【Phase 5 修正 (#35)】 学習対象外メタデータ ---
+            "disc",  # 週末跨ぎギャップ判定 bool 列 (engine_1_C 経由で漏れる可能性に対する最終防御線)
         }
 
         # 動的除外ルールの適用 (完全一致だけでなく、前方一致等も弾く)
@@ -99,25 +101,50 @@ def create_updated_feature_list(source_file: Path, output_file: Path):
                 continue
             if "sample_weight" in col:
                 continue
+            # [Phase 6 修正] volume / tick_count 系を学習特徴量から除外
+            # 過去 (Phase 5以前) は volume=0 の定数列で 2_B variance フィルタにより
+            # filtered_hf_features.txt に含まれなかったため自動的に学習対象外だった。
+            # Phase 6 で volume = tick_count に修正されると有意な値となり variance を
+            # 通過するため、明示的に除外する必要がある。
+            # volume 由来の特徴量 (e1d_cmf_*, e1d_vwap_dist_*, e1d_obv_rel 等) は
+            # engine_1_D で個別に計算され e1d_ prefix で残るので、それらは学習対象に残る。
+            # 「volume」「tick_count」自体 (生のカラム or suffix 付き volume_M3 等) は除外。
+            base_name = col.split("_M")[0].split("_H")[0].split("_D")[0].split("_W")[0]
+            if base_name in ("volume", "tick_count"):
+                continue
             feature_cols.append(col)
 
         # =====================================================================
-        # 【緊急防壁】未来情報（データリーク）を含む汚染特徴量の強制除外
+        # 【LEAKED_PREFIXES の解放】
+        # 過去の応急処置: engine 側に未来リーク疑義のあった特徴量3グループを学習対象から除外
+        #     ("e1a_fast_basic_stabilization", "e1c_dpo", "e1d_hv_regime")
+        # 解放の根拠 (今回の再学習機会で適用):
+        #   - basic_stabilization_numba: 全体 np.nanmin/nanmax → 過去50要素ローリングに修正済 (engine_1_A L775)
+        #   - hv_regime: volatility_regime_udf → ローリング分位数 (rolling_quantile) に修正済 (engine_1_D L1840)
+        #   - dpo: 元々 close - rolling_mean(period) で未来リークなし (Polars rolling は末尾基準)
+        #   - 同様の修正済特徴量 (e1a_fast_robust_stabilization 等) は別フェーズで再学習済のため
+        #     既に LEAKED に含まれていない (時系列の都合で本3つだけ最終フェーズに残っていた)
+        # 今回の再学習で engine 側の修正後ロジックが初めて全特徴量に適用される。
         # =====================================================================
-        # startswithで一括判定するため、必ずタプル () で定義してください
-        LEAKED_PREFIXES = ("e1a_fast_basic_stabilization", "e1c_dpo", "e1d_hv_regime")
+        LEAKED_PREFIXES = ()  # 空タプル: 全特徴量を学習対象に解放
 
         original_count = len(feature_cols)
 
         # 指定したプレフィックスから始まるカラムをリストから一掃する
-        feature_cols = [
-            col for col in feature_cols if not col.startswith(LEAKED_PREFIXES)
-        ]
+        # (LEAKED_PREFIXES が空ならフィルターは何も除外しない)
+        if LEAKED_PREFIXES:
+            feature_cols = [
+                col for col in feature_cols if not col.startswith(LEAKED_PREFIXES)
+            ]
 
         removed_count = original_count - len(feature_cols)
         if removed_count > 0:
             print(
                 f"🚨 SECURITY WARNING: Removed {removed_count} leaked features from the training list!"
+            )
+        else:
+            print(
+                "ℹ️  LEAKED_PREFIXES が空のため除外なし (engine 側で全修正済を前提)"
             )
         # =====================================================================
 

@@ -214,34 +214,53 @@ class FinalAssembler:
         with open(feature_path, "r") as f:
             raw_features = [line.strip() for line in f if line.strip()]
 
+        # 【Phase 5 修正 (#35)】 Ax2/Bx2/Cx2 の exclude_exact を統一 (union)
+        # 各ファイル間で不整合があった項目 (concurrency_long/short, duration_long/short,
+        # payoff_ratio_long/short 等) を全て含めることで、3 ファイル間の挙動を一致させる。
+        # disc は学習対象外メタデータ (週末跨ぎギャップ判定 bool 列) — 最終防御線。
         exclude_exact = {
+            # --- 基本メタ ---
             "timestamp",
             "timeframe",  # 学習特徴量から除外（_filter_dataframe()でのデータ管理用途は継続）
+            "is_trigger",
             "t1",
+            "direction",
+            "exit_type",
+            "first_ex_reason_int",
+            # --- ラベル系 (双方向) ---
             "label",
             "label_long",
             "label_short",
+            # --- uniqueness 系 (双方向) ---
             "uniqueness",
             "uniqueness_long",
             "uniqueness_short",
+            # --- duration 系 (双方向) ---
+            "duration_long",
+            "duration_short",
+            # --- concurrency 系 (双方向、未来情報リーク防止) ---
+            "concurrency_long",
+            "concurrency_short",
+            # --- payoff/multiplier 系 (双方向) ---
             "payoff_ratio",
             "payoff_ratio_long",
             "payoff_ratio_short",
             "pt_multiplier",
             "sl_multiplier",
-            "direction",
-            "exit_type",
-            "first_ex_reason_int",
+            # --- ATR / 補助計算 ---
             "atr_value",
             "calculated_body_ratio",
             "fallback_vol",
+            # --- 価格データ ---
             "open",
             "high",
             "low",
             "close",
-            "meta_label",
+            # --- メタラベリング系 ---
             "m1_pred_proba",  # 後段でjoinされるため特徴量リストから除外
-            "is_trigger",
+            "meta_label",
+            # --- 【Phase 5 修正】学習対象外メタデータ ---
+            "disc",  # 週末跨ぎギャップ判定 bool 列 (engine_1_C 経由で漏れる可能性に対する最終防御線)
         }
 
         features = []

@@ -9,21 +9,24 @@
 # 新しいファイルの終わり（末尾）の10行を確認するコマンド
 # Get-Content "C:\Users\Public\Documents\Downloads\XAUUSDm_custom_filtered.csv" -Tail 10
 # 元のファイルの最初（先頭）の10行を確認するコマンド
-# Get-Content "C:\Users\Public\Documents\Downloads\XAUUSDm_202107021340_202603232359.csv" -TotalCount 10
+# Get-Content "C:\Users\Public\Documents\Downloads\XAUUSDm_202107021340_202605012057.csv" -TotalCount 10
 # 元のファイルの終わり（末尾）の10行を確認するコマンド
-# Get-Content "C:\Users\Public\Documents\Downloads\XAUUSDm_202107021340_202603232359.csv" -Tail 10
+# Get-Content "C:\Users\Public\Documents\Downloads\XAUUSDm_202107021340_202605012057.csv" -Tail 10
 
 import time
 
 # 入出力ファイルのパス（適宜ファイル名を変更してください）
+# ▼▼ Phase 5 再学習用: 新ブローカー CSV (2021/7/2 〜 2026/5/1 20:57) に対応
 input_file = (
-    r"C:\Users\Public\Documents\Downloads\XAUUSDm_202107021340_202603232359.csv"
+    r"C:\Users\Public\Documents\Downloads\XAUUSDm_202107021340_202605012057.csv"
 )
 output_file = r"C:\Users\Public\Documents\Downloads\XAUUSDm_custom_filtered.csv"
 
 # 抽出する期間（この日付「を含む」期間が抽出されます）
+# ▼▼ Phase 5 再学習用: end_date を 2026.05.01 に更新
+#     start_date は元学習との整合性を保つため 2021.07.12 を維持
 start_date = "2021.07.12"
-end_date = "2026.03.23"  # "2026.03.23"に設定した場合 2026.03.23 23:59:59 までの全ティックが含まれます
+end_date = "2026.05.01"  # "2026.05.01"に設定した場合 2026.05.01 23:59:59 までの全ティックが含まれます
 
 print(f"処理を開始します。{start_date} から {end_date} までのデータを抽出します...")
 start_time = time.time()

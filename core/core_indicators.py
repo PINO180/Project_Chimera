@@ -41,7 +41,9 @@ Project Cimera V5 — Single Source of Truth (単一の真実の情報源)
 
 import numpy as np
 import numba as nb
+import math  # _standard_normal_cdf_fast 等のヘルパー関数で math.erf を使用
 from numba import njit, guvectorize
+from typing import Tuple  # pivot_point_udf 等の戻り値型注釈で使用
 
 # ===========================================================================
 # [CATEGORY: ATR & VOLATILITY]  ボラティリティ
@@ -2407,11 +2409,15 @@ def rolling_network_clustering_udf(prices: np.ndarray, window_size: int) -> np.n
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
 
-        if len(window_prices) < 15:
+        # [Phase 6 修正] 旧ハードコード `< 15` では window_size=10/12/15 の特徴量が
+        # 機能不全になる (全 NaN → fill_nan で 0 化、定数列となり 2_B variance フィルタで除外)。
+        # window_size に応じた min_samples に変更し、harmony_udf と同じパターンに統一。
+        min_samples = max(window_size // 2, 5)
+        if len(window_prices) < min_samples:
             continue
 
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
+        if len(finite_prices) < min_samples:
             continue
 
         window_n = len(finite_prices)
@@ -2641,11 +2647,14 @@ def rolling_semantic_flow_udf(prices: np.ndarray, window_size: int) -> np.ndarra
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
 
-        if len(window_prices) < 15:
+        # [Phase 6 修正] 旧 `< 15` では window_size=10/12/15 で機能不全。
+        # window_size に応じた min_samples に変更し、harmony_udf と同パターンに統一。
+        min_samples = max(window_size // 2, 5)
+        if len(window_prices) < min_samples:
             continue
 
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
+        if len(finite_prices) < min_samples:
             continue
 
         window_n = len(finite_prices)
@@ -2862,11 +2871,14 @@ def rolling_aesthetic_balance_udf(prices: np.ndarray, window_size: int) -> np.nd
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
 
-        if len(window_prices) < 15:
+        # [Phase 6 修正] 旧 `< 15` では window_size=10/12/15 で機能不全。
+        # window_size に応じた min_samples に変更し、harmony_udf と同パターンに統一。
+        min_samples = max(window_size // 2, 5)
+        if len(window_prices) < min_samples:
             continue
 
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
+        if len(finite_prices) < min_samples:
             continue
 
         grad_len = len(finite_prices) - 1
@@ -3092,11 +3104,22 @@ def rolling_harmony_udf(prices: np.ndarray, window_size: int) -> np.ndarray:
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
 
-        if len(window_prices) < 30:
+        # 【修正】従来は `< 30` ハードコードだったため、window_size=12, 24 で
+        #   常に skip されて harmony_12 / harmony_24 が 100% NaN という無価値カラムを
+        #   生成していた (engine と rfe で同じ値を出すので train-serve 整合は保たれていたが、
+        #   モデルにとっては定数列で何の情報も無い)。
+        #   修正後は window_size に追従し、有効データが半分以上あれば計算する。
+        #     - window_prices 自体が window_size より短い: skip (warmup 期間)
+        #     - finite_prices が window_size の半分未満 (最低 8 個): skip (有効データ不足)
+        if len(window_prices) < window_size:
             continue
 
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 30:
+        # 有効データの最低必要数: window_size の半分、ただし下限 8 個
+        min_required = window_size // 2
+        if min_required < 8:
+            min_required = 8
+        if len(finite_prices) < min_required:
             continue
 
         window_n = len(finite_prices)
@@ -3178,11 +3201,14 @@ def rolling_musical_tension_udf(prices: np.ndarray, window_size: int) -> np.ndar
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
 
-        if len(window_prices) < 15:
+        # [Phase 6 修正] 旧 `< 15` では window_size=10/12/15 で機能不全。
+        # window_size に応じた min_samples に変更し、harmony_udf と同パターンに統一。
+        min_samples = max(window_size // 2, 5)
+        if len(window_prices) < min_samples:
             continue
 
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
+        if len(finite_prices) < min_samples:
             continue
 
         diff_len = len(finite_prices) - 1
@@ -3290,11 +3316,14 @@ def rolling_muscle_force_udf(prices: np.ndarray, window_size: int) -> np.ndarray
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
 
-        if len(window_prices) < 15:
+        # [Phase 6 修正] 旧 `< 15` では window_size=10/12/15 で機能不全。
+        # window_size に応じた min_samples に変更し、harmony_udf と同パターンに統一。
+        min_samples = max(window_size // 2, 5)
+        if len(window_prices) < min_samples:
             continue
 
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
+        if len(finite_prices) < min_samples:
             continue
 
         vel_len = len(finite_prices) - 1
@@ -3419,7 +3448,10 @@ def rolling_energy_expenditure_udf(prices: np.ndarray, window_size: int) -> np.n
     for i in range(window_size - 1, n):
         window_prices = prices[i - window_size + 1 : i + 1]
         finite_prices = window_prices[np.isfinite(window_prices)]
-        if len(finite_prices) < 15:
+        # [Phase 6 修正] 旧 `< 15` では window_size=10/12/15 で機能不全。
+        # window_size に応じた min_samples に変更し、harmony_udf と同パターンに統一。
+        min_samples = max(window_size // 2, 5)
+        if len(finite_prices) < min_samples:
             continue
 
         n_fp = len(finite_prices)
@@ -3485,6 +3517,1739 @@ def rolling_energy_expenditure_udf(prices: np.ndarray, window_size: int) -> np.n
 # 同一 OHLCV データを学習側（Polars 互換方式）・リアルタイム側（NumPy 逐次）
 # の両方に流し、特徴量の値が完全一致することを数値検証する。
 # ===========================================================================
+
+
+
+# ===========================================================================
+# [CATEGORY: STATISTICS — Engine 1A (Numba) 用]
+# ===========================================================================
+# 本セクションは Step 1 の SSoT 統一で集約された関数群。
+# 学習側 (engine_1_X) と本番側 (realtime_feature_engine_1X) の両方が
+# import で参照する正本。修正はここ一箇所のみ行う。
+# ===========================================================================
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def fast_quality_score_numba(arr, out):
+    """高速品質スコア計算"""
+    n = len(arr)
+    for i in range(n):
+        if i < 50:  # 最小評価ウィンドウ
+            out[i] = 0.0
+        else:
+            # ウィンドウ内のNaN/Inf率計算
+            window_size = min(50, i + 1)
+            nan_inf_count = 0
+            finite_count = 0
+
+            for j in range(i - window_size + 1, i + 1):
+                if np.isnan(arr[j]) or np.isinf(arr[j]):
+                    nan_inf_count += 1
+                else:
+                    finite_count += 1
+
+            if window_size == 0:
+                out[i] = 0.0
+            else:
+                nan_inf_ratio = nan_inf_count / window_size
+                finite_ratio = finite_count / window_size
+                out[i] = finite_ratio * 0.8 + 0.2  # 基本品質スコア
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def biweight_location_numba(arr, out):
+    """ローリングBiweight位置計算（厳密実装）"""
+    n = len(arr)
+    window = 20
+
+    # ▼▼ 新規追加: ループ外での事前アロケーション（動的メモリ確保の排除）
+    weights_buffer = np.zeros(window, dtype=np.float64)
+    finite_buffer = np.empty(window, dtype=np.float64)
+    # ▲▲
+
+    for i in range(n):
+        if i < window - 1:
+            out[i] = np.nan
+        else:
+            window_data = arr[max(0, i - window + 1) : i + 1]
+            count = 0
+            for j in range(len(window_data)):
+                if not np.isnan(window_data[j]):
+                    finite_buffer[count] = window_data[j]
+                    count += 1
+            finite_data = finite_buffer[:count]
+
+            if len(finite_data) < 5:
+                out[i] = np.median(finite_data) if len(finite_data) > 0 else np.nan
+            else:
+                # Tukey's Biweight位置推定の厳密実装
+                # 反復アルゴリズム
+
+                # 初期値として中央値を使用
+                current_location = np.median(finite_data)
+                tolerance = 1e-10
+                max_iterations = 50
+
+                for iteration in range(max_iterations):
+                    # MAD計算
+                    abs_residuals = np.abs(finite_data - current_location)
+                    mad_val = np.median(abs_residuals)
+
+                    if mad_val < 1e-15:
+                        break
+
+                    # スケールファクター（6 * MAD）
+                    scale = 6.0 * mad_val
+
+                    # 標準化残差
+                    u_values = (finite_data - current_location) / scale
+
+                    # ▼▼ 修正前: ループ内での動的配列確保
+                    # weights = np.zeros(len(finite_data))
+                    # ▼▼ 修正後: 事前アロケーションしたバッファを再利用
+                    weights = weights_buffer[: len(finite_data)]
+                    # ▲▲
+
+                    numerator = 0.0
+                    denominator = 0.0
+
+                    for j in range(len(finite_data)):
+                        u_abs = abs(u_values[j])
+
+                        if u_abs < 1.0:
+                            # Biweight重み: (1 - u²)²
+                            weight = (1.0 - u_values[j] ** 2) ** 2
+                            weights[j] = weight
+                            numerator += finite_data[j] * weight
+                            denominator += weight
+                        else:
+                            weights[j] = 0.0
+
+                    if denominator > 1e-15:
+                        new_location = numerator / denominator
+                    else:
+                        # 重みがすべてゼロの場合は中央値を返す
+                        new_location = np.median(finite_data)
+                        break
+
+                    # 収束判定
+                    if abs(new_location - current_location) < tolerance:
+                        break
+
+                    current_location = new_location
+
+                out[i] = current_location
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def winsorized_mean_numba(arr, out):
+    """ローリングウィンソライズ平均（上下5%クリップ）"""
+    n = len(arr)
+    window = 20
+
+    finite_buffer = np.empty(window, dtype=np.float64)
+
+    for i in range(n):
+        if i < window - 1:
+            out[i] = np.nan
+        else:
+            window_data = arr[max(0, i - window + 1) : i + 1]
+            count = 0
+            for j in range(len(window_data)):
+                if not np.isnan(window_data[j]):
+                    finite_buffer[count] = window_data[j]
+                    count += 1
+            finite_data = finite_buffer[:count]
+
+            # 修正後
+            if count < 5:
+                out[i] = np.mean(finite_data) if count > 0 else np.nan
+            else:
+                # 上下5%点の計算
+                p05 = np.percentile(finite_data, 5)
+                p95 = np.percentile(finite_data, 95)
+
+                # ウィンソライズ（クリッピング）
+                winsorized_data = np.clip(finite_data, p05, p95)
+                out[i] = np.mean(winsorized_data)
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def jarque_bera_statistic_numba(arr, out):
+    """ローリングJarque-Bera検定統計量"""
+    n = len(arr)
+    window = 50
+
+    for i in range(n):
+        if i < window - 1:
+            out[i] = np.nan
+        else:
+            window_data = arr[max(0, i - window + 1) : i + 1]
+            finite_data = window_data[~np.isnan(window_data)]
+
+            if len(finite_data) < 20:
+                out[i] = np.nan
+            else:
+                # 基本統計量
+                mean_val = np.mean(finite_data)
+
+                # ▼▼ 修正前: variance = variance / (len(finite_data) - 1); std_val = np.sqrt(variance) + 1e-10
+                # ▼▼ 修正後: モーメント計算の原則に従い ddof=0 を使用
+                variance = 0.0
+                n_val = float(len(finite_data))
+                for val in finite_data:
+                    variance += (val - mean_val) ** 2
+                variance = variance / n_val  # ddof=0
+                std_val = np.sqrt(variance) + 1e-10
+
+                if std_val < 1e-10:
+                    out[i] = 0.0
+                else:
+                    # 標準化
+                    z_sum_3 = 0.0
+                    z_sum_4 = 0.0
+                    for val in finite_data:
+                        z = (val - mean_val) / std_val
+                        z_sum_3 += z**3
+                        z_sum_4 += z**4
+
+                    skewness = z_sum_3 / n_val
+                    kurtosis = z_sum_4 / n_val - 3.0
+
+                    # ▼▼ 修正前: jb_stat = len(finite_data) * (skewness**2 / 6 + kurtosis**2 / 24)
+                    # ▼▼ 修正後: Urzua (1996) に基づく小標本補正 (ALM) の厳密実装
+                    c1 = (
+                        6.0 * (n_val - 2.0) / ((n_val + 1.0) * (n_val + 3.0))
+                    )  # 小標本における歪度の分散
+                    c2 = (
+                        24.0
+                        * n_val
+                        * (n_val - 2.0)
+                        * (n_val - 3.0)
+                        / (((n_val + 1.0) ** 2) * (n_val + 3.0) * (n_val + 5.0))
+                    )  # 小標本における尖度の分散
+
+                    jb_stat = (skewness**2 / c1) + (kurtosis**2 / c2)
+                    out[i] = jb_stat
+
+
+@nb.njit(cache=True)
+def _standard_normal_cdf_fast(x):
+    """標準正規分布の累積分布関数 (CDF) — math.erf の高速近似版。
+
+    anderson_darling_numba の内部で参照されるヘルパー関数。
+    @nb.guvectorize でデコレートされた関数の名前解決は core_indicators の
+    グローバル名前空間で行われるため、このヘルパーも core_indicators に
+    定義する必要がある (engine_1_A / rfe_1A 側に重複定義しても参照されない)。
+    """
+    SQRT2 = 1.4142135623730951
+    return 0.5 * (1.0 + math.erf(x / SQRT2))
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def anderson_darling_numba(arr, out):
+    """ローリングAnderson-Darling統計量（厳密実装）"""
+    n = len(arr)
+    window = 30
+
+    # ▼▼ 新規追加: ループ外での事前アロケーション（動的メモリ確保の排除）
+    standardized_buffer = np.zeros(window, dtype=np.float64)
+    # ▲▲
+
+    for i in range(n):
+        if i < window - 1:
+            out[i] = np.nan
+        else:
+            window_data = arr[max(0, i - window + 1) : i + 1]
+            finite_data = window_data[~np.isnan(window_data)]
+
+            if len(finite_data) < 10:
+                out[i] = np.nan
+            else:
+                # ソート
+                sorted_data = np.sort(finite_data)
+                n_data = len(sorted_data)
+
+                # 手動で平均と標準偏差計算（Numba対応）
+                mean_val = np.mean(sorted_data)
+
+                # 手動分散計算
+                variance = 0.0
+                for val in sorted_data:
+                    variance += (val - mean_val) ** 2
+                variance = variance / (n_data - 1)
+                std_val = np.sqrt(variance)
+
+                if std_val < 1e-10:
+                    out[i] = 0.0
+                else:
+                    # ▼▼ 修正前: ループ内での動的配列確保
+                    # standardized_data = np.zeros(n_data)
+                    # ▼▼ 修正後: 事前アロケーションしたバッファを再利用
+                    standardized_data = standardized_buffer[:n_data]
+                    # ▲▲
+
+                    for j in range(n_data):
+                        standardized_data[j] = (sorted_data[j] - mean_val) / std_val
+
+                    # Anderson-Darling統計量の厳密計算
+                    ad_sum = 0.0
+                    for j in range(n_data):
+                        # 高速化されたCDF関数を呼び出します。
+                        # 修正後
+                        F_j = _standard_normal_cdf_fast(standardized_data[j])
+                        F_nj = _standard_normal_cdf_fast(
+                            standardized_data[n_data - 1 - j]
+                        )
+
+                        # ゼロ除算回避
+                        if F_j > 1e-15 and (1 - F_nj) > 1e-15:
+                            log_term = np.log(F_j) + np.log(1 - F_nj)
+                            ad_sum += (2 * j + 1) * log_term
+
+                    # ▼▼ 修正前: out[i] = -n_data - ad_sum / n_data
+                    # ▼▼ 修正後: Stephens (1974) の小標本補正係数を適用した真のAD統計量
+                    ad_stat = -n_data - ad_sum / n_data
+                    n_float = float(n_data)
+                    stephens_correction = (
+                        1.0 + 4.0 / n_float - 25.0 / (n_float * n_float)
+                    )
+                    out[i] = ad_stat * stephens_correction
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def runs_test_numba(arr, out):
+    """ローリングRuns Test統計量"""
+    n = len(arr)
+    window = 30
+
+    for i in range(n):
+        if i < window - 1:
+            out[i] = np.nan
+        else:
+            window_data = arr[max(0, i - window + 1) : i + 1]
+            finite_data = window_data[~np.isnan(window_data)]
+
+            if len(finite_data) < 10:
+                out[i] = np.nan
+            else:
+                # 中央値を基準にバイナリ系列作成
+                median_val = np.median(finite_data)
+                binary_series = (finite_data > median_val).astype(np.int32)
+
+                # ランの数をカウント
+                runs = 1
+                for j in range(1, len(binary_series)):
+                    if binary_series[j] != binary_series[j - 1]:
+                        runs += 1
+
+                # 期待ランの数と分散
+                n1 = np.sum(binary_series)  # 1の個数
+                n2 = len(binary_series) - n1  # 0の個数
+
+                if n1 > 0 and n2 > 0:
+                    expected_runs = (2 * n1 * n2) / (n1 + n2) + 1
+                    var_runs = (2 * n1 * n2 * (2 * n1 * n2 - n1 - n2)) / (
+                        (n1 + n2) ** 2 * (n1 + n2 - 1)
+                    )
+
+                    if var_runs > 0:
+                        # ▼▼ 修正前: out[i] = (runs - expected_runs) / np.sqrt(var_runs)
+                        # ▼▼ 修正後: 極小値によるゼロ除算・オーバーフロー防衛
+                        out[i] = (runs - expected_runs) / np.sqrt(var_runs + 1e-10)
+                    else:
+                        out[i] = 0.0
+                else:
+                    out[i] = 0.0
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def von_neumann_ratio_numba(arr, out):
+    """ローリングVon Neumann比（厳密実装）"""
+    n = len(arr)
+    window = 30
+
+    for i in range(n):
+        if i < window - 1:
+            out[i] = np.nan
+        else:
+            window_data = arr[max(0, i - window + 1) : i + 1]
+            finite_data = window_data[~np.isnan(window_data)]
+
+            if len(finite_data) < 3:  # 最低3点必要（差分計算のため）
+                out[i] = np.nan
+            else:
+                n_points = len(finite_data)
+
+                # 1次差分の平方和（厳密計算）
+                diff_sq_sum = 0.0
+                for j in range(1, n_points):
+                    diff = finite_data[j] - finite_data[j - 1]
+                    diff_sq_sum += diff * diff
+
+                # 平均値の厳密計算
+                sum_values = 0.0
+                for j in range(n_points):
+                    sum_values += finite_data[j]
+                mean_val = sum_values / n_points
+
+                # 不偏分散の厳密計算（n-1で除算）
+                sum_sq_deviations = 0.0
+                for j in range(n_points):
+                    deviation = finite_data[j] - mean_val
+                    sum_sq_deviations += deviation * deviation
+
+                # ▼▼ 修正前: vn_ratio = diff_sq_sum / sum_sq_deviations
+                # ▼▼ 修正後: 分母にゼロ除算防止の微小値 (+ 1e-10) を追加
+                if sum_sq_deviations > 1e-15:
+                    # 分子: 1次差分の平方和
+                    # 分母: 総平方和（不偏分散 × (n-1)）
+                    vn_ratio = diff_sq_sum / (sum_sq_deviations + 1e-10)
+
+                    # 理論的範囲チェック（0 ≤ VN比 ≤ 4）
+                    if vn_ratio < 0.0:
+                        out[i] = 0.0
+                    elif vn_ratio > 4.0:
+                        out[i] = 4.0
+                    else:
+                        out[i] = vn_ratio
+                else:
+                    # 全て同じ値の場合、理論的にVN比は0
+                    out[i] = 0.0
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def basic_stabilization_numba(arr, out):
+    # ▼▼ 修正前: 全体配列に対する np.nanmin(out) と np.nanmax(out) の計算 (未来リーク)
+    # ▼▼ 修正後: 過去50要素のローリングウィンドウによる局所Min/Max計算 (完全な因果律の担保)
+    n = len(arr)
+    window = 50
+    for i in range(n):
+        if np.isnan(arr[i]) or np.isinf(arr[i]):
+            out[i] = 0.0
+        else:
+            if i < 2:
+                out[i] = arr[i]
+            else:
+                local_min = np.inf
+                local_max = -np.inf
+                start_idx = max(0, i - window + 1)
+
+                # ローリングウィンドウ内の有効値を走査
+                for j in range(start_idx, i + 1):
+                    val = arr[j]
+                    if np.isfinite(val):
+                        if val < local_min:
+                            local_min = val
+                        if val > local_max:
+                            local_max = val
+
+                if local_min != np.inf and local_max != -np.inf:
+                    range_val = local_max - local_min
+                    if range_val > 1e-10:
+                        clip_margin = range_val * 0.01
+                        if arr[i] < local_min + clip_margin:
+                            out[i] = local_min + clip_margin
+                        elif arr[i] > local_max - clip_margin:
+                            out[i] = local_max - clip_margin
+                        else:
+                            out[i] = arr[i]
+                    else:
+                        out[i] = arr[i]
+                else:
+                    out[i] = arr[i]
+
+
+@nb.guvectorize(["void(float64[:], float64[:])"], "(n)->(n)", nopython=True, cache=True)
+def robust_stabilization_numba(arr, out):
+    # ▼▼ 修正前: 全要素から finite_vals を抽出しての中央値計算 (未来リーク)
+    # ▼▼ 修正後: 過去50要素のローリングウィンドウによる動的中央値・MAD計算
+    n = len(arr)
+    window = 50
+    finite_vals_buffer = np.empty(window, dtype=np.float64)
+    for i in range(n):
+        if i < 2:
+            out[i] = 0.0 if not np.isfinite(arr[i]) else arr[i]
+            continue
+
+        start_idx = max(0, i - window + 1)
+        window_data = arr[start_idx : i + 1]
+
+        # ウィンドウ内の有限値を抽出
+        finite_vals = finite_vals_buffer[: len(window_data)]
+        count = 0
+        for j in range(len(window_data)):
+            if np.isfinite(window_data[j]):
+                finite_vals[count] = window_data[j]
+                count += 1
+
+        if count < 3:
+            out[i] = 0.0 if not np.isfinite(arr[i]) else arr[i]
+            continue
+
+        valid_data = finite_vals[:count]
+        median_val = np.median(valid_data)
+
+        abs_devs = np.abs(valid_data - median_val)
+        mad_val = np.median(abs_devs)
+
+        if mad_val < 1e-10:
+            # ddof=1を明記した不偏標準偏差のフォールバック
+            mean_val = np.mean(valid_data)
+            var_sum = np.sum((valid_data - mean_val) ** 2)
+            mad_val = np.sqrt(var_sum / (count - 1)) * 0.6745 if count > 1 else 1e-10
+
+        lower_bound = median_val - 3.0 * mad_val
+        upper_bound = median_val + 3.0 * mad_val
+
+        if np.isnan(arr[i]):
+            out[i] = median_val
+        elif np.isinf(arr[i]):
+            out[i] = upper_bound if arr[i] > 0 else lower_bound
+        else:
+            if arr[i] < lower_bound:
+                out[i] = lower_bound
+            elif arr[i] > upper_bound:
+                out[i] = upper_bound
+            else:
+                out[i] = arr[i]
+
+
+
+
+# ===========================================================================
+# [CATEGORY: TIME SERIES — Engine 1B (UDF) 用]
+# ===========================================================================
+# 本セクションは Step 1 の SSoT 統一で集約された関数群。
+# 学習側 (engine_1_X) と本番側 (realtime_feature_engine_1X) の両方が
+# import で参照する正本。修正はここ一箇所のみ行う。
+# ===========================================================================
+
+@nb.njit(fastmath=False, cache=True)
+def adf_統計量_udf(prices: np.ndarray) -> float:
+    """
+    真の拡張ディッキー・フラー（ADF）検定統計量計算
+    ラグ差分項（Δy_{t-1}）を追加し、系列の自己相関をパラメトリックに吸収する
+    帰無仮説：系列が単位根を持つ（非定常）
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    # NaN値除去
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 10:
+        return np.nan
+
+    # 1次差分計算
+    diff_prices = np.diff(finite_prices)
+
+    # ▼▼ 修正前: 差分ラグ項のない単なるDF検定
+    # lagged_prices = finite_prices[:-1]
+    # n = len(diff_prices)
+    # X = np.column_stack((np.ones(n, dtype=np.float64), lagged_prices))
+    # y = diff_prices
+
+    # ▼▼ 修正後: 差分ラグ項（Δy_{t-1}）を追加した真のADF検定
+    if len(diff_prices) < 5:
+        return np.nan
+
+    # ADF回帰: Δy_t = α + β*y_{t-1} + γ*Δy_{t-1} + ε_t
+    y = diff_prices[1:]  # Δy_t
+    lagged_y = finite_prices[1:-1]  # y_{t-1}
+    lagged_diff = diff_prices[:-1]  # Δy_{t-1}
+
+    n = len(y)
+    if n < 3:
+        return np.nan
+
+    # 設計行列: [定数項, ラグレベル, 差分ラグ]
+    X = np.empty((n, 3), dtype=np.float64)
+    X[:, 0] = 1.0
+    X[:, 1] = lagged_y
+    X[:, 2] = lagged_diff
+
+    # OLS計算: β = (X'X)^(-1)X'y
+    try:
+        XtX = X.T @ X
+        XtX_inv = np.linalg.inv(XtX)
+        XtY = X.T @ y
+        beta = XtX_inv @ XtY
+
+        # 残差と標準誤差計算
+        residuals = y - X @ beta
+
+        # 自由度はパラメータ数(3)を消費するため n-3
+        sse = np.sum(residuals**2)
+        mse = sse / (n - 3.0)
+
+        # β係数（ラグレベル：インデックス1）の標準誤差
+        se_beta = np.sqrt(mse * XtX_inv[1, 1])
+
+        # ADF t統計量
+        if se_beta > 1e-10:
+            adf_stat = beta[1] / se_beta
+        else:
+            adf_stat = np.nan
+
+    except:
+        adf_stat = np.nan
+
+    return adf_stat
+
+
+@nb.njit(fastmath=False, cache=True)
+def phillips_perron_統計量_udf(prices: np.ndarray) -> float:
+    """
+    真のフィリップス・ペロン検定統計量計算（Newey-West長期的分散補正付き）
+    異分散性と自己相関をノンパラメトリックに修正したZ_t統計量を算出
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 10:
+        return np.nan
+
+    # 1次差分とラグレベル計算
+    diff_prices = np.diff(finite_prices)
+    lagged_prices = finite_prices[:-1]
+
+    if len(diff_prices) < 5:
+        return np.nan
+
+    n = len(diff_prices)
+
+    # OLS回帰: Δy_t = α + βy_{t-1} + ε_t
+    X = np.empty((n, 2), dtype=np.float64)
+    X[:, 0] = 1.0
+    X[:, 1] = lagged_prices
+    y = diff_prices
+
+    try:
+        # OLS推定
+        XtX_inv = np.linalg.inv(X.T @ X)
+        beta = XtX_inv @ X.T @ y
+
+        # 残差
+        residuals = y - X @ beta
+
+        # ▼▼ 修正前: sigma2 = np.var(residuals) ... (簡略版)
+        # ▼▼ 修正後: 真のPhillips-Perron検定（Newey-West長期的分散補正）
+
+        # 1. 残差の標本分散 (gamma_0)
+        gamma_0 = np.sum(residuals**2) / n
+
+        # 2. BartlettカーネルによるNewey-West長期的分散 (lambda_sq)
+        # ラグ数の経験則: 4 * (T/100)^(2/9)
+        lag_max = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
+        if lag_max < 1:
+            lag_max = 1
+
+        lambda_sq = gamma_0
+        for j in range(1, lag_max + 1):
+            # 自己共分散 (gamma_j)
+            gamma_j = np.sum(residuals[j:] * residuals[:-j]) / n
+            # Bartlett重み
+            weight = 1.0 - (j / (lag_max + 1.0))
+            lambda_sq += 2.0 * weight * gamma_j
+
+        # 3. 標準誤差とt統計量
+        # 不偏分散（s^2）による回帰の標準誤差
+        s2 = np.sum(residuals**2) / (n - 2.0)
+        s = np.sqrt(s2)
+
+        se_beta = np.sqrt(s2 * XtX_inv[1, 1])
+        if se_beta <= 1e-10 or lambda_sq <= 1e-10:
+            return np.nan
+
+        t_stat = beta[1] / se_beta
+
+        # 4. Phillips-Perron Z_t 統計量の算出
+        term1 = np.sqrt(gamma_0 / lambda_sq) * t_stat
+        term2 = 0.5 * ((lambda_sq - gamma_0) / np.sqrt(lambda_sq)) * (n * se_beta / s)
+        pp_stat = term1 - term2
+
+    except:
+        pp_stat = np.nan
+
+    return pp_stat
+
+
+@nb.njit(fastmath=False, cache=True)
+def kpss_統計量_udf(prices: np.ndarray) -> float:
+    """
+    真のKPSS検定統計量計算（Newey-West長期的分散補正付き）
+    帰無仮説：系列がトレンド周りで定常
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 10:
+        return np.nan
+
+    n = len(finite_prices)
+    t = np.arange(n, dtype=np.float64)
+
+    try:
+        # OLS: y = α + βt + ε
+        sum_t = np.sum(t)
+        sum_t2 = np.sum(t**2)
+        sum_y = np.sum(finite_prices)
+        sum_ty = np.sum(t * finite_prices)
+
+        beta = (n * sum_ty - sum_t * sum_y) / (n * sum_t2 - sum_t**2 + 1e-10)
+        alpha = (sum_y - beta * sum_t) / n
+
+        # デトレンドされた系列 (残差)
+        detrended = finite_prices - (alpha + beta * t)
+        cumsum = np.cumsum(detrended)
+
+        # ▼▼ 修正前: 単なる短期分散 (sse = np.sum(detrended**2) / n)
+        # ▼▼ 修正後: Bartlettカーネルによる真の長期的分散 (long_run_var)
+        gamma_0 = np.sum(detrended**2) / n
+
+        # ラグ数の経験則: 4 * (T/100)^(2/9)  ※Schwert (1989) 基準
+        lag_max = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
+        if lag_max < 1:
+            lag_max = 1
+
+        long_run_var = gamma_0
+        for j in range(1, lag_max + 1):
+            gamma_j = np.sum(detrended[j:] * detrended[:-j]) / n
+            weight = 1.0 - (j / (lag_max + 1.0))
+            long_run_var += 2.0 * weight * gamma_j
+
+        # KPSS統計量の算出
+        if long_run_var > 1e-10:
+            kpss_stat = np.sum(cumsum**2) / (n**2 * long_run_var)
+        else:
+            kpss_stat = np.nan
+
+    except:
+        kpss_stat = np.nan
+
+    return kpss_stat
+
+
+@nb.njit(fastmath=False, cache=True)
+def t分布_自由度_udf(returns: np.ndarray) -> float:
+    """
+    t分布の自由度パラメータ推定
+    尖度ベース推定によるモーメント法使用
+    """
+    if len(returns) < 10:
+        return np.nan
+
+    finite_returns = returns[np.isfinite(returns)]
+    if len(finite_returns) < 10:
+        return np.nan
+
+    # リターン標準化
+    mean_ret = np.mean(finite_returns)
+    # ▼▼ 修正前: std_ret = np.std(finite_returns) または np.std(finite_returns, ddof=1)
+    # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当) に置換
+    n_ret = len(finite_returns)
+    std_ret = np.std(finite_returns) * np.sqrt(n_ret / (n_ret - 1.0))
+
+    if std_ret <= 0:
+        return np.nan
+
+    standardized = (finite_returns - mean_ret) / std_ret
+
+    # サンプル尖度計算
+    fourth_moment = np.mean(standardized**4)
+
+    # t分布用: E[X^4] = 3*ν/(ν-4) for ν > 4
+    # ν解: ν = 4*(3 + kurtosis)/(kurtosis - 3)
+    excess_kurtosis = fourth_moment - 3.0
+
+    if excess_kurtosis > 0:
+        dof = 4.0 * (3.0 + fourth_moment) / excess_kurtosis
+        # 合理的範囲への制約
+        dof = max(2.1, min(dof, 100.0))
+    else:
+        dof = 100.0  # 非常に高いDOF（概正規近似）
+
+    return dof
+
+
+@nb.njit(fastmath=False, cache=True)
+def t分布_尺度_udf(returns: np.ndarray) -> float:
+    """
+    t分布の尺度パラメータ推定
+    尺度パラメータは分布のスプレッドを表す
+    """
+    if len(returns) < 5:
+        return np.nan
+
+    finite_returns = returns[np.isfinite(returns)]
+    if len(finite_returns) < 5:
+        return np.nan
+
+    # 最初に自由度推定
+    dof = t分布_自由度_udf(returns)
+
+    if np.isnan(dof) or dof <= 2:
+        # サンプル標準偏差へのフォールバック
+        # ▼▼ 修正前: return np.std(finite_returns)
+        # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当)
+        n_ret = len(finite_returns)
+        return np.std(finite_returns) * np.sqrt(n_ret / (n_ret - 1.0))
+
+    # 既知νを持つt分布用、尺度パラメータσ推定可能:
+    # σ² = sample_variance * (ν-2)/ν
+    # ▼▼ 修正前: sample_var = np.var(finite_returns)
+    # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当)
+    n_ret = len(finite_returns)
+    sample_var = np.var(finite_returns) * (n_ret / (n_ret - 1.0))
+    scale_squared = sample_var * (dof - 2.0) / dof
+
+    return np.sqrt(max(scale_squared, 1e-8))
+
+
+@nb.njit(fastmath=False, cache=True)
+def gev_形状_udf(extremes: np.ndarray) -> float:
+    """
+    GEV分布形状パラメータ（ξ）推定
+    ξ > 0: フレシェ（重い尾）、ξ = 0: ガンベル、ξ < 0: ワイブル（有界）
+    """
+    if len(extremes) < 10:
+        return np.nan
+
+    finite_extremes = extremes[np.isfinite(extremes)]
+    if len(finite_extremes) < 10:
+        return np.nan
+
+    # 頑健推定のためのL-モーメント法
+    sorted_data = np.sort(finite_extremes)
+    n = len(sorted_data)
+
+    # L-モーメント計算
+    l1 = np.mean(sorted_data)  # L1 = 平均
+
+    # L2（L-スケール）
+    sum_l2 = 0.0
+    for i in range(n):
+        weight = (2.0 * i - n + 1.0) / n
+        sum_l2 += weight * sorted_data[i]
+    l2 = sum_l2 / 2.0
+
+    # L3（L-歪度）
+    sum_l3 = 0.0
+    for i in range(n):
+        weight = ((i * (i - 1.0)) - 2.0 * i * (n - 1.0) + (n - 1.0) * (n - 2.0)) / (
+            n * (n - 1.0)
+        )
+        sum_l3 += weight * sorted_data[i]
+    l3 = sum_l3 / 3.0
+
+    # L-歪度比
+    if abs(l2) > 1e-8:
+        tau3 = l3 / l2
+        # GEV形状パラメータ関係（Hosking et al. 1985）
+        # ξ ≈ 7.859*τ3 + 2.9554*τ3^2
+        shape = 7.859 * tau3 + 2.9554 * tau3**2
+        # 合理的範囲への制約
+        shape = max(-0.5, min(shape, 0.5))
+    else:
+        shape = 0.0  # ガンベル分布
+
+    return shape
+
+
+@nb.njit(fastmath=False, cache=True)
+def holt_winters_レベル_udf(prices: np.ndarray) -> float:
+    """
+    ホルト・ウィンターズ指数平滑からレベル成分を抽出
+    レベルは時系列の平滑化された局所平均を表す
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 10:
+        return np.nan
+
+    # レベル用適切指数平滑（α = 0.3）
+    alpha = 0.3
+    level = finite_prices[0]  # 最初の観測値で初期化
+
+    for i in range(1, len(finite_prices)):
+        level = alpha * finite_prices[i] + (1 - alpha) * level
+
+    return level
+
+
+@nb.njit(fastmath=False, cache=True)
+def holt_winters_トレンド_udf(prices: np.ndarray) -> float:
+    """
+    ホルト・ウィンターズ指数平滑からトレンド成分を抽出
+    トレンドは時系列の平滑化された局所傾きを表す
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 10:
+        return np.nan
+
+    # 適切二重指数平滑（ホルト法）
+    alpha = 0.3  # レベル平滑
+    beta = 0.1  # トレンド平滑
+
+    # 初期化
+    level = finite_prices[0]
+    trend = finite_prices[1] - finite_prices[0] if len(finite_prices) > 1 else 0.0
+
+    for i in range(1, len(finite_prices)):
+        new_level = alpha * finite_prices[i] + (1 - alpha) * (level + trend)
+        new_trend = beta * (new_level - level) + (1 - beta) * trend
+        level = new_level
+        trend = new_trend
+
+    return trend
+
+
+@nb.njit(fastmath=False, cache=True)
+def arima_残差分散_udf(prices: np.ndarray) -> float:
+    """
+    ARIMA(1,1,0) モデルからの残差分散計算
+    ※高速化のためMA(1)成分の非線形推定は行わず、1次差分に対するAR(1)をOLS推定する
+    """
+    if len(prices) < 15:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 15:
+        return np.nan
+
+    # 定常性のための1次差分
+    diff_prices = np.diff(finite_prices)
+
+    if len(diff_prices) < 10:
+        return np.nan
+
+    # 差分にAR(1)モデル適合: Δy_t = φ*Δy_{t-1} + ε_t
+    y = diff_prices[1:]
+    x = diff_prices[:-1]
+
+    # 適切分散計算付OLS推定
+    n = len(y)
+    if n < 5:
+        return np.nan
+
+    sum_x = np.sum(x)
+    sum_y = np.sum(y)
+    sum_xy = np.sum(x * y)
+    sum_x2 = np.sum(x * x)
+
+    # AR係数計算
+    # ▼▼ 修正前: if n * sum_x2 - sum_x**2 != 0: ブランチ
+    # ▼▼ 修正後: if 分岐を廃止し + 1e-10 で保護
+    phi = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x**2 + 1e-10)
+
+    # 残差計算
+    intercept = (sum_y - phi * sum_x) / n
+    residuals = y - (intercept + phi * x)
+
+    # 残差分散（不偏推定量）
+    # ▼▼ 修正後: なぜ n-2 なのかの根拠コメント（ddof=2）を追加
+    # AR(1)+定数項でパラメータ2つ分の自由度を消費するため (ddof=2)
+    residual_variance = np.sum(residuals**2) / (n - 2)
+
+    return residual_variance
+
+
+@nb.njit(fastmath=False, cache=True)
+def kalman_状態推定_udf(prices: np.ndarray) -> float:
+    """
+    価格レベル用カルマンフィルタ状態推定
+    ノイズ低減による基礎となる真の価格レベル推定
+    """
+    if len(prices) < 5:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 5:
+        return np.nan
+
+    # 局所レベルモデル用適切カルマンフィルタ
+    # 状態: x_t = x_{t-1} + w_t (ランダムウォーク)
+    # 観測: y_t = x_t + v_t (観測ノイズ)
+
+    # 初期化
+    x = finite_prices[0]  # 初期状態推定
+    P = 1.0  # 初期状態分散
+
+    # プロセスと観測ノイズ分散推定
+    if len(finite_prices) > 1:
+        # ▼▼ 修正前: diff_var = np.var(np.diff(finite_prices)) / obs_var = np.var(finite_prices)
+        # ▼▼ 修正後: 手動ベッセル補正 (ddof=1相当) に置換
+        diff_vals = np.diff(finite_prices)
+        n_diff = len(diff_vals)
+        n_prices = len(finite_prices)
+
+        diff_var = np.var(diff_vals) * (n_diff / (n_diff - 1.0)) if n_diff > 1 else 0.0
+        obs_var = (
+            np.var(finite_prices) * (n_prices / (n_prices - 1.0))
+            if n_prices > 1
+            else 0.0
+        )
+
+        Q = max(diff_var, obs_var * 0.01)  # プロセスノイズ
+        R = obs_var * 0.1  # 観測ノイズ（信号の10%）
+    else:
+        Q = 1.0
+        R = 0.1
+
+    # カルマンフィルタ再帰
+    for i in range(1, len(finite_prices)):
+        # 予測ステップ
+        x_pred = x  # x_{t|t-1} = x_{t-1|t-1} (ランダムウォーク)
+        P_pred = P + Q  # P_{t|t-1} = P_{t-1|t-1} + Q
+
+        # 更新ステップ
+        K = P_pred / (P_pred + R)  # カルマンゲイン
+        x = x_pred + K * (finite_prices[i] - x_pred)  # 更新状態推定
+        P = (1 - K) * P_pred  # 更新状態分散
+
+    return x
+
+
+@nb.njit(fastmath=False, cache=True)
+def lowess_適合値_udf(prices: np.ndarray) -> float:
+    """
+    LOWESS（局所重み付け散布図平滑）適合値
+    トレンド推定のための局所回帰
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    if len(finite_prices) < 10:
+        return np.nan
+
+    n = len(finite_prices)
+    bandwidth = 0.3  # 30%帯域幅
+    h = max(3, int(bandwidth * n))
+
+    # ターゲット点は最後の観測値
+    target_idx = n - 1
+
+    # ターゲット点への距離計算
+    distances = np.abs(np.arange(n) - target_idx)
+
+    # k近傍探索
+    sorted_indices = np.argsort(distances)
+    neighbor_indices = sorted_indices[:h]
+
+    # 近傍抽出
+    x_neighbors = neighbor_indices.astype(np.float64)
+    y_neighbors = finite_prices[neighbor_indices]
+
+    # 三次重み計算
+    max_dist = np.max(distances[neighbor_indices])
+    # ▼▼ 修正前: if max_dist > 0: / weights = np.zeros(h)
+    # ▼▼ 修正後: 1e-10によるゼロ除算保護と dtype=np.float64 の明記（ルール5, 8）
+    if max_dist > 1e-10:
+        weights = np.zeros(h, dtype=np.float64)
+        for i in range(h):
+            u = distances[neighbor_indices[i]] / max_dist
+            if u < 1.0:
+                # 三次重み関数（1.0でfloat明記）
+                weights[i] = (1.0 - u**3) ** 3
+            else:
+                weights[i] = 0.0
+    else:
+        weights = np.ones(h, dtype=np.float64)
+
+    # 重み付き最小二乗回帰
+    if len(x_neighbors) >= 2:
+        # 重み付き平均
+        sum_w = np.sum(weights)
+        # ▼▼ 修正前: if sum_w > 0: ... else: fitted_value = np.mean(y_neighbors)
+        # ▼▼ 修正後: ロジック整理（微小値保護とelseブランチの明示化）
+        if sum_w > 1e-10:
+            x_mean = np.sum(weights * x_neighbors) / sum_w
+            y_mean = np.sum(weights * y_neighbors) / sum_w
+
+            # 重み付き回帰係数
+            numerator = np.sum(
+                weights * (x_neighbors - x_mean) * (y_neighbors - y_mean)
+            )
+            denominator = np.sum(weights * (x_neighbors - x_mean) ** 2)
+
+            if denominator > 1e-10:
+                slope = numerator / denominator
+                intercept = y_mean - slope * x_mean
+                fitted_value = intercept + slope * target_idx
+            else:
+                fitted_value = y_mean
+        else:
+            fitted_value = np.mean(y_neighbors)
+    else:
+        fitted_value = finite_prices[-1]
+
+    return fitted_value
+
+
+@nb.njit(fastmath=False, cache=True)
+def theil_sen_傾き_udf(prices: np.ndarray) -> float:
+    """
+    頑健傾き推定のためのタイル・セン推定量
+    外れ値に耐性のある全ペアワイズ傾きの中央値
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    finite_prices = prices[np.isfinite(prices)]
+    n = len(finite_prices)
+    if n < 10:
+        return np.nan
+
+    # ▼▼ 修正前: slopes = [] ... slopes.append(slope)
+    # ▼▼ 修正後: Numpy配列の事前確保（Pre-allocation）による超高速化（ルール6）
+    max_pairs = min(1000, (n * (n - 1)) // 2)  # 効率用制限
+    slopes = np.zeros(max_pairs, dtype=np.float64)
+    slope_idx = 0
+
+    if max_pairs < (n * (n - 1)) // 2:
+        # ペア一様サンプリング
+        step = max(1, ((n * (n - 1)) // 2) // max_pairs)
+        count = 0
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                if count % step == 0 and slope_idx < max_pairs:
+                    if j != i:  # ゼロ除算回避
+                        slopes[slope_idx] = (
+                            finite_prices[j] - finite_prices[i]
+                        ) / float(j - i)
+                        slope_idx += 1
+                count += 1
+    else:
+        # 全ペア計算
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                if slope_idx < max_pairs:
+                    slopes[slope_idx] = (finite_prices[j] - finite_prices[i]) / float(
+                        j - i
+                    )
+                    slope_idx += 1
+
+    if slope_idx > 0:
+        # 実際に計算された部分のみで中央値を計算
+        return np.median(slopes[:slope_idx])
+    else:
+        return np.nan
+
+
+
+
+# ===========================================================================
+# [CATEGORY: TECHNICAL OSCILLATORS — Engine 1C (Numba) 用]
+# ===========================================================================
+# 本セクションは Step 1 の SSoT 統一で集約された関数群。
+# 学習側 (engine_1_X) と本番側 (realtime_feature_engine_1X) の両方が
+# import で参照する正本。修正はここ一箇所のみ行う。
+# ===========================================================================
+
+@nb.njit(cache=True)
+def _wma_helper(data, start, length):
+    if start + length > len(data):
+        return np.nan
+    weight_sum = 0.0
+    value_sum = 0.0
+    for i in range(length):
+        weight = length - i
+        value_sum += data[start + i] * weight
+        weight_sum += weight
+    if weight_sum > 0:
+        return value_sum / weight_sum
+    return np.nan
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_wma_numba(prices, period, out):
+    """WMA (Weighted Moving Average) 計算 (完全版)"""
+    n = len(prices)
+    if n < period:
+        for i in range(n):
+            out[i] = np.nan
+        return
+
+    weight_sum = period * (period + 1) / 2.0
+    for i in range(n):
+        if i < period - 1:
+            out[i] = np.nan
+        else:
+            val_sum = 0.0
+            for j in range(period):
+                weight = period - j
+                val_sum += prices[i - j] * weight
+            out[i] = val_sum / weight_sum
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_hma_numba(prices, period, out):
+    """Hull Moving Average計算 (Numba最適化版)"""
+    n = len(prices)
+    half_period = period // 2
+    sqrt_period = int(np.sqrt(period))
+
+    # 中間配列
+    wma_half = np.zeros(n)
+    wma_full = np.zeros(n)
+    raw_hma = np.zeros(n)
+
+    # 計算
+    for i in range(n):
+        if i >= half_period - 1:
+            wma_half[i] = _wma_helper(prices, i - half_period + 1, half_period)
+        else:
+            wma_half[i] = np.nan
+
+        if i >= period - 1:
+            wma_full[i] = _wma_helper(prices, i - period + 1, period)
+        else:
+            wma_full[i] = np.nan
+
+        if not np.isnan(wma_half[i]) and not np.isnan(wma_full[i]):
+            raw_hma[i] = 2 * wma_half[i] - wma_full[i]
+        else:
+            raw_hma[i] = np.nan
+
+    # 最終HMA計算
+    for i in range(n):
+        if i >= sqrt_period - 1:
+            out[i] = _wma_helper(raw_hma, i - sqrt_period + 1, sqrt_period)
+        else:
+            out[i] = np.nan
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_kama_numba(prices, period, out):
+    """Kaufman Adaptive Moving Average計算 (Numba最適化版)"""
+    n = len(prices)
+    fast_ema = 2
+    slow_ema = 30
+
+    for i in range(n):
+        if i < period:
+            out[i] = np.nan
+        else:
+            # Efficiency Ratio計算
+            direction = abs(prices[i] - prices[i - period])
+            volatility = 0.0
+            for j in range(i - period + 1, i + 1):
+                volatility += abs(prices[j] - prices[j - 1])
+
+            if volatility == 0:
+                er = 0.0
+            else:
+                er = direction / volatility
+
+            # Smoothing Constant計算
+            fast_sc = 2.0 / (fast_ema + 1.0)
+            slow_sc = 2.0 / (slow_ema + 1.0)
+            sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+
+            # KAMA計算
+            if i == period:
+                out[i] = prices[i]
+            else:
+                if not np.isnan(out[i - 1]):
+                    out[i] = out[i - 1] + sc * (prices[i] - out[i - 1])
+                else:
+                    out[i] = prices[i]
+
+
+@nb.guvectorize(
+    ["void(float64[:], float64[:], float64[:], int64, int64, int64, float64[:])"],
+    "(n),(n),(n),(),(),()->(n)",
+    nopython=True,
+    cache=True,
+)
+def calculate_stochastic_numba(high, low, close, k_period, d_period, slow_period, out):
+    """Stochastic Oscillator計算 (Numba最適化版)"""
+    n = len(high)
+
+    # %K計算
+    k_values = np.zeros(n)
+    for i in range(n):
+        if i < k_period - 1:
+            k_values[i] = np.nan
+        else:
+            highest = high[i]
+            lowest = low[i]
+            for j in range(i - k_period + 1, i):
+                if high[j] > highest:
+                    highest = high[j]
+                if low[j] < lowest:
+                    lowest = low[j]
+
+            if highest - lowest > 0:
+                k_values[i] = 100 * (close[i] - lowest) / (highest - lowest)
+            else:
+                k_values[i] = 50.0
+
+    # %D計算 (Simple MA of %K)
+    for i in range(n):
+        if i < k_period + d_period - 2:
+            out[i] = np.nan
+        else:
+            sum_k = 0.0
+            # ▼▼ 修正前: count = 0
+            # ▼▼ 修正後: ルール8（型の厳格化）に基づき、float の 0.0 で初期化
+            count = 0.0
+            for j in range(i - d_period + 1, i + 1):
+                if not np.isnan(k_values[j]):
+                    sum_k += k_values[j]
+                    # ▼▼ 修正前: count += 1
+                    # ▼▼ 修正後: 型の厳格化
+                    count += 1.0
+
+            # ▼▼ 修正前: if count > 0:
+            # ▼▼ 修正前:     out[i] = sum_k / count
+            # ▼▼ 修正後: 型の厳格化（0.0）と、ルール5（ゼロ除算の鉄壁防衛）のための + 1e-10 の追加
+            # 修正後
+            if count > 0.0:
+                out[i] = sum_k / count
+            else:
+                out[i] = np.nan
+
+
+@nb.guvectorize(
+    ["void(float64[:], float64[:], float64[:], int64, float64[:])"],
+    "(n),(n),(n),()->(n)",
+    nopython=True,
+    cache=True,
+)
+def calculate_williams_r_numba(high, low, close, period, out):
+    """Williams %R計算 (Numba最適化版)"""
+    n = len(high)
+
+    for i in range(n):
+        if i < period - 1:
+            out[i] = np.nan
+        else:
+            highest = high[i]
+            lowest = low[i]
+
+            for j in range(i - period + 1, i):
+                if high[j] > highest:
+                    highest = high[j]
+                if low[j] < lowest:
+                    lowest = low[j]
+
+            if highest - lowest > 0:
+                out[i] = -100 * (highest - close[i]) / (highest - lowest)
+            else:
+                out[i] = -50.0
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_trix_numba(prices, period, out):
+    """TRIX指標計算 (Numba最適化版)"""
+    n = len(prices)
+
+    # 三重指数移動平均
+    ema1 = np.zeros(n)
+    ema2 = np.zeros(n)
+    ema3 = np.zeros(n)
+
+    alpha = 2.0 / (period + 1.0)
+
+    # 1st EMA
+    for i in range(n):
+        if i == 0:
+            ema1[i] = prices[i]
+        else:
+            ema1[i] = alpha * prices[i] + (1 - alpha) * ema1[i - 1]
+
+    # 2nd EMA
+    for i in range(n):
+        if i == 0:
+            ema2[i] = ema1[i]
+        else:
+            ema2[i] = alpha * ema1[i] + (1 - alpha) * ema2[i - 1]
+
+    # 3rd EMA
+    for i in range(n):
+        if i == 0:
+            ema3[i] = ema2[i]
+        else:
+            ema3[i] = alpha * ema2[i] + (1 - alpha) * ema3[i - 1]
+
+    # TRIX計算
+    for i in range(n):
+        if i < period * 3:
+            out[i] = np.nan
+        elif ema3[i - 1] == 0:
+            out[i] = 0.0
+        else:
+            out[i] = 10000 * (ema3[i] - ema3[i - 1]) / ema3[i - 1]
+
+
+@nb.guvectorize(
+    ["void(float64[:], float64[:], float64[:], float64[:], float64[:])"],
+    "(n),(n),(n),(n)->(n)",
+    nopython=True,
+    cache=True,
+)
+def calculate_ultimate_oscillator_numba(high, low, close, volume, out):
+    """Ultimate Oscillator計算 (Numba最適化版)"""
+    n = len(high)
+    period_7 = 7
+    period_14 = 14
+    period_28 = 28
+    weight_0 = 4.0
+    weight_1 = 2.0
+    weight_2 = 1.0
+    weight_total = 7.0
+    max_period = 28
+
+    # Buying Pressure and True Range計算
+    bp = np.zeros(n)
+    tr = np.zeros(n)
+
+    for i in range(n):
+        if i == 0:
+            bp[i] = close[i] - low[i]
+            tr[i] = high[i] - low[i]
+        else:
+            lc = close[i - 1]
+            bp[i] = close[i] - (low[i] if low[i] < lc else lc)
+            h_l = high[i] - low[i]
+            h_pc = abs(high[i] - close[i - 1])
+            l_pc = abs(low[i] - close[i - 1])
+            tr[i] = max(h_l, h_pc, l_pc)
+
+    # Ultimate Oscillator計算
+    for i in range(n):
+        if i < max_period:
+            out[i] = np.nan
+        else:
+            weighted_sum = 0.0
+
+            for j in range(3):
+                if j == 0:
+                    period = period_7
+                    w = weight_0
+                elif j == 1:
+                    period = period_14
+                    w = weight_1
+                else:
+                    period = period_28
+                    w = weight_2
+                bp_sum = 0.0
+                tr_sum = 0.0
+
+                for k in range(i - period + 1, i + 1):
+                    bp_sum += bp[k]
+                    tr_sum += tr[k]
+
+                if tr_sum > 0:
+                    avg = bp_sum / tr_sum
+                else:
+                    avg = 0.0
+
+                # 修正後
+                weighted_sum += avg * w
+
+            out[i] = 100 * weighted_sum / weight_total
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_aroon_up_numba(high, period, out):
+    """Aroon Up計算 (Numba最適化版)"""
+    n = len(high)
+
+    for i in range(n):
+        if i < period - 1:  # 修正箇所: period から period - 1 へ変更
+            out[i] = np.nan
+        else:
+            # Find highest high in period
+            highest_idx = i
+            highest_val = high[i]
+
+            # ループ範囲は i - period + 1 から i (iを含まない) まで
+            # (例: i=13, period=14 -> range(0, 13) -> j=0...12)
+            for j in range(i - period + 1, i):
+                if high[j] > highest_val:
+                    highest_val = high[j]
+                    highest_idx = j
+
+            # Calculate periods since highest
+            periods_since = i - highest_idx
+            out[i] = 100.0 * (period - periods_since) / period
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_aroon_down_numba(low, period, out):
+    """Aroon Down計算 (Numba最適化版)"""
+    n = len(low)
+
+    for i in range(n):
+        if i < period - 1:  # 修正箇所: period から period - 1 へ変更
+            out[i] = np.nan
+        else:
+            # Find lowest low in period
+            lowest_idx = i
+            lowest_val = low[i]
+
+            # ループ範囲は i - period + 1 から i (iを含まない) まで
+            for j in range(i - period + 1, i):
+                if low[j] < lowest_val:
+                    lowest_val = low[j]
+                    lowest_idx = j
+
+            # Calculate periods since lowest
+            periods_since = i - lowest_idx
+            out[i] = 100.0 * (period - periods_since) / period
+
+
+@nb.guvectorize(
+    ["void(float64[:], int64, float64[:])"], "(n),()->(n)", nopython=True, cache=True
+)
+def calculate_tsi_numba(prices, period, out):
+    """True Strength Index計算 (Numba最適化版)"""
+    n = len(prices)
+    long_period = period
+    short_period = period // 2
+
+    # Price momentum
+    momentum = np.zeros(n)
+    for i in range(1, n):
+        momentum[i] = prices[i] - prices[i - 1]
+    momentum[0] = 0.0
+
+    # Double smoothed momentum
+    alpha_long = 2.0 / (long_period + 1.0)
+    alpha_short = 2.0 / (short_period + 1.0)
+
+    # First EMA of momentum
+    ema1_mom = np.zeros(n)
+    ema1_abs = np.zeros(n)
+
+    for i in range(n):
+        if i == 0:
+            ema1_mom[i] = momentum[i]
+            ema1_abs[i] = abs(momentum[i])
+        else:
+            ema1_mom[i] = alpha_long * momentum[i] + (1 - alpha_long) * ema1_mom[i - 1]
+            ema1_abs[i] = (
+                alpha_long * abs(momentum[i]) + (1 - alpha_long) * ema1_abs[i - 1]
+            )
+
+    # Second EMA
+    ema2_mom = np.zeros(n)
+    ema2_abs = np.zeros(n)
+
+    for i in range(n):
+        if i == 0:
+            ema2_mom[i] = ema1_mom[i]
+            ema2_abs[i] = ema1_abs[i]
+        else:
+            ema2_mom[i] = (
+                alpha_short * ema1_mom[i] + (1 - alpha_short) * ema2_mom[i - 1]
+            )
+            ema2_abs[i] = (
+                alpha_short * ema1_abs[i] + (1 - alpha_short) * ema2_abs[i - 1]
+            )
+
+    # TSI計算
+    for i in range(n):
+        if i < long_period + short_period:
+            out[i] = np.nan
+        elif ema2_abs[i] == 0:
+            out[i] = 0.0
+        else:
+            out[i] = 100 * ema2_mom[i] / ema2_abs[i]
+
+
+@nb.njit(fastmath=False, cache=True)
+def _calculate_di_wilder(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int,
+) -> tuple:
+    """
+    DI+ / DI- — calculate_adx (core_indicators) の内部ロジックと完全同一の
+    Wilder 平滑化実装。ADX と DI が同一の ATR 平滑化を参照することを保証する。
+
+    Returns:
+        (di_plus_arr, di_minus_arr): 各 shape=(n,) の ndarray
+    """
+    n = len(high)
+    di_plus_out = np.full(n, np.nan, dtype=np.float64)
+    di_minus_out = np.full(n, np.nan, dtype=np.float64)
+    if n <= period:
+        return di_plus_out, di_minus_out
+
+    # TR, DM+, DM- — calculate_adx 内部と同一
+    tr = np.zeros(n, dtype=np.float64)
+    dm_plus = np.zeros(n, dtype=np.float64)
+    dm_minus = np.zeros(n, dtype=np.float64)
+
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i - 1])
+        lc = abs(low[i] - close[i - 1])
+        tr[i] = max(hl, hc, lc)
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+        dm_plus[i] = up_move if (up_move > down_move and up_move > 0.0) else 0.0
+        dm_minus[i] = down_move if (down_move > up_move and down_move > 0.0) else 0.0
+
+    # Wilder 平滑化 — calculate_adx 内部と同一（単純合計シード）
+    atr_w = np.zeros(n, dtype=np.float64)
+    dmp_w = np.zeros(n, dtype=np.float64)
+    dmm_w = np.zeros(n, dtype=np.float64)
+
+    init_tr = 0.0
+    init_dmp = 0.0
+    init_dmm = 0.0
+    for j in range(period):
+        init_tr += tr[j]
+        init_dmp += dm_plus[j]
+        init_dmm += dm_minus[j]
+
+    atr_w[period - 1] = init_tr
+    dmp_w[period - 1] = init_dmp
+    dmm_w[period - 1] = init_dmm
+
+    for i in range(period, n):
+        atr_w[i] = atr_w[i - 1] - atr_w[i - 1] / period + tr[i]
+        dmp_w[i] = dmp_w[i - 1] - dmp_w[i - 1] / period + dm_plus[i]
+        dmm_w[i] = dmm_w[i - 1] - dmm_w[i - 1] / period + dm_minus[i]
+
+    # DI+ / DI- 計算
+    for i in range(period - 1, n):
+        if atr_w[i] > 1e-10:
+            di_plus_out[i] = dmp_w[i] / atr_w[i] * 100.0
+            di_minus_out[i] = dmm_w[i] / atr_w[i] * 100.0
+
+    return di_plus_out, di_minus_out
+
+
+
+
+# ===========================================================================
+# [CATEGORY: VOLUME EXTRA — Engine 1D 追加 (HV / Pivot / Donchian)]
+# ===========================================================================
+# 本セクションは Step 1 の SSoT 統一で集約された関数群。
+# 学習側 (engine_1_X) と本番側 (realtime_feature_engine_1X) の両方が
+# import で参照する正本。修正はここ一箇所のみ行う。
+# ===========================================================================
+
+@nb.njit(fastmath=False, cache=True)
+def hv_standard_udf(returns: np.ndarray) -> float:
+    """
+    標準ヒストリカルボラティリティ計算
+    標準偏差ベースの伝統的ボラティリティ指標
+    """
+    if len(returns) < 5:
+        return np.nan
+
+    finite_returns = returns[np.isfinite(returns)]
+    if len(finite_returns) < 5:
+        return np.nan
+
+    # 標準偏差計算（不偏推定量）
+    mean_return = np.mean(finite_returns)
+    squared_deviations = (finite_returns - mean_return) ** 2
+    variance = np.sum(squared_deviations) / (len(finite_returns) - 1)
+    volatility = np.sqrt(variance)
+
+    return volatility
+
+
+@nb.njit(fastmath=False, cache=True)
+def hv_robust_udf(returns: np.ndarray) -> float:
+    """
+    ロバストボラティリティ計算
+    中央絶対偏差（MAD）ベースの外れ値耐性ボラティリティ
+    """
+    if len(returns) < 5:
+        return np.nan
+
+    finite_returns = returns[np.isfinite(returns)]
+    if len(finite_returns) < 5:
+        return np.nan
+
+    # MADベースロバスト標準偏差
+    median_return = np.median(finite_returns)
+    abs_deviations = np.abs(finite_returns - median_return)
+    mad = np.median(abs_deviations)
+
+    # MADを標準偏差に変換（正規分布仮定下）
+    robust_volatility = mad * 1.4826  # 1.4826 = 1/Φ^(-1)(0.75)
+
+    return robust_volatility
+
+
+@nb.njit(fastmath=False, cache=True)
+def pivot_point_udf(
+    high: float, low: float, close: float
+) -> Tuple[float, float, float, float, float]:
+    """
+    ピボットポイント計算
+    Returns: (pivot_point, resistance1, support1, resistance2, support2)
+    """
+    if not (np.isfinite(high) and np.isfinite(low) and np.isfinite(close)):
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    pivot = (high + low + close) / 3.0
+    r1 = 2.0 * pivot - low
+    s1 = 2.0 * pivot - high
+    r2 = pivot + (high - low)
+    s2 = pivot - (high - low)
+
+    return pivot, r1, s1, r2, s2
+
+
+@nb.njit(fastmath=False, cache=True)
+def donchian_channel_udf(high: np.ndarray, low: np.ndarray, window: int) -> np.ndarray:
+    """
+    ドンチャンチャネル計算
+    Returns: 各行に[upper, middle, lower]を含む配列
+    """
+    n = len(high)
+    result = np.full((n, 3), np.nan)
+
+    if n < window:
+        return result
+
+    for i in range(window - 1, n):
+        period_high = -np.inf
+        period_low = np.inf
+
+        for j in range(i - window + 1, i + 1):
+            if np.isfinite(high[j]) and high[j] > period_high:
+                period_high = high[j]
+            if np.isfinite(low[j]) and low[j] < period_low:
+                period_low = low[j]
+
+        if np.isfinite(period_high) and np.isfinite(period_low):
+            result[i, 0] = period_high  # upper
+            result[i, 1] = (period_high + period_low) / 2.0  # middle
+            result[i, 2] = period_low  # lower
+
+    return result
+
 
 def _run_validation():
     """数値検証: core_indicators の各関数の出力を確認する。"""

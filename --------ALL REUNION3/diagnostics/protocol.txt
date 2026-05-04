@@ -1,0 +1,37 @@
+ツール①の使い方（feature_snapshot_tool.py）
+自動で動きます。 main.pyを起動してATRフィルターを通過したM3シグナルが発生するたびに自動でCSVが /workspace/data/diagnostics/feature_snapshots/ に保存されます。
+確認の手順：
+
+本番稼働中にシグナルが出るのを待つ
+CSVが出力されたら中身を開く
+各特徴量の値を目視確認。異常値（inf・NaN・極端に大きい値）がないか確認
+複数のCSVが溜まったら値の分布を確認
+
+何を見るか：
+
+_neutralized 特徴量が全て数値か（0.0だらけなら純化が機能していない可能性）
+atr_ratio_M3 が0.0ではなく正しい値になっているか（今回の修正確認）
+M2予測値（_m2_long/short）の水準がOOF分布と近いか
+
+
+ツール③の使い方（reproducibility_verifier.py）
+手動で実行します。 本番稼働とは独立して任意のタイミングで実行できます。
+bashcd /workspace/diagnostics
+python reproducibility_verifier.py --direction long --n_samples 50 --min_proba 0.70
+完了すると /workspace/data/XAUUSD/stratum_7_models/reproducibility_results/ に以下が出力されます：
+
+comparison_long.csv：OOF予測値 vs 再現予測値の全件比較
+summary_report_long.txt：MAE・相関係数・乖離TOP10
+
+推奨する実行タイミング：
+
+今すぐ実行（ベースライン取得）：現状の再現性を数値化しておく
+修正後に再実行：m1_pred_probaの順序修正・atr_ratio修正後に再実行して改善を確認
+再学習後に実行：モデルを更新したときに必ず実行して再現性を確認
+
+結果の読み方：
+
+相関係数 > 0.95 → 良好
+MAE < 0.05 → 良好
+差分 < 0.01が80%以上 → 非常に良好
+乖離TOP10で特定の時間帯や相場環境に偏りがあれば①で特徴量を確認

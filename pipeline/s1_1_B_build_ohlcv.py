@@ -74,6 +74,39 @@ TIMEFRAMES_GPU = {
 }
 
 # -------------------------------------------------------------------
+# 【DISC-FLAG】各時間足の「想定バー間隔(秒)」
+#  filter(tick_count > 0) で削除されたバー(=ティックなし時間帯)による不連続を検知し、
+#  ATR計算で前バーcloseを使ったTRが過大評価されるのを防ぐためのフラグ。
+#
+#  判定ルール:
+#      gap_seconds = (timestamp[i] - timestamp[i-1]).total_seconds()
+#      disc[i] = (gap_seconds > expected_seconds * 1.5)
+#
+#  例 (M3, expected=180s):
+#      連続バー: gap = 180s     → disc = False (連続)
+#      週末跨ぎ: gap = 200000s  → disc = True  (不連続: 前closeを使わずH-LでTR計算)
+# -------------------------------------------------------------------
+TIMEFRAME_FREQ_SECONDS = {
+    "tick": 0,           # tick はバー集約なし
+    "M0.5": 30,
+    "M1":   60,
+    "M3":   180,
+    "M5":   300,
+    "M8":   480,
+    "M15":  900,
+    "M30":  1800,
+    "H1":   3600,
+    "H4":   14400,
+    "H6":   21600,
+    "H12":  43200,
+    "D1":   86400,
+    "W1":   604800,
+    "MN":   2592000,    # 月足は概算30日 (実日数は月により異なるが本判定には影響しない)
+}
+# disc 判定の閾値倍率: 想定間隔の何倍を超えたら「不連続」とみなすか
+DISC_GAP_MULTIPLIER = 1.5
+
+# -------------------------------------------------------------------
 # 環境検出
 # -------------------------------------------------------------------
 try:
@@ -117,6 +150,19 @@ def process_with_gpu():
         ddf["tick_count"] = 1
     if "volume" not in ddf.columns:
         ddf["volume"] = ddf["tick_count"]
+    else:
+        # [VOLUME-FALLBACK] ECN ブローカー由来の CSV では volume 列は存在するが
+        # 全行 0/None になる。その場合は tick_count を volume として使用する。
+        # 本番側 (ProjectForgeReceiver.mq5) も同じく tick 数カウントに統一済み。
+        try:
+            vol_filled = ddf["volume"].fillna(0)
+            if (vol_filled == 0).all().compute():
+                logger.warning(
+                    "[VOLUME-FALLBACK] volume 列が全 0/None のため tick_count で代用します。"
+                )
+                ddf["volume"] = ddf["tick_count"]
+        except Exception as e:
+            logger.warning(f"[VOLUME-FALLBACK] チェックスキップ: {e}")
 
     # 数値計算用タイムスタンプ（ナノ秒）
     ddf_int_ts = ddf[ts_col].astype("int64")
@@ -147,6 +193,8 @@ def process_with_gpu():
             resampled_ddf["high"] = resampled_ddf["open"]
             resampled_ddf["low"] = resampled_ddf["open"]
             resampled_ddf["close"] = resampled_ddf["open"]
+            # [DISC-FLAG] tick足は連続データのため disc=False で固定
+            resampled_ddf["disc"] = False
         else:
             # 数値計算によるグルーピング
             bucket_size_ns = pd.to_timedelta(freq).total_seconds() * 1_000_000_000
@@ -169,8 +217,27 @@ def process_with_gpu():
             resampled = resampled.reset_index().rename(
                 columns={"group_key": "timestamp"}
             )
+            # ★[GPU側 filter(tick_count > 0) 同期]
+            #   CPU側は group_by_dynamic + filter(tick_count > 0) で
+            #   ティックなしバーを削除している。GPU側でも同等の処理を入れて
+            #   学習側全体で「ティックなしバーは存在しない」を保証する。
+            resampled = resampled[resampled["tick_count"] > 0]
+            resampled = resampled.sort_values("timestamp").reset_index(drop=True)
+
             resampled["timestamp"] = resampled["timestamp"].astype("datetime64[ns]")
             resampled_ddf = resampled.drop(columns=["group_key"], errors="ignore")
+
+            # [DISC-FLAG] 不連続フラグの付与 (CPU側と同じロジック)
+            #   timestamp_ns[i] - timestamp_ns[i-1] > expected_seconds * 1.5 * 1e9 → disc=True
+            #   先頭バーは便宜上 False
+            expected_sec = TIMEFRAME_FREQ_SECONDS.get(name, 0)
+            if expected_sec > 0:
+                threshold_ns = int(expected_sec * DISC_GAP_MULTIPLIER * 1_000_000_000)
+                ts_int = resampled_ddf["timestamp"].astype("int64")
+                gaps = ts_int.diff()
+                resampled_ddf["disc"] = (gaps > threshold_ns).fillna(False)
+            else:
+                resampled_ddf["disc"] = False
 
         # スキーマの厳密なキャスト
         # timestamp: 前工程(s1_1_A)の出力であるマイクロ秒(us)からミリ秒(ms)へ明示的にダウンキャストして統一
@@ -180,6 +247,8 @@ def process_with_gpu():
             resampled_ddf[col] = resampled_ddf[col].astype("float32")
         resampled_ddf["volume"] = resampled_ddf["volume"].astype("int64")
         resampled_ddf["tick_count"] = resampled_ddf["tick_count"].astype("int32")
+        # [DISC-FLAG] Boolean を明示的にキャスト
+        resampled_ddf["disc"] = resampled_ddf["disc"].astype("bool")
 
         # timeframe列の型保証: CategoricalやObject型への意図せぬ変換を避け、純粋なString型を強制する
         resampled_ddf["timeframe"] = str(name)
@@ -202,6 +271,7 @@ def process_with_gpu():
             "bid",
             "ask",
             "spread",
+            "disc",
         ]
         resampled_ddf = resampled_ddf[cols_order]
 
@@ -231,14 +301,37 @@ def process_with_cpu():
 
     # LazyFrame用のスキーマ確認
     if "volume" not in tick_lf.collect_schema().names():
+        # tick_count を volume として使用 (列が存在しない場合)
         tick_lf = tick_lf.with_columns(pl.lit(1, dtype=pl.Int64).alias("volume"))
     else:
-        tick_lf = tick_lf.with_columns(
-            pl.when(pl.col("volume").is_not_null())
-            .then(pl.col("volume").cast(pl.Int64))
-            .otherwise(pl.lit(0, dtype=pl.Int64))
-            .alias("volume")
-        )
+        # [VOLUME-FALLBACK] ECN ブローカー由来の CSV では volume 列は存在するが
+        # 全行 0/None になる。その場合は tick 1個=1 としてカウントする。
+        # 本番側 (ProjectForgeReceiver.mq5) も同じく tick 数カウントに統一済み。
+        # まず volume の最大値を計算 (Lazy collect で 1 度だけ評価)
+        try:
+            vol_check = tick_lf.select(
+                pl.col("volume").fill_null(0).max().alias("vmax")
+            ).collect()
+            v_max = vol_check["vmax"][0]
+        except Exception as e:
+            logger.warning(f"[VOLUME-FALLBACK] volume max 取得失敗: {e}")
+            v_max = None
+
+        if v_max is None or v_max == 0:
+            logger.warning(
+                "[VOLUME-FALLBACK] volume 列が全 0/None のため tick=1 カウントで代用します。"
+            )
+            # ECN ブローカー: tick 1 個 = 1 として扱う
+            tick_lf = tick_lf.with_columns(
+                pl.lit(1, dtype=pl.Int64).alias("volume")
+            )
+        else:
+            tick_lf = tick_lf.with_columns(
+                pl.when(pl.col("volume").is_not_null())
+                .then(pl.col("volume").cast(pl.Int64))
+                .otherwise(pl.lit(0, dtype=pl.Int64))
+                .alias("volume")
+            )
 
     summary_stats = {}
 
@@ -256,6 +349,8 @@ def process_with_cpu():
                     pl.col("mid_price").alias("low"),
                     pl.col("mid_price").alias("close"),
                     pl.lit(1).cast(pl.Int32).alias("tick_count"),
+                    # [DISC-FLAG] tick足は連続データのため disc=False で固定
+                    pl.lit(False).alias("disc"),
                 ]
             )
         else:
@@ -280,6 +375,34 @@ def process_with_cpu():
 
             bars_lf = bars_lf.rename({"datetime": "timestamp"})
 
+            # [DISC-FLAG] 不連続フラグの付与
+            #   filter(tick_count > 0) でティックなしバーを削除した結果、
+            #   時系列上の前バーとのタイムスタンプ差が「想定間隔×1.5」を超えた場合を
+            #   不連続(disc=True)とマークする。
+            #
+            #   このフラグは後続の create_proxy_labels / engine_1_C のATR計算で
+            #   「disc=True のバーでは前バーcloseを使わずH-LのみでTRを計算する」
+            #   ために使用される (週末跨ぎ等のギャップ越境TR防止)。
+            #
+            #   先頭バーは便宜上 disc=False (前バーがないので連続とみなす)。
+            expected_sec = TIMEFRAME_FREQ_SECONDS.get(name, 0)
+            if expected_sec > 0:
+                threshold_us = int(expected_sec * DISC_GAP_MULTIPLIER * 1_000_000)
+                bars_lf = bars_lf.with_columns(
+                    (
+                        (
+                            pl.col("timestamp").cast(pl.Datetime("us")).cast(pl.Int64)
+                            - pl.col("timestamp").cast(pl.Datetime("us")).cast(pl.Int64).shift(1)
+                        )
+                        > threshold_us
+                    )
+                    .fill_null(False)  # 先頭バーは False (連続扱い)
+                    .alias("disc")
+                )
+            else:
+                # tick等、想定間隔が定義されていないTFは disc=False で固定
+                bars_lf = bars_lf.with_columns(pl.lit(False).alias("disc"))
+
         # スキーマの厳密なキャスト
         bars_lf = bars_lf.with_columns(
             [
@@ -294,6 +417,8 @@ def process_with_cpu():
                 pl.col("bid").cast(pl.Float32),
                 pl.col("ask").cast(pl.Float32),
                 pl.col("spread").cast(pl.Float32),
+                # [DISC-FLAG] Boolean のまま保持 (Parquet で 1 byte/row、十分軽量)
+                pl.col("disc").cast(pl.Boolean),
             ]
         ).select(
             [
@@ -308,6 +433,7 @@ def process_with_cpu():
                 "bid",
                 "ask",
                 "spread",
+                "disc",
             ]
         )
 

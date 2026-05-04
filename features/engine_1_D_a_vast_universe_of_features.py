@@ -29,8 +29,24 @@ import sys as _sys_ci
 _sys_ci.path.append(str(config.CORE_DIR))
 from core_indicators import (
     calculate_atr_wilder,  # Wilder平滑化ATR（SMA版 calculate_atr_numba を置き換え）
-    scale_by_atr,          # ゼロ除算保護付きATR割り（NumPy配列用・将来のrealtime側で使用）
     calculate_sample_weight,  # Zスコアサンプルウェイト（Polarsインライン計算を置き換え）
+    # [SSoT 統一] Engine 1D の UDF を core_indicators から import
+    # (旧: 本ファイル内で定義 → 本番側 rfe_1D と二重定義 = SSoT 違反)
+    # 既存の core_indicators 関数 (Phase 4 以前から集約済)
+    chaikin_volatility_udf,
+    mass_index_udf,
+    cmf_udf,
+    mfi_udf,
+    vwap_udf,
+    obv_udf,
+    accumulation_distribution_udf,
+    force_index_udf,
+    commodity_channel_index_udf,
+    fibonacci_levels_udf,
+    candlestick_patterns_udf,
+    # 今回新規追加の関数
+    hv_standard_udf,
+    hv_robust_udf,
 )
 del _sys_ci
 # --------------------------------------------------------
@@ -390,413 +406,13 @@ class DataEngine:
 # =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True)
-def hv_standard_udf(returns: np.ndarray) -> float:
-    """
-    標準ヒストリカルボラティリティ計算
-    標準偏差ベースの伝統的ボラティリティ指標
-    """
-    if len(returns) < 5:
-        return np.nan
-
-    finite_returns = returns[np.isfinite(returns)]
-    if len(finite_returns) < 5:
-        return np.nan
-
-    # 標準偏差計算（不偏推定量）
-    mean_return = np.mean(finite_returns)
-    squared_deviations = (finite_returns - mean_return) ** 2
-    variance = np.sum(squared_deviations) / (len(finite_returns) - 1)
-    volatility = np.sqrt(variance)
-
-    return volatility
-
-
-@nb.njit(fastmath=True, cache=True)
-def hv_robust_udf(returns: np.ndarray) -> float:
-    """
-    ロバストボラティリティ計算
-    中央絶対偏差（MAD）ベースの外れ値耐性ボラティリティ
-    """
-    if len(returns) < 5:
-        return np.nan
-
-    finite_returns = returns[np.isfinite(returns)]
-    if len(finite_returns) < 5:
-        return np.nan
-
-    # MADベースロバスト標準偏差
-    median_return = np.median(finite_returns)
-    abs_deviations = np.abs(finite_returns - median_return)
-    mad = np.median(abs_deviations)
-
-    # MADを標準偏差に変換（正規分布仮定下）
-    robust_volatility = mad * 1.4826  # 1.4826 = 1/Φ^(-1)(0.75)
-
-    return robust_volatility
-
-
 # ▼▼ 修正前: @nb.njit(fastmath=True, cache=True, parallel=True) でSMAによる偽装計算
 # ▼▼ 修正後: parallel=True を削除し、真の連続EMAによる計算に純化
-@nb.njit(fastmath=True, cache=True)
-def chaikin_volatility_udf(
-    high: np.ndarray, low: np.ndarray, window: int
-) -> np.ndarray:
-    """
-    真のChaikin Volatility計算 (EMAベース)
-    High-Low範囲の指数平滑移動平均の変化率
-    """
-    n = len(high)
-    result = np.full(n, np.nan, dtype=np.float64)
-
-    if n < window * 2:
-        return result
-
-    hl_range = high - low
-    ema = np.full(n, np.nan, dtype=np.float64)
-
-    # 有効な開始位置の探索
-    valid_start = 0
-    while valid_start < n and not np.isfinite(hl_range[valid_start]):
-        valid_start += 1
-
-    if valid_start + window > n:
-        return result
-
-    # EMAの初期化 (最初のwindow期間のSMA)
-    sma_init = 0.0
-    for i in range(valid_start, valid_start + window):
-        sma_init += hl_range[i]
-    sma_init /= window
-    ema[valid_start + window - 1] = sma_init
-
-    # 連続的な真のEMA計算
-    alpha = 2.0 / (window + 1.0)
-    for i in range(valid_start + window, n):
-        ema[i] = alpha * hl_range[i] + (1.0 - alpha) * ema[i - 1]
-
-    # Chaikin Volatility = (EMA - n期間前のEMA) / n期間前のEMA * 100
-    for i in range(valid_start + window * 2 - 1, n):
-        prev_ema = ema[i - window]
-        if np.isfinite(ema[i]) and np.isfinite(prev_ema) and prev_ema > 0:
-            result[i] = (ema[i] - prev_ema) / prev_ema * 100.0
-
-    return result
-
-
 # ▼▼ 修正前: @nb.njit(fastmath=True, cache=True, parallel=True) で打ち切りEMAの近似
 # ▼▼ 修正後: parallel=True を削除し、真の連続Double EMAによる計算に純化
-@nb.njit(fastmath=True, cache=True)
-def mass_index_udf(high: np.ndarray, low: np.ndarray, window: int) -> np.ndarray:
-    """
-    真のMass Index計算
-    EMA(9)とEMA(EMA(9))の比率の連続累積和
-    """
-    n = len(high)
-    result = np.full(n, np.nan, dtype=np.float64)
-
-    # EMA(9) + DoubleEMA(9) + window期間の累積和 に必要な最低データ長
-    if n < 9 + 9 + window:
-        return result
-
-    hl_range = high - low
-    ema9 = np.full(n, np.nan, dtype=np.float64)
-    ema_ema9 = np.full(n, np.nan, dtype=np.float64)
-
-    alpha = 2.0 / (9.0 + 1.0)
-
-    valid_start = 0
-    while valid_start < n and not np.isfinite(hl_range[valid_start]):
-        valid_start += 1
-
-    if valid_start + 9 > n:
-        return result
-
-    # 第1段階：真の連続 EMA(9) 計算
-    sma_init = 0.0
-    for i in range(valid_start, valid_start + 9):
-        sma_init += hl_range[i]
-    ema9[valid_start + 8] = sma_init / 9.0
-
-    for i in range(valid_start + 9, n):
-        ema9[i] = alpha * hl_range[i] + (1.0 - alpha) * ema9[i - 1]
-
-    # 第2段階：真の連続 Double EMA(9) 計算
-    if valid_start + 17 > n:
-        return result
-
-    sma_ema_init = 0.0
-    for i in range(valid_start + 8, valid_start + 17):
-        sma_ema_init += ema9[i]
-    ema_ema9[valid_start + 16] = sma_ema_init / 9.0
-
-    for i in range(valid_start + 17, n):
-        ema_ema9[i] = alpha * ema9[i] + (1.0 - alpha) * ema_ema9[i - 1]
-
-    # 第3段階：window期間の比率累積和 (Mass Index)
-    for i in range(valid_start + 16 + window - 1, n):
-        mass_sum = 0.0
-        is_valid = True
-        for j in range(i - window + 1, i + 1):
-            if (
-                not np.isfinite(ema9[j])
-                or not np.isfinite(ema_ema9[j])
-                or ema_ema9[j] <= 0
-            ):
-                is_valid = False
-                break
-            mass_sum += ema9[j] / ema_ema9[j]
-
-        if is_valid:
-            result[i] = mass_sum
-
-    return result
-
-
 # =============================================================================
 # 出来高関連指標 (Numba UDF集)
 # =============================================================================
-
-
-@nb.njit(fastmath=True, cache=True)
-def cmf_udf(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    window: int,
-) -> np.ndarray:
-    """
-    Chaikin Money Flow (CMF) 計算
-    出来高加重された価格位置の移動平均
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < window:
-        return result
-
-    for i in range(window - 1, n):
-        mf_volume_sum = 0.0
-        volume_sum = 0.0
-
-        for j in range(i - window + 1, i + 1):
-            if (
-                np.isfinite(high[j])
-                and np.isfinite(low[j])
-                and np.isfinite(close[j])
-                and np.isfinite(volume[j])
-            ):
-                if high[j] != low[j]:
-                    # ▼▼ 修正後: ゼロ除算防止と型の厳格化 (ルール5, 8)
-                    hl_range = high[j] - low[j]
-                    mf_multiplier = ((close[j] - low[j]) - (high[j] - close[j])) / (
-                        hl_range + 1e-10
-                    )
-                    mf_volume = mf_multiplier * volume[j]
-                    mf_volume_sum += mf_volume
-                    volume_sum += volume[j]
-
-        if volume_sum > 0:
-            result[i] = mf_volume_sum / volume_sum
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def mfi_udf(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    window: int,
-) -> np.ndarray:
-    """
-    Money Flow Index (MFI) 計算
-    出来高加重RSI（価格×出来高ベース）
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < window + 1:
-        return result
-
-    # Typical Price = (High + Low + Close) / 3
-    for i in range(window, n):
-        positive_flow = 0.0
-        negative_flow = 0.0
-
-        for j in range(i - window + 1, i + 1):
-            if j == 0:
-                continue
-
-            if (
-                np.isfinite(high[j])
-                and np.isfinite(low[j])
-                and np.isfinite(close[j])
-                and np.isfinite(volume[j])
-                and np.isfinite(high[j - 1])
-                and np.isfinite(low[j - 1])
-                and np.isfinite(close[j - 1])
-            ):
-                typical_price = (high[j] + low[j] + close[j]) / 3.0
-                prev_typical_price = (high[j - 1] + low[j - 1] + close[j - 1]) / 3.0
-                raw_money_flow = typical_price * volume[j]
-
-                if typical_price > prev_typical_price:
-                    positive_flow += raw_money_flow
-                elif typical_price < prev_typical_price:
-                    negative_flow += raw_money_flow
-
-        if negative_flow > 0:
-            money_ratio = positive_flow / negative_flow
-            result[i] = 100.0 - (100.0 / (1.0 + money_ratio))
-        elif positive_flow > 0:
-            result[i] = 100.0
-        else:
-            result[i] = 50.0
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def vwap_udf(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    window: int,
-) -> np.ndarray:
-    """
-    Volume Weighted Average Price (VWAP) 計算
-    出来高加重平均価格
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < window:
-        return result
-
-    for i in range(window - 1, n):
-        price_volume_sum = 0.0
-        volume_sum = 0.0
-
-        for j in range(i - window + 1, i + 1):
-            if (
-                np.isfinite(high[j])
-                and np.isfinite(low[j])
-                and np.isfinite(close[j])
-                and np.isfinite(volume[j])
-            ):
-                # Typical Price = (High + Low + Close) / 3
-                typical_price = (high[j] + low[j] + close[j]) / 3.0
-                price_volume_sum += typical_price * volume[j]
-                volume_sum += volume[j]
-
-        if volume_sum > 0:
-            result[i] = price_volume_sum / volume_sum
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def obv_udf(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    """
-    On Balance Volume (OBV) 計算
-    価格方向に基づく累積出来高指標
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < 2:
-        return result
-
-    result[0] = volume[0] if np.isfinite(volume[0]) else 0.0
-
-    for i in range(1, n):
-        prev_obv = result[i - 1] if np.isfinite(result[i - 1]) else 0.0
-
-        if (
-            np.isfinite(close[i])
-            and np.isfinite(close[i - 1])
-            and np.isfinite(volume[i])
-        ):
-            if close[i] > close[i - 1]:
-                result[i] = prev_obv + volume[i]
-            elif close[i] < close[i - 1]:
-                result[i] = prev_obv - volume[i]
-            else:
-                result[i] = prev_obv
-        else:
-            result[i] = prev_obv
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def accumulation_distribution_udf(
-    high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray
-) -> np.ndarray:
-    """
-    Accumulation/Distribution Line 計算
-    価格位置と出来高に基づく累積指標
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < 1:
-        return result
-
-    result[0] = 0.0
-
-    for i in range(1, n):
-        prev_ad = result[i - 1] if np.isfinite(result[i - 1]) else 0.0
-
-        if (
-            np.isfinite(high[i])
-            and np.isfinite(low[i])
-            and np.isfinite(close[i])
-            and np.isfinite(volume[i])
-        ):
-            if high[i] != low[i]:
-                # ▼▼ 修正後: ゼロ除算防止 (ルール5)
-                hl_range = high[i] - low[i]
-                clv = ((close[i] - low[i]) - (high[i] - close[i])) / (hl_range + 1e-10)
-                result[i] = prev_ad + (clv * volume[i])
-            else:
-                result[i] = prev_ad
-        else:
-            result[i] = prev_ad
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def force_index_udf(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    """
-    Force Index 計算
-    価格変動と出来高の積による勢力指標
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < 2:
-        return result
-
-    result[0] = 0.0
-
-    for i in range(1, n):
-        if (
-            np.isfinite(close[i])
-            and np.isfinite(close[i - 1])
-            and np.isfinite(volume[i])
-        ):
-            price_change = close[i] - close[i - 1]
-            result[i] = price_change * volume[i]
-        else:
-            result[i] = 0.0
-
-    return result
 
 
 # =============================================================================
@@ -804,147 +420,9 @@ def force_index_udf(close: np.ndarray, volume: np.ndarray) -> np.ndarray:
 # =============================================================================
 
 
-@nb.njit(fastmath=True, cache=True)
-def pivot_point_udf(
-    high: float, low: float, close: float
-) -> Tuple[float, float, float, float, float]:
-    """
-    ピボットポイント計算
-    Returns: (pivot_point, resistance1, support1, resistance2, support2)
-    """
-    if not (np.isfinite(high) and np.isfinite(low) and np.isfinite(close)):
-        return np.nan, np.nan, np.nan, np.nan, np.nan
-
-    pivot = (high + low + close) / 3.0
-    r1 = 2.0 * pivot - low
-    s1 = 2.0 * pivot - high
-    r2 = pivot + (high - low)
-    s2 = pivot - (high - low)
-
-    return pivot, r1, s1, r2, s2
-
-
-@nb.njit(fastmath=True, cache=True)
-def fibonacci_levels_udf(high: np.ndarray, low: np.ndarray, window: int) -> np.ndarray:
-    """
-    フィボナッチリトレースメントレベル計算
-    指定期間での高値・安値からフィボナッチレベルを計算
-    """
-    n = len(high)
-    result = np.full((n, 5), np.nan)  # 5つのフィボナッチレベル
-
-    if n < window:
-        return result
-
-    # フィボナッチ比率
-    fib_ratios = np.array([0.236, 0.382, 0.500, 0.618, 0.786])
-
-    for i in range(window - 1, n):
-        # 指定期間での高値・安値を探索
-        period_high = -np.inf
-        period_low = np.inf
-
-        for j in range(i - window + 1, i + 1):
-            if np.isfinite(high[j]) and high[j] > period_high:
-                period_high = high[j]
-            if np.isfinite(low[j]) and low[j] < period_low:
-                period_low = low[j]
-
-        if np.isfinite(period_high) and np.isfinite(period_low):
-            price_range = period_high - period_low
-            for k in range(5):
-                result[i, k] = period_high - (fib_ratios[k] * price_range)
-
-    return result
-
-
-@nb.njit(fastmath=True, cache=True)
-def candlestick_patterns_udf(
-    open_prices: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
-) -> np.ndarray:
-    """
-    ローソク足パターン認識
-    Returns: パターンID配列 (0.0=なし, 1.0=ハンマー, 2.0=流れ星, 3.0=同事, 4.0=強気, 5.0=弱気)
-    """
-    n = len(close)
-    # ▼▼ 修正前: result = np.full(n, 0)
-    # ▼▼ 修正後: 型の厳格化 (float64)
-    result = np.full(n, 0.0, dtype=np.float64)
-
-    for i in range(n):
-        if not (
-            np.isfinite(open_prices[i])
-            and np.isfinite(high[i])
-            and np.isfinite(low[i])
-            and np.isfinite(close[i])
-        ):
-            continue
-
-        body_size = abs(close[i] - open_prices[i])
-        upper_shadow = high[i] - max(open_prices[i], close[i])
-        lower_shadow = min(open_prices[i], close[i]) - low[i]
-        total_range = high[i] - low[i]
-
-        if total_range <= 0:
-            continue
-
-        # 実体・ヒゲ比率
-        body_ratio = body_size / total_range
-        upper_shadow_ratio = upper_shadow / total_range
-        lower_shadow_ratio = lower_shadow / total_range
-
-        # 同事（実体が小さい）
-        if body_ratio < 0.1:
-            result[i] = 3.0
-        # ハンマー（下ヒゲが長く、上ヒゲが短い）
-        elif lower_shadow_ratio > 0.6 and upper_shadow_ratio < 0.1:
-            result[i] = 1.0
-        # 流れ星（上ヒゲが長く、下ヒゲが短い）
-        elif upper_shadow_ratio > 0.6 and lower_shadow_ratio < 0.1:
-            result[i] = 2.0
-        # 強気（実体が大きく陽線）
-        elif body_ratio > 0.6 and close[i] > open_prices[i]:
-            result[i] = 4.0
-        # 弱気（実体が大きく陰線）
-        elif body_ratio > 0.6 and close[i] < open_prices[i]:
-            result[i] = 5.0
-
-    return result
-
-
 # =============================================================================
 # ブレイクアウト・レンジ指標 (Numba UDF集)
 # =============================================================================
-
-
-@nb.njit(fastmath=True, cache=True)
-def donchian_channel_udf(high: np.ndarray, low: np.ndarray, window: int) -> np.ndarray:
-    """
-    ドンチャンチャネル計算
-    Returns: 各行に[upper, middle, lower]を含む配列
-    """
-    n = len(high)
-    result = np.full((n, 3), np.nan)
-
-    if n < window:
-        return result
-
-    for i in range(window - 1, n):
-        period_high = -np.inf
-        period_low = np.inf
-
-        for j in range(i - window + 1, i + 1):
-            if np.isfinite(high[j]) and high[j] > period_high:
-                period_high = high[j]
-            if np.isfinite(low[j]) and low[j] < period_low:
-                period_low = low[j]
-
-        if np.isfinite(period_high) and np.isfinite(period_low):
-            result[i, 0] = period_high  # upper
-            result[i, 1] = (period_high + period_low) / 2.0  # middle
-            result[i, 2] = period_low  # lower
-
-    return result
 
 
 # ▼▼ 修正前
@@ -957,70 +435,6 @@ def donchian_channel_udf(high: np.ndarray, low: np.ndarray, window: int) -> np.n
 
 
 # ▼▼ 修正後
-@nb.njit(fastmath=True, cache=True)
-def commodity_channel_index_udf(
-    high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int
-) -> np.ndarray:
-    """
-    Commodity Channel Index (CCI) 計算
-    価格位置の統計的偏差を測定する勢い指標
-    """
-    n = len(close)
-    result = np.full(n, np.nan)
-
-    if n < window:
-        return result
-
-    # ループ外でのメモリ事前確保（メモリ・スラッシング防止）
-    typical_prices = np.zeros(window, dtype=np.float64)
-
-    for i in range(window - 1, n):
-        # ループ内での明示的ゼロクリア
-        typical_prices.fill(0.0)
-
-        # Typical Price計算
-        for j in range(window):
-            idx = i - window + 1 + j
-            if (
-                np.isfinite(high[idx])
-                and np.isfinite(low[idx])
-                and np.isfinite(close[idx])
-            ):
-                typical_prices[j] = (high[idx] + low[idx] + close[idx]) / 3.0
-            else:
-                typical_prices[j] = np.nan
-
-        # 有効なTypical Priceの数を確認
-        valid_count = 0
-        for tp in typical_prices:
-            if np.isfinite(tp):
-                valid_count += 1
-
-        if valid_count < window // 2:
-            continue
-
-        # SMA計算
-        tp_sum = 0.0
-        for tp in typical_prices:
-            if np.isfinite(tp):
-                tp_sum += tp
-        sma = tp_sum / valid_count
-
-        # Mean Deviation計算
-        md_sum = 0.0
-        for tp in typical_prices:
-            if np.isfinite(tp):
-                md_sum += abs(tp - sma)
-        mean_deviation = md_sum / valid_count
-
-        # CCI計算
-        current_tp = (high[i] + low[i] + close[i]) / 3.0
-        if mean_deviation > 0:
-            result[i] = (current_tp - sma) / (0.015 * mean_deviation)
-
-    return result
-
-
 class CalculationEngine:
     """
     計算核心クラス（60%） - Project Forge統合版（修正版：ディスクベース垂直分割）
@@ -1540,21 +954,27 @@ class CalculationEngine:
         stabilization_exprs = []
 
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【修正 (Phase 5)】EWM 状態汚染防止と inf 入力時の bounds 維持
+            # 詳細は engine_1_B/E と同じ。NaN も null 化し、forward_fill で bounds 維持。
+            # ─────────────────────────────────────────────────────────────
             # EWMによる動的5σバンド計算 (過去情報のみに依存)
             col_expr = (
                 pl.when(pl.col(col_name).is_infinite())
                 .then(None)
                 .otherwise(pl.col(col_name))
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
             )
 
             # 修正後
             # ▼▼ 修正: half_life 変数を使用
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = col_expr.ewm_mean(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = col_expr.ewm_std(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
             upper_bound = ewm_mean + 5.0 * ewm_std
             lower_bound = ewm_mean - 5.0 * ewm_std
 
@@ -1716,25 +1136,27 @@ class CalculationEngine:
         stabilization_exprs = []
 
         for col_name in feature_columns:
+            # ─────────────────────────────────────────────────────────────
+            # 【修正 (Phase 5)】EWM 状態汚染防止と inf 入力時の bounds 維持
+            # 詳細は apply_quality_assurance_to_group のコメント参照。
+            # ─────────────────────────────────────────────────────────────
             # EWMによる動的5σバンド計算 (過去情報のみに依存)
             col_expr = (
                 pl.when(pl.col(col_name).is_infinite())
                 .then(None)
                 .otherwise(pl.col(col_name))
+                .fill_nan(None)  # ★ NaN も null 化 (Polars EWM 仕様への対応)
             )
 
-            # 修正後
-            # ▼▼ 修正: half_life 変数を使用
+            # ★ + forward_fill() で inf/NaN 位置でも有効な bounds を提供
             ewm_mean = col_expr.ewm_mean(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 mean を維持
             ewm_std = col_expr.ewm_std(
                 half_life=half_life, adjust=False, ignore_nulls=True
-            )
+            ).forward_fill()  # ★ inf/NaN 位置でも直前の有効 std を維持
             upper_bound = ewm_mean + 5.0 * ewm_std
             lower_bound = ewm_mean - 5.0 * ewm_std
-
-            # Inf値を動的境界値で置換し、クリッピング
 
             # Inf値を動的境界値で置換し、クリッピング
             stabilized_col = (

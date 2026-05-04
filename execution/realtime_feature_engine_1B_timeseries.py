@@ -61,6 +61,20 @@ import blueprint as config
 sys.path.append(str(config.CORE_DIR))
 from core_indicators import (
     calculate_atr_wilder,
+    # [SSoT 統一] Engine 1B の UDF を core_indicators から import
+    # (旧: 本ファイル内で定義 → 学習側 engine_1_B と二重定義 = SSoT 違反)
+    adf_統計量_udf,
+    phillips_perron_統計量_udf,
+    kpss_統計量_udf,
+    t分布_自由度_udf,
+    t分布_尺度_udf,
+    gev_形状_udf,
+    holt_winters_レベル_udf,
+    holt_winters_トレンド_udf,
+    arima_残差分散_udf,
+    kalman_状態推定_udf,
+    lowess_適合値_udf,
+    theil_sen_傾き_udf,
 )
 
 logger = logging.getLogger("ProjectForge.FeatureEngine.1B")
@@ -190,22 +204,39 @@ class QAState:
 
         # Step3: ±5σ クリップ
         # Polars ewm_std(adjust=False, bias=False) の bias 補正を適用:
+        #
+        # 【修正前 (誤式)】
         #   bias_corr = 1 / sqrt(1 - (1-alpha)^(2n))
+        #
+        # 【修正後 (Polars 互換式 — 1e-15 精度で完全一致)】
+        #   m = n - 1, sum_w2 = α²(1-r2^m)/(1-r2) + r2^m, bias_factor_var = 1/(1-sum_w2)
         ewm_mean  = self._ewm_mean[key]
         n_updates = self._ewm_n.get(key, 1)
-        decay_2n  = (1.0 - alpha) ** (2 * n_updates)
-        denom     = 1.0 - decay_2n
-        bias_corr = 1.0 / np.sqrt(denom) if denom > 1e-15 else 1.0
-        ewm_std   = np.sqrt(max(self._ewm_var[key], 0.0)) * bias_corr
+        if n_updates <= 1:
+            ewm_std = 0.0
+        else:
+            r2 = (1.0 - alpha) ** 2
+            m  = n_updates - 1
+            if r2 < 1.0 - 1e-15:
+                sum_w2 = alpha * alpha * (1.0 - r2 ** m) / (1.0 - r2) + r2 ** m
+            else:
+                sum_w2 = 1.0
+            if sum_w2 < 1.0 - 1e-15:
+                bias_factor_var = 1.0 / (1.0 - sum_w2)
+                ewm_std = np.sqrt(max(self._ewm_var[key] * bias_factor_var, 0.0))
+            else:
+                ewm_std = 0.0
         lower     = ewm_mean - 5.0 * ewm_std
         upper     = ewm_mean + 5.0 * ewm_std
 
-        if np.isnan(ewm_input):
-            return 0.0
+        # 【修正済み】Option B: チェック順序入れ替え (is_pos_inf → is_neg_inf → np.isnan(raw_val))
+        # 旧バグ: np.isnan(ewm_input) が先に発火し is_pos_inf に到達不能 → +inf 入力で常に 0.0
         if is_pos_inf:
             return float(upper) if np.isfinite(upper) else 0.0
         if is_neg_inf:
             return float(lower) if np.isfinite(lower) else 0.0
+        if np.isnan(raw_val):
+            return 0.0
 
         clipped = float(np.clip(raw_val, lower, upper))
         return clipped if np.isfinite(clipped) else 0.0
@@ -214,419 +245,6 @@ class QAState:
 # ==================================================================
 # Numba UDF群（学習側 engine_1_B と完全同一実装）
 # ==================================================================
-
-@nb.njit(fastmath=True, cache=True)
-def adf_統計量_udf(prices: np.ndarray) -> float:
-    """真のADF検定統計量（学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    diff_prices = np.diff(finite_prices)
-    if len(diff_prices) < 5:
-        return np.nan
-
-    y = diff_prices[1:]
-    lagged_y = finite_prices[1:-1]
-    lagged_diff = diff_prices[:-1]
-    n = len(y)
-    if n < 3:
-        return np.nan
-
-    X = np.empty((n, 3), dtype=np.float64)
-    X[:, 0] = 1.0
-    X[:, 1] = lagged_y
-    X[:, 2] = lagged_diff
-
-    try:
-        XtX = X.T @ X
-        XtX_inv = np.linalg.inv(XtX)
-        XtY = X.T @ y
-        beta = XtX_inv @ XtY
-        residuals = y - X @ beta
-        sse = np.sum(residuals ** 2)
-        mse = sse / (n - 3.0)
-        se_beta = np.sqrt(mse * XtX_inv[1, 1])
-        if se_beta > 1e-10:
-            return beta[1] / se_beta
-        else:
-            return np.nan
-    except:
-        return np.nan
-
-
-@nb.njit(fastmath=True, cache=True)
-def phillips_perron_統計量_udf(prices: np.ndarray) -> float:
-    """真のPhillips-Perron検定統計量（Newey-West補正付き、学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    diff_prices = np.diff(finite_prices)
-    lagged_prices = finite_prices[:-1]
-    if len(diff_prices) < 5:
-        return np.nan
-
-    n = len(diff_prices)
-    X = np.empty((n, 2), dtype=np.float64)
-    X[:, 0] = 1.0
-    X[:, 1] = lagged_prices
-    y = diff_prices
-
-    try:
-        XtX_inv = np.linalg.inv(X.T @ X)
-        beta = XtX_inv @ X.T @ y
-        residuals = y - X @ beta
-
-        gamma_0 = np.sum(residuals ** 2) / n
-        lag_max = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
-        if lag_max < 1:
-            lag_max = 1
-
-        lambda_sq = gamma_0
-        for j in range(1, lag_max + 1):
-            gamma_j = np.sum(residuals[j:] * residuals[:-j]) / n
-            weight = 1.0 - (j / (lag_max + 1.0))
-            lambda_sq += 2.0 * weight * gamma_j
-
-        s2 = np.sum(residuals ** 2) / (n - 2.0)
-        s = np.sqrt(s2)
-        se_beta = np.sqrt(s2 * XtX_inv[1, 1])
-
-        if se_beta <= 1e-10 or lambda_sq <= 1e-10:
-            return np.nan
-
-        t_stat = beta[1] / se_beta
-        term1 = np.sqrt(gamma_0 / lambda_sq) * t_stat
-        term2 = 0.5 * ((lambda_sq - gamma_0) / np.sqrt(lambda_sq)) * (n * se_beta / s)
-        return term1 - term2
-    except:
-        return np.nan
-
-
-@nb.njit(fastmath=True, cache=True)
-def kpss_統計量_udf(prices: np.ndarray) -> float:
-    """真のKPSS検定統計量（Newey-West補正付き、学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    n = len(finite_prices)
-    t = np.arange(n, dtype=np.float64)
-
-    try:
-        sum_t = np.sum(t)
-        sum_t2 = np.sum(t ** 2)
-        sum_y = np.sum(finite_prices)
-        sum_ty = np.sum(t * finite_prices)
-
-        beta = (n * sum_ty - sum_t * sum_y) / (n * sum_t2 - sum_t ** 2 + 1e-10)
-        alpha = (sum_y - beta * sum_t) / n
-
-        detrended = finite_prices - (alpha + beta * t)
-        cumsum = np.cumsum(detrended)
-
-        gamma_0 = np.sum(detrended ** 2) / n
-        lag_max = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
-        if lag_max < 1:
-            lag_max = 1
-
-        long_run_var = gamma_0
-        for j in range(1, lag_max + 1):
-            gamma_j = np.sum(detrended[j:] * detrended[:-j]) / n
-            weight = 1.0 - (j / (lag_max + 1.0))
-            long_run_var += 2.0 * weight * gamma_j
-
-        if long_run_var > 1e-10:
-            return np.sum(cumsum ** 2) / (n ** 2 * long_run_var)
-        else:
-            return np.nan
-    except:
-        return np.nan
-
-
-@nb.njit(fastmath=True, cache=True)
-def t分布_自由度_udf(returns: np.ndarray) -> float:
-    """t分布の自由度パラメータ推定（ddof=1、学習側と同一）"""
-    if len(returns) < 10:
-        return np.nan
-    finite_returns = returns[np.isfinite(returns)]
-    if len(finite_returns) < 10:
-        return np.nan
-
-    mean_ret = np.mean(finite_returns)
-    n_ret = len(finite_returns)
-    std_ret = np.std(finite_returns) * np.sqrt(n_ret / (n_ret - 1.0))  # ddof=1
-
-    if std_ret <= 0:
-        return np.nan
-
-    standardized = (finite_returns - mean_ret) / std_ret
-    fourth_moment = np.mean(standardized ** 4)
-    excess_kurtosis = fourth_moment - 3.0
-
-    if excess_kurtosis > 0:
-        dof = 4.0 * (3.0 + fourth_moment) / excess_kurtosis
-        dof = max(2.1, min(dof, 100.0))
-    else:
-        dof = 100.0
-
-    return dof
-
-
-@nb.njit(fastmath=True, cache=True)
-def t分布_尺度_udf(returns: np.ndarray) -> float:
-    """t分布の尺度パラメータ推定（ddof=1、学習側と同一）"""
-    if len(returns) < 5:
-        return np.nan
-    finite_returns = returns[np.isfinite(returns)]
-    if len(finite_returns) < 5:
-        return np.nan
-
-    dof = t分布_自由度_udf(returns)
-
-    if np.isnan(dof) or dof <= 2:
-        n_ret = len(finite_returns)
-        return np.std(finite_returns) * np.sqrt(n_ret / (n_ret - 1.0))  # ddof=1
-
-    n_ret = len(finite_returns)
-    sample_var = np.var(finite_returns) * (n_ret / (n_ret - 1.0))  # ddof=1
-    scale_squared = sample_var * (dof - 2.0) / dof
-    return np.sqrt(max(scale_squared, 1e-8))
-
-
-@nb.njit(fastmath=True, cache=True)
-def gev_形状_udf(extremes: np.ndarray) -> float:
-    """GEV分布形状パラメータ推定（L-モーメント法、学習側と同一）"""
-    if len(extremes) < 10:
-        return np.nan
-    finite_extremes = extremes[np.isfinite(extremes)]
-    if len(finite_extremes) < 10:
-        return np.nan
-
-    sorted_data = np.sort(finite_extremes)
-    n = len(sorted_data)
-
-    l1 = np.mean(sorted_data)
-
-    sum_l2 = 0.0
-    for i in range(n):
-        weight = (2.0 * i - n + 1.0) / n
-        sum_l2 += weight * sorted_data[i]
-    l2 = sum_l2 / 2.0
-
-    sum_l3 = 0.0
-    for i in range(n):
-        weight = ((i * (i - 1.0)) - 2.0 * i * (n - 1.0) + (n - 1.0) * (n - 2.0)) / (n * (n - 1.0))
-        sum_l3 += weight * sorted_data[i]
-    l3 = sum_l3 / 3.0
-
-    if abs(l2) > 1e-8:
-        tau3 = l3 / l2
-        shape = 7.859 * tau3 + 2.9554 * tau3 ** 2
-        shape = max(-0.5, min(shape, 0.5))
-    else:
-        shape = 0.0
-
-    return shape
-
-
-@nb.njit(fastmath=True, cache=True)
-def holt_winters_レベル_udf(prices: np.ndarray) -> float:
-    """Holt-Wintersレベル成分（alpha=0.3、学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    alpha = 0.3
-    level = finite_prices[0]
-    for i in range(1, len(finite_prices)):
-        level = alpha * finite_prices[i] + (1 - alpha) * level
-    return level
-
-
-@nb.njit(fastmath=True, cache=True)
-def holt_winters_トレンド_udf(prices: np.ndarray) -> float:
-    """Holt-Wintersトレンド成分（alpha=0.3, beta=0.1、学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    alpha = 0.3
-    beta = 0.1
-    level = finite_prices[0]
-    trend = finite_prices[1] - finite_prices[0] if len(finite_prices) > 1 else 0.0
-
-    for i in range(1, len(finite_prices)):
-        new_level = alpha * finite_prices[i] + (1 - alpha) * (level + trend)
-        new_trend = beta * (new_level - level) + (1 - beta) * trend
-        level = new_level
-        trend = new_trend
-
-    return trend
-
-
-@nb.njit(fastmath=True, cache=True)
-def arima_残差分散_udf(prices: np.ndarray) -> float:
-    """ARIMA(1,1,0)残差分散（+ 1e-10 ゼロ除算保護、学習側と同一）"""
-    if len(prices) < 15:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 15:
-        return np.nan
-
-    diff_prices = np.diff(finite_prices)
-    if len(diff_prices) < 10:
-        return np.nan
-
-    y = diff_prices[1:]
-    x = diff_prices[:-1]
-    n = len(y)
-    if n < 5:
-        return np.nan
-
-    sum_x = np.sum(x)
-    sum_y = np.sum(y)
-    sum_xy = np.sum(x * y)
-    sum_x2 = np.sum(x * x)
-
-    phi = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x ** 2 + 1e-10)
-    intercept = (sum_y - phi * sum_x) / n
-    residuals = y - (intercept + phi * x)
-    return np.sum(residuals ** 2) / (n - 2)
-
-
-@nb.njit(fastmath=True, cache=True)
-def kalman_状態推定_udf(prices: np.ndarray) -> float:
-    """カルマンフィルタ状態推定（ddof=1補正、学習側と同一）"""
-    if len(prices) < 5:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 5:
-        return np.nan
-
-    x = finite_prices[0]
-    P = 1.0
-
-    if len(finite_prices) > 1:
-        diff_vals = np.diff(finite_prices)
-        n_diff = len(diff_vals)
-        n_prices = len(finite_prices)
-        diff_var = np.var(diff_vals) * (n_diff / (n_diff - 1.0)) if n_diff > 1 else 0.0
-        obs_var = np.var(finite_prices) * (n_prices / (n_prices - 1.0)) if n_prices > 1 else 0.0
-        Q = max(diff_var, obs_var * 0.01)
-        R = obs_var * 0.1
-    else:
-        Q = 1.0
-        R = 0.1
-
-    for i in range(1, len(finite_prices)):
-        x_pred = x
-        P_pred = P + Q
-        K = P_pred / (P_pred + R)
-        x = x_pred + K * (finite_prices[i] - x_pred)
-        P = (1 - K) * P_pred
-
-    return x
-
-
-@nb.njit(fastmath=True, cache=True)
-def lowess_適合値_udf(prices: np.ndarray) -> float:
-    """LOWESS適合値（bandwidth=0.3、学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    if len(finite_prices) < 10:
-        return np.nan
-
-    n = len(finite_prices)
-    bandwidth = 0.3
-    h = max(3, int(bandwidth * n))
-    target_idx = n - 1
-
-    distances = np.abs(np.arange(n) - target_idx)
-    sorted_indices = np.argsort(distances)
-    neighbor_indices = sorted_indices[:h]
-
-    x_neighbors = neighbor_indices.astype(np.float64)
-    y_neighbors = finite_prices[neighbor_indices]
-
-    max_dist = np.max(distances[neighbor_indices])
-    if max_dist > 1e-10:
-        weights = np.zeros(h, dtype=np.float64)
-        for i in range(h):
-            u = distances[neighbor_indices[i]] / max_dist
-            if u < 1.0:
-                weights[i] = (1.0 - u ** 3) ** 3
-            else:
-                weights[i] = 0.0
-    else:
-        weights = np.ones(h, dtype=np.float64)
-
-    if len(x_neighbors) >= 2:
-        sum_w = np.sum(weights)
-        if sum_w > 1e-10:
-            x_mean = np.sum(weights * x_neighbors) / sum_w
-            y_mean = np.sum(weights * y_neighbors) / sum_w
-            numerator = np.sum(weights * (x_neighbors - x_mean) * (y_neighbors - y_mean))
-            denominator = np.sum(weights * (x_neighbors - x_mean) ** 2)
-            if denominator > 1e-10:
-                slope = numerator / denominator
-                intercept = y_mean - slope * x_mean
-                return intercept + slope * target_idx
-            else:
-                return y_mean
-        else:
-            return np.mean(y_neighbors)
-    else:
-        return finite_prices[-1]
-
-
-@nb.njit(fastmath=True, cache=True)
-def theil_sen_傾き_udf(prices: np.ndarray) -> float:
-    """Theil-Sen傾き推定（max_pairs=1000、学習側と同一）"""
-    if len(prices) < 10:
-        return np.nan
-    finite_prices = prices[np.isfinite(prices)]
-    n = len(finite_prices)
-    if n < 10:
-        return np.nan
-
-    max_pairs = min(1000, (n * (n - 1)) // 2)
-    slopes = np.zeros(max_pairs, dtype=np.float64)
-    slope_idx = 0
-
-    if max_pairs < (n * (n - 1)) // 2:
-        step = max(1, ((n * (n - 1)) // 2) // max_pairs)
-        count = 0
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                if count % step == 0 and slope_idx < max_pairs:
-                    slopes[slope_idx] = (finite_prices[j] - finite_prices[i]) / float(j - i)
-                    slope_idx += 1
-                count += 1
-    else:
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                if slope_idx < max_pairs:
-                    slopes[slope_idx] = (finite_prices[j] - finite_prices[i]) / float(j - i)
-                    slope_idx += 1
-
-    if slope_idx > 0:
-        return np.median(slopes[:slope_idx])
-    else:
-        return np.nan
-
 
 # ==================================================================
 # メイン計算クラス

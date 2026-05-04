@@ -468,16 +468,26 @@ class ProxyLabelingEngine:
             target_atr_name = f"e1c_atr_{ATR_PERIOD}_{tf}"
             atr_ratio_name = f"atr_ratio_{tf}"
             baseline_period = timeframe_bars_per_day.get(tf, 1440) * ATR_BASELINE_DAYS
+
+            # [DISC-FLAG 対応] s1_1_B が出力する disc 列を読み込み、
+            #   不連続バー (disc=True) では前バーcloseを使わず H-L のみで TR を計算する。
+            #   これにより週末跨ぎや祝日のギャップが ATR を異常値で汚染するのを防ぐ。
+            #   本番側 core_indicators.calculate_barrier_atr と同じ思想 (Train-Serve Skew Free)。
             atr_lf = (
                 pl.scan_parquet(str(price_dir_tf / "*.parquet"))
-                .select(["timestamp", "high", "low", "close"])
+                .select(["timestamp", "high", "low", "close", "disc"])
                 .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
                 .sort("timestamp")
                 .with_columns([
-                    pl.max_horizontal(
-                        pl.col("high") - pl.col("low"),
-                        (pl.col("high") - pl.col("close").shift(1)).abs(),
-                        (pl.col("low") - pl.col("close").shift(1)).abs(),
+                    # disc=True の足は H-L のみ、それ以外は通常の True Range
+                    pl.when(pl.col("disc"))
+                    .then(pl.col("high") - pl.col("low"))
+                    .otherwise(
+                        pl.max_horizontal(
+                            pl.col("high") - pl.col("low"),
+                            (pl.col("high") - pl.col("close").shift(1)).abs(),
+                            (pl.col("low") - pl.col("close").shift(1)).abs(),
+                        )
                     )
                     .ewm_mean(alpha=1 / ATR_PERIOD, adjust=False)
                     .alias(target_atr_name)
@@ -493,7 +503,7 @@ class ProxyLabelingEngine:
             )
             all_atr_lfs.append(atr_lf)
             logging.info(
-                f"  -> Prepared ATR blueprint: S1_PROCESSED/timeframe={tf} -> '{target_atr_name}' + '{atr_ratio_name}' (baseline={baseline_period}bars)"
+                f"  -> Prepared ATR blueprint: S1_PROCESSED/timeframe={tf} -> '{target_atr_name}' + '{atr_ratio_name}' (baseline={baseline_period}bars, disc-aware)"
             )
 
         if not all_atr_lfs:

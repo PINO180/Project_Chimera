@@ -367,6 +367,38 @@ class RealtimeFeatureEngine:
 
         return df.set_index("timestamp")
 
+    @staticmethod
+    def _add_disc_column(df: pd.DataFrame, freq_seconds: int) -> pd.DataFrame:
+        """
+        [DISC-FLAG] DataFrame のインデックス(timestamp)から不連続フラグ列 'disc' を追加する。
+
+        学習側 s1_1_B_build_ohlcv.py の DISC-FLAG 付与ロジックと完全一致させるため、
+        本メソッドはウォームアップ・リアルタイム双方から呼ばれる単一の disc 推定器として機能する
+        (Train-Serve Skew Free)。
+
+        判定ルール:
+            disc[i] = (timestamp[i] - timestamp[i-1]) > freq_seconds * 1.5
+            先頭バーは便宜上 False (前バーがないため連続扱い)
+
+        Args:
+            df:           timestamp 昇順の DataFrame (index がタイムスタンプ)
+            freq_seconds: 当該時間足の想定バー間隔 (秒)。0 のときは disc=False で固定。
+
+        Returns:
+            'disc' 列を追加した DataFrame (元 DataFrame は変更しない)。
+        """
+        out = df.copy()
+        if freq_seconds <= 0 or len(out) == 0:
+            out["disc"] = False
+            return out
+
+        threshold_ns = int(freq_seconds * 1.5 * 1_000_000_000)
+        ts_int = out.index.astype("int64").to_numpy()
+        gaps = np.diff(ts_int, prepend=ts_int[0])
+        gaps[0] = 0  # 先頭バーは disc=False
+        out["disc"] = gaps > threshold_ns
+        return out
+
     def _replace_buffer_from_dataframe(
         self,
         tf_name: str,
@@ -421,6 +453,8 @@ class RealtimeFeatureEngine:
         # 1. OHLCVバッファを一旦完全にクリア
         for col in self.OHLCV_COLS:
             self.data_buffers[tf_name][col].clear()
+        # [DISC-FLAG] disc deque も同時にクリア (バグA修正の一部)
+        self.data_buffers[tf_name]["disc"].clear()
 
         # プロキシがない場合（通常はここには来ない）
         if market_proxy_cache is None or market_proxy_cache.empty:
@@ -430,6 +464,27 @@ class RealtimeFeatureEngine:
             for col in self.OHLCV_COLS:
                 self.data_buffers[tf_name][col].extend(
                     df_slice_for_no_proxy[col].values
+                )
+            # [DISC-FLAG / バグA修正] disc deque も OHLCV と同時に充填する。
+            #   旧実装ではこの分岐 (および OLS 経由の通常分岐) で disc deque を
+            #   空のまま放置していたため、calculate_barrier_atr が起動直後に
+            #   全 disc=False としてパディングし、ギャップ越境TR をシードに
+            #   含む異常 ATR を最大20時間出力していた。
+            if "disc" in df_slice_for_no_proxy.columns:
+                self.data_buffers[tf_name]["disc"].clear()
+                self.data_buffers[tf_name]["disc"].extend(
+                    df_slice_for_no_proxy["disc"].astype(bool).values
+                )
+            else:
+                # disc 列が無い場合は安全側 (全 False = 連続) で初期化。
+                # ただし通常はウォームアップ呼び出し側で _add_disc_column が
+                # 既に呼ばれている前提のため、警告ログを残す。
+                self.logger.warning(
+                    f"  -> {tf_name:<3} disc 列が見つかりません。全 False で初期化します。"
+                )
+                self.data_buffers[tf_name]["disc"].clear()
+                self.data_buffers[tf_name]["disc"].extend(
+                    [False] * len(df_slice_for_no_proxy)
                 )
             self.last_bar_timestamps[tf_name] = df_slice_for_no_proxy.index[-1]
             if len(df_slice_for_no_proxy) > 0:
@@ -462,6 +517,25 @@ class RealtimeFeatureEngine:
         for col in self.OHLCV_COLS:
             self.data_buffers[tf_name][col].extend(
                 df_for_processing[col].values[-buffer_len:]
+            )
+        # [DISC-FLAG / バグA修正] disc deque も同時に充填する。
+        #   旧実装ではここで disc deque が空のまま放置されており、
+        #   calculate_barrier_atr が全 disc=False とみなしてギャップ越境TR を
+        #   通常 TR として扱い、起動から最大20時間 ATR が異常値を出力していた。
+        if "disc" in df_for_processing.columns:
+            self.data_buffers[tf_name]["disc"].clear()
+            self.data_buffers[tf_name]["disc"].extend(
+                df_for_processing["disc"].astype(bool).values[-buffer_len:]
+            )
+        else:
+            # 通常はウォームアップ呼び出し側で _add_disc_column が呼ばれて
+            # disc 列が DataFrame に付与されている前提。万一無い場合は警告。
+            self.logger.warning(
+                f"  -> {tf_name:<3} disc 列が見つかりません。全 False で初期化します。"
+            )
+            self.data_buffers[tf_name]["disc"].clear()
+            self.data_buffers[tf_name]["disc"].extend(
+                [False] * min(len(df_for_processing), buffer_len)
             )
         self.last_bar_timestamps[tf_name] = timestamps[-1]
 
@@ -553,13 +627,25 @@ class RealtimeFeatureEngine:
                     "volume": "sum",
                 }
             )
-            .dropna()
+            .dropna()  # 学習側 filter(tick_count>0) と完全一致
         )
+        # [DISC-FLAG] タイムスタンプ差から不連続フラグを推定
+        #   学習側 s1_1_B の DISC-FLAG 付与ロジックと完全一致させる。
+        m1_history_pd = self._add_disc_column(m1_history_pd, freq_seconds=60)
         self._replace_buffer_from_dataframe("M1", m1_history_pd, market_proxy_cache)
 
         self.m05_dataframe.clear()
         m05_records = m05_history_pd.reset_index().to_dict("records")
         self.m05_dataframe.extend(m05_records)
+
+        # TF_RESAMPLE_RULES → 想定秒数のマッピング (s1_1_B と完全一致)
+        _freq_seconds_map = {
+            "1min": 60, "3min": 180, "5min": 300, "8min": 480,
+            "15min": 900, "30min": 1800,
+            "1h": 3600, "1H": 3600, "4h": 14400, "4H": 14400,
+            "6h": 21600, "6H": 21600, "12h": 43200, "12H": 43200,
+            "1D": 86400, "1d": 86400,
+        }
 
         for tf_name, rule in self.TF_RESAMPLE_RULES.items():
             if tf_name not in self.data_buffers or tf_name in ("M0.5", "M1"):
@@ -578,12 +664,18 @@ class RealtimeFeatureEngine:
                             "volume": "sum",
                         }
                     )
-                    .dropna()
+                    .dropna()  # 学習側 filter(tick_count>0) と完全一致
                 )
 
                 if resampled_df.empty:
                     self.logger.warning(f"{tf_name} のリサンプリング結果が空です。")
                     continue
+
+                # [DISC-FLAG] タイムスタンプ差から不連続フラグを推定
+                expected_sec = _freq_seconds_map.get(rule, 0)
+                resampled_df = self._add_disc_column(
+                    resampled_df, freq_seconds=expected_sec
+                )
 
                 self._replace_buffer_from_dataframe(
                     tf_name, resampled_df, market_proxy_cache
@@ -683,18 +775,45 @@ class RealtimeFeatureEngine:
                     }
                 )
             )
-            # [DISC-FLAG] dropna()を廃止し、NaN行を不連続フラグで管理する。
-            # dropna()はNaN行を削除することで時系列を不連続にし、
-            # ギャップ越境TR（数時間分の価格差が1本のTRになる）を引き起こす。
-            # NaN行はforward fillで補完しつつdiscフラグをTrueにして後段でTR計算を制限する。
-            disc_mask = resampled_df["close"].isna()
-            resampled_df = resampled_df.ffill()
-            # ffill後もNaNが残る場合（バッファ先頭等）はbfillで補完
-            resampled_df = resampled_df.bfill()
-            # 完全に補完できない行のみ除外（ffill/bfill両方で補完不能=全NaN）
-            resampled_df = resampled_df.dropna()
-            # discフラグを付与
-            resampled_df["disc"] = disc_mask.reindex(resampled_df.index).fillna(False)
+            # ─────────────────────────────────────────────────────────────
+            # [3者完全統一] 学習側 s1_1_B_build_ohlcv.py の
+            #   `.filter(pl.col("tick_count") > 0)` と完全に同じ挙動に揃える。
+            #
+            # 旧実装 (ffill + disc=isna) は学習側に存在しない「ffillで埋めたバー」を
+            # バッファに混入させ、rolling系特徴量の時間幅が学習と本番でズレる
+            # 構造的な Train-Serve Skew 源だった。
+            #
+            # 新実装:
+            #   1. resample 結果が NaN の行 (= ティックなしバー) はバッファに追加しない
+            #      → 学習側の filter(tick_count>0) と完全等価
+            #   2. 残った行に対し、タイムスタンプ差から disc を後付け推定
+            #      (前バーとの間隔 > 想定間隔×1.5 なら不連続)
+            #      → s1_1_B の DISC-FLAG 付与ロジックと完全等価
+            # ─────────────────────────────────────────────────────────────
+            # 1. NaN 行を完全に除外 (学習側 filter(tick_count>0) 相当)
+            resampled_df = resampled_df.dropna(subset=["close"])
+
+            if len(resampled_df) == 0:
+                return []
+
+            # 2. タイムスタンプ差から disc 推定
+            #    s1_1_B の TIMEFRAME_FREQ_SECONDS と完全一致させる
+            _freq_seconds_map = {
+                "1min": 60, "3min": 180, "5min": 300, "8min": 480,
+                "15min": 900, "30min": 1800, "1h": 3600, "1H": 3600,
+                "4h": 14400, "4H": 14400, "6h": 21600, "6H": 21600,
+                "12h": 43200, "12H": 43200, "1D": 86400, "1d": 86400,
+            }
+            expected_sec = _freq_seconds_map.get(rule, 0)
+            if expected_sec > 0:
+                threshold_ns = int(expected_sec * 1.5 * 1_000_000_000)
+                ts_int = resampled_df.index.astype("int64")
+                gaps = np.diff(ts_int, prepend=ts_int[0])
+                # 先頭バーは便宜上 disc=False (前バーがないので連続扱い)
+                gaps[0] = 0
+                resampled_df["disc"] = gaps > threshold_ns
+            else:
+                resampled_df["disc"] = False
 
             if len(resampled_df) < 2:
                 return []

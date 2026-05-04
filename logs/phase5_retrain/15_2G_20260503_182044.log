@@ -1,0 +1,257 @@
+======================================================================
+### 2_G_alpha_neutralizer.py: Multi-Timeframe Alpha Neutralization ###
+======================================================================
+[INFO] Loaded 1985 features from /workspace/data/XAUUSD/stratum_3_artifacts/final_feature_set.txt
+Mapping features to source files (S2_FEATURES_VALIDATED)...
+Caching source schemas:   0%|          | 0/90 [00:00<?, ?it/s]Caching source schemas:  11%|█         | 10/90 [00:00<00:00, 86.18it/s]Caching source schemas:  21%|██        | 19/90 [00:00<00:01, 56.17it/s]Caching source schemas:  29%|██▉       | 26/90 [00:00<00:01, 49.31it/s]Caching source schemas:  36%|███▌      | 32/90 [00:00<00:01, 46.76it/s]Caching source schemas:  41%|████      | 37/90 [00:00<00:01, 45.84it/s]Caching source schemas:  47%|████▋     | 42/90 [00:00<00:01, 43.76it/s]Caching source schemas:  52%|█████▏    | 47/90 [00:00<00:00, 44.37it/s]Caching source schemas:  58%|█████▊    | 52/90 [00:01<00:00, 44.35it/s]Caching source schemas:  63%|██████▎   | 57/90 [00:01<00:00, 44.38it/s]Caching source schemas:  69%|██████▉   | 62/90 [00:01<00:00, 44.72it/s]Caching source schemas:  74%|███████▍  | 67/90 [00:01<00:00, 43.78it/s]Caching source schemas:  80%|████████  | 72/90 [00:01<00:00, 44.39it/s]Caching source schemas:  86%|████████▌ | 77/90 [00:01<00:00, 44.50it/s]Caching source schemas:  91%|█████████ | 82/90 [00:01<00:00, 44.56it/s]Caching source schemas:  97%|█████████▋| 87/90 [00:01<00:00, 45.27it/s]Caching source schemas: 100%|██████████| 90/90 [00:01<00:00, 46.38it/s]
+Searching 1985 features across 84 source files...
+Mapping features:   0%|          | 0/1985 [00:00<?, ?it/s]Mapping features: 100%|██████████| 1985/1985 [00:00<00:00, 124909.13it/s]
+[WARN] Could not determine timeframe for 'lf_mid_score'. Skipping.
+[WARN] Could not determine timeframe for 'lf_short_score'. Skipping.
+Grouped 1985 features into 78 source files.
+[INFO] Building proxy LazyFrame: M5 (for group=HF)
+[INFO] Building proxy LazyFrame: H4 (for group=LF_SHORT)
+[INFO] Building proxy LazyFrame: D1 (for group=LF_MID)
+[INFO] Building proxy LazyFrame: W1 (for group=LF_LONG)
+
+[INFO] Starting neutralization for 78 source files...
+
+--- [1/78] features_e1a_D1.parquet (6 features) ---
+  [INFO] Group=LF_MID, proxy=D1, window=90, features=6
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_D1_neutralized.parquet
+--- [2/78] features_e1a_H1.parquet (34 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=34
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_H1_neutralized.parquet
+--- [3/78] features_e1a_M0.5.parquet (35 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=35
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M0.5_neutralized.parquet
+--- [4/78] features_e1a_M1.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M1_neutralized.parquet
+--- [5/78] features_e1a_M15.parquet (32 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=32
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M15_neutralized.parquet
+--- [6/78] features_e1a_M3.parquet (30 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=30
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M3_neutralized.parquet
+--- [7/78] features_e1a_M30.parquet (33 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=33
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M30_neutralized.parquet
+--- [8/78] features_e1a_M5.parquet (30 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=30
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M5_neutralized.parquet
+--- [9/78] features_e1a_M8.parquet (33 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=33
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_M8_neutralized.parquet
+--- [10/78] features_e1a_H12.parquet (6 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=6
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_H12_neutralized.parquet
+--- [11/78] features_e1a_H4.parquet (7 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=7
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_H4_neutralized.parquet
+--- [12/78] features_e1a_H6.parquet (8 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=8
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_H6_neutralized.parquet
+--- [13/78] features_e1a_MN.parquet (12 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=12
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_MN_neutralized.parquet
+--- [14/78] features_e1a_W1.parquet (3 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=3
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeA/features_e1a_W1_neutralized.parquet
+--- [15/78] features_e1b_H1.parquet (29 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=29
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_H1_neutralized.parquet
+--- [16/78] features_e1b_M0.5.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M0.5_neutralized.parquet
+--- [17/78] features_e1b_M1.parquet (23 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=23
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M1_neutralized.parquet
+--- [18/78] features_e1b_M15.parquet (24 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=24
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M15_neutralized.parquet
+--- [19/78] features_e1b_M3.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M3_neutralized.parquet
+--- [20/78] features_e1b_M30.parquet (26 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=26
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M30_neutralized.parquet
+--- [21/78] features_e1b_M5.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M5_neutralized.parquet
+--- [22/78] features_e1b_M8.parquet (24 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=24
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_M8_neutralized.parquet
+--- [23/78] features_e1b_MN.parquet (7 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=7
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_MN_neutralized.parquet
+--- [24/78] features_e1b_D1.parquet (4 features) ---
+  [INFO] Group=LF_MID, proxy=D1, window=90, features=4
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_D1_neutralized.parquet
+--- [25/78] features_e1b_H12.parquet (4 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=4
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_H12_neutralized.parquet
+--- [26/78] features_e1b_H4.parquet (3 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=3
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_H4_neutralized.parquet
+--- [27/78] features_e1b_H6.parquet (3 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=3
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_H6_neutralized.parquet
+--- [28/78] features_e1b_W1.parquet (1 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=1
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeB/features_e1b_W1_neutralized.parquet
+--- [29/78] features_e1c_H1.parquet (65 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=65
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_H1_neutralized.parquet
+--- [30/78] features_e1c_M0.5.parquet (82 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=82
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M0.5_neutralized.parquet
+--- [31/78] features_e1c_M1.parquet (64 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=64
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M1_neutralized.parquet
+--- [32/78] features_e1c_M15.parquet (66 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=66
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M15_neutralized.parquet
+--- [33/78] features_e1c_M3.parquet (73 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=73
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M3_neutralized.parquet
+--- [34/78] features_e1c_M30.parquet (64 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=64
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M30_neutralized.parquet
+--- [35/78] features_e1c_M5.parquet (57 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=57
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M5_neutralized.parquet
+--- [36/78] features_e1c_M8.parquet (56 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=56
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_M8_neutralized.parquet
+--- [37/78] features_e1c_MN.parquet (8 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=8
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_MN_neutralized.parquet
+--- [38/78] features_e1c_D1.parquet (5 features) ---
+  [INFO] Group=LF_MID, proxy=D1, window=90, features=5
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_D1_neutralized.parquet
+--- [39/78] features_e1c_H6.parquet (5 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=5
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_H6_neutralized.parquet
+--- [40/78] features_e1c_H12.parquet (3 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=3
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_H12_neutralized.parquet
+--- [41/78] features_e1c_H4.parquet (5 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=5
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeC/features_e1c_H4_neutralized.parquet
+--- [42/78] features_e1d_H1.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_H1_neutralized.parquet
+--- [43/78] features_e1d_M0.5.parquet (26 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=26
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M0.5_neutralized.parquet
+--- [44/78] features_e1d_M1.parquet (25 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=25
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M1_neutralized.parquet
+--- [45/78] features_e1d_M15.parquet (27 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=27
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M15_neutralized.parquet
+--- [46/78] features_e1d_M3.parquet (24 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=24
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M3_neutralized.parquet
+--- [47/78] features_e1d_M5.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M5_neutralized.parquet
+--- [48/78] features_e1d_M8.parquet (28 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=28
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M8_neutralized.parquet
+--- [49/78] features_e1d_W1.parquet (8 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=8
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_W1_neutralized.parquet
+--- [50/78] features_e1d_D1.parquet (7 features) ---
+  [INFO] Group=LF_MID, proxy=D1, window=90, features=7
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_D1_neutralized.parquet
+--- [51/78] features_e1d_H12.parquet (4 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=4
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_H12_neutralized.parquet
+--- [52/78] features_e1d_H4.parquet (4 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=4
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_H4_neutralized.parquet
+--- [53/78] features_e1d_H6.parquet (5 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=5
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_H6_neutralized.parquet
+--- [54/78] features_e1d_M30.parquet (25 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=25
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_M30_neutralized.parquet
+--- [55/78] features_e1d_MN.parquet (7 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=7
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeD/features_e1d_MN_neutralized.parquet
+--- [56/78] features_e1e_H1.parquet (34 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=34
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_H1_neutralized.parquet
+--- [57/78] features_e1e_M0.5.parquet (33 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=33
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M0.5_neutralized.parquet
+--- [58/78] features_e1e_M1.parquet (32 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=32
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M1_neutralized.parquet
+--- [59/78] features_e1e_M15.parquet (33 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=33
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M15_neutralized.parquet
+--- [60/78] features_e1e_M3.parquet (33 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=33
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M3_neutralized.parquet
+--- [61/78] features_e1e_M30.parquet (34 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=34
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M30_neutralized.parquet
+--- [62/78] features_e1e_M5.parquet (35 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=35
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M5_neutralized.parquet
+--- [63/78] features_e1e_M8.parquet (35 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=35
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_M8_neutralized.parquet
+--- [64/78] features_e1e_H4.parquet (2 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=2
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeE/features_e1e_H4_neutralized.parquet
+--- [65/78] features_e1f_D1.parquet (14 features) ---
+  [INFO] Group=LF_MID, proxy=D1, window=90, features=14
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_D1_neutralized.parquet
+--- [66/78] features_e1f_H1.parquet (43 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=43
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_H1_neutralized.parquet
+--- [67/78] features_e1f_H12.parquet (15 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=15
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_H12_neutralized.parquet
+--- [68/78] features_e1f_M0.5.parquet (41 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=41
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M0.5_neutralized.parquet
+--- [69/78] features_e1f_M1.parquet (40 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=40
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M1_neutralized.parquet
+--- [70/78] features_e1f_M15.parquet (41 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=41
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M15_neutralized.parquet
+--- [71/78] features_e1f_M3.parquet (41 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=41
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M3_neutralized.parquet
+--- [72/78] features_e1f_M30.parquet (41 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=41
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M30_neutralized.parquet
+--- [73/78] features_e1f_M5.parquet (40 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=40
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M5_neutralized.parquet
+--- [74/78] features_e1f_M8.parquet (40 features) ---
+  [INFO] Group=HF, proxy=M5, window=2016, features=40
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_M8_neutralized.parquet
+--- [75/78] features_e1f_W1.parquet (4 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=4
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_W1_neutralized.parquet
+--- [76/78] features_e1f_MN.parquet (9 features) ---
+  [INFO] Group=LF_LONG, proxy=W1, window=52, features=9
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_MN_neutralized.parquet
+--- [77/78] features_e1f_H4.parquet (7 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=7
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_H4_neutralized.parquet
+--- [78/78] features_e1f_H6.parquet (8 features) ---
+  [INFO] Group=LF_SHORT, proxy=H4, window=504, features=8
+  [INFO] Output → /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned/feature_value_a_vast_universeF/features_e1f_H6_neutralized.parquet
+
+======================================================================
+### 2_G_alpha_neutralizer.py: COMPLETED ###
+Output: /workspace/data/XAUUSD/stratum_5_alpha/neutralized_alpha_set_partitioned
+======================================================================

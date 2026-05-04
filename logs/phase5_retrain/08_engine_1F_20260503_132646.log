@@ -1,0 +1,601 @@
+2026-05-03 15:19:02,922 - INFO - 検出されたタイムフレーム: 15個
+
+======================================================================
+  Engine 1F - Interdisciplinary Features 
+  Project Forge - 軍資金増大プロジェクト  
+======================================================================
+🎯 目標: XAU/USD市場の学際的パターン抽出
+🤖 AI頭脳による学際融合法則発見
+💰 Project Chimera開発資金調達
+🔧 【修正】物理的垂直分割によるメモリ・スラッシング回避
+======================================================================
+
+実行タイプを選択してください:
+  1. 新規実行
+  2. 中断した処理を再開
+選択 (1/2): 新規に処理を開始します。
+
+並列処理スレッド数を選択してください:
+  1. 自動設定 (推奨)
+  2. 手動設定
+選択 (1/2): スレッド数を入力 (1-12): スレッド数設定: 12
+
+出力パスを選択してください:
+  1. デフォルト (/workspace/data/XAUUSD/stratum_2_features)
+  2. カスタムパス
+選択 (1/2): 
+メモリ制限を選択してください:
+  1. デフォルト (55.0GB)
+  2. カスタム設定
+選択 (1/2): 
+実行モードを選択してください:
+  1. テストモード（少量データで動作確認）
+  2. 本格モード（全データ処理）
+選択 (1/2): 
+タイムフレームを選択してください:
+  0. 全て処理
+   1. tick
+   2. M0.5
+   3. M1
+   4. M3
+   5. M5
+   6. M8
+   7. M15
+   8. M30
+   9. H1
+  10. H4
+  11. H6
+  12. H12
+  13. D1
+  14. W1
+  15. MN
+  (例: 1,3,5 または 1-5 カンマ区切り)
+選択: 
+============================================================
+Engine E1F - Engine_1F_InterdisciplinaryFeatures
+============================================================
+🎯 Project Forge - 軍資金増大プロジェクト
+🚀 最終目標: Project Chimera開発・完成のための資金調達
+💻 探索対象: マーケットの亡霊（統計的に有意で非ランダムな微細パターン）
+🏅 思想的継承: ジム・シモンズ（ルネサンス・テクノロジーズ）
+============================================================
+入力パス: /workspace/data/XAUUSD/stratum_1_base/master_processed
+出力パス: /workspace/data/XAUUSD/stratum_2_features
+Tickパーティションパス: /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned
+エンジンID: e1f
+並列スレッド数: 12
+メモリ制限: 55.0GB
+
+処理対象タイムフレーム (14個):
+   1. M0.5
+   2. M1
+   3. M3
+   4. M5
+   5. M8
+   6. M15
+   7. M30
+   8. H1
+   9. H4
+  10. H6
+  11. H12
+  12. D1
+  13. W1
+  14. MN
+
+処理内容:
+  - 学際的・実験的特徴量（ネットワーク科学、言語学、美学、音楽理論、生体力学）
+  - 2段階品質保証システム
+  - 【修正】物理的垂直分割（ディスクベース中間ファイル）
+  - Polars LazyFrame + Numba JITハイブリッド最適化
+
+処理を開始しますか？ (y/n): 2026-05-03 15:19:02,923 - INFO - 並列処理スレッド数: 12
+2026-05-03 15:19:02,923 - INFO - === 通常処理開始: timeframe=M0.5 ===
+2026-05-03 15:19:02,924 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_3paq8ayg
+2026-05-03 15:19:02,924 - INFO - LazyFrame生成開始: timeframe=M0.5
+2026-05-03 15:19:02,961 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:19:02,961 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:19:02,961 - INFO - LazyFrame生成完了: timeframe=M0.5
+2026-05-03 15:19:03,138 - INFO - データサマリー: {'total_rows': 3398074, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57, 30), 'avg_price': 2501.596540386609, 'total_volume': 220520772}
+2026-05-03 15:19:04,347 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:19:04,347 - INFO - グループ計算開始: network_science
+2026-05-03 15:19:04,348 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=2880)
+2026-05-03 15:19:04,348 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:27:12,859 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:27:12,859 - INFO - グループ計算開始: linguistics
+2026-05-03 15:27:12,859 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=2880)
+2026-05-03 15:27:12,860 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:28:19,952 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:28:19,952 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:28:19,952 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=2880)
+2026-05-03 15:28:19,953 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:29:20,425 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:29:20,425 - INFO - グループ計算開始: music_theory
+2026-05-03 15:29:20,425 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=2880)
+2026-05-03 15:29:20,426 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:31:21,916 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:31:21,916 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:31:21,917 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=2880)
+2026-05-03 15:31:21,918 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:31:53,816 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:31:54,709 - INFO - NaN埋め処理開始
+2026-05-03 15:31:54,709 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:31:54,710 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M0.5.parquet
+2026-05-03 15:31:54,712 - INFO - NaN埋め処理開始
+2026-05-03 15:31:54,713 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:32:01,644 - INFO - 保存完了: 1167.48MB, 6.93秒
+2026-05-03 15:32:01,644 - INFO - === 通常処理完了: M0.5 - 778.72秒 ===
+2026-05-03 15:32:01,908 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_3paq8ayg
+2026-05-03 15:32:01,911 - INFO - === 通常処理開始: timeframe=M1 ===
+2026-05-03 15:32:01,912 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_05l8j9c1
+2026-05-03 15:32:01,912 - INFO - LazyFrame生成開始: timeframe=M1
+2026-05-03 15:32:01,949 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:32:01,949 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:32:01,949 - INFO - LazyFrame生成完了: timeframe=M1
+2026-05-03 15:32:02,061 - INFO - データサマリー: {'total_rows': 1699402, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57), 'avg_price': 2501.5528949516483, 'total_volume': 220520772}
+2026-05-03 15:32:02,657 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:32:02,657 - INFO - グループ計算開始: network_science
+2026-05-03 15:32:02,658 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=1440)
+2026-05-03 15:32:02,658 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:36:08,961 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:36:08,961 - INFO - グループ計算開始: linguistics
+2026-05-03 15:36:08,961 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1440)
+2026-05-03 15:36:08,962 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:36:39,884 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:36:39,884 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:36:39,884 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1440)
+2026-05-03 15:36:39,885 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:37:08,758 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:37:08,759 - INFO - グループ計算開始: music_theory
+2026-05-03 15:37:08,759 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1440)
+2026-05-03 15:37:08,760 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:38:06,747 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:38:06,747 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:38:06,748 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1440)
+2026-05-03 15:38:06,749 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:38:21,849 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:38:22,334 - INFO - NaN埋め処理開始
+2026-05-03 15:38:22,335 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:38:22,335 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M1.parquet
+2026-05-03 15:38:22,340 - INFO - NaN埋め処理開始
+2026-05-03 15:38:22,341 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:38:25,701 - INFO - 保存完了: 584.59MB, 3.35秒
+2026-05-03 15:38:25,701 - INFO - === 通常処理完了: M1 - 383.79秒 ===
+2026-05-03 15:38:25,835 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_05l8j9c1
+2026-05-03 15:38:25,836 - INFO - === 通常処理開始: timeframe=M3 ===
+2026-05-03 15:38:25,837 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_tv7div7x
+2026-05-03 15:38:25,837 - INFO - LazyFrame生成開始: timeframe=M3
+2026-05-03 15:38:25,871 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:38:25,872 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:38:25,872 - INFO - LazyFrame生成完了: timeframe=M3
+2026-05-03 15:38:25,929 - INFO - データサマリー: {'total_rows': 567730, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57), 'avg_price': 2501.6155532900075, 'total_volume': 220520772}
+2026-05-03 15:38:26,206 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:38:26,207 - INFO - グループ計算開始: network_science
+2026-05-03 15:38:26,207 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=480)
+2026-05-03 15:38:26,207 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:39:50,270 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:39:50,271 - INFO - グループ計算開始: linguistics
+2026-05-03 15:39:50,271 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=480)
+2026-05-03 15:39:50,272 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:40:00,806 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:40:00,807 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:40:00,807 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=480)
+2026-05-03 15:40:00,808 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:40:10,680 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:40:10,680 - INFO - グループ計算開始: music_theory
+2026-05-03 15:40:10,680 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=480)
+2026-05-03 15:40:10,681 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:40:30,529 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:40:30,529 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:40:30,529 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=480)
+2026-05-03 15:40:30,530 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:40:35,775 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:40:36,223 - INFO - NaN埋め処理開始
+2026-05-03 15:40:36,223 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:40:36,223 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M3.parquet
+2026-05-03 15:40:36,229 - INFO - NaN埋め処理開始
+2026-05-03 15:40:36,230 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:40:37,457 - INFO - 保存完了: 196.15MB, 1.22秒
+2026-05-03 15:40:37,457 - INFO - === 通常処理完了: M3 - 131.62秒 ===
+2026-05-03 15:40:37,504 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_tv7div7x
+2026-05-03 15:40:37,504 - INFO - === 通常処理開始: timeframe=M5 ===
+2026-05-03 15:40:37,505 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_5m9uc23w
+2026-05-03 15:40:37,505 - INFO - LazyFrame生成開始: timeframe=M5
+2026-05-03 15:40:37,543 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:40:37,543 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:40:37,543 - INFO - LazyFrame生成完了: timeframe=M5
+2026-05-03 15:40:37,606 - INFO - データサマリー: {'total_rows': 340602, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 55), 'avg_price': 2501.7083046243993, 'total_volume': 220520772}
+2026-05-03 15:40:37,793 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:40:37,793 - INFO - グループ計算開始: network_science
+2026-05-03 15:40:37,794 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=288)
+2026-05-03 15:40:37,794 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:41:28,730 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:41:28,730 - INFO - グループ計算開始: linguistics
+2026-05-03 15:41:28,730 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=288)
+2026-05-03 15:41:28,731 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:41:35,133 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:41:35,133 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:41:35,134 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=288)
+2026-05-03 15:41:35,134 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:41:41,098 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:41:41,098 - INFO - グループ計算開始: music_theory
+2026-05-03 15:41:41,098 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=288)
+2026-05-03 15:41:41,099 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:41:52,986 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:41:52,987 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:41:52,987 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=288)
+2026-05-03 15:41:52,988 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:41:56,269 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:41:56,682 - INFO - NaN埋め処理開始
+2026-05-03 15:41:56,683 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:41:56,683 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M5.parquet
+2026-05-03 15:41:56,690 - INFO - NaN埋め処理開始
+2026-05-03 15:41:56,691 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:41:57,413 - INFO - 保存完了: 117.95MB, 0.72秒
+2026-05-03 15:41:57,413 - INFO - === 通常処理完了: M5 - 79.91秒 ===
+2026-05-03 15:41:57,443 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_5m9uc23w
+2026-05-03 15:41:57,444 - INFO - === 通常処理開始: timeframe=M8 ===
+2026-05-03 15:41:57,444 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_9dzjz59t
+2026-05-03 15:41:57,444 - INFO - LazyFrame生成開始: timeframe=M8
+2026-05-03 15:41:57,482 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:41:57,482 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:41:57,482 - INFO - LazyFrame生成完了: timeframe=M8
+2026-05-03 15:41:57,513 - INFO - データサマリー: {'total_rows': 213577, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 56), 'avg_price': 2501.6966365391136, 'total_volume': 220520772}
+2026-05-03 15:41:57,643 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:41:57,643 - INFO - グループ計算開始: network_science
+2026-05-03 15:41:57,643 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=180)
+2026-05-03 15:41:57,644 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:42:29,966 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:42:29,966 - INFO - グループ計算開始: linguistics
+2026-05-03 15:42:29,967 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=180)
+2026-05-03 15:42:29,967 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:42:34,028 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:42:34,028 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:42:34,028 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=180)
+2026-05-03 15:42:34,029 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:42:37,879 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:42:37,879 - INFO - グループ計算開始: music_theory
+2026-05-03 15:42:37,879 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=180)
+2026-05-03 15:42:37,880 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:42:45,549 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:42:45,549 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:42:45,549 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=180)
+2026-05-03 15:42:45,550 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:42:47,742 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:42:48,123 - INFO - NaN埋め処理開始
+2026-05-03 15:42:48,124 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:42:48,124 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M8.parquet
+2026-05-03 15:42:48,129 - INFO - NaN埋め処理開始
+2026-05-03 15:42:48,130 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:42:48,600 - INFO - 保存完了: 74.02MB, 0.46秒
+2026-05-03 15:42:48,600 - INFO - === 通常処理完了: M8 - 51.16秒 ===
+2026-05-03 15:42:48,618 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_9dzjz59t
+2026-05-03 15:42:48,618 - INFO - === 通常処理開始: timeframe=M15 ===
+2026-05-03 15:42:48,619 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_8o3lpbfj
+2026-05-03 15:42:48,619 - INFO - LazyFrame生成開始: timeframe=M15
+2026-05-03 15:42:48,651 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:42:48,651 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:42:48,651 - INFO - LazyFrame生成完了: timeframe=M15
+2026-05-03 15:42:48,671 - INFO - データサマリー: {'total_rows': 113625, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 45), 'avg_price': 2501.624636705858, 'total_volume': 220520772}
+2026-05-03 15:42:48,748 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:42:48,748 - INFO - グループ計算開始: network_science
+2026-05-03 15:42:48,749 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=96)
+2026-05-03 15:42:48,749 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:06,154 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:06,154 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:06,155 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=96)
+2026-05-03 15:43:06,155 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:08,442 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:08,442 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:08,442 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=96)
+2026-05-03 15:43:08,443 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:10,588 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:10,588 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:10,589 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=96)
+2026-05-03 15:43:10,590 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:14,742 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:14,743 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:14,743 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=96)
+2026-05-03 15:43:14,744 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:16,067 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:16,404 - INFO - NaN埋め処理開始
+2026-05-03 15:43:16,404 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:16,405 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M15.parquet
+2026-05-03 15:43:16,412 - INFO - NaN埋め処理開始
+2026-05-03 15:43:16,413 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:16,662 - INFO - 保存完了: 39.48MB, 0.24秒
+2026-05-03 15:43:16,662 - INFO - === 通常処理完了: M15 - 28.04秒 ===
+2026-05-03 15:43:16,672 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_8o3lpbfj
+2026-05-03 15:43:16,672 - INFO - === 通常処理開始: timeframe=M30 ===
+2026-05-03 15:43:16,673 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_kvrklcfr
+2026-05-03 15:43:16,673 - INFO - LazyFrame生成開始: timeframe=M30
+2026-05-03 15:43:16,708 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:16,708 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:16,708 - INFO - LazyFrame生成完了: timeframe=M30
+2026-05-03 15:43:16,724 - INFO - データサマリー: {'total_rows': 56829, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 30), 'avg_price': 2501.688120554698, 'total_volume': 220520772}
+2026-05-03 15:43:16,770 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:16,771 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:16,771 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=48)
+2026-05-03 15:43:16,771 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:25,374 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:25,374 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:25,375 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=48)
+2026-05-03 15:43:25,376 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:26,641 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:26,641 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:26,641 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=48)
+2026-05-03 15:43:26,642 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:27,849 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:27,849 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:27,849 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=48)
+2026-05-03 15:43:27,850 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:30,093 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:30,093 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:30,093 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=48)
+2026-05-03 15:43:30,094 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:30,924 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:31,223 - INFO - NaN埋め処理開始
+2026-05-03 15:43:31,224 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:31,224 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_M30.parquet
+2026-05-03 15:43:31,230 - INFO - NaN埋め処理開始
+2026-05-03 15:43:31,231 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:31,371 - INFO - 保存完了: 19.80MB, 0.13秒
+2026-05-03 15:43:31,371 - INFO - === 通常処理完了: M30 - 14.70秒 ===
+2026-05-03 15:43:31,377 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_kvrklcfr
+2026-05-03 15:43:31,377 - INFO - === 通常処理開始: timeframe=H1 ===
+2026-05-03 15:43:31,378 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_obuwju82
+2026-05-03 15:43:31,378 - INFO - LazyFrame生成開始: timeframe=H1
+2026-05-03 15:43:31,412 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:31,412 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:31,412 - INFO - LazyFrame生成完了: timeframe=H1
+2026-05-03 15:43:31,422 - INFO - データサマリー: {'total_rows': 28433, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 0), 'avg_price': 2501.7362490259447, 'total_volume': 220520772}
+2026-05-03 15:43:31,451 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:31,451 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:31,452 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=24)
+2026-05-03 15:43:31,452 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:35,764 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:35,764 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:35,765 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=24)
+2026-05-03 15:43:35,765 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:36,531 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:36,532 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:36,532 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=24)
+2026-05-03 15:43:36,533 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:37,269 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:37,269 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:37,269 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=24)
+2026-05-03 15:43:37,270 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:38,558 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:38,559 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:38,559 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=24)
+2026-05-03 15:43:38,560 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:39,185 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:39,484 - INFO - NaN埋め処理開始
+2026-05-03 15:43:39,485 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:39,485 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_H1.parquet
+2026-05-03 15:43:39,490 - INFO - NaN埋め処理開始
+2026-05-03 15:43:39,491 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:39,585 - INFO - 保存完了: 9.95MB, 0.09秒
+2026-05-03 15:43:39,585 - INFO - === 通常処理完了: H1 - 8.21秒 ===
+2026-05-03 15:43:39,588 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_obuwju82
+2026-05-03 15:43:39,589 - INFO - === 通常処理開始: timeframe=H4 ===
+2026-05-03 15:43:39,589 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_cmrs6ca0
+2026-05-03 15:43:39,590 - INFO - LazyFrame生成開始: timeframe=H4
+2026-05-03 15:43:39,629 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:39,629 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:39,629 - INFO - LazyFrame生成完了: timeframe=H4
+2026-05-03 15:43:39,636 - INFO - データサマリー: {'total_rows': 7691, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 0), 'avg_price': 2502.1429270832487, 'total_volume': 220520772}
+2026-05-03 15:43:39,653 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:39,653 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:39,653 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=6)
+2026-05-03 15:43:39,654 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:40,907 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:40,907 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:40,907 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=6)
+2026-05-03 15:43:40,908 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:41,283 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:41,283 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:41,284 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=6)
+2026-05-03 15:43:41,284 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:41,659 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:41,659 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:41,659 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=6)
+2026-05-03 15:43:41,660 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:42,220 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:42,220 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:42,221 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=6)
+2026-05-03 15:43:42,221 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:42,598 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:42,884 - INFO - NaN埋め処理開始
+2026-05-03 15:43:42,885 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:42,885 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_H4.parquet
+2026-05-03 15:43:42,891 - INFO - NaN埋め処理開始
+2026-05-03 15:43:42,892 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:42,940 - INFO - 保存完了: 2.71MB, 0.04秒
+2026-05-03 15:43:42,941 - INFO - === 通常処理完了: H4 - 3.35秒 ===
+2026-05-03 15:43:42,942 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_cmrs6ca0
+2026-05-03 15:43:42,942 - INFO - === 通常処理開始: timeframe=H6 ===
+2026-05-03 15:43:42,943 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_zsmfmifs
+2026-05-03 15:43:42,943 - INFO - LazyFrame生成開始: timeframe=H6
+2026-05-03 15:43:42,976 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:42,976 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:42,976 - INFO - LazyFrame生成完了: timeframe=H6
+2026-05-03 15:43:42,983 - INFO - データサマリー: {'total_rows': 5217, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 18, 0), 'avg_price': 2502.558648900417, 'total_volume': 220520772}
+2026-05-03 15:43:42,998 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:42,998 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:42,998 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=4)
+2026-05-03 15:43:42,999 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:43,927 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:43,928 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:43,928 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=4)
+2026-05-03 15:43:43,929 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:44,270 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:44,270 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:44,271 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=4)
+2026-05-03 15:43:44,271 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:44,615 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:44,615 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:44,616 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=4)
+2026-05-03 15:43:44,617 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:45,101 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:45,101 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:45,102 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=4)
+2026-05-03 15:43:45,102 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:45,472 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:45,756 - INFO - NaN埋め処理開始
+2026-05-03 15:43:45,757 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:45,757 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_H6.parquet
+2026-05-03 15:43:45,763 - INFO - NaN埋め処理開始
+2026-05-03 15:43:45,764 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:45,810 - INFO - 保存完了: 1.85MB, 0.04秒
+2026-05-03 15:43:45,810 - INFO - === 通常処理完了: H6 - 2.87秒 ===
+2026-05-03 15:43:45,812 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_zsmfmifs
+2026-05-03 15:43:45,812 - INFO - === 通常処理開始: timeframe=H12 ===
+2026-05-03 15:43:45,813 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_hmreh9zj
+2026-05-03 15:43:45,813 - INFO - LazyFrame生成開始: timeframe=H12
+2026-05-03 15:43:45,848 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:45,848 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:45,848 - INFO - LazyFrame生成完了: timeframe=H12
+2026-05-03 15:43:45,854 - INFO - データサマリー: {'total_rows': 2736, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 12, 0), 'avg_price': 2503.838708308705, 'total_volume': 220520772}
+2026-05-03 15:43:45,867 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:45,867 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:45,867 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=2)
+2026-05-03 15:43:45,868 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:46,437 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:46,437 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:46,438 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=2)
+2026-05-03 15:43:46,438 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:46,741 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:46,741 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:46,742 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=2)
+2026-05-03 15:43:46,742 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:47,032 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:47,032 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:47,033 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=2)
+2026-05-03 15:43:47,033 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:47,419 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:47,419 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:47,420 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=2)
+2026-05-03 15:43:47,421 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:47,761 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:48,044 - INFO - NaN埋め処理開始
+2026-05-03 15:43:48,045 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:48,045 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_H12.parquet
+2026-05-03 15:43:48,050 - INFO - NaN埋め処理開始
+2026-05-03 15:43:48,050 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:48,091 - INFO - 保存完了: 0.99MB, 0.04秒
+2026-05-03 15:43:48,091 - INFO - === 通常処理完了: H12 - 2.28秒 ===
+2026-05-03 15:43:48,092 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_hmreh9zj
+2026-05-03 15:43:48,093 - INFO - === 通常処理開始: timeframe=D1 ===
+2026-05-03 15:43:48,094 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_0n2qmcsw
+2026-05-03 15:43:48,094 - INFO - LazyFrame生成開始: timeframe=D1
+2026-05-03 15:43:48,131 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:48,131 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:48,131 - INFO - LazyFrame生成完了: timeframe=D1
+2026-05-03 15:43:48,138 - INFO - データサマリー: {'total_rows': 1495, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 0, 0), 'avg_price': 2505.4262536090355, 'total_volume': 220520772}
+2026-05-03 15:43:48,151 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:48,152 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:48,152 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:48,152 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:48,549 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:48,550 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:48,550 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:48,550 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:48,822 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:48,822 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:48,823 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:48,823 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:49,091 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:49,091 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:49,092 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:49,093 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:49,439 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:49,439 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:49,440 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:49,441 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:49,754 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:50,039 - INFO - NaN埋め処理開始
+2026-05-03 15:43:50,040 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:50,040 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_D1.parquet
+2026-05-03 15:43:50,047 - INFO - NaN埋め処理開始
+2026-05-03 15:43:50,048 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:50,087 - INFO - 保存完了: 0.55MB, 0.03秒
+2026-05-03 15:43:50,087 - INFO - === 通常処理完了: D1 - 1.99秒 ===
+2026-05-03 15:43:50,088 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_0n2qmcsw
+2026-05-03 15:43:50,088 - INFO - === 通常処理開始: timeframe=W1 ===
+2026-05-03 15:43:50,089 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_i7au3fh1
+2026-05-03 15:43:50,089 - INFO - LazyFrame生成開始: timeframe=W1
+2026-05-03 15:43:50,126 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:50,126 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:50,126 - INFO - LazyFrame生成完了: timeframe=W1
+2026-05-03 15:43:50,133 - INFO - データサマリー: {'total_rows': 251, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 4, 27, 0, 0), 'avg_price': 2508.222277880665, 'total_volume': 220520772}
+2026-05-03 15:43:50,145 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:50,145 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:50,145 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:50,146 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:50,362 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:50,362 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:50,362 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:50,363 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:50,610 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:50,610 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:50,610 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:50,611 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:50,864 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:50,865 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:50,865 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:50,866 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:51,184 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:51,184 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:51,185 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:51,185 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:51,497 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:51,778 - INFO - NaN埋め処理開始
+2026-05-03 15:43:51,779 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:51,779 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_W1.parquet
+2026-05-03 15:43:51,786 - INFO - NaN埋め処理開始
+2026-05-03 15:43:51,787 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:51,815 - INFO - 保存完了: 0.11MB, 0.02秒
+2026-05-03 15:43:51,815 - INFO - === 通常処理完了: W1 - 1.73秒 ===
+2026-05-03 15:43:51,815 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_i7au3fh1
+2026-05-03 15:43:51,816 - INFO - === 通常処理開始: timeframe=MN ===
+2026-05-03 15:43:51,817 - INFO - 一時ディレクトリ作成: /tmp/features_e1f_ybcrhhxy
+2026-05-03 15:43:51,817 - INFO - LazyFrame生成開始: timeframe=MN
+2026-05-03 15:43:51,852 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 15:43:51,852 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 15:43:51,852 - INFO - LazyFrame生成完了: timeframe=MN
+2026-05-03 15:43:51,859 - INFO - データサマリー: {'total_rows': 59, 'start_time': datetime.datetime(2021, 7, 1, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 0, 0), 'avg_price': 2551.342618263374, 'total_volume': 220520772}
+2026-05-03 15:43:51,870 - INFO - グループ処理開始: network_science (8個の特徴量)
+2026-05-03 15:43:51,870 - INFO - グループ計算開始: network_science
+2026-05-03 15:43:51,870 - INFO - 品質保証適用: 8個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:51,871 - INFO - グループ計算完了: network_science - 8個の特徴量
+2026-05-03 15:43:52,052 - INFO - グループ処理開始: linguistics (12個の特徴量)
+2026-05-03 15:43:52,052 - INFO - グループ計算開始: linguistics
+2026-05-03 15:43:52,053 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:52,053 - INFO - グループ計算完了: linguistics - 12個の特徴量
+2026-05-03 15:43:52,301 - INFO - グループ処理開始: aesthetics (12個の特徴量)
+2026-05-03 15:43:52,301 - INFO - グループ計算開始: aesthetics
+2026-05-03 15:43:52,302 - INFO - 品質保証適用: 12個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:52,302 - INFO - グループ計算完了: aesthetics - 12個の特徴量
+2026-05-03 15:43:52,551 - INFO - グループ処理開始: music_theory (16個の特徴量)
+2026-05-03 15:43:52,551 - INFO - グループ計算開始: music_theory
+2026-05-03 15:43:52,551 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:52,552 - INFO - グループ計算完了: music_theory - 16個の特徴量
+2026-05-03 15:43:52,879 - INFO - グループ処理開始: biomechanics (16個の特徴量)
+2026-05-03 15:43:52,879 - INFO - グループ計算開始: biomechanics
+2026-05-03 15:43:52,880 - INFO - 品質保証適用: 16個の特徴量 (EWM 5σクリッピング, half_life=1)
+2026-05-03 15:43:52,881 - INFO - グループ計算完了: biomechanics - 16個の特徴量
+2026-05-03 15:43:53,187 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 15:43:53,469 - INFO - NaN埋め処理開始
+2026-05-03 15:43:53,469 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:53,469 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeF/features_e1f_MN.parquet
+2026-05-03 15:43:53,475 - INFO - NaN埋め処理開始
+2026-05-03 15:43:53,476 - INFO - NaN埋め処理完了: 64個の特徴量
+2026-05-03 15:43:53,501 - INFO - 保存完了: 0.04MB, 0.02秒
+2026-05-03 15:43:53,501 - INFO - === 通常処理完了: MN - 1.68秒 ===
+2026-05-03 15:43:53,501 - INFO - 一時ディレクトリ削除: /tmp/features_e1f_ybcrhhxy
+
+============================================================
+処理開始...
+============================================================
+
+全ての要求された処理が完了しました。総処理時間: 1490.58秒

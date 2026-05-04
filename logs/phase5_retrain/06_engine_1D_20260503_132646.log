@@ -1,0 +1,577 @@
+2026-05-03 14:37:39,847 - INFO - 検出されたタイムフレーム: 15個
+
+======================================================================
+  Engine 1D - Volume & Price Action Features (修正版) 
+  Project Forge - 軍資金増大プロジェクト  
+======================================================================
+🎯 目標: XAU/USD市場の統計的パターン抽出
+🤖 AI頭脳による普遍的法則発見
+💰 Project Chimera開発資金調達
+🔧 【修正】物理的垂直分割によるメモリ・スラッシング回避
+======================================================================
+
+実行タイプを選択してください:
+  1. 新規実行
+  2. 中断した処理を再開
+選択 (1/2): 新規に処理を開始します。
+
+並列処理スレッド数を選択してください:
+  1. 自動設定 (推奨)
+  2. 手動設定
+選択 (1/2): スレッド数を入力 (1-12): スレッド数設定: 12
+
+出力パスを選択してください:
+  1. デフォルト (/workspace/data/XAUUSD/stratum_2_features)
+  2. カスタムパス
+選択 (1/2): 
+メモリ制限を選択してください:
+  1. デフォルト (55.0GB)
+  2. カスタム設定
+選択 (1/2): 
+実行モードを選択してください:
+  1. テストモード（少量データで動作確認）
+  2. 本格モード（全データ処理）
+選択 (1/2): 
+タイムフレームを選択してください:
+  0. 全て処理
+   1. tick
+   2. M0.5
+   3. M1
+   4. M3
+   5. M5
+   6. M8
+   7. M15
+   8. M30
+   9. H1
+  10. H4
+  11. H6
+  12. H12
+  13. D1
+  14. W1
+  15. MN
+  (例: 1,3,5 または 1-5 カンマ区切り)
+選択: 
+============================================================
+Engine E1D - Engine_1D_VolumeActionFeatures
+============================================================
+🎯 Project Forge - 軍資金増大プロジェクト
+🚀 最終目標: Project Chimera開発・完成のための資金調達
+💻 探索対象: マーケットの亡霊（統計的に有意で非ランダムな微細パターン）
+🏅 思想的継承: ジム・シモンズ（ルネサンス・テクノロジーズ）
+============================================================
+入力パス: /workspace/data/XAUUSD/stratum_1_base/master_processed
+出力パス: /workspace/data/XAUUSD/stratum_2_features
+Tickパーティションパス: /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned
+エンジンID: e1d
+並列スレッド数: 12
+メモリ制限: 55.0GB
+
+処理対象タイムフレーム (14個):
+   1. M0.5
+   2. M1
+   3. M3
+   4. M5
+   5. M8
+   6. M15
+   7. M30
+   8. H1
+   9. H4
+  10. H6
+  11. H12
+  12. D1
+  13. W1
+  14. MN
+
+処理内容:
+  - ボラティリティ指標（標準・ロバスト・Chaikin・Mass Index等）
+  - 出来高関連指標（CMF・MFI・VWAP・OBV・A/D Line等）
+  - ブレイクアウト・レンジ（Donchian・Price Channel・CCI等）
+  - サポート・レジスタンス（ピボットポイント・フィボナッチ等）
+  - 価格アクション（ローソク足パターン・実体比率等）
+  - 2段階品質保証システム
+  - 【修正】物理的垂直分割（ディスクベース中間ファイル）
+  - Polars LazyFrame + Numba JITハイブリッド最適化
+
+処理を開始しますか？ (y/n): 2026-05-03 14:37:39,848 - INFO - 並列処理スレッド数: 12
+2026-05-03 14:37:39,848 - INFO - === 通常処理開始: timeframe=M0.5 ===
+2026-05-03 14:37:39,849 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_32n_o_0q
+2026-05-03 14:37:39,849 - INFO - LazyFrame生成開始: timeframe=M0.5
+2026-05-03 14:37:39,885 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:37:39,886 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:37:39,886 - INFO - LazyFrame生成完了: timeframe=M0.5
+2026-05-03 14:37:40,052 - INFO - データサマリー: {'total_rows': 3398074, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57, 30), 'avg_price': 2501.596540386609, 'total_volume': 220520772}
+2026-05-03 14:37:40,643 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:37:40,643 - INFO - グループ計算開始: volatility
+2026-05-03 14:37:40,644 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:37:40,646 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:43:20,832 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:43:20,832 - INFO - グループ計算開始: volume
+2026-05-03 14:43:20,833 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:43:20,834 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:44:01,716 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:44:01,716 - INFO - グループ計算開始: breakout
+2026-05-03 14:44:01,717 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:44:01,719 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:44:59,648 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:44:59,648 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:44:59,649 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:44:59,650 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:45:12,834 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:45:12,834 - INFO - グループ計算開始: price_action
+2026-05-03 14:45:12,834 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:45:12,835 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:45:31,589 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:45:32,834 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M0.5.parquet
+2026-05-03 14:45:32,860 - INFO - NaN埋め処理開始
+2026-05-03 14:45:32,861 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:45:44,313 - INFO - 保存完了: 1715.74MB, 11.44秒
+2026-05-03 14:45:44,314 - INFO - === 通常処理完了: M0.5 - 484.47秒 ===
+2026-05-03 14:45:44,314 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_32n_o_0q
+2026-05-03 14:45:44,316 - INFO - === 通常処理開始: timeframe=M1 ===
+2026-05-03 14:45:44,317 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_gl1_pih6
+2026-05-03 14:45:44,317 - INFO - LazyFrame生成開始: timeframe=M1
+2026-05-03 14:45:44,358 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:45:44,359 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:45:44,359 - INFO - LazyFrame生成完了: timeframe=M1
+2026-05-03 14:45:44,493 - INFO - データサマリー: {'total_rows': 1699402, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57), 'avg_price': 2501.5528949516483, 'total_volume': 220520772}
+2026-05-03 14:45:44,950 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:45:44,950 - INFO - グループ計算開始: volatility
+2026-05-03 14:45:44,952 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:45:44,954 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:48:27,926 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:48:27,926 - INFO - グループ計算開始: volume
+2026-05-03 14:48:27,927 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:48:27,928 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:48:47,293 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:48:47,294 - INFO - グループ計算開始: breakout
+2026-05-03 14:48:47,295 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:48:47,296 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:49:14,400 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:49:14,400 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:49:14,401 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:49:14,401 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:49:20,749 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:49:20,749 - INFO - グループ計算開始: price_action
+2026-05-03 14:49:20,750 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:49:20,750 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:49:30,134 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:49:30,741 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M1.parquet
+2026-05-03 14:49:30,747 - INFO - NaN埋め処理開始
+2026-05-03 14:49:30,748 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:49:36,121 - INFO - 保存完了: 861.19MB, 5.37秒
+2026-05-03 14:49:36,122 - INFO - === 通常処理完了: M1 - 231.81秒 ===
+2026-05-03 14:49:36,122 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_gl1_pih6
+2026-05-03 14:49:36,123 - INFO - === 通常処理開始: timeframe=M3 ===
+2026-05-03 14:49:36,124 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_hi6cd_s_
+2026-05-03 14:49:36,124 - INFO - LazyFrame生成開始: timeframe=M3
+2026-05-03 14:49:36,162 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:49:36,163 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:49:36,163 - INFO - LazyFrame生成完了: timeframe=M3
+2026-05-03 14:49:36,224 - INFO - データサマリー: {'total_rows': 567730, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57), 'avg_price': 2501.6155532900075, 'total_volume': 220520772}
+2026-05-03 14:49:36,441 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:49:36,441 - INFO - グループ計算開始: volatility
+2026-05-03 14:49:36,442 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:49:36,443 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:50:31,875 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:50:31,876 - INFO - グループ計算開始: volume
+2026-05-03 14:50:31,876 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:50:31,877 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:50:38,332 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:50:38,332 - INFO - グループ計算開始: breakout
+2026-05-03 14:50:38,333 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:50:38,335 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:50:48,004 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:50:48,004 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:50:48,005 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:50:48,005 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:50:50,213 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:50:50,213 - INFO - グループ計算開始: price_action
+2026-05-03 14:50:50,214 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:50:50,214 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:50:53,348 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:50:53,772 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M3.parquet
+2026-05-03 14:50:53,779 - INFO - NaN埋め処理開始
+2026-05-03 14:50:53,780 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:50:55,528 - INFO - 保存完了: 289.10MB, 1.74秒
+2026-05-03 14:50:55,528 - INFO - === 通常処理完了: M3 - 79.40秒 ===
+2026-05-03 14:50:55,528 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_hi6cd_s_
+2026-05-03 14:50:55,529 - INFO - === 通常処理開始: timeframe=M5 ===
+2026-05-03 14:50:55,530 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_rt7eeunj
+2026-05-03 14:50:55,530 - INFO - LazyFrame生成開始: timeframe=M5
+2026-05-03 14:50:55,564 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:50:55,564 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:50:55,564 - INFO - LazyFrame生成完了: timeframe=M5
+2026-05-03 14:50:55,604 - INFO - データサマリー: {'total_rows': 340602, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 55), 'avg_price': 2501.7083046243993, 'total_volume': 220520772}
+2026-05-03 14:50:55,779 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:50:55,779 - INFO - グループ計算開始: volatility
+2026-05-03 14:50:55,780 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:50:55,781 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:51:29,900 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:51:29,900 - INFO - グループ計算開始: volume
+2026-05-03 14:51:29,901 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:51:29,902 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:51:34,110 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:51:34,111 - INFO - グループ計算開始: breakout
+2026-05-03 14:51:34,111 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:51:34,113 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:51:39,888 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:51:39,888 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:51:39,889 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:51:39,889 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:51:41,231 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:51:41,231 - INFO - グループ計算開始: price_action
+2026-05-03 14:51:41,232 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:51:41,232 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:51:43,120 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:51:43,498 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M5.parquet
+2026-05-03 14:51:43,504 - INFO - NaN埋め処理開始
+2026-05-03 14:51:43,505 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:51:44,510 - INFO - 保存完了: 173.68MB, 1.00秒
+2026-05-03 14:51:44,510 - INFO - === 通常処理完了: M5 - 48.98秒 ===
+2026-05-03 14:51:44,510 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_rt7eeunj
+2026-05-03 14:51:44,511 - INFO - === 通常処理開始: timeframe=M8 ===
+2026-05-03 14:51:44,511 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_kurivimv
+2026-05-03 14:51:44,511 - INFO - LazyFrame生成開始: timeframe=M8
+2026-05-03 14:51:44,548 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:51:44,548 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:51:44,548 - INFO - LazyFrame生成完了: timeframe=M8
+2026-05-03 14:51:44,575 - INFO - データサマリー: {'total_rows': 213577, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 56), 'avg_price': 2501.6966365391136, 'total_volume': 220520772}
+2026-05-03 14:51:44,682 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:51:44,682 - INFO - グループ計算開始: volatility
+2026-05-03 14:51:44,683 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:51:44,684 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:04,807 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:04,807 - INFO - グループ計算開始: volume
+2026-05-03 14:52:04,808 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:04,809 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:07,373 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:07,373 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:07,374 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:07,375 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:10,894 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:10,894 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:10,895 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:10,895 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:11,791 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:11,791 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:11,792 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:11,793 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:13,035 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:13,377 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M8.parquet
+2026-05-03 14:52:13,384 - INFO - NaN埋め処理開始
+2026-05-03 14:52:13,385 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:14,019 - INFO - 保存完了: 109.00MB, 0.63秒
+2026-05-03 14:52:14,020 - INFO - === 通常処理完了: M8 - 29.51秒 ===
+2026-05-03 14:52:14,020 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_kurivimv
+2026-05-03 14:52:14,020 - INFO - === 通常処理開始: timeframe=M15 ===
+2026-05-03 14:52:14,021 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_u1lxbz4h
+2026-05-03 14:52:14,021 - INFO - LazyFrame生成開始: timeframe=M15
+2026-05-03 14:52:14,054 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:14,054 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:14,054 - INFO - LazyFrame生成完了: timeframe=M15
+2026-05-03 14:52:14,074 - INFO - データサマリー: {'total_rows': 113625, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 45), 'avg_price': 2501.624636705858, 'total_volume': 220520772}
+2026-05-03 14:52:14,136 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:14,136 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:14,137 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:14,138 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:24,902 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:24,902 - INFO - グループ計算開始: volume
+2026-05-03 14:52:24,903 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:24,904 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:26,371 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:26,371 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:26,372 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:26,373 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:28,414 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:28,414 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:28,415 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:28,415 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:28,937 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:28,937 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:28,937 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:28,938 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:29,689 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:29,989 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M15.parquet
+2026-05-03 14:52:29,996 - INFO - NaN埋め処理開始
+2026-05-03 14:52:29,996 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:30,354 - INFO - 保存完了: 58.05MB, 0.35秒
+2026-05-03 14:52:30,355 - INFO - === 通常処理完了: M15 - 16.33秒 ===
+2026-05-03 14:52:30,355 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_u1lxbz4h
+2026-05-03 14:52:30,355 - INFO - === 通常処理開始: timeframe=M30 ===
+2026-05-03 14:52:30,356 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_31jrviwl
+2026-05-03 14:52:30,356 - INFO - LazyFrame生成開始: timeframe=M30
+2026-05-03 14:52:30,391 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:30,391 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:30,391 - INFO - LazyFrame生成完了: timeframe=M30
+2026-05-03 14:52:30,405 - INFO - データサマリー: {'total_rows': 56829, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 30), 'avg_price': 2501.688120554698, 'total_volume': 220520772}
+2026-05-03 14:52:30,442 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:30,442 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:30,443 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:30,444 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:36,038 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:36,038 - INFO - グループ計算開始: volume
+2026-05-03 14:52:36,039 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:36,040 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:36,926 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:36,926 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:36,927 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:36,928 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:38,134 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:38,135 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:38,135 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:38,136 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:38,471 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:38,471 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:38,471 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:38,472 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:38,943 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:39,189 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_M30.parquet
+2026-05-03 14:52:39,194 - INFO - NaN埋め処理開始
+2026-05-03 14:52:39,195 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:39,390 - INFO - 保存完了: 29.08MB, 0.19秒
+2026-05-03 14:52:39,391 - INFO - === 通常処理完了: M30 - 9.04秒 ===
+2026-05-03 14:52:39,391 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_31jrviwl
+2026-05-03 14:52:39,391 - INFO - === 通常処理開始: timeframe=H1 ===
+2026-05-03 14:52:39,392 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_l45csett
+2026-05-03 14:52:39,392 - INFO - LazyFrame生成開始: timeframe=H1
+2026-05-03 14:52:39,423 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:39,423 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:39,423 - INFO - LazyFrame生成完了: timeframe=H1
+2026-05-03 14:52:39,435 - INFO - データサマリー: {'total_rows': 28433, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 0), 'avg_price': 2501.7362490259447, 'total_volume': 220520772}
+2026-05-03 14:52:39,462 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:39,462 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:39,463 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:39,464 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:42,383 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:42,383 - INFO - グループ計算開始: volume
+2026-05-03 14:52:42,384 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:42,385 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:42,973 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:42,973 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:42,974 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:42,975 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:43,784 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:43,784 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:43,785 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:43,785 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:44,021 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:44,021 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:44,022 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:44,022 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:44,344 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:44,574 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_H1.parquet
+2026-05-03 14:52:44,580 - INFO - NaN埋め処理開始
+2026-05-03 14:52:44,581 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:44,707 - INFO - 保存完了: 14.62MB, 0.12秒
+2026-05-03 14:52:44,708 - INFO - === 通常処理完了: H1 - 5.32秒 ===
+2026-05-03 14:52:44,708 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_l45csett
+2026-05-03 14:52:44,708 - INFO - === 通常処理開始: timeframe=H4 ===
+2026-05-03 14:52:44,709 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_rxtbuwv5
+2026-05-03 14:52:44,709 - INFO - LazyFrame生成開始: timeframe=H4
+2026-05-03 14:52:44,740 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:44,741 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:44,741 - INFO - LazyFrame生成完了: timeframe=H4
+2026-05-03 14:52:44,749 - INFO - データサマリー: {'total_rows': 7691, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 0), 'avg_price': 2502.1429270832487, 'total_volume': 220520772}
+2026-05-03 14:52:44,766 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:44,766 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:44,767 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:44,768 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:45,747 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:45,747 - INFO - グループ計算開始: volume
+2026-05-03 14:52:45,747 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:45,748 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:46,105 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:46,106 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:46,107 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:46,109 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:46,599 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:46,599 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:46,600 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:46,601 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:46,758 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:46,759 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:46,759 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:46,760 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:46,973 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:47,199 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_H4.parquet
+2026-05-03 14:52:47,205 - INFO - NaN埋め処理開始
+2026-05-03 14:52:47,205 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:47,262 - INFO - 保存完了: 3.96MB, 0.05秒
+2026-05-03 14:52:47,263 - INFO - === 通常処理完了: H4 - 2.55秒 ===
+2026-05-03 14:52:47,263 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_rxtbuwv5
+2026-05-03 14:52:47,263 - INFO - === 通常処理開始: timeframe=H6 ===
+2026-05-03 14:52:47,264 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_rvv30vu2
+2026-05-03 14:52:47,264 - INFO - LazyFrame生成開始: timeframe=H6
+2026-05-03 14:52:47,298 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:47,298 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:47,298 - INFO - LazyFrame生成完了: timeframe=H6
+2026-05-03 14:52:47,305 - INFO - データサマリー: {'total_rows': 5217, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 18, 0), 'avg_price': 2502.558648900417, 'total_volume': 220520772}
+2026-05-03 14:52:47,319 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:47,319 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:47,319 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:47,320 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:48,051 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:48,051 - INFO - グループ計算開始: volume
+2026-05-03 14:52:48,052 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:48,053 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:48,383 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:48,383 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:48,384 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:48,385 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:48,809 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:48,809 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:48,810 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:48,811 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:48,958 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:48,959 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:48,959 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:48,960 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:49,156 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:49,375 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_H6.parquet
+2026-05-03 14:52:49,381 - INFO - NaN埋め処理開始
+2026-05-03 14:52:49,382 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:49,437 - INFO - 保存完了: 2.69MB, 0.05秒
+2026-05-03 14:52:49,438 - INFO - === 通常処理完了: H6 - 2.17秒 ===
+2026-05-03 14:52:49,438 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_rvv30vu2
+2026-05-03 14:52:49,438 - INFO - === 通常処理開始: timeframe=H12 ===
+2026-05-03 14:52:49,439 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_n7v0xhp2
+2026-05-03 14:52:49,439 - INFO - LazyFrame生成開始: timeframe=H12
+2026-05-03 14:52:49,472 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:49,472 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:49,472 - INFO - LazyFrame生成完了: timeframe=H12
+2026-05-03 14:52:49,480 - INFO - データサマリー: {'total_rows': 2736, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 12, 0), 'avg_price': 2503.838708308705, 'total_volume': 220520772}
+2026-05-03 14:52:49,494 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:49,494 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:49,495 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:49,496 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:49,993 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:49,993 - INFO - グループ計算開始: volume
+2026-05-03 14:52:49,994 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:49,995 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:50,288 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:50,289 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:50,289 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:50,291 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:50,693 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:50,693 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:50,694 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:50,694 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:50,832 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:50,832 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:50,833 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:50,833 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:51,017 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:51,241 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_H12.parquet
+2026-05-03 14:52:51,248 - INFO - NaN埋め処理開始
+2026-05-03 14:52:51,248 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:51,307 - INFO - 保存完了: 1.42MB, 0.05秒
+2026-05-03 14:52:51,307 - INFO - === 通常処理完了: H12 - 1.87秒 ===
+2026-05-03 14:52:51,308 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_n7v0xhp2
+2026-05-03 14:52:51,308 - INFO - === 通常処理開始: timeframe=D1 ===
+2026-05-03 14:52:51,309 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_313erm6e
+2026-05-03 14:52:51,309 - INFO - LazyFrame生成開始: timeframe=D1
+2026-05-03 14:52:51,344 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:51,344 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:51,344 - INFO - LazyFrame生成完了: timeframe=D1
+2026-05-03 14:52:51,352 - INFO - データサマリー: {'total_rows': 1495, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 0, 0), 'avg_price': 2505.4262536090355, 'total_volume': 220520772}
+2026-05-03 14:52:51,364 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:51,364 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:51,365 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:51,366 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:51,736 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:51,736 - INFO - グループ計算開始: volume
+2026-05-03 14:52:51,736 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:51,737 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:52,019 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:52,019 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:52,020 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:52,021 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:52,397 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:52,397 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:52,397 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:52,398 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:52,525 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:52,525 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:52,525 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:52,526 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:52,700 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:52,921 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_D1.parquet
+2026-05-03 14:52:52,927 - INFO - NaN埋め処理開始
+2026-05-03 14:52:52,928 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:52,977 - INFO - 保存完了: 0.77MB, 0.04秒
+2026-05-03 14:52:52,978 - INFO - === 通常処理完了: D1 - 1.67秒 ===
+2026-05-03 14:52:52,978 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_313erm6e
+2026-05-03 14:52:52,978 - INFO - === 通常処理開始: timeframe=W1 ===
+2026-05-03 14:52:52,979 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_leqd2fe9
+2026-05-03 14:52:52,979 - INFO - LazyFrame生成開始: timeframe=W1
+2026-05-03 14:52:53,017 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:53,017 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:53,017 - INFO - LazyFrame生成完了: timeframe=W1
+2026-05-03 14:52:53,024 - INFO - データサマリー: {'total_rows': 251, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 4, 27, 0, 0), 'avg_price': 2508.222277880665, 'total_volume': 220520772}
+2026-05-03 14:52:53,037 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:53,037 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:53,038 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:53,039 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:53,277 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:53,277 - INFO - グループ計算開始: volume
+2026-05-03 14:52:53,278 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:53,279 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:53,536 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:53,536 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:53,537 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:53,538 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:53,868 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:53,868 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:53,869 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:53,869 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:54,001 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:54,002 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:54,002 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:54,003 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:54,166 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:54,388 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_W1.parquet
+2026-05-03 14:52:54,394 - INFO - NaN埋め処理開始
+2026-05-03 14:52:54,395 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:54,420 - INFO - 保存完了: 0.14MB, 0.02秒
+2026-05-03 14:52:54,420 - INFO - === 通常処理完了: W1 - 1.44秒 ===
+2026-05-03 14:52:54,421 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_leqd2fe9
+2026-05-03 14:52:54,421 - INFO - === 通常処理開始: timeframe=MN ===
+2026-05-03 14:52:54,422 - INFO - 一時ディレクトリ作成: /tmp/features_e1d_vr6uso6_
+2026-05-03 14:52:54,422 - INFO - LazyFrame生成開始: timeframe=MN
+2026-05-03 14:52:54,456 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:52:54,456 - INFO - 型変換を適用: 1個のカラム
+2026-05-03 14:52:54,456 - INFO - LazyFrame生成完了: timeframe=MN
+2026-05-03 14:52:54,463 - INFO - データサマリー: {'total_rows': 59, 'start_time': datetime.datetime(2021, 7, 1, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 0, 0), 'avg_price': 2551.342618263374, 'total_volume': 220520772}
+2026-05-03 14:52:54,477 - INFO - グループ処理開始: volatility (16個の特徴量)
+2026-05-03 14:52:54,477 - INFO - グループ計算開始: volatility
+2026-05-03 14:52:54,477 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:54,478 - INFO - グループ計算完了: volatility - 15個の特徴量
+2026-05-03 14:52:54,705 - INFO - グループ処理開始: volume (15個の特徴量)
+2026-05-03 14:52:54,705 - INFO - グループ計算開始: volume
+2026-05-03 14:52:54,706 - INFO - 品質保証適用(EWM 5σ): 15個の特徴量
+2026-05-03 14:52:54,707 - INFO - グループ計算完了: volume - 15個の特徴量
+2026-05-03 14:52:54,959 - INFO - グループ処理開始: breakout (22個の特徴量)
+2026-05-03 14:52:54,959 - INFO - グループ計算開始: breakout
+2026-05-03 14:52:54,960 - INFO - 品質保証適用(EWM 5σ): 22個の特徴量
+2026-05-03 14:52:54,961 - INFO - グループ計算完了: breakout - 22個の特徴量
+2026-05-03 14:52:55,290 - INFO - グループ処理開始: support_resistance (5個の特徴量)
+2026-05-03 14:52:55,290 - INFO - グループ計算開始: support_resistance
+2026-05-03 14:52:55,290 - INFO - 品質保証適用(EWM 5σ): 5個の特徴量
+2026-05-03 14:52:55,291 - INFO - グループ計算完了: support_resistance - 5個の特徴量
+2026-05-03 14:52:55,412 - INFO - グループ処理開始: price_action (9個の特徴量)
+2026-05-03 14:52:55,412 - INFO - グループ計算開始: price_action
+2026-05-03 14:52:55,413 - INFO - 品質保証適用(EWM 5σ): 9個の特徴量
+2026-05-03 14:52:55,413 - INFO - グループ計算完了: price_action - 9個の特徴量
+2026-05-03 14:52:55,580 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:52:55,801 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeD/features_e1d_MN.parquet
+2026-05-03 14:52:55,806 - INFO - NaN埋め処理開始
+2026-05-03 14:52:55,807 - INFO - NaN埋め処理完了: 66個の特徴量
+2026-05-03 14:52:55,833 - INFO - 保存完了: 0.05MB, 0.02秒
+2026-05-03 14:52:55,834 - INFO - === 通常処理完了: MN - 1.41秒 ===
+2026-05-03 14:52:55,834 - INFO - 一時ディレクトリ削除: /tmp/features_e1d_vr6uso6_
+
+============================================================
+処理開始...
+============================================================
+
+全ての要求された処理が完了しました。総処理時間: 915.99秒

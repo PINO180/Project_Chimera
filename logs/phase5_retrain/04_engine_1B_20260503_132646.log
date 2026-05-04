@@ -1,0 +1,674 @@
+2026-05-03 13:50:17,983 - INFO - 検出されたタイムフレーム: 15個
+
+======================================================================
+  Engine 1B - A Vast Universe of Features (修正版) 
+  Project Forge - 軍資金増大プロジェクト  
+======================================================================
+🎯 目標: XAU/USD市場の統計的パターン抽出
+🤖 AI頭脳による普遍的法則発見
+💰 Project Chimera開発資金調達
+🔧 【修正】物理的垂直分割によるメモリ・スラッシング回避
+======================================================================
+
+実行タイプを選択してください:
+  1. 新規実行
+  2. 中断した処理を再開
+選択 (1/2): 新規に処理を開始します。
+
+並列処理スレッド数を選択してください:
+  1. 自動設定 (推奨)
+  2. 手動設定
+選択 (1/2): スレッド数を入力 (1-12): スレッド数設定: 12
+
+出力パスを選択してください:
+  1. デフォルト (/workspace/data/XAUUSD/stratum_2_features)
+  2. カスタムパス
+選択 (1/2): 
+メモリ制限を選択してください:
+  1. デフォルト (55.0GB)
+  2. カスタム設定
+選択 (1/2): 
+実行モードを選択してください:
+  1. テストモード（少量データで動作確認）
+  2. 本格モード（全データ処理）
+選択 (1/2): 
+タイムフレームを選択してください:
+  0. 全て処理
+   1. tick
+   2. M0.5
+   3. M1
+   4. M3
+   5. M5
+   6. M8
+   7. M15
+   8. M30
+   9. H1
+  10. H4
+  11. H6
+  12. H12
+  13. D1
+  14. W1
+  15. MN
+  (例: 1,3,5 または 1-5 カンマ区切り)
+選択: 
+============================================================
+Engine E1B - Engine_1B_VastUniverse
+============================================================
+🎯 Project Forge - 軍資金増大プロジェクト
+🚀 最終目標: Project Chimera開発・完成のための資金調達
+💻 探索対象: マーケットの亡霊（統計的に有意で非ランダムな微細パターン）
+🏅 思想的継承: ジム・シモンズ（ルネサンス・テクノロジーズ）
+============================================================
+入力パス: /workspace/data/XAUUSD/stratum_1_base/master_processed
+出力パス: /workspace/data/XAUUSD/stratum_2_features
+Tickパーティションパス: /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned
+エンジンID: e1b
+並列スレッド数: 12
+メモリ制限: 55.0GB
+
+処理対象タイムフレーム (14個):
+   1. M0.5
+   2. M1
+   3. M3
+   4. M5
+   5. M8
+   6. M15
+   7. M30
+   8. H1
+   9. H4
+  10. H6
+  11. H12
+  12. D1
+  13. W1
+  14. MN
+
+処理内容:
+  - 時系列解析特徴量（ADF、PP、KPSS検定等）
+  - 分布パラメータ特徴量（t分布、GEV分布）
+  - 指数平滑特徴量（ホルト・ウィンターズ）
+  - 回帰予測特徴量（ARIMA、カルマンフィルタ、頑健回帰）
+  - 2段階品質保証システム
+  - 【修正】物理的垂直分割（ディスクベース中間ファイル）
+  - Polars LazyFrame + Numba JITハイブリッド最適化
+
+処理を開始しますか？ (y/n): 2026-05-03 13:50:17,984 - INFO - 並列処理スレッド数: 12
+2026-05-03 13:50:17,984 - INFO - === 通常処理開始: timeframe=M0.5 ===
+2026-05-03 13:50:17,985 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_gljcla0i
+2026-05-03 13:50:17,985 - INFO - LazyFrame生成開始: timeframe=M0.5
+2026-05-03 13:50:18,030 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 13:50:18,030 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 13:50:18,030 - INFO - LazyFrame生成完了: timeframe=M0.5
+2026-05-03 13:50:18,184 - INFO - データサマリー: {'total_rows': 3398074, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57, 30), 'avg_price': 2501.596540386609, 'total_volume': 220520772}
+2026-05-03 13:50:18,761 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 13:50:18,762 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 13:50:18,762 - INFO - グループ計算開始: basic_stats
+2026-05-03 13:50:18,762 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=2880 + 5σクリッピング)
+2026-05-03 13:50:18,764 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 13:51:28,714 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 13:51:28,714 - INFO - グループ計算開始: composite
+2026-05-03 13:51:28,714 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=2880 + 5σクリッピング)
+2026-05-03 13:51:28,715 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 13:51:54,454 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 13:51:54,454 - INFO - グループ計算開始: timeseries
+2026-05-03 13:51:54,455 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=2880 + 5σクリッピング)
+2026-05-03 13:51:54,455 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 13:56:23,410 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 13:56:23,410 - INFO - グループ計算開始: exponential_arima
+2026-05-03 13:56:23,410 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=2880 + 5σクリッピング)
+2026-05-03 13:56:23,411 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 13:59:23,174 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 13:59:23,174 - INFO - グループ計算開始: kalman_regression
+2026-05-03 13:59:23,175 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=2880 + 5σクリッピング)
+2026-05-03 13:59:23,175 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:04:32,078 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:04:32,078 - INFO - グループ計算開始: distributions
+2026-05-03 14:04:32,078 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=2880 + 5σクリッピング)
+2026-05-03 14:04:32,079 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:06:10,577 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:06:11,934 - INFO - NaN埋め処理開始
+2026-05-03 14:06:11,934 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:06:11,935 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M0.5.parquet
+2026-05-03 14:06:11,942 - INFO - NaN埋め処理開始
+2026-05-03 14:06:11,943 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:06:20,003 - INFO - 保存完了: 1489.67MB, 8.05秒
+2026-05-03 14:06:20,003 - INFO - === 通常処理完了: M0.5 - 962.02秒 ===
+2026-05-03 14:06:20,003 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_gljcla0i
+2026-05-03 14:06:20,004 - INFO - === 通常処理開始: timeframe=M1 ===
+2026-05-03 14:06:20,005 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_g11z5onv
+2026-05-03 14:06:20,005 - INFO - LazyFrame生成開始: timeframe=M1
+2026-05-03 14:06:20,038 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:06:20,038 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:06:20,038 - INFO - LazyFrame生成完了: timeframe=M1
+2026-05-03 14:06:20,141 - INFO - データサマリー: {'total_rows': 1699402, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57), 'avg_price': 2501.5528949516483, 'total_volume': 220520772}
+2026-05-03 14:06:20,543 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:06:20,543 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:06:20,543 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:06:20,544 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=1440 + 5σクリッピング)
+2026-05-03 14:06:20,546 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:06:49,641 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:06:49,641 - INFO - グループ計算開始: composite
+2026-05-03 14:06:49,642 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=1440 + 5σクリッピング)
+2026-05-03 14:06:49,642 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:07:02,530 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:07:02,530 - INFO - グループ計算開始: timeseries
+2026-05-03 14:07:02,530 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1440 + 5σクリッピング)
+2026-05-03 14:07:02,530 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:09:11,801 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:09:11,801 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:09:11,802 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1440 + 5σクリッピング)
+2026-05-03 14:09:11,802 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:10:41,387 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:10:41,387 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:10:41,388 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1440 + 5σクリッピング)
+2026-05-03 14:10:41,388 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:13:14,132 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:13:14,132 - INFO - グループ計算開始: distributions
+2026-05-03 14:13:14,133 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=1440 + 5σクリッピング)
+2026-05-03 14:13:14,133 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:14:00,722 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:14:01,527 - INFO - NaN埋め処理開始
+2026-05-03 14:14:01,528 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:14:01,528 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M1.parquet
+2026-05-03 14:14:01,534 - INFO - NaN埋め処理開始
+2026-05-03 14:14:01,535 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:14:05,594 - INFO - 保存完了: 743.88MB, 4.05秒
+2026-05-03 14:14:05,595 - INFO - === 通常処理完了: M1 - 465.59秒 ===
+2026-05-03 14:14:05,595 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_g11z5onv
+2026-05-03 14:14:05,596 - INFO - === 通常処理開始: timeframe=M3 ===
+2026-05-03 14:14:05,597 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_vs4t8h5l
+2026-05-03 14:14:05,598 - INFO - LazyFrame生成開始: timeframe=M3
+2026-05-03 14:14:05,634 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:14:05,634 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:14:05,634 - INFO - LazyFrame生成完了: timeframe=M3
+2026-05-03 14:14:05,695 - INFO - データサマリー: {'total_rows': 567730, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 57), 'avg_price': 2501.6155532900075, 'total_volume': 220520772}
+2026-05-03 14:14:05,916 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:14:05,916 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:14:05,916 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:14:05,917 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=480 + 5σクリッピング)
+2026-05-03 14:14:05,918 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:14:18,024 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:14:18,025 - INFO - グループ計算開始: composite
+2026-05-03 14:14:18,025 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=480 + 5σクリッピング)
+2026-05-03 14:14:18,026 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:14:22,555 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:14:22,555 - INFO - グループ計算開始: timeseries
+2026-05-03 14:14:22,555 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=480 + 5σクリッピング)
+2026-05-03 14:14:22,556 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:15:05,961 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:15:05,962 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:15:05,962 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=480 + 5σクリッピング)
+2026-05-03 14:15:05,962 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:15:35,699 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:15:35,699 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:15:35,699 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=480 + 5σクリッピング)
+2026-05-03 14:15:35,700 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:16:26,402 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:16:26,402 - INFO - グループ計算開始: distributions
+2026-05-03 14:16:26,403 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=480 + 5σクリッピング)
+2026-05-03 14:16:26,403 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:16:42,058 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:16:42,667 - INFO - NaN埋め処理開始
+2026-05-03 14:16:42,668 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:16:42,668 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M3.parquet
+2026-05-03 14:16:42,673 - INFO - NaN埋め処理開始
+2026-05-03 14:16:42,674 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:16:44,077 - INFO - 保存完了: 249.14MB, 1.40秒
+2026-05-03 14:16:44,077 - INFO - === 通常処理完了: M3 - 158.48秒 ===
+2026-05-03 14:16:44,077 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_vs4t8h5l
+2026-05-03 14:16:44,078 - INFO - === 通常処理開始: timeframe=M5 ===
+2026-05-03 14:16:44,079 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_m9i_yu9u
+2026-05-03 14:16:44,079 - INFO - LazyFrame生成開始: timeframe=M5
+2026-05-03 14:16:44,113 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:16:44,113 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:16:44,113 - INFO - LazyFrame生成完了: timeframe=M5
+2026-05-03 14:16:44,152 - INFO - データサマリー: {'total_rows': 340602, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 55), 'avg_price': 2501.7083046243993, 'total_volume': 220520772}
+2026-05-03 14:16:44,280 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:16:44,280 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:16:44,280 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:16:44,280 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=288 + 5σクリッピング)
+2026-05-03 14:16:44,282 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:16:50,365 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:16:50,365 - INFO - グループ計算開始: composite
+2026-05-03 14:16:50,366 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=288 + 5σクリッピング)
+2026-05-03 14:16:50,366 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:16:53,080 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:16:53,080 - INFO - グループ計算開始: timeseries
+2026-05-03 14:16:53,081 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=288 + 5σクリッピング)
+2026-05-03 14:16:53,082 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:17:18,813 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:17:18,813 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:17:18,814 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=288 + 5σクリッピング)
+2026-05-03 14:17:18,814 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:17:36,881 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:17:36,881 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:17:36,882 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=288 + 5σクリッピング)
+2026-05-03 14:17:36,882 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:18:07,725 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:18:07,725 - INFO - グループ計算開始: distributions
+2026-05-03 14:18:07,725 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=288 + 5σクリッピング)
+2026-05-03 14:18:07,726 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:18:17,172 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:18:17,735 - INFO - NaN埋め処理開始
+2026-05-03 14:18:17,736 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:18:17,736 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M5.parquet
+2026-05-03 14:18:17,742 - INFO - NaN埋め処理開始
+2026-05-03 14:18:17,743 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:18:18,580 - INFO - 保存完了: 149.71MB, 0.83秒
+2026-05-03 14:18:18,581 - INFO - === 通常処理完了: M5 - 94.50秒 ===
+2026-05-03 14:18:18,581 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_m9i_yu9u
+2026-05-03 14:18:18,581 - INFO - === 通常処理開始: timeframe=M8 ===
+2026-05-03 14:18:18,583 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_f9firh3q
+2026-05-03 14:18:18,583 - INFO - LazyFrame生成開始: timeframe=M8
+2026-05-03 14:18:18,617 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:18:18,617 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:18:18,618 - INFO - LazyFrame生成完了: timeframe=M8
+2026-05-03 14:18:18,647 - INFO - データサマリー: {'total_rows': 213577, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 56), 'avg_price': 2501.6966365391136, 'total_volume': 220520772}
+2026-05-03 14:18:18,743 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:18:18,744 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:18:18,744 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:18:18,744 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=180 + 5σクリッピング)
+2026-05-03 14:18:18,746 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:18:22,591 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:18:22,591 - INFO - グループ計算開始: composite
+2026-05-03 14:18:22,591 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=180 + 5σクリッピング)
+2026-05-03 14:18:22,592 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:18:24,363 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:18:24,363 - INFO - グループ計算開始: timeseries
+2026-05-03 14:18:24,363 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=180 + 5σクリッピング)
+2026-05-03 14:18:24,364 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:18:40,968 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:18:40,968 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:18:40,969 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=180 + 5σクリッピング)
+2026-05-03 14:18:40,969 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:18:52,369 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:18:52,369 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:18:52,370 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=180 + 5σクリッピング)
+2026-05-03 14:18:52,371 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:19:11,880 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:19:11,881 - INFO - グループ計算開始: distributions
+2026-05-03 14:19:11,881 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=180 + 5σクリッピング)
+2026-05-03 14:19:11,881 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:19:17,914 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:19:18,425 - INFO - NaN埋め処理開始
+2026-05-03 14:19:18,425 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:19:18,425 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M8.parquet
+2026-05-03 14:19:18,430 - INFO - NaN埋め処理開始
+2026-05-03 14:19:18,431 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:19:18,956 - INFO - 保存完了: 94.03MB, 0.52秒
+2026-05-03 14:19:18,956 - INFO - === 通常処理完了: M8 - 60.37秒 ===
+2026-05-03 14:19:18,956 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_f9firh3q
+2026-05-03 14:19:18,957 - INFO - === 通常処理開始: timeframe=M15 ===
+2026-05-03 14:19:18,958 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_mk0m4_vd
+2026-05-03 14:19:18,958 - INFO - LazyFrame生成開始: timeframe=M15
+2026-05-03 14:19:18,992 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:19:18,992 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:19:18,992 - INFO - LazyFrame生成完了: timeframe=M15
+2026-05-03 14:19:19,013 - INFO - データサマリー: {'total_rows': 113625, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 45), 'avg_price': 2501.624636705858, 'total_volume': 220520772}
+2026-05-03 14:19:19,073 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:19:19,073 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:19:19,073 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:19:19,074 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=96 + 5σクリッピング)
+2026-05-03 14:19:19,075 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:19:21,325 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:19:21,325 - INFO - グループ計算開始: composite
+2026-05-03 14:19:21,325 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=96 + 5σクリッピング)
+2026-05-03 14:19:21,326 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:19:22,364 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:19:22,364 - INFO - グループ計算開始: timeseries
+2026-05-03 14:19:22,365 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=96 + 5σクリッピング)
+2026-05-03 14:19:22,365 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:19:31,367 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:19:31,367 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:19:31,367 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=96 + 5σクリッピング)
+2026-05-03 14:19:31,368 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:19:37,617 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:19:37,617 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:19:37,617 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=96 + 5σクリッピング)
+2026-05-03 14:19:37,618 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:19:47,956 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:19:47,956 - INFO - グループ計算開始: distributions
+2026-05-03 14:19:47,957 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=96 + 5σクリッピング)
+2026-05-03 14:19:47,957 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:19:51,176 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:19:51,627 - INFO - NaN埋め処理開始
+2026-05-03 14:19:51,628 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:19:51,628 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M15.parquet
+2026-05-03 14:19:51,633 - INFO - NaN埋め処理開始
+2026-05-03 14:19:51,634 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:19:51,924 - INFO - 保存完了: 50.19MB, 0.28秒
+2026-05-03 14:19:51,924 - INFO - === 通常処理完了: M15 - 32.97秒 ===
+2026-05-03 14:19:51,924 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_mk0m4_vd
+2026-05-03 14:19:51,924 - INFO - === 通常処理開始: timeframe=M30 ===
+2026-05-03 14:19:51,925 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_z_yw43dm
+2026-05-03 14:19:51,925 - INFO - LazyFrame生成開始: timeframe=M30
+2026-05-03 14:19:51,957 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:19:51,957 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:19:51,957 - INFO - LazyFrame生成完了: timeframe=M30
+2026-05-03 14:19:51,969 - INFO - データサマリー: {'total_rows': 56829, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 30), 'avg_price': 2501.688120554698, 'total_volume': 220520772}
+2026-05-03 14:19:52,007 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:19:52,008 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:19:52,008 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:19:52,008 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=48 + 5σクリッピング)
+2026-05-03 14:19:52,010 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:19:53,337 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:19:53,337 - INFO - グループ計算開始: composite
+2026-05-03 14:19:53,337 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=48 + 5σクリッピング)
+2026-05-03 14:19:53,338 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:19:54,012 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:19:54,013 - INFO - グループ計算開始: timeseries
+2026-05-03 14:19:54,013 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=48 + 5σクリッピング)
+2026-05-03 14:19:54,014 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:19:58,595 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:19:58,596 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:19:58,596 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=48 + 5σクリッピング)
+2026-05-03 14:19:58,596 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:01,810 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:01,810 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:01,811 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=48 + 5σクリッピング)
+2026-05-03 14:20:01,811 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:06,994 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:06,995 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:06,995 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=48 + 5σクリッピング)
+2026-05-03 14:20:06,995 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:08,669 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:09,094 - INFO - NaN埋め処理開始
+2026-05-03 14:20:09,095 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:09,095 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_M30.parquet
+2026-05-03 14:20:09,101 - INFO - NaN埋め処理開始
+2026-05-03 14:20:09,102 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:09,256 - INFO - 保存完了: 25.19MB, 0.15秒
+2026-05-03 14:20:09,256 - INFO - === 通常処理完了: M30 - 17.33秒 ===
+2026-05-03 14:20:09,257 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_z_yw43dm
+2026-05-03 14:20:09,257 - INFO - === 通常処理開始: timeframe=H1 ===
+2026-05-03 14:20:09,258 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_ll3_kuv0
+2026-05-03 14:20:09,258 - INFO - LazyFrame生成開始: timeframe=H1
+2026-05-03 14:20:09,291 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:09,291 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:09,291 - INFO - LazyFrame生成完了: timeframe=H1
+2026-05-03 14:20:09,300 - INFO - データサマリー: {'total_rows': 28433, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 0), 'avg_price': 2501.7362490259447, 'total_volume': 220520772}
+2026-05-03 14:20:09,325 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:09,326 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:09,326 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:09,326 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=24 + 5σクリッピング)
+2026-05-03 14:20:09,328 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:10,208 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:10,208 - INFO - グループ計算開始: composite
+2026-05-03 14:20:10,209 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=24 + 5σクリッピング)
+2026-05-03 14:20:10,210 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:10,638 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:10,638 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:10,638 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=24 + 5σクリッピング)
+2026-05-03 14:20:10,639 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:12,945 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:12,945 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:12,945 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=24 + 5σクリッピング)
+2026-05-03 14:20:12,946 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:14,602 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:14,602 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:14,603 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=24 + 5σクリッピング)
+2026-05-03 14:20:14,603 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:17,286 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:17,286 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:17,287 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=24 + 5σクリッピング)
+2026-05-03 14:20:17,287 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:18,197 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:18,608 - INFO - NaN埋め処理開始
+2026-05-03 14:20:18,608 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:18,608 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_H1.parquet
+2026-05-03 14:20:18,614 - INFO - NaN埋め処理開始
+2026-05-03 14:20:18,615 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:18,714 - INFO - 保存完了: 12.66MB, 0.09秒
+2026-05-03 14:20:18,714 - INFO - === 通常処理完了: H1 - 9.46秒 ===
+2026-05-03 14:20:18,714 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_ll3_kuv0
+2026-05-03 14:20:18,714 - INFO - === 通常処理開始: timeframe=H4 ===
+2026-05-03 14:20:18,715 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_p5dcs8xe
+2026-05-03 14:20:18,715 - INFO - LazyFrame生成開始: timeframe=H4
+2026-05-03 14:20:18,750 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:18,751 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:18,751 - INFO - LazyFrame生成完了: timeframe=H4
+2026-05-03 14:20:18,758 - INFO - データサマリー: {'total_rows': 7691, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 20, 0), 'avg_price': 2502.1429270832487, 'total_volume': 220520772}
+2026-05-03 14:20:18,775 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:18,775 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:18,775 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:18,776 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=6 + 5σクリッピング)
+2026-05-03 14:20:18,777 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:19,299 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:19,299 - INFO - グループ計算開始: composite
+2026-05-03 14:20:19,299 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=6 + 5σクリッピング)
+2026-05-03 14:20:19,300 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:19,572 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:19,572 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:19,573 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=6 + 5σクリッピング)
+2026-05-03 14:20:19,573 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:20,317 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:20,317 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:20,318 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=6 + 5σクリッピング)
+2026-05-03 14:20:20,318 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:20,870 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:20,870 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:20,871 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=6 + 5σクリッピング)
+2026-05-03 14:20:20,871 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:21,706 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:21,707 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:21,707 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=6 + 5σクリッピング)
+2026-05-03 14:20:21,707 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:22,034 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:22,433 - INFO - NaN埋め処理開始
+2026-05-03 14:20:22,434 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:22,434 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_H4.parquet
+2026-05-03 14:20:22,440 - INFO - NaN埋め処理開始
+2026-05-03 14:20:22,441 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:22,495 - INFO - 保存完了: 3.43MB, 0.05秒
+2026-05-03 14:20:22,495 - INFO - === 通常処理完了: H4 - 3.78秒 ===
+2026-05-03 14:20:22,496 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_p5dcs8xe
+2026-05-03 14:20:22,496 - INFO - === 通常処理開始: timeframe=H6 ===
+2026-05-03 14:20:22,497 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_bz6f04y7
+2026-05-03 14:20:22,497 - INFO - LazyFrame生成開始: timeframe=H6
+2026-05-03 14:20:22,537 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:22,537 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:22,537 - INFO - LazyFrame生成完了: timeframe=H6
+2026-05-03 14:20:22,544 - INFO - データサマリー: {'total_rows': 5217, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 18, 0), 'avg_price': 2502.558648900417, 'total_volume': 220520772}
+2026-05-03 14:20:22,558 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:22,558 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:22,558 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:22,559 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=4 + 5σクリッピング)
+2026-05-03 14:20:22,561 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:23,054 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:23,054 - INFO - グループ計算開始: composite
+2026-05-03 14:20:23,055 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=4 + 5σクリッピング)
+2026-05-03 14:20:23,056 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:23,300 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:23,300 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:23,301 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=4 + 5σクリッピング)
+2026-05-03 14:20:23,301 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:23,855 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:23,855 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:23,855 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=4 + 5σクリッピング)
+2026-05-03 14:20:23,856 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:24,292 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:24,292 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:24,292 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=4 + 5σクリッピング)
+2026-05-03 14:20:24,293 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:24,905 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:24,905 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:24,906 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=4 + 5σクリッピング)
+2026-05-03 14:20:24,906 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:25,166 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:25,561 - INFO - NaN埋め処理開始
+2026-05-03 14:20:25,562 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:25,562 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_H6.parquet
+2026-05-03 14:20:25,567 - INFO - NaN埋め処理開始
+2026-05-03 14:20:25,567 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:25,616 - INFO - 保存完了: 2.33MB, 0.04秒
+2026-05-03 14:20:25,617 - INFO - === 通常処理完了: H6 - 3.12秒 ===
+2026-05-03 14:20:25,617 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_bz6f04y7
+2026-05-03 14:20:25,617 - INFO - === 通常処理開始: timeframe=H12 ===
+2026-05-03 14:20:25,618 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_p1o2yvx7
+2026-05-03 14:20:25,618 - INFO - LazyFrame生成開始: timeframe=H12
+2026-05-03 14:20:25,650 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:25,650 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:25,650 - INFO - LazyFrame生成完了: timeframe=H12
+2026-05-03 14:20:25,657 - INFO - データサマリー: {'total_rows': 2736, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 12, 0), 'avg_price': 2503.838708308705, 'total_volume': 220520772}
+2026-05-03 14:20:25,670 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:25,670 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:25,670 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:25,671 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=2 + 5σクリッピング)
+2026-05-03 14:20:25,672 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:26,102 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:26,102 - INFO - グループ計算開始: composite
+2026-05-03 14:20:26,103 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=2 + 5σクリッピング)
+2026-05-03 14:20:26,104 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:26,334 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:26,335 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:26,335 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=2 + 5σクリッピング)
+2026-05-03 14:20:26,336 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:26,695 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:26,695 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:26,696 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=2 + 5σクリッピング)
+2026-05-03 14:20:26,696 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:26,993 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:26,993 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:26,994 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=2 + 5σクリッピング)
+2026-05-03 14:20:26,994 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:27,380 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:27,380 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:27,380 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=2 + 5σクリッピング)
+2026-05-03 14:20:27,381 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:27,569 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:27,976 - INFO - NaN埋め処理開始
+2026-05-03 14:20:27,977 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:27,977 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_H12.parquet
+2026-05-03 14:20:27,981 - INFO - NaN埋め処理開始
+2026-05-03 14:20:27,982 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:28,024 - INFO - 保存完了: 1.22MB, 0.04秒
+2026-05-03 14:20:28,024 - INFO - === 通常処理完了: H12 - 2.41秒 ===
+2026-05-03 14:20:28,024 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_p1o2yvx7
+2026-05-03 14:20:28,025 - INFO - === 通常処理開始: timeframe=D1 ===
+2026-05-03 14:20:28,025 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_op0jwq3r
+2026-05-03 14:20:28,026 - INFO - LazyFrame生成開始: timeframe=D1
+2026-05-03 14:20:28,061 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:28,061 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:28,061 - INFO - LazyFrame生成完了: timeframe=D1
+2026-05-03 14:20:28,068 - INFO - データサマリー: {'total_rows': 1495, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 0, 0), 'avg_price': 2505.4262536090355, 'total_volume': 220520772}
+2026-05-03 14:20:28,081 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:28,081 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:28,081 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:28,082 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:28,083 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:28,485 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:28,485 - INFO - グループ計算開始: composite
+2026-05-03 14:20:28,486 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:28,486 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:28,708 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:28,708 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:28,709 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:28,709 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:28,977 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:28,977 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:28,978 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:28,978 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:29,205 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:29,205 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:29,205 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:29,206 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:29,481 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:29,481 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:29,481 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:29,482 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:29,631 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:30,020 - INFO - NaN埋め処理開始
+2026-05-03 14:20:30,020 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:30,020 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_D1.parquet
+2026-05-03 14:20:30,026 - INFO - NaN埋め処理開始
+2026-05-03 14:20:30,027 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:30,070 - INFO - 保存完了: 0.66MB, 0.04秒
+2026-05-03 14:20:30,070 - INFO - === 通常処理完了: D1 - 2.04秒 ===
+2026-05-03 14:20:30,070 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_op0jwq3r
+2026-05-03 14:20:30,071 - INFO - === 通常処理開始: timeframe=W1 ===
+2026-05-03 14:20:30,072 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_4u1dw4lm
+2026-05-03 14:20:30,072 - INFO - LazyFrame生成開始: timeframe=W1
+2026-05-03 14:20:30,113 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:30,114 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:30,114 - INFO - LazyFrame生成完了: timeframe=W1
+2026-05-03 14:20:30,121 - INFO - データサマリー: {'total_rows': 251, 'start_time': datetime.datetime(2021, 7, 12, 0, 0), 'end_time': datetime.datetime(2026, 4, 27, 0, 0), 'avg_price': 2508.222277880665, 'total_volume': 220520772}
+2026-05-03 14:20:30,132 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:30,133 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:30,133 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:30,133 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:30,135 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:30,516 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:30,517 - INFO - グループ計算開始: composite
+2026-05-03 14:20:30,517 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:30,518 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:30,724 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:30,724 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:30,725 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:30,725 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:30,887 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:30,887 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:30,887 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:30,888 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:31,040 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:31,040 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:31,041 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:31,041 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:31,205 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:31,205 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:31,205 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:31,206 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:31,317 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:31,704 - INFO - NaN埋め処理開始
+2026-05-03 14:20:31,705 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:31,705 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_W1.parquet
+2026-05-03 14:20:31,711 - INFO - NaN埋め処理開始
+2026-05-03 14:20:31,712 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:31,740 - INFO - 保存完了: 0.11MB, 0.02秒
+2026-05-03 14:20:31,740 - INFO - === 通常処理完了: W1 - 1.67秒 ===
+2026-05-03 14:20:31,740 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_4u1dw4lm
+2026-05-03 14:20:31,741 - INFO - === 通常処理開始: timeframe=MN ===
+2026-05-03 14:20:31,742 - INFO - 一時ディレクトリ作成: /tmp/features_e1b_4gwk6uou
+2026-05-03 14:20:31,742 - INFO - LazyFrame生成開始: timeframe=MN
+2026-05-03 14:20:31,775 - INFO - 検出されたスキーマ: ['timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'disc', 'log_return', 'rolling_volatility', 'rolling_avg_volume', 'price_direction', 'price_momentum', 'volume_ratio']
+2026-05-03 14:20:31,775 - INFO - 型変換不要: 全カラムが適切な型です
+2026-05-03 14:20:31,775 - INFO - LazyFrame生成完了: timeframe=MN
+2026-05-03 14:20:31,781 - INFO - データサマリー: {'total_rows': 59, 'start_time': datetime.datetime(2021, 7, 1, 0, 0), 'end_time': datetime.datetime(2026, 5, 1, 0, 0), 'avg_price': 2551.342618263374, 'total_volume': 220520772}
+2026-05-03 14:20:31,792 - INFO - 内部計算用ATR13 (__temp_atr_safe) を事前注入します...
+2026-05-03 14:20:31,792 - INFO - グループ処理開始: basic_stats (24個の特徴量)
+2026-05-03 14:20:31,792 - INFO - グループ計算開始: basic_stats
+2026-05-03 14:20:31,793 - INFO - 品質保証適用: 24個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:31,794 - INFO - グループ計算完了: basic_stats - 24個の特徴量
+2026-05-03 14:20:32,166 - INFO - グループ処理開始: composite (11個の特徴量)
+2026-05-03 14:20:32,166 - INFO - グループ計算開始: composite
+2026-05-03 14:20:32,166 - INFO - 品質保証適用: 11個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:32,167 - INFO - グループ計算完了: composite - 11個の特徴量
+2026-05-03 14:20:32,359 - INFO - グループ処理開始: timeseries (6個の特徴量)
+2026-05-03 14:20:32,359 - INFO - グループ計算開始: timeseries
+2026-05-03 14:20:32,360 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:32,360 - INFO - グループ計算完了: timeseries - 6個の特徴量
+2026-05-03 14:20:32,499 - INFO - グループ処理開始: exponential_arima (6個の特徴量)
+2026-05-03 14:20:32,499 - INFO - グループ計算開始: exponential_arima
+2026-05-03 14:20:32,499 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:32,499 - INFO - グループ計算完了: exponential_arima - 6個の特徴量
+2026-05-03 14:20:32,643 - INFO - グループ処理開始: kalman_regression (6個の特徴量)
+2026-05-03 14:20:32,643 - INFO - グループ計算開始: kalman_regression
+2026-05-03 14:20:32,643 - INFO - 品質保証適用: 6個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:32,644 - INFO - グループ計算完了: kalman_regression - 6個の特徴量
+2026-05-03 14:20:32,802 - INFO - グループ処理開始: distributions (3個の特徴量)
+2026-05-03 14:20:32,802 - INFO - グループ計算開始: distributions
+2026-05-03 14:20:32,802 - INFO - 品質保証適用: 3個の特徴量 (EWM half_life=1 + 5σクリッピング)
+2026-05-03 14:20:32,803 - INFO - グループ計算完了: distributions - 3個の特徴量
+2026-05-03 14:20:32,933 - INFO - 全グループ計算完了。ファイルの結合を開始します...
+2026-05-03 14:20:33,377 - INFO - NaN埋め処理開始
+2026-05-03 14:20:33,378 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:33,378 - INFO - 特徴量保存開始: /workspace/data/XAUUSD/stratum_2_features/feature_value_a_vast_universeB/features_e1b_MN.parquet
+2026-05-03 14:20:33,383 - INFO - NaN埋め処理開始
+2026-05-03 14:20:33,384 - INFO - NaN埋め処理完了: 56個の特徴量
+2026-05-03 14:20:33,403 - INFO - 保存完了: 0.03MB, 0.01秒
+2026-05-03 14:20:33,404 - INFO - === 通常処理完了: MN - 1.66秒 ===
+2026-05-03 14:20:33,404 - INFO - 一時ディレクトリ削除: /tmp/features_e1b_4gwk6uou
+
+============================================================
+処理開始...
+============================================================
+
+全ての要求された処理が完了しました。総処理時間: 1815.42秒

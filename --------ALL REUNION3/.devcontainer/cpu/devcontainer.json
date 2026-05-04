@@ -1,0 +1,65 @@
+{
+    "name": "CPU Hephaestus Zero",
+    // Dockerfileからビルド
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "../.."
+    },
+    // ワークスペースのマウント設定
+    "workspaceFolder": "/workspace",
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+        "source=${localWorkspaceFolder}/duckdb_temp,target=/duckdb_temp,type=bind"
+    ],
+    // time zoneの変更
+    "containerEnv": {
+        "TZ": "Asia/Tokyo"
+    },
+    "remoteUser": "hephaestus-zero",
+    // CPU環境用の設定（GPUオプションは削除）
+    "runArgs": [
+        "--name=hephaestus-zero",
+        "--hostname=xxxxx18x",
+        "--memory=64g",
+        "--memory-swap=64g",
+        "--shm-size=2g"
+    ],
+    // VS Codeの便利な設定
+    "customizations": {
+        "vscode": {
+            // --- ここで設定するのは、コンテナの「デフォルト値」のみ ---
+            // プロジェクト固有のフォーマッター設定などは .vscode/settings.json に任せる
+            "settings": {
+                // Pythonインタプリタのパスを現在の環境に合わせて修正
+                "python.defaultInterpreterPath": "/opt/conda/bin/python",
+                // ターミナル起動時にconda環境を有効化
+                "python.terminal.activateEnvironment": true
+            },
+            // --- コンテナ起動時に自動インストールする拡張機能リスト ---
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter",
+                "charliermarsh.ruff"
+            ]
+        }
+    },
+
+    // コンテナ作成後に実行されるコマンドを、所有権問題の解決策に書き換える
+    "postCreateCommand": "git config --global --add safe.directory /workspace",
+
+
+    // コンテナ内のポートを手元のPCに転送
+    "forwardPorts": [
+        8888,
+        8787
+    ],
+    "portsAttributes": {
+        "8888": {
+            "label": "JupyterLab"
+        },
+        "8787": {
+            "label": "Dask Dashboard"
+        }
+    }
+}
