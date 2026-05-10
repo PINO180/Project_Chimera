@@ -98,8 +98,33 @@ class BacktestConfig:
     min_capital_threshold: float = 1.0
     min_lot_size: float = 0.01
     min_atr_threshold: float = (
-        0.8  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
+        0.9  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
     )
+    # [baseline_ATR床フィルター] 前日24h ATR平均の絶対下限 (0.0 = フィルターなし)
+    # baseline_ATR = atr_value / atr_ratio (= 直近480本のATR平均 = 前日の平均ボラ水準)
+    # この値未満の場合はエントリーをスキップ (前日が静かすぎる日は入らない)
+    # 分析結果: 0.82でPF 19.09→19.62, 0.90でPF 19.97, 1.00でPF 20.27
+    # Optunaで最適値を探索すること (backtest_simulator_run_optuna_baseline.py)
+    min_baseline_atr: float = 0.0
+
+    # [baseline_ratio相対フィルター] 前日24h baseline / 過去N日 baseline の比率下限
+    # baseline_ratio = mean(ATR,1日) / mean(ATR,N日) = 昨日 vs 過去N日平均の相対ボラ比率
+    # 価格水準($1800/$4600)に依存しないスケールフリーなフィルター
+    # 0.0 = フィルターなし（デフォルト）
+    # Optunaで探索: backtest_simulator_run_optuna_baseline_ratio.py
+    min_baseline_ratio: float = 0.0
+    baseline_ratio_lookback_days: int = 7  # 分母の長期ウィンドウ日数
+
+    # [SAR: 日中季節性調整済み相対ATRフィルター]
+    # SAR = 現在ATR / 過去D日間の同時刻ATR平均
+    # 「UTC 13:00のATRを過去D日のUTC 13:00平均と比較」
+    # → 24h混合ベースラインの問題を根本解決
+    # → XAU/USDの時間帯季節性（Tokyo静/London活発）を分離評価
+    # → 価格水準非依存・重複ウィンドウ問題なし
+    # 0.0 = フィルターなし（デフォルト）
+    # Optunaで探索: backtest_simulator_run_optuna_sar.py
+    min_sar_threshold: float = 0.0
+    sar_lookback_days: int = 10  # 過去何日間の同時刻平均を使うか
 
     max_positions: int = 100
 
@@ -175,9 +200,99 @@ class BacktestSimulator:
 
         # 1回のcollect()で全件メモリに乗せる（1382回のディスクスキャンを回避）
         logging.info("Executing single collect() pass on dataset. Please wait...")
-        df_all = lf.with_columns(
-            pl.col("timestamp").dt.date().alias("date")
-        ).collect()
+        df_all = lf.with_columns(pl.col("timestamp").dt.date().alias("date")).collect()
+
+        # [baseline_ratio相対フィルター用] 全データを時系列ソートしてbaseline_ratioを一括計算
+        # baseline_atr  = atr_value / (atr_ratio + 1e-10)  = 過去1日(480本)ATR平均
+        # baseline_7d   = baseline_atrのrolling_mean(N日分=N×480本)
+        # baseline_ratio = baseline_atr / baseline_7d
+        #   = 「昨日のボラ」 vs 「過去N日のボラ平均」の相対比率
+        # ※ 全期間データに対して一括計算することでパーティション境界の問題を回避
+        bars_per_day = 480  # M3: 1日=480本
+        long_window = bars_per_day * self.config.baseline_ratio_lookback_days
+        df_all = (
+            df_all.sort("timestamp")
+            .with_columns(
+                [
+                    (pl.col("atr_value") / (pl.col("atr_ratio") + 1e-10)).alias(
+                        "_baseline_atr"
+                    ),
+                ]
+            )
+            .with_columns(
+                [
+                    pl.col("_baseline_atr")
+                    .rolling_mean(window_size=long_window, min_samples=bars_per_day)
+                    .alias("_baseline_long"),
+                ]
+            )
+            .with_columns(
+                [
+                    (
+                        pl.col("_baseline_atr") / (pl.col("_baseline_long") + 1e-10)
+                    ).alias("baseline_ratio"),
+                ]
+            )
+            .drop(["_baseline_atr", "_baseline_long"])
+        )
+        logging.info(
+            f"baseline_ratio computed: lookback={self.config.baseline_ratio_lookback_days}days "
+            f"({long_window}bars), null_count={df_all['baseline_ratio'].null_count()}"
+        )
+
+        # [SAR: 日中季節性調整済み相対ATRフィルター]
+        # SAR = 現在ATR / 過去D日間の同時刻ATR平均
+        # 設計原則（Gemini Deep Research推奨・案C）:
+        #   - UTC時刻（時・分）でグループ化し「同時刻」のATR平均をベースラインにする
+        #   - shift(1) で当日データを除外 → 重複ウィンドウ問題を完全回避
+        #   - Tokyo静/London活発の日中季節性を分離評価
+        #   - 前日が祝日で静くても当日London閾値は過去D日のLondon基準
+        # min_sar_threshold=0.0 のとき計算をスキップ（後方互換）
+        if self.config.min_sar_threshold > 0.0:
+            logging.info(
+                f"Computing SAR (Seasonality-Adjusted Ratio): "
+                f"lookback={self.config.sar_lookback_days}days..."
+            )
+            df_all = (
+                df_all.sort("timestamp")
+                .with_columns(
+                    [
+                        # UTC時刻キー: (hour, minute) でグループ化
+                        pl.col("timestamp").dt.hour().alias("_tod_h"),
+                        pl.col("timestamp").dt.minute().alias("_tod_m"),
+                    ]
+                )
+                .with_columns(
+                    [
+                        # 同時刻グループ内でshift(1)して当日を除外し、
+                        # 過去D日分（sar_lookback_days本）の移動平均をベースラインに
+                        pl.col("atr_value")
+                        .shift(1)
+                        .rolling_mean(
+                            window_size=self.config.sar_lookback_days,
+                            min_samples=max(1, self.config.sar_lookback_days // 2),
+                        )
+                        .over(["_tod_h", "_tod_m"])
+                        .alias("_sar_baseline"),
+                    ]
+                )
+                .with_columns(
+                    [
+                        # SAR = 現在ATR / 同時刻ベースライン
+                        (pl.col("atr_value") / (pl.col("_sar_baseline") + 1e-10)).alias(
+                            "sar"
+                        ),
+                    ]
+                )
+                .drop(["_tod_h", "_tod_m", "_sar_baseline"])
+            )
+            logging.info(
+                f"SAR computed: null_count={df_all['sar'].null_count()}, "
+                f"mean={df_all['sar'].drop_nulls().mean():.4f}"
+            )
+        else:
+            # min_sar_threshold=0.0: SAR列を作らない（後方互換）
+            pass
 
         preloaded_dict = {}
         partitions_to_process = partitions_df
@@ -537,13 +652,13 @@ class BacktestSimulator:
         MAX_POSITIONS = self.config.max_positions
 
         # --- 連続SL/Loss・証拠金維持率トラッキング ---
-        consec_sl_long_cur = 0    # 現在のLong連続SL数
-        consec_sl_short_cur = 0   # 現在のShort連続SL数
-        consec_loss_cur = 0       # 現在の全体連続負け数（SL+TO）
-        max_consec_sl_long = 0    # Long最大連続SL
-        max_consec_sl_short = 0   # Short最大連続SL
-        max_consec_sl_total = 0   # 全体最大連続SL
-        max_consec_loss_total = 0 # 全体最大連続負け（SL+TO）
+        consec_sl_long_cur = 0  # 現在のLong連続SL数
+        consec_sl_short_cur = 0  # 現在のShort連続SL数
+        consec_loss_cur = 0  # 現在の全体連続負け数（SL+TO）
+        max_consec_sl_long = 0  # Long最大連続SL
+        max_consec_sl_short = 0  # Short最大連続SL
+        max_consec_sl_total = 0  # 全体最大連続SL
+        max_consec_loss_total = 0  # 全体最大連続負け（SL+TO）
 
         # --- DataFrameからのデータ抽出 (高速化のためリスト/Numpy配列化) ---
         timestamps_chunk = df_chunk["timestamp"].to_list()
@@ -552,6 +667,21 @@ class BacktestSimulator:
         atr_ratios_chunk = df_chunk[
             "atr_ratio"
         ].to_numpy()  # ★追加: ATR Ratio (プロンプト⑯ 修正②)
+        # [baseline_ratio相対フィルター用] preload_dataで計算済みの列を読み込む
+        # nullの場合（ウォームアップ期間）はフィルタースキップ用にNaNで埋める
+        if "baseline_ratio" in df_chunk.columns:
+            baseline_ratios_chunk = (
+                df_chunk["baseline_ratio"].fill_null(float("nan")).to_numpy()
+            )
+        else:
+            baseline_ratios_chunk = None
+
+        # [SAR] preload_dataで計算済みのsar列を読み込む
+        # min_sar_threshold=0.0 の場合列が存在しないためNoneで安全にスキップ
+        if "sar" in df_chunk.columns:
+            sar_chunk = df_chunk["sar"].fill_null(float("nan")).to_numpy()
+        else:
+            sar_chunk = None
 
         # V5 Two-Brain の確率とラベル
         p_long_chunk = df_chunk["m2_proba_long"].to_numpy()
@@ -651,7 +781,9 @@ class BacktestSimulator:
                 # 最大値更新
                 max_consec_sl_long = max(max_consec_sl_long, consec_sl_long_cur)
                 max_consec_sl_short = max(max_consec_sl_short, consec_sl_short_cur)
-                max_consec_sl_total = max(max_consec_sl_total, consec_sl_long_cur + consec_sl_short_cur)
+                max_consec_sl_total = max(
+                    max_consec_sl_total, consec_sl_long_cur + consec_sl_short_cur
+                )
                 max_consec_loss_total = max(max_consec_loss_total, consec_loss_cur)
 
                 # 決済確定後の連続SL値をlog_entryに書き込んでからトレードログに追記
@@ -779,6 +911,35 @@ class BacktestSimulator:
                         < self.config.min_atr_threshold  # ★修正: ATR Ratio と比較 (プロンプト⑯ 修正②)
                     ):
                         continue
+
+                    # [baseline_ATR床フィルター] 前日24h ATR平均の絶対下限チェック
+                    # baseline_atr = atr_value / atr_ratio (= 直近480本のATR平均)
+                    # min_baseline_atr=0.0 のとき無効 (後方互換)
+                    if self.config.min_baseline_atr > 0.0:
+                        baseline_atr_float = atr_value_float / (atr_ratio_float + 1e-10)
+                        if baseline_atr_float < self.config.min_baseline_atr:
+                            continue
+
+                    # [baseline_ratio相対フィルター] 昨日ボラ / 過去N日ボラ の比率チェック
+                    # min_baseline_ratio=0.0 のとき無効 (後方互換)
+                    if (
+                        self.config.min_baseline_ratio > 0.0
+                        and baseline_ratios_chunk is not None
+                    ):
+                        br = baseline_ratios_chunk[i]
+                        if not np.isfinite(br) or br < self.config.min_baseline_ratio:
+                            continue
+
+                    # [SARフィルター] 日中季節性調整済み相対ATR
+                    # SAR = 現在ATR / 過去D日の同時刻ATR平均
+                    # min_sar_threshold=0.0 のとき無効 (後方互換)
+                    if self.config.min_sar_threshold > 0.0 and sar_chunk is not None:
+                        sar_val = sar_chunk[i]
+                        if (
+                            not np.isfinite(sar_val)
+                            or sar_val < self.config.min_sar_threshold
+                        ):
+                            continue
 
                     # [FIX-4] Auto Lot 計算を extreme_risk_engine.calculate_auto_lot() と統一
                     # 旧: ハードコード乗数方式 (0.25倍/0.5倍) → 新: 証拠金上限数式
@@ -1010,9 +1171,9 @@ class BacktestSimulator:
                             "TD": float(duration_val),
                             "DD(%)": float(current_dd_pct),
                             "mg_lv%": _mg_lv,
-                            "csl_L": 0,   # 決済時に上書き
-                            "csl_S": 0,   # 決済時に上書き
-                            "closs": 0,   # 決済時に上書き
+                            "csl_L": 0,  # 決済時に上書き
+                            "csl_S": 0,  # 決済時に上書き
+                            "closs": 0,  # 決済時に上書き
                         }
 
                         if duration_float is not None and np.isfinite(duration_float):
@@ -1041,7 +1202,9 @@ class BacktestSimulator:
         self.max_consec_sl_long = max(self.max_consec_sl_long, max_consec_sl_long)
         self.max_consec_sl_short = max(self.max_consec_sl_short, max_consec_sl_short)
         self.max_consec_sl_total = max(self.max_consec_sl_total, max_consec_sl_total)
-        self.max_consec_loss_total = max(self.max_consec_loss_total, max_consec_loss_total)
+        self.max_consec_loss_total = max(
+            self.max_consec_loss_total, max_consec_loss_total
+        )
 
         results_chunk_df = pl.DataFrame(
             {
@@ -1069,10 +1232,10 @@ class BacktestSimulator:
             "aS": pl.Int32,
             "TD": pl.Float64,
             "DD(%)": pl.Float64,
-            "mg_lv%": pl.Float64,   # 証拠金維持率(%)
-            "csl_L": pl.Int32,      # Long連続SL（決済後）
-            "csl_S": pl.Int32,      # Short連続SL（決済後）
-            "closs": pl.Int32,      # 全体連続負け（SL+TO）
+            "mg_lv%": pl.Float64,  # 証拠金維持率(%)
+            "csl_L": pl.Int32,  # Long連続SL（決済後）
+            "csl_S": pl.Int32,  # Short連続SL（決済後）
+            "closs": pl.Int32,  # 全体連続負け（SL+TO）
         }
 
         if trade_log_chunk:
@@ -1510,7 +1673,8 @@ class BacktestSimulator:
 
                 # timestampをUTC→JSTに変換（+9時間）して上書き
                 trade_log_final_csv = trade_log_final_csv.with_columns(
-                    pl.col("timestamp").str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
+                    pl.col("timestamp")
+                    .str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
                     .dt.offset_by("9h")
                     .alias("timestamp")
                 )
@@ -1738,51 +1902,66 @@ class BacktestSimulator:
             # --- 時間帯・曜日分析の事前計算（CSVとTXT両方で使用）---
             def _session(h):
                 """JST時間帯でセッション分類"""
-                if 9 <= h < 16:   return "Tokyo"
-                elif 16 <= h < 21: return "London"
-                elif h >= 21 or h < 1: return "Overlap"
-                elif 1 <= h < 6:  return "NY"
-                else:              return "Oceania"  # 6-9 JST
+                if 9 <= h < 16:
+                    return "Tokyo"
+                elif 16 <= h < 21:
+                    return "London"
+                elif h >= 21 or h < 1:
+                    return "Overlap"
+                elif 1 <= h < 6:
+                    return "NY"
+                else:
+                    return "Oceania"  # 6-9 JST
 
             def _band_stats(indices, pnl_lst, label_lst):
                 if not indices:
                     return None
                 p = [float(pnl_lst[i]) for i in indices if pnl_lst[i] is not None]
-                wins   = [x for x in p if x > 0]
+                wins = [x for x in p if x > 0]
                 losses = [x for x in p if x < 0]
-                wr  = len(wins) / len(p) * 100 if p else 0.0
-                pf  = sum(wins) / abs(sum(losses)) if losses else float("inf")
+                wr = len(wins) / len(p) * 100 if p else 0.0
+                pf = sum(wins) / abs(sum(losses)) if losses else float("inf")
                 avg = sum(p) / len(p) if p else 0.0
                 tot = sum(p)
-                return {"count": len(p), "win_rate": wr, "pf": pf, "avg_pnl": avg, "total_pnl": tot}
+                return {
+                    "count": len(p),
+                    "win_rate": wr,
+                    "pf": pf,
+                    "avg_pnl": avg,
+                    "total_pnl": tot,
+                }
 
-            hourly_stats  = {}
+            hourly_stats = {}
             weekday_stats = {}
-            hxatr_stats   = {}
+            hxatr_stats = {}
 
             if not trade_log.is_empty():
-                ts_list2  = trade_log["timestamp"].to_list()
-                pnl_lst2  = trade_log["pnl"].to_list()
-                lbl_lst2  = trade_log["label"].to_list()
-                atr_lst2  = trade_log["atr_ratio"].to_list() if "atr_ratio" in trade_log.columns else [1.0] * len(ts_list2)
+                ts_list2 = trade_log["timestamp"].to_list()
+                pnl_lst2 = trade_log["pnl"].to_list()
+                lbl_lst2 = trade_log["label"].to_list()
+                atr_lst2 = (
+                    trade_log["atr_ratio"].to_list()
+                    if "atr_ratio" in trade_log.columns
+                    else [1.0] * len(ts_list2)
+                )
 
                 atr_bands = [
-                    ("< 0.5",   lambda x: x < 0.5),
+                    ("< 0.5", lambda x: x < 0.5),
                     ("0.5-0.8", lambda x: 0.5 <= x < 0.8),
                     ("0.8-1.0", lambda x: 0.8 <= x < 1.0),
                     ("1.0-1.2", lambda x: 1.0 <= x < 1.2),
                     ("1.2-1.5", lambda x: 1.2 <= x < 1.5),
-                    (">= 1.5",  lambda x: x >= 1.5),
+                    (">= 1.5", lambda x: x >= 1.5),
                 ]
 
-                hour_idx    = {}
+                hour_idx = {}
                 weekday_idx = {}
-                hxatr_idx   = {}
+                hxatr_idx = {}
 
                 for i, ts in enumerate(ts_list2):
                     try:
                         # UTC→JST変換（+9時間）
-                        h_jst  = (ts.hour + 9) % 24
+                        h_jst = (ts.hour + 9) % 24
                         # 日またぎ考慮: UTC時刻+9が24を超えた場合は翌日
                         day_offset = 1 if (ts.hour + 9) >= 24 else 0
                         wd_jst = (ts.weekday() + day_offset) % 7
@@ -1798,12 +1977,18 @@ class BacktestSimulator:
                                 break
 
                 for h in range(24):
-                    hourly_stats[h] = _band_stats(hour_idx.get(h, []), pnl_lst2, lbl_lst2)
+                    hourly_stats[h] = _band_stats(
+                        hour_idx.get(h, []), pnl_lst2, lbl_lst2
+                    )
                 for wd in range(7):
-                    weekday_stats[wd] = _band_stats(weekday_idx.get(wd, []), pnl_lst2, lbl_lst2)
+                    weekday_stats[wd] = _band_stats(
+                        weekday_idx.get(wd, []), pnl_lst2, lbl_lst2
+                    )
                 for h in range(24):
                     for band_name, _ in atr_bands:
-                        hxatr_stats[(h, band_name)] = _band_stats(hxatr_idx.get((h, band_name), []), pnl_lst2, lbl_lst2)
+                        hxatr_stats[(h, band_name)] = _band_stats(
+                            hxatr_idx.get((h, band_name), []), pnl_lst2, lbl_lst2
+                        )
 
             with open(text_report_path, "w", encoding="utf-8") as f:
                 f.write("=" * 60 + "\n")
@@ -1852,8 +2037,8 @@ class BacktestSimulator:
                 max_dd = report_data.get("max_drawdown_pct", 0.0)
                 f.write(f"Maximal Drawdown:\t{abs(max_dd):,.2f} %\n")
                 f.write(
-                    f"Min Margin Level:\t"
-                    f"{min_mg_lv:,.1f} %" if min_mg_lv is not None
+                    f"Min Margin Level:\t{min_mg_lv:,.1f} %"
+                    if min_mg_lv is not None
                     else "Min Margin Level:\tN/A (no open positions)"
                 )
                 f.write("\n\n")
@@ -1877,8 +2062,8 @@ class BacktestSimulator:
                 f.write(f"{'':20}{'Long':>12}{'Short':>12}\n")
                 f.write(f"{'Trade Count':20}{count_l:>12}{count_s:>12}\n")
                 f.write(f"{'Win Rate (%)':20}{wr_l:>11.2f}%{wr_s:>11.2f}%\n")
-                pf_l_str = f"{pf_l:.2f}" if pf_l != float('inf') else "inf"
-                pf_s_str = f"{pf_s:.2f}" if pf_s != float('inf') else "inf"
+                pf_l_str = f"{pf_l:.2f}" if pf_l != float("inf") else "inf"
+                pf_s_str = f"{pf_s:.2f}" if pf_s != float("inf") else "inf"
                 f.write(f"{'Profit Factor':20}{pf_l_str:>12}{pf_s_str:>12}\n\n")
 
                 f.write("-" * 25 + " Consecutive Losses " + "-" * 25 + "\n")
@@ -1905,12 +2090,14 @@ class BacktestSimulator:
                 # --- M1 全トリガー分布（参考値・M2モード時のみ追加表示）---
                 if "m1_oof" not in str(self.config.oof_long_path):
                     try:
-                        _m1_oof_long  = pl.read_parquet(S7_M1_OOF_PREDICTIONS_LONG)
+                        _m1_oof_long = pl.read_parquet(S7_M1_OOF_PREDICTIONS_LONG)
                         _m1_oof_short = pl.read_parquet(S7_M1_OOF_PREDICTIONS_SHORT)
-                        _m1_all = pl.concat([_m1_oof_long, _m1_oof_short])["prediction"].to_list()
+                        _m1_all = pl.concat([_m1_oof_long, _m1_oof_short])[
+                            "prediction"
+                        ].to_list()
                         _m1_total = len(_m1_all)
                         _m1_bins = {
-                            "<= 0.50":   sum(1 for x in _m1_all if x <= 0.50),
+                            "<= 0.50": sum(1 for x in _m1_all if x <= 0.50),
                             "0.50-0.55": sum(1 for x in _m1_all if 0.50 < x <= 0.55),
                             "0.55-0.60": sum(1 for x in _m1_all if 0.55 < x <= 0.60),
                             "0.60-0.65": sum(1 for x in _m1_all if 0.60 < x <= 0.65),
@@ -1922,11 +2109,18 @@ class BacktestSimulator:
                             "0.90-0.95": sum(1 for x in _m1_all if 0.90 < x <= 0.95),
                             "0.95-1.00": sum(1 for x in _m1_all if x > 0.95),
                         }
-                        f.write("-" * 23 + " M1 Proba Distribution (参考 / OOFベース) " + "-" * 3 + "\n")
+                        f.write(
+                            "-" * 23
+                            + " M1 Proba Distribution (参考 / OOFベース) "
+                            + "-" * 3
+                            + "\n"
+                        )
                         f.write("  ※ M1の生の出力分布（M2への入力前）\n")
                         for k, v in _m1_bins.items():
                             pct = (v / _m1_total) * 100 if _m1_total > 0 else 0
-                            f.write(f"{k.ljust(15)}: {str(v).rjust(8)} ({pct:5.1f} %)\n")
+                            f.write(
+                                f"{k.ljust(15)}: {str(v).rjust(8)} ({pct:5.1f} %)\n"
+                            )
                         f.write("\n")
                     except Exception as _e:
                         logging.warning(f"M1分布の計算に失敗しました: {_e}")
@@ -2025,8 +2219,16 @@ class BacktestSimulator:
                 # ▲▲▲ ここまで追加 ▲▲▲
 
                 # --- TXTに時間帯・曜日サマリーを追記 ---
-                wd_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-                session_order = ["Tokyo","London","Overlap","NY","Oceania"]
+                wd_names = [
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                    "Sunday",
+                ]
+                session_order = ["Tokyo", "London", "Overlap", "NY", "Oceania"]
 
                 # セッション別集計
                 session_stats = {}
@@ -2035,58 +2237,96 @@ class BacktestSimulator:
                         continue
                     s = _session(h)
                     if s not in session_stats:
-                        session_stats[s] = {"count":0,"wins":0,"pnl_wins":0.0,"pnl_losses":0.0}
+                        session_stats[s] = {
+                            "count": 0,
+                            "wins": 0,
+                            "pnl_wins": 0.0,
+                            "pnl_losses": 0.0,
+                        }
                     session_stats[s]["count"] += st["count"]
                     w = int(st["count"] * st["win_rate"] / 100)
                     session_stats[s]["wins"] += w
                     if st["pf"] != float("inf"):
                         l_cnt = st["count"] - w
                         if l_cnt > 0:
-                            avg_loss = st["avg_pnl"] - st["win_rate"]/100 * (st["avg_pnl"] * st["pf"] / (1 + st["pf"]) if st["pf"] > 0 else 0)
-                    session_stats[s]["pnl_wins"] += st["total_pnl"] if st["total_pnl"] > 0 else 0
-                    session_stats[s]["pnl_losses"] += st["total_pnl"] if st["total_pnl"] < 0 else 0
+                            avg_loss = st["avg_pnl"] - st["win_rate"] / 100 * (
+                                st["avg_pnl"] * st["pf"] / (1 + st["pf"])
+                                if st["pf"] > 0
+                                else 0
+                            )
+                    session_stats[s]["pnl_wins"] += (
+                        st["total_pnl"] if st["total_pnl"] > 0 else 0
+                    )
+                    session_stats[s]["pnl_losses"] += (
+                        st["total_pnl"] if st["total_pnl"] < 0 else 0
+                    )
 
                 f.write("-" * 22 + " Session Summary " + "-" * 21 + "\n")
-                f.write(f"  {'Session':<10}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n")
+                f.write(
+                    f"  {'Session':<10}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n"
+                )
                 f.write("  " + "-" * 66 + "\n")
                 for s in session_order:
-                    hs = [st for h, st in hourly_stats.items() if _session(h) == s and st is not None]
+                    hs = [
+                        st
+                        for h, st in hourly_stats.items()
+                        if _session(h) == s and st is not None
+                    ]
                     if not hs:
                         continue
-                    tc  = sum(x["count"] for x in hs)
-                    tw  = sum(int(x["count"]*x["win_rate"]/100) for x in hs)
-                    wr  = tw/tc*100 if tc > 0 else 0
+                    tc = sum(x["count"] for x in hs)
+                    tw = sum(int(x["count"] * x["win_rate"] / 100) for x in hs)
+                    wr = tw / tc * 100 if tc > 0 else 0
                     all_pnl = [x["total_pnl"] for x in hs]
                     pw = sum(x for x in all_pnl if x > 0)
                     pl_neg = sum(x for x in all_pnl if x < 0)
-                    pf_s = pw/abs(pl_neg) if pl_neg != 0 else float("inf")
+                    pf_s = pw / abs(pl_neg) if pl_neg != 0 else float("inf")
                     pf_str = f"{pf_s:.2f}" if pf_s != float("inf") else "inf"
                     tot = sum(all_pnl)
-                    avg = tot/tc if tc > 0 else 0
-                    f.write(f"  {s:<10}{tc:>8}{wr:>9.2f}%{pf_str:>8}{avg:>14,.0f}{tot:>16,.0f}\n")
+                    avg = tot / tc if tc > 0 else 0
+                    f.write(
+                        f"  {s:<10}{tc:>8}{wr:>9.2f}%{pf_str:>8}{avg:>14,.0f}{tot:>16,.0f}\n"
+                    )
                 f.write("\n")
 
                 f.write("-" * 22 + " Weekday Summary " + "-" * 21 + "\n")
-                f.write(f"  {'Weekday':<12}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n")
+                f.write(
+                    f"  {'Weekday':<12}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n"
+                )
                 f.write("  " + "-" * 66 + "\n")
                 for wd in range(7):
                     st = weekday_stats.get(wd)
                     if st is None:
                         continue
-                    pf_str = f"{st['pf']:.2f}" if st['pf'] != float("inf") else "inf"
-                    f.write(f"  {wd_names[wd]:<12}{st['count']:>8}{st['win_rate']:>9.2f}%{pf_str:>8}{st['avg_pnl']:>14,.0f}{st['total_pnl']:>16,.0f}\n")
+                    pf_str = f"{st['pf']:.2f}" if st["pf"] != float("inf") else "inf"
+                    f.write(
+                        f"  {wd_names[wd]:<12}{st['count']:>8}{st['win_rate']:>9.2f}%{pf_str:>8}{st['avg_pnl']:>14,.0f}{st['total_pnl']:>16,.0f}\n"
+                    )
                 f.write("\n")
 
                 # ベスト・ワースト時間帯
-                valid_hours = [(h, st) for h, st in hourly_stats.items() if st and st["count"] >= 10]
+                valid_hours = [
+                    (h, st)
+                    for h, st in hourly_stats.items()
+                    if st and st["count"] >= 10
+                ]
                 if valid_hours:
-                    best_wr  = max(valid_hours, key=lambda x: x[1]["win_rate"])
+                    best_wr = max(valid_hours, key=lambda x: x[1]["win_rate"])
                     worst_wr = min(valid_hours, key=lambda x: x[1]["win_rate"])
-                    best_pf  = max(valid_hours, key=lambda x: x[1]["pf"] if x[1]["pf"] != float("inf") else 0)
+                    best_pf = max(
+                        valid_hours,
+                        key=lambda x: x[1]["pf"] if x[1]["pf"] != float("inf") else 0,
+                    )
                     f.write("-" * 22 + " Hourly Highlights " + "-" * 19 + "\n")
-                    f.write(f"  Best  Win Rate : {best_wr[0]:02d}:00 UTC ({_session(best_wr[0])}) → {best_wr[1]['win_rate']:.2f}%\n")
-                    f.write(f"  Worst Win Rate : {worst_wr[0]:02d}:00 UTC ({_session(worst_wr[0])}) → {worst_wr[1]['win_rate']:.2f}%\n")
-                    f.write(f"  Best  PF       : {best_pf[0]:02d}:00 UTC ({_session(best_pf[0])}) → PF {best_pf[1]['pf']:.2f}\n\n")
+                    f.write(
+                        f"  Best  Win Rate : {best_wr[0]:02d}:00 UTC ({_session(best_wr[0])}) → {best_wr[1]['win_rate']:.2f}%\n"
+                    )
+                    f.write(
+                        f"  Worst Win Rate : {worst_wr[0]:02d}:00 UTC ({_session(worst_wr[0])}) → {worst_wr[1]['win_rate']:.2f}%\n"
+                    )
+                    f.write(
+                        f"  Best  PF       : {best_pf[0]:02d}:00 UTC ({_session(best_pf[0])}) → PF {best_pf[1]['pf']:.2f}\n\n"
+                    )
 
                 f.write("=" * 60 + "\n")
             logging.info(f"Text performance report saved successfully.")
@@ -2100,18 +2340,24 @@ class BacktestSimulator:
                     FINAL_REPORT_PATH.stem + "_monthly_breakdown.csv"
                 )
                 # pnl/balance はObject型のため先にFloat64へ変換
-                _tl = trade_log.with_columns([
-                    pl.col("pnl").map_elements(
-                        lambda x: float(x) if x is not None else None,
-                        return_dtype=pl.Float64
-                    ).alias("pnl_f"),
-                    pl.col("label").cast(pl.Int32).alias("label_i"),
-                    pl.col("timestamp").dt.year().alias("year"),
-                    pl.col("timestamp").dt.month().alias("month"),
-                ])
+                _tl = trade_log.with_columns(
+                    [
+                        pl.col("pnl")
+                        .map_elements(
+                            lambda x: float(x) if x is not None else None,
+                            return_dtype=pl.Float64,
+                        )
+                        .alias("pnl_f"),
+                        pl.col("label").cast(pl.Int32).alias("label_i"),
+                        pl.col("timestamp").dt.year().alias("year"),
+                        pl.col("timestamp").dt.month().alias("month"),
+                    ]
+                )
 
                 monthly_rows = []
-                for (yr, mo), grp in _tl.group_by(["year", "month"], maintain_order=False):
+                for (yr, mo), grp in _tl.group_by(
+                    ["year", "month"], maintain_order=False
+                ):
                     pnls = grp["pnl_f"].to_list()
                     labels = grp["label_i"].to_list()
                     wins = [p for p in pnls if p > 0]
@@ -2121,14 +2367,19 @@ class BacktestSimulator:
                     tot_pnl = sum(pnls)
                     dd_vals = grp["DD(%)"].to_list()
                     max_dd = min(dd_vals) if dd_vals else 0.0
-                    monthly_rows.append({
-                        "year": yr, "month": mo,
-                        "trades": len(pnls),
-                        "win_rate_%": round(wr, 2),
-                        "profit_factor": round(pf, 3) if pf != float("inf") else None,
-                        "total_pnl": round(tot_pnl, 2),
-                        "max_dd_%": round(max_dd, 2),
-                    })
+                    monthly_rows.append(
+                        {
+                            "year": yr,
+                            "month": mo,
+                            "trades": len(pnls),
+                            "win_rate_%": round(wr, 2),
+                            "profit_factor": round(pf, 3)
+                            if pf != float("inf")
+                            else None,
+                            "total_pnl": round(tot_pnl, 2),
+                            "max_dd_%": round(max_dd, 2),
+                        }
+                    )
 
                 monthly_rows.sort(key=lambda r: (r["year"], r["month"]))
 
@@ -2139,18 +2390,31 @@ class BacktestSimulator:
                 for row in monthly_rows:
                     if cur_year is not None and row["year"] != cur_year:
                         # 年計
-                        yr_pnls_w = [r["total_pnl"] for r in year_buf if r["total_pnl"] > 0]
-                        yr_pnls_l = [r["total_pnl"] for r in year_buf if r["total_pnl"] < 0]
+                        yr_pnls_w = [
+                            r["total_pnl"] for r in year_buf if r["total_pnl"] > 0
+                        ]
+                        yr_pnls_l = [
+                            r["total_pnl"] for r in year_buf if r["total_pnl"] < 0
+                        ]
                         yr_trades = sum(r["trades"] for r in year_buf)
-                        yr_pf = sum(yr_pnls_w) / abs(sum(yr_pnls_l)) if yr_pnls_l else None
-                        output_rows.append({
-                            "year": cur_year, "month": "TOTAL",
-                            "trades": yr_trades,
-                            "win_rate_%": "",
-                            "profit_factor": round(yr_pf, 3) if yr_pf else None,
-                            "total_pnl": round(sum(r["total_pnl"] for r in year_buf), 2),
-                            "max_dd_%": round(min(r["max_dd_%"] for r in year_buf), 2),
-                        })
+                        yr_pf = (
+                            sum(yr_pnls_w) / abs(sum(yr_pnls_l)) if yr_pnls_l else None
+                        )
+                        output_rows.append(
+                            {
+                                "year": cur_year,
+                                "month": "TOTAL",
+                                "trades": yr_trades,
+                                "win_rate_%": "",
+                                "profit_factor": round(yr_pf, 3) if yr_pf else None,
+                                "total_pnl": round(
+                                    sum(r["total_pnl"] for r in year_buf), 2
+                                ),
+                                "max_dd_%": round(
+                                    min(r["max_dd_%"] for r in year_buf), 2
+                                ),
+                            }
+                        )
                         output_rows.append({})  # 空行
                         year_buf = []
                     cur_year = row["year"]
@@ -2162,17 +2426,31 @@ class BacktestSimulator:
                     yr_pnls_w = [r["total_pnl"] for r in year_buf if r["total_pnl"] > 0]
                     yr_pnls_l = [r["total_pnl"] for r in year_buf if r["total_pnl"] < 0]
                     yr_pf = sum(yr_pnls_w) / abs(sum(yr_pnls_l)) if yr_pnls_l else None
-                    output_rows.append({
-                        "year": cur_year, "month": "TOTAL",
-                        "trades": sum(r["trades"] for r in year_buf),
-                        "win_rate_%": "",
-                        "profit_factor": round(yr_pf, 3) if yr_pf else None,
-                        "total_pnl": round(sum(r["total_pnl"] for r in year_buf), 2),
-                        "max_dd_%": round(min(r["max_dd_%"] for r in year_buf), 2),
-                    })
+                    output_rows.append(
+                        {
+                            "year": cur_year,
+                            "month": "TOTAL",
+                            "trades": sum(r["trades"] for r in year_buf),
+                            "win_rate_%": "",
+                            "profit_factor": round(yr_pf, 3) if yr_pf else None,
+                            "total_pnl": round(
+                                sum(r["total_pnl"] for r in year_buf), 2
+                            ),
+                            "max_dd_%": round(min(r["max_dd_%"] for r in year_buf), 2),
+                        }
+                    )
 
                 import csv as _csv
-                fieldnames = ["year", "month", "trades", "win_rate_%", "profit_factor", "total_pnl", "max_dd_%"]
+
+                fieldnames = [
+                    "year",
+                    "month",
+                    "trades",
+                    "win_rate_%",
+                    "profit_factor",
+                    "total_pnl",
+                    "max_dd_%",
+                ]
                 with open(monthly_path, "w", newline="", encoding="utf-8") as f:
                     writer = _csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
@@ -2186,26 +2464,51 @@ class BacktestSimulator:
         try:
             if not trade_log.is_empty() and hourly_stats:
                 import csv as _csv
+
                 hourly_path = FINAL_REPORT_PATH.parent / (
                     FINAL_REPORT_PATH.stem + "_hourly_analysis.csv"
                 )
-                fields = ["hour_jst","session","trades","win_rate_%","profit_factor","avg_pnl","total_pnl"]
+                fields = [
+                    "hour_jst",
+                    "session",
+                    "trades",
+                    "win_rate_%",
+                    "profit_factor",
+                    "avg_pnl",
+                    "total_pnl",
+                ]
                 with open(hourly_path, "w", newline="", encoding="utf-8") as f:
                     w = _csv.DictWriter(f, fieldnames=fields)
                     w.writeheader()
                     for h in range(24):
                         st = hourly_stats.get(h)
                         if st is None:
-                            w.writerow({"hour_jst": h, "session": _session(h), "trades": 0,
-                                        "win_rate_%": "", "profit_factor": "", "avg_pnl": "", "total_pnl": ""})
+                            w.writerow(
+                                {
+                                    "hour_jst": h,
+                                    "session": _session(h),
+                                    "trades": 0,
+                                    "win_rate_%": "",
+                                    "profit_factor": "",
+                                    "avg_pnl": "",
+                                    "total_pnl": "",
+                                }
+                            )
                         else:
-                            pf_val = round(st["pf"], 3) if st["pf"] != float("inf") else None
-                            w.writerow({"hour_jst": h, "session": _session(h),
-                                        "trades": st["count"],
-                                        "win_rate_%": round(st["win_rate"], 2),
-                                        "profit_factor": pf_val,
-                                        "avg_pnl": round(st["avg_pnl"], 2),
-                                        "total_pnl": round(st["total_pnl"], 2)})
+                            pf_val = (
+                                round(st["pf"], 3) if st["pf"] != float("inf") else None
+                            )
+                            w.writerow(
+                                {
+                                    "hour_jst": h,
+                                    "session": _session(h),
+                                    "trades": st["count"],
+                                    "win_rate_%": round(st["win_rate"], 2),
+                                    "profit_factor": pf_val,
+                                    "avg_pnl": round(st["avg_pnl"], 2),
+                                    "total_pnl": round(st["total_pnl"], 2),
+                                }
+                            )
                 logging.info(f"Hourly analysis CSV saved to {hourly_path}")
         except Exception as e:
             logging.error(f"Failed to save hourly analysis CSV: {e}", exc_info=True)
@@ -2214,27 +2517,60 @@ class BacktestSimulator:
         try:
             if not trade_log.is_empty() and weekday_stats:
                 import csv as _csv
+
                 wd_path = FINAL_REPORT_PATH.parent / (
                     FINAL_REPORT_PATH.stem + "_weekday_analysis.csv"
                 )
-                wd_names_csv = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-                fields = ["weekday","weekday_name","trades","win_rate_%","profit_factor","avg_pnl","total_pnl"]
+                wd_names_csv = [
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                    "Sunday",
+                ]
+                fields = [
+                    "weekday",
+                    "weekday_name",
+                    "trades",
+                    "win_rate_%",
+                    "profit_factor",
+                    "avg_pnl",
+                    "total_pnl",
+                ]
                 with open(wd_path, "w", newline="", encoding="utf-8") as f:
                     w = _csv.DictWriter(f, fieldnames=fields)
                     w.writeheader()
                     for wd in range(7):
                         st = weekday_stats.get(wd)
                         if st is None:
-                            w.writerow({"weekday": wd, "weekday_name": wd_names_csv[wd], "trades": 0,
-                                        "win_rate_%": "", "profit_factor": "", "avg_pnl": "", "total_pnl": ""})
+                            w.writerow(
+                                {
+                                    "weekday": wd,
+                                    "weekday_name": wd_names_csv[wd],
+                                    "trades": 0,
+                                    "win_rate_%": "",
+                                    "profit_factor": "",
+                                    "avg_pnl": "",
+                                    "total_pnl": "",
+                                }
+                            )
                         else:
-                            pf_val = round(st["pf"], 3) if st["pf"] != float("inf") else None
-                            w.writerow({"weekday": wd, "weekday_name": wd_names_csv[wd],
-                                        "trades": st["count"],
-                                        "win_rate_%": round(st["win_rate"], 2),
-                                        "profit_factor": pf_val,
-                                        "avg_pnl": round(st["avg_pnl"], 2),
-                                        "total_pnl": round(st["total_pnl"], 2)})
+                            pf_val = (
+                                round(st["pf"], 3) if st["pf"] != float("inf") else None
+                            )
+                            w.writerow(
+                                {
+                                    "weekday": wd,
+                                    "weekday_name": wd_names_csv[wd],
+                                    "trades": st["count"],
+                                    "win_rate_%": round(st["win_rate"], 2),
+                                    "profit_factor": pf_val,
+                                    "avg_pnl": round(st["avg_pnl"], 2),
+                                    "total_pnl": round(st["total_pnl"], 2),
+                                }
+                            )
                 logging.info(f"Weekday analysis CSV saved to {wd_path}")
         except Exception as e:
             logging.error(f"Failed to save weekday analysis CSV: {e}", exc_info=True)
@@ -2243,11 +2579,28 @@ class BacktestSimulator:
         try:
             if not trade_log.is_empty() and hxatr_stats:
                 import csv as _csv
+
                 hxatr_path = FINAL_REPORT_PATH.parent / (
                     FINAL_REPORT_PATH.stem + "_hour_x_atr_analysis.csv"
                 )
-                atr_band_names = ["< 0.5","0.5-0.8","0.8-1.0","1.0-1.2","1.2-1.5",">= 1.5"]
-                fields = ["hour_jst","session","atr_band","trades","win_rate_%","profit_factor","avg_pnl","total_pnl"]
+                atr_band_names = [
+                    "< 0.5",
+                    "0.5-0.8",
+                    "0.8-1.0",
+                    "1.0-1.2",
+                    "1.2-1.5",
+                    ">= 1.5",
+                ]
+                fields = [
+                    "hour_jst",
+                    "session",
+                    "atr_band",
+                    "trades",
+                    "win_rate_%",
+                    "profit_factor",
+                    "avg_pnl",
+                    "total_pnl",
+                ]
                 with open(hxatr_path, "w", newline="", encoding="utf-8") as f:
                     w = _csv.DictWriter(f, fieldnames=fields)
                     w.writeheader()
@@ -2256,14 +2609,21 @@ class BacktestSimulator:
                             st = hxatr_stats.get((h, band_name))
                             if st is None or st["count"] == 0:
                                 continue
-                            pf_val = round(st["pf"], 3) if st["pf"] != float("inf") else None
-                            w.writerow({"hour_jst": h, "session": _session(h),
-                                        "atr_band": band_name,
-                                        "trades": st["count"],
-                                        "win_rate_%": round(st["win_rate"], 2),
-                                        "profit_factor": pf_val,
-                                        "avg_pnl": round(st["avg_pnl"], 2),
-                                        "total_pnl": round(st["total_pnl"], 2)})
+                            pf_val = (
+                                round(st["pf"], 3) if st["pf"] != float("inf") else None
+                            )
+                            w.writerow(
+                                {
+                                    "hour_jst": h,
+                                    "session": _session(h),
+                                    "atr_band": band_name,
+                                    "trades": st["count"],
+                                    "win_rate_%": round(st["win_rate"], 2),
+                                    "profit_factor": pf_val,
+                                    "avg_pnl": round(st["avg_pnl"], 2),
+                                    "total_pnl": round(st["total_pnl"], 2),
+                                }
+                            )
                 logging.info(f"Hour x ATR analysis CSV saved to {hxatr_path}")
         except Exception as e:
             logging.error(f"Failed to save hour x ATR analysis CSV: {e}", exc_info=True)

@@ -1,0 +1,54 @@
+blueprint.py (2 箇所)
+① HF_TIMEFRAMES のコメントアウトを外す:
+pythonHF_TIMEFRAMES = [
+    "M0.5", "M1", "M3", "M5", "M8", "M15",
+    "M30", "H1",  # ← コメントアウトを外す
+]
+② EXCLUDED_HF_TIMEFRAMES から削除:
+pythonEXCLUDED_HF_TIMEFRAMES = []  # ← M30/H1 を削除して空に
+③ NEUTRALIZATION_CONFIG["HF"]["window_per_tf"] のコメントアウトを外して値を入れる:
+python"window_per_tf": {
+    "M0.5": 5760,
+    "M1":   2880,
+    "M3":    960,
+    "M5":    576,
+    "M8":    360,
+    "M15":   192,
+    "M30":   336,  # ← コメントアウトを外して 1週間案の値に (2日=96 だと充填不足)
+    "H1":    168,  # ← 同上 (2日=48 だと充填不足)
+},
+realtime_feature_engine.py (1 箇所)
+④ OLS_WINDOW_PER_TF のコメントアウトを外す (blueprint と同じ値):
+pythonOLS_WINDOW_PER_TF = {
+    "M0.5": 5760,
+    "M1":   2880,
+    "M3":    960,
+    "M5":    576,
+    "M8":    360,
+    "M15":   192,
+    "M30":   336,  # ← コメントアウトを外す
+    "H1":    168,  # ← 同上
+}
+
+注意点
+
+M30 と H1 だけ 1 週間案 (336/168 本) にするのが推奨。2 日案だと M30=96 本、H1=48 本で OLS が不安定 (MIN_SAMPLES=30 ギリギリ)
+M0.5〜M15 は 2 日案のまま にして混在も可能。グループ全体が同じ window である必要はない (各 TF 個別に window を持つ設計なので)
+ただし全 TF で同じ「日数」に揃えるのが思想的にきれいなので、復活時に「全 TF を 1 週間案にする」も選択肢
+どちらにしても再学習必須 (純化値分布が変わるため)
+
+split_features_first_orthogonal.py の EXCLUDE_TIMEFRAME_SUFFIXES には M30/H1 が二重防御として残っているので、復活させる時はそこからも削除する必要があります:
+pythonEXCLUDE_TIMEFRAME_SUFFIXES = ("_H4", "_H6", "_H12", "_D1", "_W1", "_MN")
+# ↑ "_M30", "_H1" を削除
+これで M30/H1 が下流に流れます。
+
+
+
+
+復活時の手順 (ドキュメント)
+LF 系を復活させる場合は以下 2 箇所を変更:
+
+2_G_alpha_neutralizer.py の 3 箇所の if group != "HF": ガードを削除
+split_features_first_orthogonal.py の EXCLUDE_TIMEFRAME_SUFFIXES から該当 TF を削除
+
+これでパイプライン全体が LF を扱うようになります。再学習必須。

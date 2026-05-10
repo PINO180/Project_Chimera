@@ -1,9 +1,11 @@
 # /workspace/execution/realtime_feature_engine.py
 import sys
+from concurrent.futures import ThreadPoolExecutor  # [LAG-FIX-3] 6 TF 並列計算用
 from pathlib import Path
 from collections import deque
 import numpy as np
 import pandas as pd
+import polars as pl  # [Phase 9b] 統合 .select() 用
 import logging
 
 # ▼▼▼ 追加: Numpyの無害な計算警告をミュートしてログをクリーンに保つ ▼▼▼
@@ -37,7 +39,7 @@ from blueprint import ATR_BASELINE_DAYS  # noqa: E402
 
 # --- core_indicators: Single Source of Truth ---
 sys.path.append(str(config.CORE_DIR))
-from core_indicators import calculate_atr_wilder, calculate_barrier_atr, neutralize_ols  # noqa: E402
+from core_indicators import calculate_atr_wilder, calculate_atr_wilder_disc_aware, calculate_barrier_atr, neutralize_ols  # noqa: E402
 
 # ==================================================================
 # 外部モジュール (完全カプセル化クラス群) のインポート
@@ -130,6 +132,75 @@ class RealtimeFeatureEngine:
     OHLCV_COLS = ["open", "high", "low", "close", "volume"]
     DEFAULT_LOOKBACK = 200
     ATR_CALC_PERIOD = 13
+    OLS_WINDOW_DEFAULT = 2016  # 純化用 OLS 回帰窓のフォールバック値
+    # [Phase 9d 発見 #63] TF 毎の OLS 窓は blueprint.NEUTRALIZATION_CONFIG["HF"]
+    # ["window_per_tf"] が SSoT (Phase 10 設計、2 日案):
+    #     M0.5: 5760  /  M1: 2880  /  M3:  960
+    #     M5:    576  /  M8:  360  /  M15: 192
+    # 本属性は blueprint に未登録の TF のみフォールバックとして使用される。
+
+    @classmethod
+    def _get_ols_window(cls, tf_name: str) -> int:
+        """[Phase 9d 発見 #63] TF 毎の OLS 純化窓を blueprint から取得。
+
+        学習側 2_G_alpha_neutralizer.py が
+        ``blueprint.NEUTRALIZATION_CONFIG["HF"]["window_per_tf"]`` を SSoT
+        として使用する (Phase 10 設計、2 日案)。本番側もここで完全に同じ値を
+        引くことで OLS 純化結果の数値的整合性を保証する。
+
+        blueprint に該当 TF のエントリがない場合は ``OLS_WINDOW_DEFAULT``
+        (=2016) にフォールバックする。これは Phase 9b 以前の固定窓挙動と等価。
+
+        Args:
+            tf_name: 時間足名 (例: "M0.5", "M1", "M3", "M5", "M8", "M15")
+
+        Returns:
+            int: OLS 回帰窓のサイズ (deque maxlen として使う本数)
+        """
+        try:
+            hf_config = config.NEUTRALIZATION_CONFIG.get("HF", {})
+            per_tf = hf_config.get("window_per_tf", {})
+            window = per_tf.get(tf_name)
+            if window is not None and int(window) > 0:
+                return int(window)
+        except Exception:
+            # blueprint 未ロード/属性欠落 等の防御的フォールバック
+            pass
+        return cls.OLS_WINDOW_DEFAULT
+
+                               # 全 TF 共通固定。Phase 10 で TF 毎可変化を検討予定。
+
+    # ─────────────────────────────────────────────────────────────────
+    # [DISC-FLAG SSoT] 学習側 s1_1_B_build_ohlcv.py の TIMEFRAME_FREQ_SECONDS
+    # / DISC_GAP_MULTIPLIER と完全同一。本番側 disc 計算の唯一の真実源。
+    #
+    # 発見 #60 (Phase 9d 追加修正): 通常 poll_m3_bar 経路で EA から送られる
+    # M0.5 バー dict に disc キーが含まれず、_append_bar_to_buffer 内で
+    # bar_dict.get("disc", False) が常に False を返す構造的欠陥があった。
+    # これは Phase 5 で潰したバグ A (週末跨ぎ ATR 汚染) の本質的問題が、
+    # 短時間ギャップ (45-360秒) という形で生き残っていた状態。
+    #
+    # 修正: disc 計算を _compute_disc_flag に一元化し、_append_bar_to_buffer を
+    # 通る全経路 (M0.5 直接追加 / M3-M15 リサンプル / gap-fill / warmup_only) で
+    # 自動的に正しい disc が立つ構造に変更。閾値は 1.5x ルール (学習側と同一)。
+    # ─────────────────────────────────────────────────────────────────
+    _TF_FREQ_SECONDS = {
+        "M0.5": 30,
+        "M1": 60,
+        "M3": 180,
+        "M5": 300,
+        "M8": 480,
+        "M15": 900,
+        "M30": 1800,
+        "H1": 3600,
+        "H4": 14400,
+        "H6": 21600,
+        "H12": 43200,
+        "D1": 86400,
+        "W1": 604800,
+        "MN": 2592000,
+    }
+    _DISC_GAP_MULTIPLIER = 1.5  # 想定間隔の何倍を超えたら不連続とみなすか
 
     def __init__(
         self,
@@ -220,16 +291,25 @@ class RealtimeFeatureEngine:
         ]
 
         for tf_name in self.data_buffers.keys():
-            # ▼修正: OLS純化バッファは、どの時間足でもStage3と完全一致の「2016」で固定
+            # [Phase 9d 発見 #63] OLS純化バッファ: TF 毎可変窓を blueprint から取得。
+            # 学習側 2_G の Phase 10 設計と一致させる (M0.5=5760, M1=2880, ...)。
+            # blueprint 未登録 TF は OLS_WINDOW_DEFAULT (=2016) にフォールバック。
+            tf_ols_window = self._get_ols_window(tf_name)
             self.proxy_feature_buffers[tf_name] = {
-                feat: deque(maxlen=2016) for feat in PROXY_FEATURES
+                feat: deque(maxlen=tf_ols_window) for feat in PROXY_FEATURES
             }
-            self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(maxlen=2016)
+            self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(
+                maxlen=tf_ols_window
+            )
 
             self.ols_state[tf_name] = {}
             # 各エントリは _update_incremental_ols で特徴量登場時に動的初期化される
 
         self.logger.info(f"M0.5 Dequeバッファを初期化 (maxlen: {max_m05_bars_needed})")
+
+        # [診断 L1] バッファ容量と特徴量計算要求の整合性を検証
+        # 学習側 timeframe_bars_per_day と本番側 lookbacks_by_tf のズレを起動時に検出する
+        self._validate_buffer_sizes()
 
         # 6. JITコンパイルのウォームアップ
         self._warmup_jit()
@@ -251,6 +331,16 @@ class RealtimeFeatureEngine:
                 "1F": FeatureModule1F.QAState(lookback_bars=lb),
             }
         self.logger.info("✓ 全時間足のQAStateを初期化しました。")
+
+        # [LAG-FIX-3] 6 TF 並列計算用の ThreadPoolExecutor を初期化
+        # process_new_m05_bar の step3 (全 TF 強制再計算) を並列化することで、
+        # 6 TF × 75-110ms 直列 = 547ms を、理論上 ~110ms (最遅 TF 律速) 程度まで短縮可能。
+        # 各 TF の処理は独立 (異なる self.data_buffers[tf]/proxy_feature_buffers[tf]/
+        # latest_features_cache[tf] にアクセス) のため thread safety 問題なし。
+        # save_state の対象 dict には含めないため pickle 化は問題なし。
+        self._tf_executor = ThreadPoolExecutor(
+            max_workers=6, thread_name_prefix="tf_recalc"
+        )
 
     def _load_feature_list(self, path: str) -> List[str]:
         p = Path(path)
@@ -294,31 +384,377 @@ class RealtimeFeatureEngine:
     def _parse_feature_list_and_get_lookbacks(
         self, feature_list: List[str]
     ) -> Dict[str, int]:
-        """名簿に基づき、必要な最大ルックバック期間を決定（デッドコードのe2aロジックはパージ済）"""
+        """名簿に登場する TF を抽出し、各 TF の data_buffers maxlen を決定する。
+
+        【設計】
+            data_buffers (OHLCV 用) の maxlen は「特徴量計算に必要な本数」だけで決まる。
+            純化用の OLS_WINDOW は別バッファ proxy_feature_buffers で管理されているため、
+            ここでは混入させない。3 つの概念は完全に独立:
+
+              A. 特徴量の窓 (各特徴量の rolling_*(N) の N) — モジュール毎に決まる
+              B. data_buffers の maxlen      — A の最長窓 + マージン (本メソッドが返す値)
+              C. proxy_feature_buffers の maxlen = OLS_WINDOW (別管理、TF 毎可変)
+                 - Phase 9d 発見 #63 で blueprint.NEUTRALIZATION_CONFIG["HF"]
+                   ["window_per_tf"] を SSoT として参照する設計に変更
+                 - 旧設計: 全 TF 共通 2016 (Phase 9b 以前)
+                 - 新設計: M0.5=5760, M1=2880, M3=960, M5=576, M8=360, M15=192
+                          (Phase 10 の 2 日案、学習側 2_G_alpha_neutralizer と一致)
+
+        【M0.5 バッファ不足バグの修正】
+            旧実装: 全 TF 一律 SAFE_MIN_LOOKBACK=2016 (純化窓を data_buffers に混入) + 100 = 2116
+                    → M0.5 では 1D vol_ma1440 (= 2880 本必要) が NaN を返す致命バグ
+                       (学習側 timeframe_bars_per_day["M0.5"]=2880 と数値乖離)
+                    → e1d_obv_rel_M0.5 (gain 7,463) など 5 特徴量が常時 0 で死蔵
+
+            新実装: TF 毎に「特徴量計算に必要な最大本数」を個別決定。OLS_WINDOW は
+                    別バッファに任せ、data_buffers から完全に切り離す。
+
+        【PER_TF_FEATURE_MAX の根拠】
+            各 TF で必要な最大窓 = 各モジュールの最大窓 max:
+              1A:  100, 1B: 100, 1C: 200,
+              1D: lookback_bars (= TIMEFRAME_BARS_PER_DAY[tf]),
+              1E: spectral_flux の window×2 = 1024,
+              1F:  100
+            → max を取ると:
+              M0.5: max(100, 100, 200, 2880, 1024, 100) = 2880
+              M1:   max(100, 100, 200, 1440, 1024, 100) = 1440
+              M3:   max(100, 100, 200,  480, 1024, 100) = 1024
+              M5:   max(100, 100, 200,  288, 1024, 100) = 1024
+              M8:   max(100, 100, 200,  180, 1024, 100) = 1024
+              M15:  max(100, 100, 200,   96, 1024, 100) = 1024
+        """
         tf_pattern = re.compile(r"_(M[0-9\.]+|H[0-9]+|D[0-9]+|W[0-9]+|MN|tick)$")
-        lookbacks: Dict[str, int] = {}
+        seen_tfs = set()
 
         for feature_name in feature_list:
             tf_match = tf_pattern.search(feature_name)
-            if not tf_match:
-                continue
-            tf_name_parsed = tf_match.group(1)
-            if tf_name_parsed not in lookbacks:
-                lookbacks[tf_name_parsed] = 0
+            if tf_match:
+                seen_tfs.add(tf_match.group(1))
 
-        # MFDFA等の特大要求が消えたため、ベース特徴量計算用マージンのみ確保
-        # ▼修正: 純化の2016期間を完全にカバーするため1000から2016に変更
-        SAFE_MIN_LOOKBACK = 2016
+        # TF 毎に必要な特徴量計算用バッファ本数 (上記コメント参照)
+        # dict 定義順 (M0.5 → M1 → M3 → M5 → M8 → M15) でログ出力するため、
+        # PER_TF_FEATURE_MAX の順序がそのまま出力順になる。
+        #
+        # 【案 D 網羅監査の結果 (Phase 9b 後)】
+        # 全モジュールの最大窓:
+        #   1A: 100  (for window in [5,10,20,50,100])
+        #   1B: 100  (for window in [50,100])
+        #   1C: 100  (window_sizes["general"] = [10,20,50,100])
+        #   1D: 1440 (rolling_quantile(0.8/0.6, window_size=1440) ← 固定値)
+        #        + lookback_bars (TF 毎可変、M0.5 で 2880)
+        #   1E: 128  (rolling_max(128) for spectral_flux)
+        #   1F: 100  (window_sizes 全カテゴリの最大)
+        # → 数値固定窓の絶対最大は 1440 (1D rolling_quantile)。
+        # → 全 TF で最低 1440 本のバッファが必要。
+        #
+        # 修正履歴:
+        #   旧 (Phase 9b 初期 hotfix): M3-M15 = 1024 (1E spectral_flux のみ考慮)
+        #   新 (Phase 9b 案 A): M3-M15 = 1440 (1D rolling_quantile を追加考慮)
+        #     → e1d_hv_regime_50 が学習側と整合 (現在 gain=0 で AI 未使用、構造的整合のみ)
+        PER_TF_FEATURE_MAX = {
+            "M0.5": 2880,  # 1D vol_ma1440 (= bars_per_day) 由来
+            "M1":   1440,  # 1D vol_ma1440 + 1D rolling_quantile(1440)
+            "M3":   1440,  # 1D rolling_quantile(1440) ← Phase 9b 案 A で 1024→1440
+            "M5":   1440,  # 同上
+            "M8":   1440,  # 同上
+            "M15":  1440,  # 同上
+        }
+        DEFAULT_FEATURE_MAX = 1440  # 未知 TF のフォールバック (1D rolling_quantile に合わせる)
 
         final_lookbacks = {}
-        for tf_name_parsed in lookbacks.keys():
-            req_size = max(lookbacks[tf_name_parsed], SAFE_MIN_LOOKBACK)
-            final_lookbacks[tf_name_parsed] = req_size + 100
+        # PER_TF_FEATURE_MAX の dict 定義順で処理 → ログも M0.5 → M15 の順になる
+        for tf_name_parsed in PER_TF_FEATURE_MAX.keys():
+            if tf_name_parsed not in seen_tfs:
+                continue
+            req_size = PER_TF_FEATURE_MAX.get(tf_name_parsed, DEFAULT_FEATURE_MAX)
+            final_lookbacks[tf_name_parsed] = req_size + 100  # 安全マージン
+            tf_ols_window = self._get_ols_window(tf_name_parsed)
             self.logger.info(
-                f"  -> {tf_name_parsed:<3} 最大ルックバック: {final_lookbacks[tf_name_parsed]}"
+                f"  -> {tf_name_parsed:<5} 最大ルックバック: {final_lookbacks[tf_name_parsed]} "
+                f"(特徴量計算用、純化窓 {tf_ols_window} は別バッファ)"
+            )
+
+        # PER_TF_FEATURE_MAX に未登録の TF があれば末尾に追加 (ソート済み、ログ出力)
+        for tf_name_parsed in sorted(seen_tfs - set(PER_TF_FEATURE_MAX.keys())):
+            req_size = DEFAULT_FEATURE_MAX
+            final_lookbacks[tf_name_parsed] = req_size + 100
+            tf_ols_window = self._get_ols_window(tf_name_parsed)
+            self.logger.info(
+                f"  -> {tf_name_parsed:<5} 最大ルックバック: {final_lookbacks[tf_name_parsed]} "
+                f"(特徴量計算用、純化窓 {tf_ols_window} は別バッファ、未登録TF)"
             )
 
         return final_lookbacks
+
+    def _validate_buffer_sizes(self) -> None:
+        """
+        【診断 L1: 静的設定値検証】
+        各 TF の data_buffers maxlen が、各モジュールが要求する最大窓を
+        満たすか検証する。学習側 (engine_1_X.timeframe_bars_per_day) との
+        ズレや、特徴量変更時の設定漏れを起動時に検出する。
+
+        本番運用で過去発生したバグ:
+            M0.5 で deque maxlen=2116 だったが、1D `vol_ma1440` が
+            rolling_mean(2880) を要求 → 永遠に NaN を返し、QA で 0 にクリップ。
+            学習側で gain 7,463 の `e1d_obv_rel_M0.5` が常時 0 で死蔵していた。
+
+        修正 (Phase 9b 後の hotfix):
+            data_buffers maxlen を TF 毎可変に変更
+            (M0.5: 2980, M1: 1540, M3-M15: 1124)。
+            本メソッドはこの修正が以降のバージョンでも維持されているかを
+            起動時に保証する役割を果たす。
+
+        各 TF の必要最大窓 (案 D 網羅監査の結果):
+            M0.5: 2880  (1D vol_ma1440 = bars_per_day["M0.5"])
+            M1:   1440  (1D vol_ma1440 + 1D rolling_quantile(1440))
+            M3:   1440  (1D rolling_quantile(1440) ← Phase 9b 案 A で 1024→1440)
+            M5:   1440  (同上)
+            M8:   1440  (同上)
+            M15:  1440  (同上)
+        """
+        PER_TF_FEATURE_MAX = {
+            "M0.5": 2880,
+            "M1":   1440,
+            "M3":   1440,  # Phase 9b 案 A: 1D rolling_quantile(1440) を追加考慮
+            "M5":   1440,
+            "M8":   1440,
+            "M15":  1440,
+        }
+
+        self.logger.info("--- バッファ容量検証 (診断 L1) ---")
+        all_ok = True
+        for tf_name, required in PER_TF_FEATURE_MAX.items():
+            if tf_name not in self.lookbacks_by_tf:
+                continue
+            actual = self.lookbacks_by_tf[tf_name]
+            if actual < required:
+                self.logger.error(
+                    f"  ❌ {tf_name:<5} バッファ容量不足: maxlen={actual} < 必要={required}。"
+                    f" 該当 TF の長期 rolling 特徴量が NaN→0 で死蔵します!"
+                    f" data_buffers の lookback_bars 設定を確認してください。"
+                )
+                all_ok = False
+            else:
+                self.logger.info(
+                    f"  ✓ {tf_name:<5} バッファ容量 OK: maxlen={actual} >= 必要={required}"
+                )
+        if all_ok:
+            self.logger.info("✓ 全 TF のバッファ容量が学習側要求を満たしています。")
+        else:
+            self.logger.error(
+                "❌ バッファ容量不足の TF があります。学習側との特徴量分布が乖離します。"
+            )
+
+    def run_smoke_test(self) -> None:
+        """
+        【診断 L2: 実行時健全性検証】(public 化版、Phase 9b 案 V)
+
+        全バッファ充填完了後 / スナップショット復帰完了後の **両経路** で
+        起動シーケンスから明示的に呼び出される。
+        以下の異常を検出する:
+            (a) NaN になった特徴量 (Polars 計算で None を返す特徴量)
+            (b) 過去のバグで死蔵したことがある特定の高 gain 特徴量が 0 になる
+            (c) 0 値特徴量の具体名を一覧表示 (新たな死蔵バグの早期発見、Phase 9b 案 C 強化)
+            (d) カテゴリ C 死蔵候補が 0 のとき最終バー OHLC を verbose 出力 (Phase 9b 案 W)
+
+        診断 L1 (静的検証) でカバーできない以下の事態を補完する:
+            - スナップショット復元失敗で deque が空のまま起動
+            - 学習側パラメータ変更を本番側に反映し忘れ
+            - volume が全 0 の TF など、入力データの異常で NaN が出るケース
+            - PER_TF_FEATURE_MAX 自体に見落としがあり L1 が通っても実は死蔵 (案 D で発見)
+
+        Phase 9b 案 ZAW (本セッション最終強化):
+            案 Z: WIDE_WINDOW_FEATURES の WARNING を削除 (e1d_hv_regime_50 は
+                  低レジューム判定で 60% が 0 になる正常動作。WARNING は誤検出)
+            案 A: EXPECTED_ZERO_FEATURES (gain=0 で AI 未使用、定義通り 0 が正常な
+                  4 件) を 0 値リストから除外。表示の S/N 比向上
+            案 W: SUSPICIOUS_ZERO_FEATURES (合成データでは 0 にならないが実機で
+                  0 死蔵の高 gain 特徴量) が 0 のとき、最終バー OHLCV と計算
+                  中間値を verbose 出力。実機データ特有の何かが原因と判明済み
+                  だが、デプロイ後ログから具体原因を特定するため
+
+        Phase 9b 案 V (起動経路 SSoT 化):
+            旧: `fill_all_buffers()` の最後で `self._run_initial_smoke_test()` を
+                呼んでいたため、フルウォームアップ起動時のみ smoke test が実行
+                されていた → スナップショット爆速復帰時には呼ばれず、案 W の
+                verbose ログを得られないという致命的な穴があった
+            新: メソッドを public 化 (`run_smoke_test`) し、`fill_all_buffers`
+                内の呼び出しを削除。`main.py` 起動シーケンスの両経路 (フル
+                ウォームアップ / スナップショット復帰) の合流地点で 1 回だけ
+                呼び出す形に統一 → 起動経路によらず必ず実行される
+        """
+        # 過去にバグで死蔵していた特徴量 (今後同様のバグの再発を即時検出)
+        # gain ランキング: e1d_obv_rel_M0.5 = M1L 7,463 / M1S 9,123
+        HIGH_GAIN_M05_FEATURES = [
+            "e1d_obv_rel",
+            "e1d_force_index_norm",
+            "e1d_accumulation_distribution_rel",
+            "e1d_volume_ma20_rel",
+            "e1d_volume_price_trend_norm",
+        ]
+
+        # ─────────────────────────────────────────────────────────────────
+        # Phase 9b 案 A: 「定義通り 0 が正常な特徴量」を 0 値リストから除外
+        # ─────────────────────────────────────────────────────────────────
+        # これらは gain=0 (AI 未使用) かつ計算ロジック上 0 が正常な動作:
+        #   - e1d_hv_regime_50: 60% が低レジューム判定 (rolling_quantile q60 以下)
+        #     で 0 になる定義。学習データでも 60% が 0 で、AI は使っていない
+        #   - e1f_biomechanical_efficiency_10: rolling UDF が `< 20 本でスキップ
+        #     (np.nan 維持)」する設計。window_size=10 では永遠に該当しない構造的死蔵
+        #   - e1f_linguistic_complexity_15: 同上 (window_size=15 < 20)
+        #   - e1f_rhythm_pattern_12: 同上 (window_size=12 < 20)
+        # gain=0 で AI が使っていないため、これらの 0 は「死蔵バグ」ではなく
+        # 「設計通り使わない値」。診断 L2 の S/N 比を向上させるため除外する
+        EXPECTED_ZERO_FEATURES = {
+            "e1d_hv_regime_50",
+            "e1f_biomechanical_efficiency_10",
+            "e1f_linguistic_complexity_15",
+            "e1f_rhythm_pattern_12",
+        }
+
+        # ─────────────────────────────────────────────────────────────────
+        # Phase 9b 案 W: カテゴリ C 死蔵候補の verbose デバッグ
+        # ─────────────────────────────────────────────────────────────────
+        # 合成データ (sandbox) では 0 にならないが実機で常時 0 になる高 gain 特徴量:
+        #   - e1d_lower_wick_ratio (M3 で gain 18,166! / M0.5/M1/M3 で 0)
+        #   - e1b_rolling_max_10 (M0.5 で gain 3,789! / M0.5 で 0)
+        #   - e1a_robust_q75_10 (M5/M8 で 0)
+        #   - e1a_robust_q75_20 (M5 で 0)
+        #   - e1a_runs_test_statistic_30 (M5/M15 で 0)
+        # これらが 0 のとき、最終バー OHLCV と計算中間値を出力して
+        # 実機データの何が原因かを特定する (例: high == low、open == close 等)
+        # 注: e1a_fast_basic/robust_stabilization はカテゴリ B (式の設計上ほぼ
+        #     常時 0、外れ値時のみ非ゼロ) で死蔵バグではないため除外
+        SUSPICIOUS_ZERO_FEATURES = {
+            "e1d_lower_wick_ratio",
+            "e1b_rolling_max_10",
+            "e1a_robust_q75_10",
+            "e1a_robust_q75_20",
+            "e1a_runs_test_statistic_30",
+        }
+
+        self.logger.info("--- 初期 smoke test (診断 L2) ---")
+        for tf_name in self.lookbacks_by_tf.keys():
+            if not self.is_buffer_filled.get(tf_name, False):
+                self.logger.warning(f"  ⚠️ {tf_name:<5} バッファ未充填、smoke test スキップ")
+                continue
+            try:
+                data = {
+                    col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
+                    for col in self.OHLCV_COLS
+                }
+                features = self._calculate_base_features(data, tf_name)
+
+                # (a) 全特徴量の 0 値集計 (Phase 9b 案 A: EXPECTED_ZERO_FEATURES 除外)
+                zero_features = sorted([
+                    k for k, v in features.items()
+                    if v == 0.0 and k not in EXPECTED_ZERO_FEATURES
+                ])
+                zero_count = len(zero_features)
+                total_count = len(features) - len(EXPECTED_ZERO_FEATURES)
+                zero_pct = (zero_count / total_count * 100) if total_count > 0 else 0.0
+
+                # (b) M0.5 限定: 過去のバグで死蔵していた特徴量が 0 でないかチェック
+                if tf_name == "M0.5":
+                    zero_critical = [
+                        feat for feat in HIGH_GAIN_M05_FEATURES
+                        if features.get(feat) == 0.0
+                    ]
+                    if len(zero_critical) >= 3:
+                        self.logger.error(
+                            f"  ❌ {tf_name:<5} 死蔵バグ再発の可能性: 高 gain 特徴量 "
+                            f"{len(zero_critical)} 件が同時 0 → {zero_critical}。"
+                            f" バッファ容量や入力データを確認してください。"
+                        )
+                    elif zero_critical:
+                        self.logger.warning(
+                            f"  ⚠️ {tf_name:<5} 一部の高 gain 特徴量が 0: {zero_critical}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"  ✓ {tf_name:<5} 高 gain 特徴量 {len(HIGH_GAIN_M05_FEATURES)} 件 "
+                            f"全て非ゼロ (死蔵バグなし)"
+                        )
+
+                # (c) 全 TF 共通: 特徴量の 0 比率を診断 + 0 値特徴量名のリスト出力
+                # ※ EXPECTED_ZERO_FEATURES 除外後の集計 (案 A)
+                # ※ WIDE_WINDOW_FEATURES の WARNING は削除 (案 Z)
+                if zero_pct > 30.0:
+                    self.logger.error(
+                        f"  ❌ {tf_name:<5} 特徴量 0 比率が異常に高い: "
+                        f"{zero_count}/{total_count} ({zero_pct:.1f}%)。"
+                        f" 入力データやバッファ状態を確認してください。"
+                    )
+                elif zero_pct > 10.0:
+                    self.logger.warning(
+                        f"  ⚠️ {tf_name:<5} 特徴量 0 比率がやや高い: "
+                        f"{zero_count}/{total_count} ({zero_pct:.1f}%)"
+                    )
+                else:
+                    self.logger.info(
+                        f"  ✓ {tf_name:<5} 特徴量計算正常: "
+                        f"{total_count} 件中 0 値 {zero_count} 件 ({zero_pct:.1f}%) "
+                        f"[正常 0 の {len(EXPECTED_ZERO_FEATURES)} 件は除外済み]"
+                    )
+
+                # 0 値特徴量の具体名を出力 (案 C 強化、新たな死蔵バグの早期発見)
+                # 1 件以上あれば必ず出力。20 件超なら上位 20 件のみ表示してログを過剰に長くしない。
+                if zero_features:
+                    if len(zero_features) <= 20:
+                        self.logger.info(
+                            f"     ↳ 0 値特徴量 ({zero_count}件): {zero_features}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"     ↳ 0 値特徴量 ({zero_count}件、上位20件表示): "
+                            f"{zero_features[:20]} ..."
+                        )
+
+                # (d) Phase 9b 案 W: カテゴリ C 死蔵候補の verbose デバッグ
+                # 合成データでは 0 にならないのに実機で 0 になる高 gain 特徴量が
+                # 0 になっている場合、最終バー OHLCV と計算中間値を出力して
+                # 実機データ特有の原因 (例: open==low、high==low) を特定する
+                suspicious_zero = [
+                    feat for feat in SUSPICIOUS_ZERO_FEATURES
+                    if features.get(feat) == 0.0
+                ]
+                if suspicious_zero:
+                    last_o = data["open"][-1]
+                    last_h = data["high"][-1]
+                    last_l = data["low"][-1]
+                    last_c = data["close"][-1]
+                    last_v = data["volume"][-1]
+                    hl_range = last_h - last_l
+                    min_oc = min(last_o, last_c)
+                    self.logger.info(
+                        f"     ↳ ⚠ 高 gain 死蔵候補 ({len(suspicious_zero)}件): "
+                        f"{suspicious_zero}"
+                    )
+                    self.logger.info(
+                        f"     ↳ 最終バー: O={last_o:.4f} H={last_h:.4f} "
+                        f"L={last_l:.4f} C={last_c:.4f} V={last_v:.2f}"
+                    )
+                    self.logger.info(
+                        f"     ↳ 計算中間値: high-low={hl_range:.6f}, "
+                        f"min(O,C)={min_oc:.4f}, min(O,C)-low={min_oc - last_l:.6f}, "
+                        f"high-close={last_h - last_c:.6f}, "
+                        f"close-low={last_c - last_l:.6f}"
+                    )
+                    # 直近 10 本の OHLC 範囲統計も出力 (rolling_max_10 等の挙動把握用)
+                    if len(data["close"]) >= 10:
+                        last10_close = data["close"][-10:]
+                        last10_high = data["high"][-10:]
+                        last10_low = data["low"][-10:]
+                        self.logger.info(
+                            f"     ↳ 直近10本: close[max={last10_close.max():.4f}, "
+                            f"min={last10_close.min():.4f}], "
+                            f"high_max={last10_high.max():.4f}, "
+                            f"low_min={last10_low.min():.4f}"
+                        )
+            except Exception as e:
+                self.logger.warning(f"  ⚠️ {tf_name:<5} smoke test 失敗: {e}")
+
+        self.logger.info("--- smoke test 完了 ---")
 
     def get_max_lookback_for_all_timeframes(self) -> Dict[str, int]:
         return self.lookbacks_by_tf
@@ -373,12 +809,19 @@ class RealtimeFeatureEngine:
         [DISC-FLAG] DataFrame のインデックス(timestamp)から不連続フラグ列 'disc' を追加する。
 
         学習側 s1_1_B_build_ohlcv.py の DISC-FLAG 付与ロジックと完全一致させるため、
-        本メソッドはウォームアップ・リアルタイム双方から呼ばれる単一の disc 推定器として機能する
-        (Train-Serve Skew Free)。
+        本メソッドはウォームアップ (vectorized 一括充填) 用の disc 推定器として機能する
+        (Train-Serve Skew Free)。リアルタイム単発バーは _compute_disc_flag を使用すること。
 
         判定ルール:
-            disc[i] = (timestamp[i] - timestamp[i-1]) > freq_seconds * 1.5
+            disc[i] = (timestamp[i] - timestamp[i-1]).total_seconds() > freq_seconds * 1.5
             先頭バーは便宜上 False (前バーがないため連続扱い)
+
+        [DTYPE-SAFE 修正]
+        旧実装は `out.index.astype("int64")` で ns 想定の int を取り出していたが、
+        pandas 2.0+ で DatetimeIndex のデフォルト dtype が datetime64[us] となり、
+        μs 単位の int 値を ns 単位の threshold と比較する形になり常に disc=False
+        になる構造的バグがあった。これを Timedelta 経由の秒数比較に変更し、
+        pandas/numpy のバージョンによらず正しく動作するように修正。
 
         Args:
             df:           timestamp 昇順の DataFrame (index がタイムスタンプ)
@@ -392,12 +835,55 @@ class RealtimeFeatureEngine:
             out["disc"] = False
             return out
 
-        threshold_ns = int(freq_seconds * 1.5 * 1_000_000_000)
-        ts_int = out.index.astype("int64").to_numpy()
-        gaps = np.diff(ts_int, prepend=ts_int[0])
-        gaps[0] = 0  # 先頭バーは disc=False
-        out["disc"] = gaps > threshold_ns
+        # [DTYPE-SAFE] Timedelta 経由で秒単位の差分を取得 (datetime64[ns] /
+        # datetime64[us] / tz-aware / tz-naive すべての環境で正しく動作)。
+        # _DISC_GAP_MULTIPLIER をクラス属性経由で参照 (SSoT 統一)。
+        ts_index = pd.DatetimeIndex(out.index)
+        gaps_sec = np.zeros(len(ts_index), dtype=np.float64)
+        if len(ts_index) > 1:
+            # diff() は最初の要素を NaT として返すので、先頭は 0 にする
+            # .copy() を付けるのは pandas 2.0+ で diff().to_numpy() が
+            # read-only な view を返す場合があるため
+            diffs = ts_index.to_series().diff().dt.total_seconds().to_numpy().copy()
+            diffs[0] = 0.0
+            gaps_sec = diffs
+
+        threshold_sec = freq_seconds * RealtimeFeatureEngine._DISC_GAP_MULTIPLIER
+        out["disc"] = gaps_sec > threshold_sec
         return out
+
+    def _compute_disc_flag(self, tf_name: str, bar_timestamp) -> bool:
+        """
+        [DISC-FLAG SSoT] deque 末尾との時刻差から単発バーの disc を計算する。
+
+        _add_disc_column のスカラー版 — 閾値式は完全一致 (1.5x ルール)。
+        リアルタイム単発バー追加 (poll_m3_bar / resample / gap-fill / warmup_only) の
+        全経路で本メソッドが唯一の disc 計算箇所となる (発見 #60 修正)。
+
+        学習側 s1_1_B_build_ohlcv.py との同値性:
+            学習側 (vectorized): disc[i] = (gap_seconds > expected_seconds * 1.5)
+            本番側 (scalar):     disc    = (gap_sec     > expected_sec * 1.5)
+        両者は数学的に完全一致。検証済み。
+
+        Args:
+            tf_name:       時間足名 (M0.5 / M1 / M3 / M5 / M8 / M15 等)
+            bar_timestamp: 新しいバーのタイムスタンプ (pd.Timestamp)
+
+        Returns:
+            bool: True なら不連続バー (前 close を使わない TR 計算が必要)
+                  先頭バー (前バーなし) または expected_sec=0 (tick足等) は False
+        """
+        prev_ts = self.last_bar_timestamps.get(tf_name)
+        if prev_ts is None:
+            return False  # 先頭バー (前バーがないので連続扱い)
+
+        expected_sec = self._TF_FREQ_SECONDS.get(tf_name, 0)
+        if expected_sec <= 0:
+            return False  # tick足など、想定間隔不明の TF
+
+        # pd.Timestamp 同士の差分は Timedelta、total_seconds() で秒に変換
+        gap_sec = (bar_timestamp - prev_ts).total_seconds()
+        return gap_sec > expected_sec * self._DISC_GAP_MULTIPLIER
 
     def _replace_buffer_from_dataframe(
         self,
@@ -437,7 +923,10 @@ class RealtimeFeatureEngine:
             self.logger.warning(f"_replace_buffer: {tf_name} は管理対象外です。")
             return
 
-        OLS_WINDOW = 2016
+        # [Phase 9d 発見 #63] TF 毎可変 OLS 窓に対応 (Phase 10 設計と整合)。
+        # 学習側 2_G_alpha_neutralizer は M0.5=5760, M1=2880, M3=960, M5=576,
+        # M8=360, M15=192 (2 日案) を使う。本番もこれと一致させる。
+        OLS_WINDOW = self._get_ols_window(tf_name)
         buffer_len = self.lookbacks_by_tf[tf_name]
 
         # [修正] OLS を十分なフルウィンドウ特徴量値で学習するために必要な行数。
@@ -611,13 +1100,40 @@ class RealtimeFeatureEngine:
             raise ValueError("M0.5履歴データに 'timestamp' カラムが見つかりません。")
         m05_history_pd = m05_history_pd.set_index("timestamp")
 
+        # [V=0 GUARD] 学習側 s1_1_B_build_ohlcv.py の filter(tick_count > 0) と
+        # 完全整合させるため、履歴 M0.5 から V=0 ghost bar を除外する。
+        # EA 側 CollectM05Bar の new-bucket 分岐に volume>0 ガードが欠落していた
+        # ため、ProcessHistoryRequest 経由で V=0 stub が混入していた。
+        # M1 以降のリサンプル時 .dropna() は close=NaN しか拾えず、
+        # close=prev_close (finite) の V=0 stub は通過してしまうため、
+        # M0.5 起点でフィルタをかける必要がある。
+        if "volume" in m05_history_pd.columns:
+            _n_before = len(m05_history_pd)
+            m05_history_pd = m05_history_pd[m05_history_pd["volume"] > 0]
+            _n_after = len(m05_history_pd)
+            if _n_before != _n_after:
+                self.logger.info(
+                    f"[V=0 GUARD] M0.5 履歴から V=0 ghost {_n_before - _n_after} 本を除外 "
+                    f"(残: {_n_after} / 元: {_n_before} 本)"
+                )
+
         self.logger.info(f"  -> M0.5 バッファをMT5データから充填中...")
+        # [DISC-FLAG] M1以降と同様に _add_disc_column を適用してから充填する。
+        # MT5直接取得データには disc 列が存在しないため全 False で初期化されていた。
+        # freq=30秒 (M0.5=30秒足) は s1_1_B の TIMEFRAME_FREQ_SECONDS["M0.5"]=30 と完全一致。
+        m05_history_pd = self._add_disc_column(m05_history_pd, freq_seconds=30)
         self._replace_buffer_from_dataframe("M0.5", m05_history_pd, market_proxy_cache)
 
         # M1をM0.5からリサンプリングして生成し、m05_dataframeを構築
+        # [SSoT / Phase 9d 発見 #59] closed='left', label='left' を明示。
+        #   学習側 s1_1_B_build_ohlcv.py L359 の Polars
+        #   `group_by_dynamic("datetime", every=freq, closed="left", label="left")`
+        #   と完全一致させる。pandas のデフォルトも分単位 TF では同じだが、
+        #   pandas バージョン更新でデフォルトが変わった際の Train-Serve Skew を
+        #   未然に防ぐための永続的な保険として明示する。
         self.logger.info(f"  -> M1  をM0.5からリサンプリング中...")
         m1_history_pd = (
-            m05_history_pd.resample("1min")
+            m05_history_pd.resample("1min", closed="left", label="left")
             .agg(
                 {
                     "open": "first",
@@ -638,14 +1154,8 @@ class RealtimeFeatureEngine:
         m05_records = m05_history_pd.reset_index().to_dict("records")
         self.m05_dataframe.extend(m05_records)
 
-        # TF_RESAMPLE_RULES → 想定秒数のマッピング (s1_1_B と完全一致)
-        _freq_seconds_map = {
-            "1min": 60, "3min": 180, "5min": 300, "8min": 480,
-            "15min": 900, "30min": 1800,
-            "1h": 3600, "1H": 3600, "4h": 14400, "4H": 14400,
-            "6h": 21600, "6H": 21600, "12h": 43200, "12H": 43200,
-            "1D": 86400, "1d": 86400,
-        }
+        # [DISC-FLAG SSoT] _freq_seconds_map のローカル定義は撤去 (発見 #60)。
+        # TF 名 → 秒 のマッピングはクラス属性 self._TF_FREQ_SECONDS を使用する。
 
         for tf_name, rule in self.TF_RESAMPLE_RULES.items():
             if tf_name not in self.data_buffers or tf_name in ("M0.5", "M1"):
@@ -653,8 +1163,10 @@ class RealtimeFeatureEngine:
 
             try:
                 self.logger.info(f"  -> {tf_name:<3} をM0.5からリサンプリング中...")
+                # [SSoT / Phase 9d 発見 #59] closed='left', label='left' を明示
+                #   (学習側 s1_1_B と完全一致、pandas デフォルト依存を排除)。
                 resampled_df = (
-                    m05_history_pd.resample(rule)
+                    m05_history_pd.resample(rule, closed="left", label="left")
                     .agg(
                         {
                             "open": "first",
@@ -671,8 +1183,9 @@ class RealtimeFeatureEngine:
                     self.logger.warning(f"{tf_name} のリサンプリング結果が空です。")
                     continue
 
-                # [DISC-FLAG] タイムスタンプ差から不連続フラグを推定
-                expected_sec = _freq_seconds_map.get(rule, 0)
+                # [DISC-FLAG SSoT] タイムスタンプ差から不連続フラグを推定
+                # クラス属性 _TF_FREQ_SECONDS から TF 名で直接秒数を取得
+                expected_sec = self._TF_FREQ_SECONDS.get(tf_name, 0)
                 resampled_df = self._add_disc_column(
                     resampled_df, freq_seconds=expected_sec
                 )
@@ -685,28 +1198,49 @@ class RealtimeFeatureEngine:
 
         self.logger.info("✓ 全バッファの初期充填が完了しました。")
 
+        # [Phase 9b 案 V] smoke test (診断 L2) はここでは呼ばない。
+        # main.py の起動シーケンス側 (フルウォームアップ / スナップショット復帰の
+        # 両経路の合流地点) で `engine.run_smoke_test()` を明示呼び出しすることで、
+        # 起動経路によらず必ず 1 回実行される設計に変更。
+
     def _append_bar_to_buffer(
         self,
         tf_name: str,
         bar_df: pd.DataFrame,
         market_proxy_cache: pd.DataFrame,
-    ) -> None:
+    ) -> bool:
         """
         バッファに新しいバー (DataFrame形式) を追加し、
         純化(OLS)状態を逐次更新する。
+
+        Returns:
+            True: バーが正常に追加された
+            False: 同一タイムスタンプの重複のためスキップした
         """
         if tf_name not in self.data_buffers:
-            return
+            return False
 
         try:
             bar_dict = bar_df.iloc[0].to_dict()
             bar_timestamp = bar_df.index[0]
 
+            # [DEDUP] 同一タイムスタンプの二重追加を防止。
+            # gap-fill(warmup_only)がバーをバッファに追加後、正規のpoll_m3_barパスが
+            # 同じバーを再追加しようとする場合（またはその逆）に発生する。
+            # last_bar_timestamps[tf_name] == bar_timestamp なら既に追加済み → スキップ。
+            if self.last_bar_timestamps.get(tf_name) == bar_timestamp:
+                return False
+
             # 1. OHLCVバッファを更新
             for col in self.OHLCV_COLS:
                 self.data_buffers[tf_name][col].append(bar_dict[col])
-            # [DISC-FLAG] 不連続フラグを書き込む（デフォルトはFalse=連続）
-            disc_flag = bool(bar_dict.get("disc", False))
+            # [DISC-FLAG SSoT] disc は deque 末尾との差分から動的計算する。
+            # 旧実装の bar_dict.get("disc", False) フォールバックは廃止。
+            # - 通常 poll_m3_bar 経路で M0.5 disc が常に False になっていた
+            #   構造的欠陥 (発見 #60、Phase 5 のバグA本質的修正の短時間ギャップ版) を解消
+            # - gap-fill / resample 経路で事前計算された disc は無視 (再計算で同値)
+            # - 学習側 s1_1_B の disc 判定式と完全一致 (1.5x ルール)
+            disc_flag = self._compute_disc_flag(tf_name, bar_timestamp)
             self.data_buffers[tf_name]["disc"].append(disc_flag)
             self.last_bar_timestamps[tf_name] = bar_timestamp
 
@@ -717,10 +1251,14 @@ class RealtimeFeatureEngine:
                 self.is_buffer_filled[tf_name] = True
                 self.logger.info(f"✅ {tf_name} バッファ計算開始 (Best-Effort)。")
 
+            return True
+
         except KeyError as e:
             self.logger.error(f"バーデータ {tf_name} にキーがありません: {e}")
+            return False
         except Exception as e:
             self.logger.error(f"バー {tf_name} の追加に失敗: {e}")
+            return False
 
     def _resample_and_update_buffer(
         self, tf_name: str, rule: str, market_proxy_cache: pd.DataFrame
@@ -763,8 +1301,10 @@ class RealtimeFeatureEngine:
             )
 
             # 2. 抽出したDFのみをリサンプリング
+            # [SSoT / Phase 9d 発見 #59] closed='left', label='left' を明示
+            #   (学習側 s1_1_B と完全一致、pandas デフォルト依存を排除)。
             resampled_df = (
-                new_m05_data.resample(rule)
+                new_m05_data.resample(rule, closed="left", label="left")
                 .agg(
                     {
                         "open": "first",
@@ -796,30 +1336,56 @@ class RealtimeFeatureEngine:
             if len(resampled_df) == 0:
                 return []
 
-            # 2. タイムスタンプ差から disc 推定
-            #    s1_1_B の TIMEFRAME_FREQ_SECONDS と完全一致させる
-            _freq_seconds_map = {
-                "1min": 60, "3min": 180, "5min": 300, "8min": 480,
-                "15min": 900, "30min": 1800, "1h": 3600, "1H": 3600,
-                "4h": 14400, "4H": 14400, "6h": 21600, "6H": 21600,
-                "12h": 43200, "12H": 43200, "1D": 86400, "1d": 86400,
-            }
-            expected_sec = _freq_seconds_map.get(rule, 0)
-            if expected_sec > 0:
-                threshold_ns = int(expected_sec * 1.5 * 1_000_000_000)
-                ts_int = resampled_df.index.astype("int64")
-                gaps = np.diff(ts_int, prepend=ts_int[0])
-                # 先頭バーは便宜上 disc=False (前バーがないので連続扱い)
-                gaps[0] = 0
-                resampled_df["disc"] = gaps > threshold_ns
-            else:
-                resampled_df["disc"] = False
+            # [DISC-FLAG SSoT] resample 後の disc 列付与は撤去 (発見 #60)。
+            # 旧実装ではここでタイムスタンプ差から disc を推定して bar_df["disc"]
+            # に詰めていたが、_append_bar_to_buffer 内の _compute_disc_flag が
+            # deque 末尾との差分から再計算するため重複する。
+            # 計算結果は同値 (両者とも 1.5x ルールで学習側 s1_1_B と一致) のため
+            # 撤去で副作用ゼロ。disc 計算箇所を 1 箇所に集約することで保守性向上。
 
-            if len(resampled_df) < 2:
+            # ─────────────────────────────────────────────────────────────
+            # [Phase 9d 発見 #62] iloc[:-1] による 3 分遅延を解消
+            # ─────────────────────────────────────────────────────────────
+            # 旧実装: `newly_closed_bars = resampled_df.iloc[:-1]`
+            #   → 「resample 結果の最後のバーは形成中」という保守的判定。
+            #   → 案 X (発見 #61, EA から M3 close 時に直近 6 本の M0.5 を送信) を
+            #     導入しても、最後のバー (12:02:30) を含む M3 [12:00, 12:03) bucket
+            #     は label=12:00 で resample の最後に来るため、iloc[:-1] で除外され、
+            #     M3 close 検知は次の M3 通知 (12:06 の 12:05:30 バー到着時) まで
+            #     遅延する。結果: 構造的な 3 分遅延 (シミュレーションで確認済)。
+            #
+            # 新実装: タイムスタンプベースの bucket close 判定。
+            #   bucket_close_ts = m05_dataframe[-1].timestamp + M0.5_freq_sec (= 30s)
+            #     - 最新 M0.5 バー [t, t+30s) の END 時刻 (= 次のバー想定開始時刻)
+            #   bucket [label, label + tf_freq_sec) は次を満たすとき closed:
+            #     label + tf_freq_sec <= bucket_close_ts
+            #   = 「次バーが当該 bucket に追加される余地がない」
+            #
+            # 例: bar 12:02:30 着, M3 検知:
+            #   bucket_close_ts = 12:02:30 + 30s = 12:03:00
+            #   M3 [12:00, 12:03), label=12:00, tf_freq=180s
+            #   12:00 + 180s = 12:03 <= 12:03:00? → YES → closed → 即時 close 検知
+            #
+            # 案 X (EA 6 本送信) と組み合わせて、M3 close 時に学習側と数学的に
+            # 完全等価な OHLCV 集約 + 即時シグナル発火を達成する。
+            # ─────────────────────────────────────────────────────────────
+            if not self.m05_dataframe:
                 return []
+            m05_latest_ts = self.m05_dataframe[-1]["timestamp"]
+            m05_freq_sec = self._TF_FREQ_SECONDS.get("M0.5", 30)
+            bucket_close_ts = m05_latest_ts + pd.Timedelta(seconds=m05_freq_sec)
 
-            # 3. 確定したバーのみを抽出 (形成中 = 最後の行 を除外)
-            newly_closed_bars = resampled_df.iloc[:-1]
+            tf_freq_sec = self._TF_FREQ_SECONDS.get(tf_name, 0)
+            if tf_freq_sec <= 0:
+                # tick足等、想定間隔不明 → 旧来の保守的挙動 (最後を除外)
+                newly_closed_bars = resampled_df.iloc[:-1]
+            else:
+                # bucket [label, label + tf_freq_sec) が closed なのは
+                # label + tf_freq_sec <= bucket_close_ts のとき
+                tf_freq_td = pd.Timedelta(seconds=tf_freq_sec)
+                closed_mask = (resampled_df.index + tf_freq_td) <= bucket_close_ts
+                newly_closed_bars = resampled_df[closed_mask]
+
             new_bars = newly_closed_bars[newly_closed_bars.index > last_known_timestamp]
 
             if new_bars.empty:
@@ -828,13 +1394,16 @@ class RealtimeFeatureEngine:
             new_bar_timestamps = []
 
             # 4. 新しいバーをバッファに追加
+            # _append_bar_to_buffer がTrueを返した（実際に追加された）場合のみカウント。
+            # Falseは重複排除によるスキップ（gap-fillで既に追加済みのバー）。
             for timestamp, row in new_bars.iterrows():
                 bar_df = pd.DataFrame(row).T
                 bar_df.index = [timestamp]
                 bar_df.index.name = "timestamp"
 
-                self._append_bar_to_buffer(tf_name, bar_df, market_proxy_cache)
-                new_bar_timestamps.append(timestamp)
+                added = self._append_bar_to_buffer(tf_name, bar_df, market_proxy_cache)
+                if added:
+                    new_bar_timestamps.append(timestamp)
 
             if new_bar_timestamps:
                 self.logger.debug(
@@ -869,6 +1438,22 @@ class RealtimeFeatureEngine:
         try:
             m05_timestamp = m05_bar["timestamp"]
 
+            # [V=0 GUARD] 学習側 s1_1_B_build_ohlcv.py の filter(tick_count > 0) と
+            # 物理的に同じ挙動を本番側でも確立させる fail-safe ガード。
+            # EA 側 CollectM05Bar の new-bucket 分岐に volume>0 ガードが欠落していた
+            # ため、Phase 9 #54 で導入された OnTimer 強制確定の V=0 stub が
+            # silent → tick 復帰の境界で g_m05_bars に漏出し、Python の M0.5 buffer
+            # に流入することで M3 close を「silent 開始時点の prev_close」で固定
+            # → TP_REVERSED_BY_LAG / Execution Failed の連鎖を引き起こしていた。
+            # EA 側修正後でも本ガードを残すことで、将来の EA 側退行に対する二重防御。
+            _m05_volume = m05_bar.get("volume", 0)
+            if _m05_volume is None or _m05_volume <= 0:
+                self.logger.warning(
+                    f"[V=0 GUARD] V=0 ghost bar を破棄: "
+                    f"ts={m05_timestamp} OHLC={m05_bar.get('close')} V={_m05_volume}"
+                )
+                return signal_list
+
             # 1. M0.5バッファに新しいバーを追加
             # m05_dataframe はリサンプリング起点として使用
             self.m05_dataframe.append(m05_bar)
@@ -898,6 +1483,11 @@ class RealtimeFeatureEngine:
             # ▲▲▲▲▲▲ 【修正ここまで】 ▲▲▲▲▲▲
 
             # 2. M1以外の全時間足バッファをリサンプリング更新
+            # [DEDUP対応] warmup_only=True でも全TFリサンプリングを実行し、
+            # M3/M5/M8/M15 バッファと OLS 状態を正しく更新する。
+            # 重複追加の防止は _append_bar_to_buffer の DEDUP チェックで担保する。
+            # （旧実装: warmup_only=True でリサンプリングをスキップしていたが
+            #   M3/M5 OLS が gap-fill 期間分だけ欠落する問題があった）
             newly_closed_timeframes: Dict[str, List[pd.Timestamp]] = {}
             for tf_name, rule in self.TF_RESAMPLE_RULES.items():
                 if tf_name not in self.data_buffers:
@@ -918,10 +1508,14 @@ class RealtimeFeatureEngine:
 
             m3_timestamp = newly_closed_timeframes["M3"][-1] + pd.Timedelta(minutes=3)
 
-            # M3確定時：全時間足のバッファから強制再計算（学習側と一致）
-            for tf_name in self.ALL_TIMEFRAMES.keys():
+            # [LAG-FIX-3] M3確定時：全時間足のバッファから強制再計算 (並列実行)
+            # 6 TF を ThreadPoolExecutor で並列実行することで、6 TF × ~85ms 直列 (~547ms)
+            # を、最遅 TF 律速 (~110ms) 程度まで短縮する。各 TF の処理は独立なので
+            # thread safety 問題なし。Polars の rayon/Numba njit は GIL を解放するため
+            # CPython でも本物の並列実行が可能。
+            def _recalc_one_tf(tf_name: str):
                 if not self.is_buffer_filled.get(tf_name, False):
-                    continue
+                    return None
                 try:
                     data = {
                         col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
@@ -937,8 +1531,17 @@ class RealtimeFeatureEngine:
                         base_features, tf_name, m3_timestamp, market_proxy_cache
                     )
                     self.latest_features_cache[tf_name] = neutralized
+
+                    return tf_name
                 except Exception as e:
                     self.logger.warning(f"{tf_name} 特徴量キャッシュ更新失敗: {e}")
+                    return None
+
+            # 6 TF を並列実行
+            tf_names = list(self.ALL_TIMEFRAMES.keys())
+            futures = [self._tf_executor.submit(_recalc_one_tf, tf) for tf in tf_names]
+            for future in futures:
+                future.result()
 
             # シグナルチェックはM3のみ
             # [STALE-GUARD] warmup_only=True（差分追いつき中）はシグナル生成を根本からスキップ
@@ -988,25 +1591,38 @@ class RealtimeFeatureEngine:
 
         try:
             data = {
-                "high": np.array(self.data_buffers[tf_name]["high"], dtype=np.float64),
-                "low": np.array(self.data_buffers[tf_name]["low"], dtype=np.float64),
-                "close": np.array(
-                    self.data_buffers[tf_name]["close"], dtype=np.float64
-                ),
+                "high":  np.array(self.data_buffers[tf_name]["high"],  dtype=np.float64),
+                "low":   np.array(self.data_buffers[tf_name]["low"],   dtype=np.float64),
+                "close": np.array(self.data_buffers[tf_name]["close"], dtype=np.float64),
             }
 
-            # [乖離③修正] 学習側(create_proxy_labels)と計算方式を統一:
-            #   学習側: TR.ewm_mean(alpha=1/ATR_PERIOD, adjust=False)  ← Wilder EWM
-            #   旧本番: np.mean(tr[-13:])  ← 単純平均
-            #   新本番: calculate_atr_wilder()  ← core_indicatorsのWilder EWM実装で統一
-            # ATR Ratioのbaselineも学習側に合わせ「ATR(EWM)のrolling mean」を使用
+            # [Phase 7 disc乖離修正] ATR Ratio 用 ATR を disc-aware 版で統一。
+            #
+            # 旧実装の問題:
+            #   calculate_atr_wilder() は disc フラグを参照せず、週末ギャップ越境 TR
+            #   （金曜 close → 月曜 first bar の大幅ジャンプ）をそのまま TR に含む。
+            #   → 本番 ATR が学習側より大きくスパイク
+            #   → スパイクが 480 本ローリング分母 (baseline) に混入
+            #   → 月曜 24 時間、本番 ATR Ratio が学習側より低めに計算される
+            #   → 月曜に本来通過するはずのシグナルが本番で弾かれる (週次 Train-Serve Skew)
+            #
+            # 修正:
+            #   calculate_atr_wilder_disc_aware() を使用。
+            #   学習側 create_proxy_labels の TR 計算式
+            #     pl.when(disc).then(H-L).otherwise(max(H-L, |H-prev_close|, |L-prev_close|))
+            #     .ewm_mean(alpha=1/period, adjust=False)
+            #   と完全一致する。seed=TR[0]、返却型 np.ndarray で baseline 計算にも使用可能。
+            #
+            # 注意: SL/TP バリア幅の計算は引き続き calculate_barrier_atr() を使用（責務分離）。
             high, low, close = data["high"], data["low"], data["close"]
+            disc_arr = np.array(self.data_buffers[tf_name]["disc"], dtype=np.bool_)
             if len(close) > 1:
-                # Wilder EWM ATR（学習側と同一）
-                atr_arr = calculate_atr_wilder(
+                # [Phase 7 修正] disc-aware Wilder EWM ATR（学習側と完全一致）
+                atr_arr = calculate_atr_wilder_disc_aware(
                     high.astype(np.float64),
                     low.astype(np.float64),
                     close.astype(np.float64),
+                    disc_arr,
                     self.ATR_CALC_PERIOD,
                 )
                 atr_value = float(atr_arr[-1]) if len(atr_arr) > 0 and np.isfinite(atr_arr[-1]) else 0.0
@@ -1140,7 +1756,9 @@ class RealtimeFeatureEngine:
         """
         from datetime import timezone
 
-        OLS_WINDOW = 2016
+        # [Phase 9d 発見 #63] TF 毎可変 OLS 窓 (Phase 10 設計と整合)。
+        # blueprint.NEUTRALIZATION_CONFIG["HF"]["window_per_tf"] が SSoT。
+        OLS_WINDOW = self._get_ols_window(tf_name)
 
         try:
             search_ts = timestamp
@@ -1149,7 +1767,11 @@ class RealtimeFeatureEngine:
             else:
                 search_ts = search_ts.astimezone(timezone.utc)
 
-            # 重複除去・ソートしてからffill検索
+            # [プロキシ取得] 学習側2_Gのjoin_asof(strategy="backward")+fill_null(0.0)と完全一致。
+            # join_asof(strategy="backward") = 各行タイムスタンプ以前で最新のプロキシ値 = ffill
+            # fill_null(0.0) = M5バーが1件も存在しない履歴先頭のみ0.0
+            # → get_indexer(method="ffill") + idx==-1時のみ0.0 が完全等価。
+            # 「M5未確定=0.0」は誤り。M5未確定時は直前の確定M5値をffillで使うのが正しい。
             proxy_cache_unique = market_proxy_cache[
                 ~market_proxy_cache.index.duplicated(keep="last")
             ].sort_index()
@@ -1241,7 +1863,9 @@ class RealtimeFeatureEngine:
 
         処理フロー:
             1. proxy_feature_buffers からウィンドウ分の x_arr / y_arr を抽出
-            2. neutralize_ols(y_arr, x_arr, window=2016, min_periods=30) を呼び出し
+            2. neutralize_ols 相当の incremental OLS を実行
+               (window は TF 毎に blueprint.NEUTRALIZATION_CONFIG から取得、
+                Phase 9d 発見 #63 の修正でハードコード 2016 を撤去)
             3. 結果配列の末尾要素 [-1] を最新の純化済み値として採用
         """
         neutralized_features: Dict[str, float] = {}
@@ -1295,31 +1919,123 @@ class RealtimeFeatureEngine:
         self, data: Dict[str, np.ndarray], tf_name: str
     ) -> Dict[str, float]:
         """
-        【特徴量ルーター：完全カプセル化対応版】
-        各モジュール（1A〜1F）のクラスメソッドにデータを渡し、
-        完成した特徴量辞書を一括で受け取ってマージする。
-        """
-        features = {}
+        【Phase 9b 改修版: 司令塔統合 .select()】
 
+        各モジュール (1A〜1F) の `_build_polars_pieces` から
+        (columns, exprs, layer2) を収集し、統合 DataFrame に対する
+        単一の `.select()` で全 505 特徴量を一括計算する。
+
+        効果:
+            - 旧 (Phase 9 / Step B): 6 モジュール × `df.lazy().select(exprs).tail(1).collect()`
+              → FFI overhead × 6 / TF
+            - 新 (Phase 9b): 全モジュールの式を 1 つの DataFrame に対して .select()
+              → FFI overhead × 1 / TF (期待: 各 TF 75-110ms → 30-50ms)
+
+        AI 分布への影響:
+            なし。Polars クエリープランナーは各 alias 式を独立に評価するため、
+            統合 .select() でも各特徴量の数値は単独 .select() と完全一致する
+            (CSE で重複サブグラフは 1 度しか計算されない)。
+
+        QA 振り分け:
+            プレフィックス e1a_/e1b_/.../e1f_ で qa_states[tf_name][module_id] を
+            参照。e1d_sample_weight / e1e_sample_weight は QA 対象外
+            (学習側 base_columns 扱いと一致、Phase 5 #36)。
+        """
         # [乖離①修正] qa_stateとlookback_barsを時間足に合わせて渡す
         tf_qa = self.qa_states.get(tf_name, {})
         lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
 
-        # 1. 各カテゴリのクラスにデータを渡し、完成した辞書を受け取って結合
+        features: Dict[str, float] = {}
+
+        # ---------------------------------------------------------------
+        # 1. 各モジュールから (columns, exprs, layer2) を収集
+        # ---------------------------------------------------------------
         try:
-            features.update(FeatureModule1A.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1A")))
-            features.update(FeatureModule1B.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1B")))
-            features.update(FeatureModule1C.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1C")))
-            features.update(FeatureModule1D.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1D")))
-            features.update(FeatureModule1E.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1E")))
-            features.update(FeatureModule1F.calculate_features(data, lookback_bars=lb, qa_state=tf_qa.get("1F")))
+            cols_a, exprs_a, l2_a = FeatureModule1A._build_polars_pieces(data, lb)
+            cols_b, exprs_b, l2_b = FeatureModule1B._build_polars_pieces(data, lb)
+            cols_c, exprs_c, l2_c = FeatureModule1C._build_polars_pieces(data, lb)
+            cols_d, exprs_d, l2_d = FeatureModule1D._build_polars_pieces(data, lb)
+            cols_e, exprs_e, l2_e = FeatureModule1E._build_polars_pieces(data, lb)
+            cols_f, exprs_f, l2_f = FeatureModule1F._build_polars_pieces(data, lb)
         except Exception as e:
             self.logger.error(
-                f"ベース特徴量の計算中にエラーが発生しました ({tf_name}): {e}",
+                f"_build_polars_pieces 収集中にエラー ({tf_name}): {e}",
                 exc_info=True,
             )
+            cols_a = cols_b = cols_c = cols_d = cols_e = cols_f = {}
+            exprs_a = exprs_b = exprs_c = exprs_d = exprs_e = exprs_f = []
+            l2_a    = l2_b    = l2_c    = l2_d    = l2_e    = l2_f    = {}
 
-        # 2. 純化用プロキシ (必須) の計算
+        # ---------------------------------------------------------------
+        # 2. 統合 columns/exprs/layer2 を構築
+        #
+        # 列名衝突は dict.update で同名 key 上書き → 同値なので問題なし。
+        # 共通列 (close/high/low/open/volume) と __temp_atr_13 は複数モジュールで
+        # 同じ値を入れているため、上書きしても影響なし。
+        # 1F は columns/exprs が空なので何も寄与しない (layer2 のみマージ)。
+        # ---------------------------------------------------------------
+        all_columns: Dict[str, np.ndarray] = {
+            **cols_a, **cols_b, **cols_c, **cols_d, **cols_e, **cols_f,
+        }
+        all_exprs: List[pl.Expr] = (
+            exprs_a + exprs_b + exprs_c + exprs_d + exprs_e + exprs_f
+        )
+        all_layer2: Dict[str, float] = {
+            **l2_a, **l2_b, **l2_c, **l2_d, **l2_e, **l2_f,
+        }
+
+        # ---------------------------------------------------------------
+        # 3. 統合 DataFrame で単一 .select() を実行 (FFI overhead 1 回)
+        # ---------------------------------------------------------------
+        if all_columns and all_exprs:
+            try:
+                df = pl.DataFrame(all_columns)
+                polars_results = (
+                    df.lazy().select(all_exprs).tail(1).collect().to_dicts()[0]
+                )
+                for k, v in polars_results.items():
+                    features[k] = float(v) if v is not None else np.nan
+            except Exception as e:
+                self.logger.error(
+                    f"統合 .select() 実行中にエラー ({tf_name}): {e}",
+                    exc_info=True,
+                )
+
+        # Layer 2 (Numba UDF 直接呼び結果 + 1F の全特徴量) をマージ
+        features.update(all_layer2)
+
+        # ---------------------------------------------------------------
+        # 4. QA 処理 (プレフィックスでモジュール振り分け)
+        #
+        # e1a_/e1b_/.../e1f_ 始まりの特徴量を該当モジュールの QAState で処理。
+        # sample_weight (e1d_/e1e_) は QA 対象外 (Phase 5 #36)。
+        # ---------------------------------------------------------------
+        # sample_weight は学習側 base_columns 扱いで QA 対象外
+        _SAMPLE_WEIGHT_KEYS = ("e1d_sample_weight", "e1e_sample_weight")
+
+        qa_results: Dict[str, float] = {}
+        for k, v in features.items():
+            if k in _SAMPLE_WEIGHT_KEYS:
+                # QA をスキップ。inf/NaN はそのまま (sample_weight はそもそも有限)
+                qa_results[k] = v
+                continue
+
+            # プレフィックスから モジュール ID を抽出 ("e1a_..." → "1A")
+            prefix = k.split("_", 1)[0]  # "e1a", "e1b", ...
+            if len(prefix) == 3 and prefix.startswith("e1"):
+                module_id = prefix[1:].upper()  # "1A", "1B", ...
+                qa_state = tf_qa.get(module_id)
+                if qa_state is not None:
+                    qa_results[k] = qa_state.update_and_clip(k, v)
+                    continue
+
+            # プレフィックス不一致 / qa_state 不在 → inf/NaN フォールバックのみ
+            qa_results[k] = v if np.isfinite(v) else 0.0
+
+        features = qa_results
+
+        # ---------------------------------------------------------------
+        # 5. 純化用プロキシ (必須) の計算
         # [TRAIN-SERVE-FIX] 学習側 s1_1_C_enrich.py と完全一致させる:
         #   VOLATILITY_WINDOW = 20, VOLUME_WINDOW = 50, MOMENTUM_WINDOW = 5
         #   log_return         = np.log(close[t] / close[t-1])
@@ -1327,6 +2043,7 @@ class RealtimeFeatureEngine:
         #   price_momentum     = close[t] / close[t-5] - 1   (5本前比リターン)
         #   rolling_avg_volume = volume.rolling(50, min_periods=1).mean()
         #   volume_ratio       = volume / rolling_avg_volume
+        # ---------------------------------------------------------------
         VOLATILITY_WINDOW = 20
         VOLUME_WINDOW = 50
         MOMENTUM_WINDOW = 5

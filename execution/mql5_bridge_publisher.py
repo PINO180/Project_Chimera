@@ -348,6 +348,17 @@ class MQL5BridgePublisherV3:
             # タイムスタンプ変換 (MQL5 time は Unix Timestamp)
             df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
+            # [75分ギャップ修正] EA側の①CopyTicksRange+②g_m05_bars合成で時刻逆転が起こりうる。
+            # CopyTicksRange由来の末尾(例:13:37:00)の後ろにg_m05_barsの先頭(例:12:00:00)が
+            # 単純appendされるため、Python側がソートせずiloc[-1]を参照すると
+            # g_m05_barsの最後尾が「最新」として扱われる。
+            # ソート+重複排除でEAの動作状態によらず常に正しい時系列を保証する。
+            df = (
+                df.sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"], keep="last")
+                .reset_index(drop=True)
+            )
+
             logger.info(f"✓ 全データ受信完了: {len(df)} 行 (期待値: {total_bars})")
 
             # 4. 完了確認通知 (制御チャネル)
@@ -465,22 +476,69 @@ class MQL5BridgePublisherV3:
         except (KeyError, TypeError):
             return False
 
-    def poll_m3_bar(self, timeout_ms: int = 1000) -> Optional[Dict[str, Any]]:
+    def poll_m3_bar(self, timeout_ms: int = 1000) -> Optional[List[Dict[str, Any]]]:
         """
         M3確定通知をPULLソケットで受け取る。
         timeout_ms以内に通知が来なければNoneを返す。
+
+        ─────────────────────────────────────────────────────────────
+        [Phase 9d 発見 #61] 戻り値型を Optional[Dict] → Optional[List[Dict]] に変更
+        ─────────────────────────────────────────────────────────────
+        旧: 単一 M0.5 dict を返却 (= EA は g_m05_bars の最新 1 本のみ送信)。
+            → m05_dataframe が steady-state で sparse 化し、
+              M3 OHLCV が学習側と乖離する構造的バグ。
+
+        新: 直近 6 本 (EA 設定上限) の M0.5 dict のリストを返却。
+            EA が JSON 配列 {"spread":..., "bars":[{...}, ...]} で送信し、
+            Python 側は時系列順のリストを受け取って順次
+            process_new_m05_bar に流す。
+
+        後方互換:
+            旧形式 ({"time":..., "open":..., ..., "spread":...}) で受信した
+            場合も自動検知して 1 要素リストとして返す。Phase 9d デプロイ前の
+            EA との互換用フェイルセーフ。
+
+        Returns:
+            Optional[List[Dict[str, Any]]]:
+                - 通常: 6 本の M0.5 dict (時系列順)
+                - EA 起動直後の buf_size < 6 の場合: 利用可能分のみ
+                - 全件 SPIKE-GUARD で除外された場合: None
+                - timeout: None
         """
         if not self.is_connected or self.m3_notify_socket is None:
             return None
         try:
             if self.m3_notify_socket.poll(timeout_ms):
                 msg = self.m3_notify_socket.recv_string()
-                bar = json.loads(msg)
-                bar["timestamp"] = datetime.fromtimestamp(bar["time"], tz=timezone.utc)
-                # [SPIKE-GUARD] 受信バーのバリデーション
-                if not self._validate_bar(bar):
-                    return None
-                return bar
+                payload = json.loads(msg)
+
+                # [Phase 9d 発見 #61] payload format 判別
+                if "bars" in payload:
+                    # 新形式: {"spread":..., "bars":[{"time":..., ...}, ...]}
+                    spread = payload.get("spread", 36.0)
+                    raw_bars = payload["bars"]
+                else:
+                    # 旧形式: {"time":..., ..., "spread":...}
+                    # (Phase 9d デプロイ前の EA との後方互換)
+                    spread = payload.pop("spread", 36.0)
+                    raw_bars = [payload]
+
+                result = []
+                for bar in raw_bars:
+                    bar["timestamp"] = datetime.fromtimestamp(
+                        bar["time"], tz=timezone.utc
+                    )
+                    bar["spread"] = spread
+                    # [SPIKE-GUARD] 受信バーのバリデーション
+                    if self._validate_bar(bar):
+                        result.append(bar)
+                    else:
+                        logger.warning(
+                            f"M3通知内のバー (ts={bar['timestamp']}) が "
+                            f"SPIKE-GUARD で除外されました"
+                        )
+
+                return result if result else None
             return None
         except Exception as e:
             logger.error(f"M3通知受信エラー: {e}")

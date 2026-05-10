@@ -110,6 +110,76 @@ def calculate_atr_wilder(
     return atr
 
 
+def calculate_atr_wilder_disc_aware(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    disc: np.ndarray,
+    period: int,
+) -> np.ndarray:
+    """
+    Disc-aware Wilder EWM ATR — ATR Ratio フィルター計算専用。
+
+    [新設理由 — Phase 7 disc乖離修正]
+    calculate_atr_wilder() は disc フラグを持たないため、週末ギャップ越境 TR
+    （金曜 close → 月曜 high/low の大幅ジャンプ）をそのまま TR に含む。
+    これにより本番の ATR および baseline（480本平均）が学習側より大きくスパイクし、
+    月曜24時間にわたって ATR Ratio が学習側より低めに計算される構造的乖離が発生する。
+
+    本関数は学習側 create_proxy_labels の TR 計算式:
+        pl.when(disc).then(H-L).otherwise(max(H-L, |H-prev_close|, |L-prev_close|))
+        .ewm_mean(alpha=1/period, adjust=False)   ← Wilder EWM, seed=TR[0]
+    と完全一致する配列返却型の実装。
+
+    calculate_barrier_atr() との違い:
+    - 返却型: float ではなく np.ndarray（baseline 計算のために全要素が必要）
+    - シード方式: SMA ではなく TR[0]（学習側 Polars EWM の adjust=False と一致）
+    - 用途: ATR Ratio 計算（シグナルフィルター）専用。SL/TP 幅には calculate_barrier_atr を使う
+
+    Args:
+        high, low, close : OHLC バッファ (np.ndarray)
+        disc             : 不連続フラグ配列 (True=ギャップあり、前 Close を使わない)
+        period           : ATR 期間（ATR Ratio 計算では ATR_CALC_PERIOD=13 を渡す）
+
+    Returns:
+        np.ndarray: shape=(n,), 各時点の ATR 値。
+                    calculate_atr_wilder() と同形式で、baseline 計算（rolling mean）に使用可能。
+    """
+    n = len(high)
+    atr = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return atr
+
+    # disc 配列長の整合性保証（バッファ長と異なる場合に備える）
+    n_disc = len(disc)
+    if n_disc < n:
+        disc = np.concatenate([np.zeros(n - n_disc, dtype=np.bool_), disc])
+    elif n_disc > n:
+        disc = disc[-n:]
+
+    # True Range 計算 — disc=True の足は H-L のみ（学習側と同一）
+    tr = np.zeros(n, dtype=np.float64)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        if disc[i]:
+            # [DISC-FLAG] 週末ギャップ等の不連続点: 前 Close を参照しない
+            tr[i] = hl
+        else:
+            hc = abs(high[i] - close[i - 1])
+            lc = abs(low[i] - close[i - 1])
+            tr[i] = max(hl, hc, lc)
+
+    # Wilder EWM — シード = TR[0]（Polars ewm_mean(adjust=False) と等価）
+    # ATR[0] = TR[0]
+    # ATR[i] = ATR[i-1] * (period-1)/period + TR[i] / period
+    atr[0] = tr[0]
+    for i in range(1, n):
+        atr[i] = atr[i - 1] * (period - 1.0) / period + tr[i] / period
+
+    return atr
+
+
 def calculate_barrier_atr(
     high: np.ndarray,
     low: np.ndarray,

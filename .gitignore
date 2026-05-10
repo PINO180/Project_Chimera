@@ -42,4 +42,5 @@ echo "logs/" >> .gitignore
 *.db
 *.duckdb
 duckdb_temp/
-.tmp/
+.tmp/*.pkl
+*.parquet

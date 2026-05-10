@@ -1,23 +1,49 @@
 # realtime_feature_engine_1C_technical.py
 # Project Cimera V5 - Feature Module 1C (Technical Indicators)
 #
-# 【Step 改訂】学習側との完全一致修正
-#   - RSI系全バリアント追加 (rsi_14/21/30/50, momentum, stochastic_rsi, divergence)
-#   - MACD系全バリアント追加 (12_26, 5_35, 19_39 + signal/histogram)
-#   - BB系全バリアント追加 (period=[20,30,50] × std=[2,2.5,3])
-#   - ATR系全バリアント追加 (atr_13/21/34/55, pct, trend, volatility)
-#   - Oscillator系全追加 (stoch全, ADX全, DI+/-, Aroon全, Williams %R全)
-#   - Momentum系全追加 (dpo, trix, uo, tsi, roc, momentum全, STC, coppock, kst_signal, price_oscillator)
-#   - MA系全追加 (sma/deviation, ema/deviation, wma, hma, kama, trend_slope, trend_strength, trend_consistency)
+# ==================================================================
+# 【Phase 9b 改修】司令塔統合 .select() 対応 (FFI overhead 削減)
+# ==================================================================
+#
+# 目的: Phase 9 (Step B) で達成した Polars 直呼びによる学習側との
+#       ビット完全一致を保ったまま、6 モジュールの Polars 式を司令塔
+#       で 1 回の .select() に統合できるよう構造を分解する。
+#
+# 【Phase 9b の改修】
+#   追加: `_build_polars_pieces(data, lookback_bars) -> (columns, exprs, layer2)`
+#     - columns: DataFrame に追加する列辞書 (close/high/low/open/volume +
+#                Numba UDF 事前計算結果列 __rsi_14, __atr_13_safe 等)
+#     - exprs:   Polars 式リスト (各 alias は最終特徴量名 e1c_*)
+#     - layer2:  Polars 経由しないスカラー特徴量 (1C では RVI フォールバックのみ)
+#   変更: `calculate_features` は `_build_polars_pieces` を呼んで単独計算する
+#         薄いラッパーへ。後方互換完全維持。
+#
+# 【1C の特徴】
+#   1C は全 191 特徴量がきれいに 2 層に分かれている:
+#     - Numba UDF の出力を事前計算して列化 (__rsi_*, __atr_*_raw, __adx_*,
+#       __di_*, __aroon_*, __williams_*, __stoch_*, __trix_*, __tsi_*, __uo,
+#       __wma_*, __hma_*, __kama_*)
+#     - 全特徴量を Polars 式で表現 (BB/MACD/STC/KST/Coppock/SMA/EMA/RVI 等)
+#   この構造は Phase 9b の `_build_polars_pieces` に素直にマッピングできる。
+#   1B の t_dist_scale_50 のような Layer 1/Layer 2 の cross-dependency は無い。
+#
+# 【SSoT 階層】(Phase 9 から不変)
+#   Layer 1 (rolling 統計): Polars Rust エンジン
+#   Layer 2 (Numba UDF):    core_indicators (SSoT、列化して Polars に注入)
+#
+# 【保持される過去の修正】
+#   ・atr_ok ガード廃止 → __atr_13_safe = atr_13_raw + 1e-10 統一 (Phase 9 #52)
+#   ・Williams %R: late binding バグ解消後の period=14/28/56 個別計算
+#   ・atr_pct のゼロ保護: close + 1e-10 で学習側と完全一致
+#   ・STC の half_life EMA + span=3 EMA + 2nd Stochastic + Final Smooth 完全実装
+# ==================================================================
 
 import sys
-import math
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
-import numba as nb
-from numba import njit
+import polars as pl
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import blueprint as config
@@ -26,9 +52,7 @@ from core_indicators import (
     calculate_atr_wilder,
     calculate_rsi_wilder,
     calculate_adx,
-    # [SSoT 統一] Engine 1C の Numba 関数 (案3: 案-3完全SSoT)
-    # core_indicators の guvectorize 版を import → out 引数省略で配列を返す形式で利用可
-    # (旧: 本ファイル内で _arr サフィックス付き等で重複定義 = SSoT 違反)
+    # [SSoT 統一] Engine 1C の Numba 関数 (案-3完全SSoT)
     calculate_wma_numba,
     calculate_hma_numba,
     calculate_kama_numba,
@@ -44,112 +68,28 @@ from core_indicators import (
 
 
 # ==================================================================
-# 共通ヘルパー関数群
-# ==================================================================
-
-@njit(fastmath=False, cache=True)
-def _window(arr: np.ndarray, window: int) -> np.ndarray:
-    if window <= 0:
-        return np.empty(0, dtype=arr.dtype)
-    if window > len(arr):
-        return arr
-    return arr[-window:]
-
-@njit(fastmath=False, cache=True)
-def _last(arr: np.ndarray) -> float:
-    if len(arr) == 0:
-        return np.nan
-    return float(arr[-1])
-
-@njit(fastmath=False, cache=True)
-def _ema(arr: np.ndarray, span: int) -> np.ndarray:
-    n = len(arr)
-    out = np.zeros(n, dtype=np.float64)
-    if n == 0:
-        return out
-    alpha = 2.0 / (span + 1.0)
-    out[0] = arr[0]
-    for i in range(1, n):
-        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
-    return out
-
-@njit(fastmath=False, cache=True)
-def _rolling_mean(arr: np.ndarray, window: int) -> np.ndarray:
-    """NaN-aware SMA（Polars rolling_mean 準拠）"""
-    n = len(arr)
-    out = np.full(n, np.nan)
-    if window <= 0 or n < window:
-        return out
-    for i in range(window - 1, n):
-        has_nan = False
-        s = 0.0
-        for j in range(i - window + 1, i + 1):
-            if np.isnan(arr[j]):
-                has_nan = True
-                break
-            s += arr[j]
-        if not has_nan:
-            out[i] = s / window
-    return out
-
-@njit(fastmath=False, cache=True)
-def rolling_mean_numba(arr: np.ndarray, window: int) -> float:
-    n = len(arr)
-    if n < window:
-        return np.nan
-    s = 0.0
-    for i in range(n - window, n):
-        s += arr[i]
-    return s / window
-
-
-# ==================================================================
 # QAState — 学習側 apply_quality_assurance の等価実装
+# (1A/1B と完全に同一の実装。Phase 9b では変更なし。)
 # ==================================================================
 
 class QAState:
-    """
-    【修正4】学習側 apply_quality_assurance のリアルタイム等価実装。
-
-    学習側の処理（Polars LazyFrame 全系列一括）:
-        ewm_mean = col.ewm_mean(half_life=HL, adjust=False, ignore_nulls=True)
-        ewm_std  = col.ewm_std (half_life=HL, adjust=False, ignore_nulls=True)
-        result   = col.fill_nan(0.0).fill_null(0.0).clip(ewm_mean - 5*ewm_std, ewm_mean + 5*ewm_std)
-
-    Polars ewm_mean(adjust=False) の再帰式:
-        alpha = 1 - exp(-ln2 / half_life)
-        EWM_mean[t] = alpha * x[t] + (1-alpha) * EWM_mean[t-1]  (NaN はスキップ)
-    Polars ewm_std(adjust=False) の再帰式:
-        EWM_var[t] = (1-alpha) * (EWM_var[t-1] + alpha * (x[t] - EWM_mean[t-1])^2)
-
-    使い方:
-        qa_state = FeatureModule1C.QAState(lookback_bars=1440)
-        for bar in live_stream:
-            features = FeatureModule1C.calculate_features(data_window, 1440, qa_state)
+    """学習側 apply_quality_assurance のリアルタイム等価実装。
+    詳細は realtime_feature_engine_1A_statistics.py の QAState を参照。
     """
 
     def __init__(self, lookback_bars: int = 1440):
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
-        # bias=False 補正用: Polars ewm_std は t バー目に sqrt(1/(1-(1-alpha)^(2t))) を乗じる。
-        self._ewm_n: Dict[str, int] = {}  # 有効値の累積更新回数（bias 補正に使用）
+        self._ewm_n: Dict[str, int] = {}
 
     def update_and_clip(self, key: str, raw_val: float) -> float:
-        """1特徴量の raw_val に QA処理を適用して返す（学習側と完全一致）。"""
         alpha = self.alpha
 
-        # 【inf処理修正】学習側の挙動を再現:
-        #   学習側: EWMは元col（inf含む）で計算（ignore_nulls=TrueでinfはNaN扱いスキップ）
-        #           fill_nan(0.0).fill_null(0.0).clip() → infはclipでupper/lowerにclip
-        #   本番側旧: inf → 0.0 変換後 EWMに投入（学習側と不一致）
-        #   本番側新: inf を先に記録し、EWMはNaNとしてスキップ。
-        #             clip時に +inf → upper_bound, -inf → lower_bound で置き換える。
         is_pos_inf = np.isposinf(raw_val)
         is_neg_inf = np.isneginf(raw_val)
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
-        # EWM 状態更新（ignore_nulls=True 相当）
         if key not in self._ewm_mean:
             if np.isnan(ewm_input):
                 return 0.0
@@ -161,16 +101,13 @@ class QAState:
             if not np.isnan(ewm_input):
                 prev_mean = self._ewm_mean[key]
                 prev_var  = self._ewm_var[key]
-                new_mean  = alpha * ewm_input + (1.0 - alpha) * prev_mean
-                new_var   = (1.0 - alpha) * (prev_var + alpha * (ewm_input - prev_mean) ** 2)
+                new_mean = alpha * ewm_input + (1.0 - alpha) * prev_mean
+                new_var  = (1.0 - alpha) * (prev_var + alpha * (ewm_input - prev_mean) ** 2)
                 self._ewm_mean[key] = new_mean
                 self._ewm_var[key]  = new_var
                 self._ewm_n[key]    = self._ewm_n.get(key, 0) + 1
 
-        # ±5σ クリップ（bias補正付き）
-        # Polars ewm_std(adjust=False, bias=False) と完全一致させる:
-        #   m = n - 1, sum_w2 = α²(1-r2^m)/(1-r2) + r2^m, bias_factor_var = 1/(1-sum_w2)
-        ewm_mean  = self._ewm_mean[key]
+        ewm_mean = self._ewm_mean[key]
         n_updates = self._ewm_n.get(key, 1)
         if n_updates <= 1:
             ewm_std = 0.0
@@ -186,10 +123,9 @@ class QAState:
                 ewm_std = np.sqrt(max(self._ewm_var[key] * bias_factor_var, 0.0))
             else:
                 ewm_std = 0.0
-        lower     = ewm_mean - 5.0 * ewm_std
-        upper     = ewm_mean + 5.0 * ewm_std
+        lower = ewm_mean - 5.0 * ewm_std
+        upper = ewm_mean + 5.0 * ewm_std
 
-        # 【修正済み】Option B: チェック順序入れ替え
         if is_pos_inf:
             return float(upper) if np.isfinite(upper) else 0.0
         if is_neg_inf:
@@ -197,13 +133,9 @@ class QAState:
         if np.isnan(raw_val):
             return 0.0
 
-        clipped  = float(np.clip(raw_val, lower, upper))
+        clipped = float(np.clip(raw_val, lower, upper))
         return clipped if np.isfinite(clipped) else 0.0
 
-
-# ==================================================================
-# Numba UDF群（学習側と完全同一）
-# ==================================================================
 
 # ==================================================================
 # メイン計算クラス
@@ -211,8 +143,446 @@ class QAState:
 
 class FeatureModule1C:
 
-    # 外部から FeatureModule1C.QAState としてアクセス可能にする
     QAState = QAState
+
+    @staticmethod
+    def _build_polars_pieces(
+        data: Dict[str, np.ndarray],
+        lookback_bars: int = 1440,
+    ) -> Tuple[Dict[str, np.ndarray], List[pl.Expr], Dict[str, float]]:
+        """
+        統合 .select() 用の 3 要素を返す。
+        司令塔は本メソッドを直接呼び、全 6 モジュールから収集した
+        columns/exprs を統合 DataFrame で 1 度の .select() で計算する。
+
+        Returns:
+            columns: Dict[str, np.ndarray]
+                DataFrame に追加する列辞書。共通列 (close/high/low/open/volume) と
+                1C 固有の Numba UDF 事前計算結果列 (__rsi_*, __atr_*_safe 等)。
+            exprs: List[pl.Expr]
+                Polars 式リスト。各 alias は最終特徴量名 (e1c_*)。
+            layer2: Dict[str, float]
+                Polars 経由しないスカラー特徴量 (1C では RVI フォールバックのみ)。
+        """
+        # ---------------------------------------------------------
+        # 入力配列の準備
+        # ---------------------------------------------------------
+        _empty = np.array([], dtype=np.float64)
+        close_arr  = np.asarray(data.get("close",  _empty), dtype=np.float64)
+        if len(close_arr) == 0:
+            return {}, [], {}
+
+        high_arr   = np.asarray(data.get("high",   _empty), dtype=np.float64)
+        low_arr    = np.asarray(data.get("low",    _empty), dtype=np.float64)
+        volume_arr = np.asarray(data.get("volume", _empty), dtype=np.float64)
+        open_arr   = np.asarray(data.get("open",   _empty), dtype=np.float64)
+
+        n = len(close_arr)
+        nan_arr = np.full(n, np.nan, dtype=np.float64)
+
+        # ---------------------------------------------------------
+        # ATR 配列を全期間分事前計算 (学習側 map_batches と等価)
+        # 学習側は scale_by_atr(target, atr_raw) を使うため + 1e-10 はゼロ保護用。
+        # 本番側では __atr_13_safe = atr_13_raw + 1e-10 を列化して
+        # `target / __atr_13_safe` で割れば scale_by_atr と完全一致 (Phase 9 #52)。
+        # ---------------------------------------------------------
+        if len(high_arr) > 0 and len(low_arr) > 0:
+            atr_13_raw = calculate_atr_wilder(high_arr, low_arr, close_arr, 13)
+            atr_21_raw = calculate_atr_wilder(high_arr, low_arr, close_arr, 21)
+            atr_34_raw = calculate_atr_wilder(high_arr, low_arr, close_arr, 34)
+            atr_55_raw = calculate_atr_wilder(high_arr, low_arr, close_arr, 55)
+        else:
+            atr_13_raw = nan_arr.copy()
+            atr_21_raw = nan_arr.copy()
+            atr_34_raw = nan_arr.copy()
+            atr_55_raw = nan_arr.copy()
+
+        atr_13_safe = atr_13_raw + 1e-10  # scale_by_atr 等価
+
+        # ---------------------------------------------------------
+        # 全 Numba UDF を事前計算 (学習側 map_batches と等価、配列を返す)
+        # ---------------------------------------------------------
+        # RSI
+        rsi_14_arr = calculate_rsi_wilder(close_arr, 14)
+        rsi_21_arr = calculate_rsi_wilder(close_arr, 21)
+        rsi_30_arr = calculate_rsi_wilder(close_arr, 30)
+        rsi_50_arr = calculate_rsi_wilder(close_arr, 50)
+
+        # ADX / DI / Aroon / Williams / Stochastic (high/low 必要)
+        if len(high_arr) > 0 and len(low_arr) > 0:
+            adx_13_arr = calculate_adx(high_arr, low_arr, close_arr, 13)
+            adx_21_arr = calculate_adx(high_arr, low_arr, close_arr, 21)
+            adx_34_arr = calculate_adx(high_arr, low_arr, close_arr, 34)
+            di_p_13, di_m_13 = _calculate_di_wilder(high_arr, low_arr, close_arr, 13)
+            di_p_21, di_m_21 = _calculate_di_wilder(high_arr, low_arr, close_arr, 21)
+            di_p_34, di_m_34 = _calculate_di_wilder(high_arr, low_arr, close_arr, 34)
+
+            aroon_u_14 = calculate_aroon_up_numba(high_arr, 14)
+            aroon_u_25 = calculate_aroon_up_numba(high_arr, 25)
+            aroon_u_50 = calculate_aroon_up_numba(high_arr, 50)
+            aroon_d_14 = calculate_aroon_down_numba(low_arr, 14)
+            aroon_d_25 = calculate_aroon_down_numba(low_arr, 25)
+            aroon_d_50 = calculate_aroon_down_numba(low_arr, 50)
+
+            williams_14 = calculate_williams_r_numba(high_arr, low_arr, close_arr, 14)
+            williams_28 = calculate_williams_r_numba(high_arr, low_arr, close_arr, 28)
+            williams_56 = calculate_williams_r_numba(high_arr, low_arr, close_arr, 56)
+
+            stoch_k_14_3_3 = calculate_stochastic_numba(high_arr, low_arr, close_arr, 14, 3, 3)
+            stoch_k_21_5_5 = calculate_stochastic_numba(high_arr, low_arr, close_arr, 21, 5, 5)
+            stoch_k_9_3_3  = calculate_stochastic_numba(high_arr, low_arr, close_arr, 9,  3, 3)
+        else:
+            adx_13_arr = adx_21_arr = adx_34_arr = nan_arr.copy()
+            di_p_13 = di_m_13 = di_p_21 = di_m_21 = di_p_34 = di_m_34 = nan_arr.copy()
+            aroon_u_14 = aroon_u_25 = aroon_u_50 = nan_arr.copy()
+            aroon_d_14 = aroon_d_25 = aroon_d_50 = nan_arr.copy()
+            williams_14 = williams_28 = williams_56 = nan_arr.copy()
+            stoch_k_14_3_3 = stoch_k_21_5_5 = stoch_k_9_3_3 = nan_arr.copy()
+
+        # TRIX / TSI / UO (UO は volume 必要)
+        trix_14 = calculate_trix_numba(close_arr, 14)
+        trix_20 = calculate_trix_numba(close_arr, 20)
+        trix_30 = calculate_trix_numba(close_arr, 30)
+        tsi_25  = calculate_tsi_numba(close_arr, 25)
+        tsi_13  = calculate_tsi_numba(close_arr, 13)
+
+        if len(high_arr) > 0 and len(low_arr) > 0 and len(volume_arr) > 0:
+            uo_arr = calculate_ultimate_oscillator_numba(high_arr, low_arr, close_arr, volume_arr)
+        else:
+            uo_arr = nan_arr.copy()
+
+        # WMA / HMA / KAMA
+        wma_10  = calculate_wma_numba(close_arr, 10)
+        wma_20  = calculate_wma_numba(close_arr, 20)
+        wma_50  = calculate_wma_numba(close_arr, 50)
+        wma_100 = calculate_wma_numba(close_arr, 100)
+        wma_200 = calculate_wma_numba(close_arr, 200)
+        hma_21  = calculate_hma_numba(close_arr, 21)
+        hma_34  = calculate_hma_numba(close_arr, 34)
+        hma_55  = calculate_hma_numba(close_arr, 55)
+        kama_21 = calculate_kama_numba(close_arr, 21)
+        kama_34 = calculate_kama_numba(close_arr, 34)
+
+        # ===== columns =====
+        columns: Dict[str, np.ndarray] = {
+            "close": close_arr,
+            "__atr_13_raw": atr_13_raw,
+            "__atr_21_raw": atr_21_raw,
+            "__atr_34_raw": atr_34_raw,
+            "__atr_55_raw": atr_55_raw,
+            "__atr_13_safe": atr_13_safe,
+            "__rsi_14": rsi_14_arr,
+            "__rsi_21": rsi_21_arr,
+            "__rsi_30": rsi_30_arr,
+            "__rsi_50": rsi_50_arr,
+            "__adx_13": adx_13_arr,
+            "__adx_21": adx_21_arr,
+            "__adx_34": adx_34_arr,
+            "__di_p_13": di_p_13, "__di_m_13": di_m_13,
+            "__di_p_21": di_p_21, "__di_m_21": di_m_21,
+            "__di_p_34": di_p_34, "__di_m_34": di_m_34,
+            "__aroon_u_14": aroon_u_14, "__aroon_d_14": aroon_d_14,
+            "__aroon_u_25": aroon_u_25, "__aroon_d_25": aroon_d_25,
+            "__aroon_u_50": aroon_u_50, "__aroon_d_50": aroon_d_50,
+            "__williams_14": williams_14,
+            "__williams_28": williams_28,
+            "__williams_56": williams_56,
+            "__stoch_k_14_3_3": stoch_k_14_3_3,
+            "__stoch_k_21_5_5": stoch_k_21_5_5,
+            "__stoch_k_9_3_3":  stoch_k_9_3_3,
+            "__trix_14": trix_14, "__trix_20": trix_20, "__trix_30": trix_30,
+            "__tsi_25": tsi_25,   "__tsi_13": tsi_13,
+            "__uo": uo_arr,
+            "__wma_10": wma_10, "__wma_20": wma_20, "__wma_50": wma_50,
+            "__wma_100": wma_100, "__wma_200": wma_200,
+            "__hma_21": hma_21, "__hma_34": hma_34, "__hma_55": hma_55,
+            "__kama_21": kama_21, "__kama_34": kama_34,
+        }
+        if len(high_arr) > 0:
+            columns["high"] = high_arr
+        if len(low_arr) > 0:
+            columns["low"] = low_arr
+        if len(open_arr) > 0:
+            columns["open"] = open_arr
+        if len(volume_arr) > 0:
+            columns["volume"] = volume_arr
+
+        # ===== exprs =====
+        # 学習側 engine_1_C の各 create_*_features と完全一致する式
+        exprs: List[pl.Expr] = []
+        atr_safe = pl.col("__atr_13_safe")  # ショートカット
+
+        # ---------------------------------------------------------
+        # ATR系 (4 stats × 4 periods = 16)
+        # 参照: engine_1_C.create_atr_features (L1188-1281)
+        # ---------------------------------------------------------
+        for period, raw_col_name in [(13, "__atr_13_raw"), (21, "__atr_21_raw"),
+                                      (34, "__atr_34_raw"), (55, "__atr_55_raw")]:
+            atr_raw = pl.col(raw_col_name)
+            exprs.append((atr_raw / atr_safe).alias(f"e1c_atr_{period}"))
+            exprs.append((atr_raw / (pl.col("close") + 1e-10) * 100)
+                         .alias(f"e1c_atr_pct_{period}"))
+            exprs.append((atr_raw.diff() / atr_safe).alias(f"e1c_atr_trend_{period}"))
+            exprs.append((atr_raw.rolling_std(period, ddof=1) / atr_safe)
+                         .alias(f"e1c_atr_volatility_{period}"))
+
+        # ---------------------------------------------------------
+        # RSI系 (rsi/rsi_momentum × 4 + stochastic_rsi/rsi_divergence × 2 = 12)
+        # 参照: engine_1_C.create_rsi_features (L934-998)
+        # ---------------------------------------------------------
+        for period in [14, 21, 30, 50]:
+            exprs.append(pl.col(f"__rsi_{period}").alias(f"e1c_rsi_{period}"))
+            exprs.append(pl.col(f"__rsi_{period}").diff().alias(f"e1c_rsi_momentum_{period}"))
+
+        for period in [14, 21]:
+            rsi_col = pl.col(f"__rsi_{period}")
+            exprs.append(
+                ((rsi_col - rsi_col.rolling_min(period))
+                 / (rsi_col.rolling_max(period) - rsi_col.rolling_min(period) + 1e-10)
+                 * 100)
+                .alias(f"e1c_stochastic_rsi_{period}")
+            )
+            price_change = (
+                (pl.col("close") - pl.col("close").shift(period))
+                / pl.col("close").shift(period)
+            )
+            rsi_change = (rsi_col - rsi_col.shift(period)) / 50 - 1
+            exprs.append((price_change - rsi_change).alias(f"e1c_rsi_divergence_{period}"))
+
+        # ---------------------------------------------------------
+        # MACD系 (3 stats × 3 configs = 9)
+        # 参照: engine_1_C.create_macd_features (L1000-1080)
+        # ---------------------------------------------------------
+        for fast, slow, signal in [(12, 26, 9), (5, 35, 5), (19, 39, 9)]:
+            ema_fast = pl.col("close").ewm_mean(span=fast, adjust=False)
+            ema_slow = pl.col("close").ewm_mean(span=slow, adjust=False)
+            macd_raw = ema_fast - ema_slow
+            signal_raw = macd_raw.ewm_mean(span=signal, adjust=False)
+            hist_raw = macd_raw - signal_raw
+            exprs.append((macd_raw / atr_safe).alias(f"e1c_macd_{fast}_{slow}"))
+            exprs.append((signal_raw / atr_safe).alias(f"e1c_macd_signal_{fast}_{slow}_{signal}"))
+            exprs.append((hist_raw / atr_safe).alias(f"e1c_macd_histogram_{fast}_{slow}_{signal}"))
+
+        # ---------------------------------------------------------
+        # Bollinger系 (6 stats × 3 periods × 3 stdevs = 54)
+        # 参照: engine_1_C.create_bollinger_features (L1082-1186)
+        # ---------------------------------------------------------
+        for period in [20, 30, 50]:
+            sma = pl.col("close").rolling_mean(period)
+            std = pl.col("close").rolling_std(period, ddof=1)
+            for num_std in [2, 2.5, 3]:
+                upper_raw = sma + num_std * std
+                lower_raw = sma - num_std * std
+                exprs.append(((upper_raw - pl.col("close")) / atr_safe)
+                             .alias(f"e1c_bb_upper_{period}_{num_std}"))
+                exprs.append(((pl.col("close") - lower_raw) / atr_safe)
+                             .alias(f"e1c_bb_lower_{period}_{num_std}"))
+                exprs.append(((pl.col("close") - lower_raw) / (upper_raw - lower_raw + 1e-10))
+                             .alias(f"e1c_bb_percent_{period}_{num_std}"))
+                exprs.append(((upper_raw - lower_raw) / atr_safe)
+                             .alias(f"e1c_bb_width_{period}_{num_std}"))
+                exprs.append(((upper_raw - lower_raw) / (sma + 1e-10) * 100)
+                             .alias(f"e1c_bb_width_pct_{period}_{num_std}"))
+                exprs.append(((pl.col("close") - sma) / (std + 1e-10))
+                             .alias(f"e1c_bb_position_{period}_{num_std}"))
+
+        # ---------------------------------------------------------
+        # ADX/DI系 (3 stats × 3 periods = 9)
+        # ---------------------------------------------------------
+        for p in [13, 21, 34]:
+            exprs.append(pl.col(f"__adx_{p}").alias(f"e1c_adx_{p}"))
+            exprs.append(pl.col(f"__di_p_{p}").alias(f"e1c_di_plus_{p}"))
+            exprs.append(pl.col(f"__di_m_{p}").alias(f"e1c_di_minus_{p}"))
+
+        # ---------------------------------------------------------
+        # Aroon系 (3 stats × 3 periods = 9)
+        # ---------------------------------------------------------
+        for p in [14, 25, 50]:
+            exprs.append(pl.col(f"__aroon_u_{p}").alias(f"e1c_aroon_up_{p}"))
+            exprs.append(pl.col(f"__aroon_d_{p}").alias(f"e1c_aroon_down_{p}"))
+            exprs.append((pl.col(f"__aroon_u_{p}") - pl.col(f"__aroon_d_{p}"))
+                         .alias(f"e1c_aroon_oscillator_{p}"))
+
+        # ---------------------------------------------------------
+        # Williams %R (3)
+        # ---------------------------------------------------------
+        for p in [14, 28, 56]:
+            exprs.append(pl.col(f"__williams_{p}").alias(f"e1c_williams_r_{p}"))
+
+        # ---------------------------------------------------------
+        # Stochastic (3 stats × 3 configs = 9)
+        # 参照: engine_1_C.create_oscillator_features (L1287-1326)
+        # ---------------------------------------------------------
+        for kp, dp, sp in [(14, 3, 3), (21, 5, 5), (9, 3, 3)]:
+            stoch_k = pl.col(f"__stoch_k_{kp}_{dp}_{sp}")
+            exprs.append(stoch_k.alias(f"e1c_stoch_k_{kp}"))
+            stoch_d = stoch_k.rolling_mean(dp)
+            exprs.append(stoch_d.alias(f"e1c_stoch_d_{kp}_{dp}"))
+            slow_d = stoch_d.rolling_mean(sp)
+            exprs.append(slow_d.alias(f"e1c_stoch_slow_d_{kp}_{dp}_{sp}"))
+
+        # ---------------------------------------------------------
+        # DPO (3)
+        # 参照: engine_1_C.create_momentum_features (L1473-1488)
+        # ---------------------------------------------------------
+        for p in [20, 30, 50]:
+            sma_dpo = pl.col("close").rolling_mean(p)
+            dpo_raw = pl.col("close") - sma_dpo
+            exprs.append((dpo_raw / atr_safe).alias(f"e1c_dpo_{p}"))
+
+        # ---------------------------------------------------------
+        # TRIX (3) / UO (1) / TSI (2)
+        # ---------------------------------------------------------
+        for p in [14, 20, 30]:
+            exprs.append(pl.col(f"__trix_{p}").alias(f"e1c_trix_{p}"))
+        exprs.append(pl.col("__uo").alias("e1c_ultimate_oscillator"))
+        for p in [25, 13]:
+            exprs.append(pl.col(f"__tsi_{p}").alias(f"e1c_tsi_{p}"))
+
+        # ---------------------------------------------------------
+        # Rate of Change (4) / Momentum (4)
+        # 参照: engine_1_C.create_momentum_features (L1535-1559)
+        # ---------------------------------------------------------
+        for p in [10, 20, 30, 50]:
+            roc = ((pl.col("close") - pl.col("close").shift(p))
+                   / pl.col("close").shift(p) * 100)
+            exprs.append(roc.alias(f"e1c_rate_of_change_{p}"))
+
+        for p in [10, 20, 30, 50]:
+            mom_raw = pl.col("close") - pl.col("close").shift(p)
+            exprs.append((mom_raw / atr_safe).alias(f"e1c_momentum_{p}"))
+
+        # ---------------------------------------------------------
+        # KST (2: kst, kst_signal)
+        # 参照: engine_1_C.create_advanced_features (L1573-1593)
+        # ---------------------------------------------------------
+        roc_10 = (pl.col("close") - pl.col("close").shift(10)) / pl.col("close").shift(10)
+        roc_15 = (pl.col("close") - pl.col("close").shift(15)) / pl.col("close").shift(15)
+        roc_20 = (pl.col("close") - pl.col("close").shift(20)) / pl.col("close").shift(20)
+        roc_30 = (pl.col("close") - pl.col("close").shift(30)) / pl.col("close").shift(30)
+        kst = (roc_10 * 1 + roc_15 * 2 + roc_20 * 3 + roc_30 * 4) / 10 * 100
+        exprs.append(kst.alias("e1c_kst"))
+        exprs.append(kst.rolling_mean(9).alias("e1c_kst_signal"))
+
+        # ---------------------------------------------------------
+        # Coppock Curve (1)
+        # 参照: engine_1_C.create_advanced_features (L1644-1657)
+        # ---------------------------------------------------------
+        roc_11 = (pl.col("close") - pl.col("close").shift(11)) / pl.col("close").shift(11) * 100
+        roc_14 = (pl.col("close") - pl.col("close").shift(14)) / pl.col("close").shift(14) * 100
+        exprs.append((roc_11 + roc_14).rolling_mean(10).alias("e1c_coppock_curve"))
+
+        # ---------------------------------------------------------
+        # Schaff Trend Cycle (2)
+        # 参照: engine_1_C.create_advanced_features (L1611-1640)
+        #
+        # 重要: 学習側は ewm_mean(half_life=fast_period, adjust=False) と
+        # ewm_mean(span=3, adjust=False) を使用。Polars 直呼びで完全一致。
+        # ---------------------------------------------------------
+        for fast_period, slow_period_stc, cycle_period in [(23, 50, 10), (12, 26, 9)]:
+            fast_ma = pl.col("close").ewm_mean(half_life=fast_period, adjust=False)
+            slow_ma = pl.col("close").ewm_mean(half_life=slow_period_stc, adjust=False)
+            macd_stc = fast_ma - slow_ma
+            macd_min1 = macd_stc.rolling_min(cycle_period)
+            macd_max1 = macd_stc.rolling_max(cycle_period)
+            stoch_macd = ((macd_stc - macd_min1) / (macd_max1 - macd_min1 + 1e-10)) * 100
+            stoch_macd_smoothed = stoch_macd.ewm_mean(span=3, adjust=False)
+            stoch_min2 = stoch_macd_smoothed.rolling_min(cycle_period)
+            stoch_max2 = stoch_macd_smoothed.rolling_max(cycle_period)
+            stoch_stoch = ((stoch_macd_smoothed - stoch_min2) / (stoch_max2 - stoch_min2 + 1e-10)) * 100
+            stc = stoch_stoch.ewm_mean(span=3, adjust=False)
+            exprs.append(stc.alias(f"e1c_schaff_trend_cycle_{fast_period}_{slow_period_stc}_{cycle_period}"))
+
+        # ---------------------------------------------------------
+        # Price Oscillator (3)
+        # 参照: engine_1_C.create_advanced_features (L1660-1667)
+        # ---------------------------------------------------------
+        for fast, slow in [(12, 26), (5, 35), (10, 20)]:
+            ema_f = pl.col("close").ewm_mean(span=fast, adjust=False)
+            ema_s = pl.col("close").ewm_mean(span=slow, adjust=False)
+            exprs.append(((ema_f - ema_s) / ema_s * 100)
+                         .alias(f"e1c_price_oscillator_{fast}_{slow}"))
+
+        # ---------------------------------------------------------
+        # RVI (relative_vigor_index/rvi_signal × 3 = 6)
+        # 参照: engine_1_C.create_advanced_features (L1597-1608)
+        # 注意: open/high/low が存在しないと計算不能 → layer2 でフォールバック
+        # ---------------------------------------------------------
+        rvi_available = (len(open_arr) > 0 and len(high_arr) > 0 and len(low_arr) > 0)
+        if rvi_available:
+            for p in [10, 14, 20]:
+                num = (pl.col("close") - pl.col("open")).rolling_mean(p)
+                den = (pl.col("high") - pl.col("low")).rolling_mean(p)
+                rvi = num / (den + 1e-10)
+                exprs.append(rvi.alias(f"e1c_relative_vigor_index_{p}"))
+                exprs.append(rvi.rolling_mean(4).alias(f"e1c_rvi_signal_{p}"))
+
+        # ---------------------------------------------------------
+        # 移動平均: SMA + SMA_dev + EMA + EMA_dev + WMA × 5 periods = 25
+        # 参照: engine_1_C.create_moving_average_features (L1693-1752)
+        # ---------------------------------------------------------
+        for p in [10, 20, 50, 100, 200]:
+            sma_raw = pl.col("close").rolling_mean(p)
+            exprs.append(((sma_raw - pl.col("close")) / atr_safe).alias(f"e1c_sma_{p}"))
+            exprs.append(((pl.col("close") - sma_raw) / (sma_raw + 1e-10) * 100)
+                         .alias(f"e1c_sma_deviation_{p}"))
+
+            ema_raw = pl.col("close").ewm_mean(span=p, adjust=False)
+            exprs.append(((ema_raw - pl.col("close")) / atr_safe).alias(f"e1c_ema_{p}"))
+            exprs.append(((pl.col("close") - ema_raw) / (ema_raw + 1e-10) * 100)
+                         .alias(f"e1c_ema_deviation_{p}"))
+
+            exprs.append(((pl.col(f"__wma_{p}") - pl.col("close")) / atr_safe)
+                         .alias(f"e1c_wma_{p}"))
+
+        # ---------------------------------------------------------
+        # HMA (3)
+        # 参照: engine_1_C.create_moving_average_features (L1755-1771)
+        # ---------------------------------------------------------
+        for p in [21, 34, 55]:
+            exprs.append(((pl.col(f"__hma_{p}") - pl.col("close")) / atr_safe)
+                         .alias(f"e1c_hma_{p}"))
+
+        # ---------------------------------------------------------
+        # KAMA (2)
+        # 参照: engine_1_C.create_moving_average_features (L1774-1793)
+        # ---------------------------------------------------------
+        for p in [21, 34]:
+            exprs.append(((pl.col(f"__kama_{p}") - pl.col("close")) / atr_safe)
+                         .alias(f"e1c_kama_{p}"))
+
+        # ---------------------------------------------------------
+        # Trend Slope/Strength/Consistency (3 stats × 3 periods = 9)
+        # 参照: engine_1_C.create_moving_average_features (L1795-1844)
+        # ---------------------------------------------------------
+        for p in [20, 50, 100]:
+            sma_for_slope = pl.col("close").rolling_mean(p)
+            wma_for_slope = pl.col(f"__wma_{p}")  # 既に計算済み
+            true_ols_slope = 6.0 * (wma_for_slope - sma_for_slope) / (p - 1.0)
+            exprs.append((true_ols_slope / atr_safe).alias(f"e1c_trend_slope_{p}"))
+
+            normalized_std = pl.col("close").rolling_std(p, ddof=1) / atr_safe
+            exprs.append(
+                (1.0 / (normalized_std + 1e-10)).clip(upper_bound=100.0)
+                .alias(f"e1c_trend_strength_{p}")
+            )
+
+            direction_changes = pl.col("close").diff().sign().diff().abs()
+            exprs.append(
+                (1 - direction_changes.rolling_mean(p) / 2)
+                .alias(f"e1c_trend_consistency_{p}")
+            )
+
+        # ===== layer2 =====
+        # 1C は基本的に Polars で完結。RVI のみ open/high/low 不在時に
+        # NaN フォールバックが必要。
+        layer2: Dict[str, float] = {}
+        if not rvi_available:
+            for p in [10, 14, 20]:
+                layer2[f"e1c_relative_vigor_index_{p}"] = np.nan
+                layer2[f"e1c_rvi_signal_{p}"]          = np.nan
+
+        return columns, exprs, layer2
 
     @staticmethod
     def calculate_features(
@@ -220,426 +590,25 @@ class FeatureModule1C:
         lookback_bars: int = 1440,
         qa_state: Optional[QAState] = None,
     ) -> Dict[str, float]:
-        features = {}
+        """
+        【Phase 9b 改修版】単独計算用ラッパー。
+        司令塔は _build_polars_pieces を直接呼んで全モジュール統合 .select() を
+        行うが、本メソッドは後方互換のためモジュール単独で動作する形を維持する。
+        """
+        columns, exprs, layer2 = FeatureModule1C._build_polars_pieces(data, lookback_bars)
+        if not columns:
+            return {}
 
-        _empty = np.array([], dtype=np.float64)
-        close_arr  = data.get("close",  _empty)
-        high_arr   = data.get("high",   _empty)
-        low_arr    = data.get("low",    _empty)
-        volume_arr = data.get("volume", _empty)
-        open_arr   = data.get("open",   _empty)
+        df = pl.DataFrame(columns)
+        result_df = df.lazy().select(exprs).tail(1).collect()
+        polars_result = result_df.to_dicts()[0]
 
-        if len(close_arr) == 0:
-            return features
+        features: Dict[str, float] = {}
+        for k, v in polars_result.items():
+            features[k] = float(v) if v is not None else np.nan
+        features.update(layer2)
 
-        current_close = float(close_arr[-1])
-
-        # ATR（全特徴量共有）
-        atr_13_arr = calculate_atr_wilder(high_arr, low_arr, close_arr, 13)
-        atr_21_arr = calculate_atr_wilder(high_arr, low_arr, close_arr, 21)
-        atr_34_arr = calculate_atr_wilder(high_arr, low_arr, close_arr, 34)
-        atr_55_arr = calculate_atr_wilder(high_arr, low_arr, close_arr, 55)
-
-        atr_13 = _last(atr_13_arr)
-        atr_ok = np.isfinite(atr_13) and atr_13 > 1e-10
-        atr_denom = atr_13 + 1e-10  # スカラー ATR割り分母
-
-        # ---------------------------------------------------------
-        # 1. ATR系
-        # ---------------------------------------------------------
-        # [TRAIN-SERVE-FIX] atr_pct のゼロ保護を学習側と完全一致させる:
-        #   学習側: atr_raw / (close + 1e-10) * 100  ← + 1e-10 ゼロ保護
-        #   旧本番: if current_close != 0.0 else np.nan  ← 条件分岐式の保護
-        #   新本番: atr_raw / (close + 1e-10) * 100  ← 学習側と完全同一
-        # XAU/USDのcloseは事実上ゼロにならないが、思想として完全に揃える。
-        # 以下、最初のatr_pct_13/21の二重計算ブロックは削除し、後段ループで一括処理する。
-        # atr_13/21/34/55 = atr_period / atr_13（比率）
-        # atr_pct_period = atr_period / (close + 1e-10) * 100  （学習側完全一致）
-        for period, arr in [(13, atr_13_arr), (21, atr_21_arr), (34, atr_34_arr), (55, atr_55_arr)]:
-            atr_val = _last(arr)
-            features[f"e1c_atr_{period}"] = (atr_val / atr_denom) if (np.isfinite(atr_val) and atr_ok) else np.nan
-            # atr_pct: 学習側 atr_raw / (close + 1e-10) * 100 と完全一致
-            features[f"e1c_atr_pct_{period}"] = (
-                (atr_val / (current_close + 1e-10)) * 100
-                if (np.isfinite(atr_val) and np.isfinite(current_close)) else np.nan
-            )
-            # atr_trend: diff / atr_13
-            if len(arr) >= 2 and np.isfinite(atr_val) and atr_ok:
-                features[f"e1c_atr_trend_{period}"] = (atr_val - arr[-2]) / atr_denom
-            else:
-                features[f"e1c_atr_trend_{period}"] = np.nan
-            # atr_volatility: rolling_std(atr_period, window=period) / atr_13
-            # 学習側: rolling_std(atr_raw, period)[i] / atr_13_arr[i] と完全一致
-            w_atr = _window(arr, period)
-            if len(w_atr) >= period and atr_ok:
-                features[f"e1c_atr_volatility_{period}"] = float(np.std(w_atr, ddof=1)) / atr_denom
-            else:
-                features[f"e1c_atr_volatility_{period}"] = np.nan
-
-        # ---------------------------------------------------------
-        # 2. RSI系
-        # ---------------------------------------------------------
-        for period in [14, 21, 30, 50]:
-            rsi_arr = calculate_rsi_wilder(close_arr, period)
-            rsi_last = _last(rsi_arr)
-            features[f"e1c_rsi_{period}"] = rsi_last
-            features[f"e1c_rsi_momentum_{period}"] = (
-                float(rsi_arr[-1] - rsi_arr[-2]) if len(rsi_arr) >= 2 else np.nan
-            )
-
-        for period in [14, 21]:
-            rsi_arr = calculate_rsi_wilder(close_arr, period)
-            rsi_min = _last(_rolling_mean(np.array([
-                float(np.min(_window(rsi_arr, period))) if len(_window(rsi_arr, period)) > 0 else np.nan
-            ]), 1))
-            w_rsi = _window(rsi_arr, period)
-            if len(w_rsi) >= period:
-                rsi_min_w = float(np.min(w_rsi))
-                rsi_max_w = float(np.max(w_rsi))
-                rsi_last = _last(rsi_arr)
-                features[f"e1c_stochastic_rsi_{period}"] = (
-                    (rsi_last - rsi_min_w) / (rsi_max_w - rsi_min_w + 1e-10) * 100
-                )
-            else:
-                features[f"e1c_stochastic_rsi_{period}"] = np.nan
-
-            # rsi_divergence: price_change - rsi_change
-            if len(close_arr) > period and len(rsi_arr) > period:
-                price_prev = close_arr[-1 - period]
-                price_change = (current_close - price_prev) / price_prev if price_prev != 0.0 else np.nan
-                rsi_change = (rsi_arr[-1] - rsi_arr[-1 - period]) / 50 - 1
-                features[f"e1c_rsi_divergence_{period}"] = (
-                    price_change - rsi_change if np.isfinite(price_change) else np.nan
-                )
-            else:
-                features[f"e1c_rsi_divergence_{period}"] = np.nan
-
-        # ---------------------------------------------------------
-        # 3. MACD系
-        # ---------------------------------------------------------
-        for fast, slow, signal in [(12, 26, 9), (5, 35, 5), (19, 39, 9)]:
-            ema_f = _ema(close_arr, fast)
-            ema_s = _ema(close_arr, slow)
-            macd_arr = ema_f - ema_s
-            sig_arr = _ema(macd_arr, signal)
-            hist_arr = macd_arr - sig_arr
-            features[f"e1c_macd_{fast}_{slow}"] = _last(macd_arr) / atr_denom if atr_ok else np.nan
-            features[f"e1c_macd_signal_{fast}_{slow}_{signal}"] = _last(sig_arr) / atr_denom if atr_ok else np.nan
-            features[f"e1c_macd_histogram_{fast}_{slow}_{signal}"] = _last(hist_arr) / atr_denom if atr_ok else np.nan
-
-        # ---------------------------------------------------------
-        # 4. ボリンジャーバンド系
-        # ---------------------------------------------------------
-        for period in [20, 30, 50]:
-            w = _window(close_arr, period)
-            if len(w) >= period:
-                sma = float(np.mean(w))
-                std = float(np.std(w, ddof=1))
-                for num_std in [2, 2.5, 3]:
-                    upper_raw = sma + num_std * std
-                    lower_raw = sma - num_std * std
-                    width_raw = upper_raw - lower_raw
-                    features[f"e1c_bb_upper_{period}_{num_std}"] = (upper_raw - current_close) / atr_denom if atr_ok else np.nan
-                    features[f"e1c_bb_lower_{period}_{num_std}"] = (current_close - lower_raw) / atr_denom if atr_ok else np.nan
-                    features[f"e1c_bb_percent_{period}_{num_std}"] = (current_close - lower_raw) / (width_raw + 1e-10)
-                    features[f"e1c_bb_width_{period}_{num_std}"]   = width_raw / atr_denom if atr_ok else np.nan
-                    features[f"e1c_bb_width_pct_{period}_{num_std}"] = (width_raw / (sma + 1e-10)) * 100
-                    features[f"e1c_bb_position_{period}_{num_std}"] = (current_close - sma) / (std + 1e-10)
-            else:
-                for num_std in [2, 2.5, 3]:
-                    for k in ["bb_upper", "bb_lower", "bb_percent", "bb_width", "bb_width_pct", "bb_position"]:
-                        features[f"e1c_{k}_{period}_{num_std}"] = np.nan
-
-        # ---------------------------------------------------------
-        # 5. ADX, DI, Aroon系
-        # ---------------------------------------------------------
-        for period in [13, 21, 34]:
-            adx_arr = calculate_adx(high_arr, low_arr, close_arr, period)
-            features[f"e1c_adx_{period}"]      = _last(adx_arr)
-            _di_p_arr, _di_m_arr = _calculate_di_wilder(high_arr, low_arr, close_arr, period)
-
-            features[f"e1c_di_plus_{period}"]  = float(_di_p_arr[-1]) if np.isfinite(_di_p_arr[-1]) else np.nan
-
-            features[f"e1c_di_minus_{period}"] = float(_di_m_arr[-1]) if np.isfinite(_di_m_arr[-1]) else np.nan
-
-        for period in [14, 25, 50]:
-            aroon_up   = _last(calculate_aroon_up_numba(high_arr, period))
-            aroon_down = _last(calculate_aroon_down_numba(low_arr, period))
-            features[f"e1c_aroon_up_{period}"]          = aroon_up
-            features[f"e1c_aroon_down_{period}"]         = aroon_down
-            features[f"e1c_aroon_oscillator_{period}"]   = aroon_up - aroon_down
-
-        # =====================================================================
-        # 【修正済み】Williams %R の period=56 固定実装は今回の再学習で解消。
-        # 学習側 engine_1_C の late binding バグ修正と同期して、本番側も
-        # period=14, 28, 56 を個別に計算する正しい挙動に戻す。
-        # =====================================================================
-        for period in [14, 28, 56]:
-            features[f"e1c_williams_r_{period}"] = _last(
-                calculate_williams_r_numba(high_arr, low_arr, close_arr, period)
-            )
-
-        # Stochastic (14,3,3), (21,5,5), (9,3,3)
-        for k_period, d_period, slow_period in [(14, 3, 3), (21, 5, 5), (9, 3, 3)]:
-            stoch_k_arr = calculate_stochastic_numba(high_arr, low_arr, close_arr, k_period, d_period, slow_period)
-            features[f"e1c_stoch_k_{k_period}"]  = _last(stoch_k_arr)
-            stoch_d_arr = _rolling_mean(stoch_k_arr, d_period)
-            features[f"e1c_stoch_d_{k_period}_{d_period}"] = _last(stoch_d_arr)
-            slow_d_arr  = _rolling_mean(stoch_d_arr, slow_period)
-            features[f"e1c_stoch_slow_d_{k_period}_{d_period}_{slow_period}"] = _last(slow_d_arr)
-
-        # ---------------------------------------------------------
-        # 6. モメンタム系
-        # ---------------------------------------------------------
-        # DPO
-        for period in [20, 30, 50]:
-            w = _window(close_arr, period)
-            sma = float(np.mean(w)) if len(w) >= period else np.nan
-            dpo_raw = current_close - sma if np.isfinite(sma) else np.nan
-            features[f"e1c_dpo_{period}"] = dpo_raw / atr_denom if (np.isfinite(dpo_raw) and atr_ok) else np.nan
-
-        # TRIX
-        for period in [14, 20, 30]:
-            features[f"e1c_trix_{period}"] = _last(calculate_trix_numba(close_arr, period))
-
-        # Ultimate Oscillator
-        features["e1c_ultimate_oscillator"] = _last(calculate_ultimate_oscillator_numba(high_arr, low_arr, close_arr, volume_arr))
-
-        # TSI
-        for period in [25, 13]:
-            features[f"e1c_tsi_{period}"] = _last(calculate_tsi_numba(close_arr, period))
-
-        # Rate of Change
-        for period in [10, 20, 30, 50]:
-            if len(close_arr) > period:
-                denom = close_arr[-1 - period]
-                features[f"e1c_rate_of_change_{period}"] = (
-                    ((current_close - denom) / denom) * 100 if denom != 0.0 else np.inf
-                )
-            else:
-                features[f"e1c_rate_of_change_{period}"] = np.nan
-
-        # Momentum
-        for period in [10, 20, 30, 50]:
-            if len(close_arr) > period and atr_ok:
-                features[f"e1c_momentum_{period}"] = (current_close - close_arr[-1 - period]) / atr_denom
-            else:
-                features[f"e1c_momentum_{period}"] = np.nan
-
-        # KST
-        if len(close_arr) >= 31:
-            d = {10: close_arr[-11], 15: close_arr[-16], 20: close_arr[-21], 30: close_arr[-31]}
-            roc_kst = {p: ((current_close - d[p]) / d[p] if d[p] != 0.0 else np.inf) for p in d}
-            kst_val = (roc_kst[10] * 1 + roc_kst[15] * 2 + roc_kst[20] * 3 + roc_kst[30] * 4) / 10 * 100
-            features["e1c_kst"] = kst_val
-            # kst_signal: rolling_mean(kst_arr, 9)
-            # 2116本の配列から過去9バー分のKST値を計算して平均を取る
-            kst_arr = np.full(len(close_arr), np.nan)
-            # 学習側に合わせてROCは小数のまま（* 100 なし）→ kst = / 10 * 100 で1回だけ変換
-            for idx in range(30, len(close_arr)):
-                c = close_arr[idx]
-                d10 = close_arr[idx - 10]; d15 = close_arr[idx - 15]
-                d20 = close_arr[idx - 20]; d30 = close_arr[idx - 30]
-                r10 = (c - d10) / d10 if d10 != 0.0 else np.nan
-                r15 = (c - d15) / d15 if d15 != 0.0 else np.nan
-                r20 = (c - d20) / d20 if d20 != 0.0 else np.nan
-                r30 = (c - d30) / d30 if d30 != 0.0 else np.nan
-                if np.isfinite(r10) and np.isfinite(r15) and np.isfinite(r20) and np.isfinite(r30):
-                    kst_arr[idx] = (r10 * 1 + r15 * 2 + r20 * 3 + r30 * 4) / 10 * 100
-            # kst_signal: rolling_mean(9)準拠 — 末尾9バーが揃っている場合のみ計算
-            w_kst = _window(kst_arr, 9)
-            w_kst_finite = w_kst[np.isfinite(w_kst)]
-            features["e1c_kst_signal"] = float(np.mean(w_kst_finite)) if len(w_kst_finite) == 9 else np.nan
-        else:
-            features["e1c_kst"]        = np.nan
-            features["e1c_kst_signal"] = np.nan
-
-        # Trend Strength
-        # 【修正】条件を >= 2 → >= period に変更。
-        # 学習側: rolling_std(period) → period本未満はNaN。
-        for period in [20, 50, 100]:
-            w = _window(close_arr, period)
-            if len(w) >= period and atr_ok:
-                normalized_std = float(np.std(w, ddof=1)) / atr_denom
-                features[f"e1c_trend_strength_{period}"] = min(1.0 / (normalized_std + 1e-10), 100.0)
-            else:
-                features[f"e1c_trend_strength_{period}"] = np.nan
-
-        # Trend Consistency: 方向変化の頻度
-        # [TRAIN-SERVE-FIX] 学習側 Polars rolling_mean(period) はデフォルト
-        # min_samples=period のため、period 本未満では NaN を返す。
-        # close.diff().sign().diff().abs() は先頭2バーが NaN になるため、
-        # 有効な direction_changes が period 本揃うには close が period + 2 本必要。
-        #
-        # 旧: if len(w) >= 3:  → period=20 でも 3本あれば計算してしまい学習側と不一致
-        # 新: if len(w) >= period + 2:  → period 本の direction_changes が揃ってから計算
-        for period in [20, 50, 100]:
-            w = _window(close_arr, period + 2)
-            if len(w) >= period + 2:
-                diff1 = np.diff(w)
-                sign1 = np.sign(diff1)
-                direction_changes = np.abs(np.diff(sign1))
-                features[f"e1c_trend_consistency_{period}"] = 1 - float(np.mean(direction_changes)) / 2
-            else:
-                features[f"e1c_trend_consistency_{period}"] = np.nan
-
-        # Coppock Curve: (ROC(11) + ROC(14)).rolling_mean(10)
-        # 学習側: (roc_11 + roc_14).rolling_mean(10)
-        if len(close_arr) >= 25:
-            coppock_arr = np.full(len(close_arr), np.nan)
-            for idx in range(14, len(close_arr)):
-                c = close_arr[idx]
-                p11 = close_arr[idx - 11]; p14 = close_arr[idx - 14]
-                r11 = (c - p11) / p11 * 100 if p11 != 0.0 else np.nan
-                r14 = (c - p14) / p14 * 100 if p14 != 0.0 else np.nan
-                if np.isfinite(r11) and np.isfinite(r14):
-                    coppock_arr[idx] = r11 + r14
-            # coppock_curve: rolling_mean(10)準拠 — 末尾10バーが揃っている場合のみ計算
-            w_copp = _window(coppock_arr, 10)
-            w_copp_finite = w_copp[np.isfinite(w_copp)]
-            features["e1c_coppock_curve"] = float(np.mean(w_copp_finite)) if len(w_copp_finite) == 10 else np.nan
-        else:
-            features["e1c_coppock_curve"] = np.nan
-
-        # Schaff Trend Cycle
-        # 【修正1】学習側と完全一致:
-        #   - EMA に half_life=period を使用（学習側: ewm_mean(half_life=fast_period, adjust=False)）
-        #     alpha = 1 - exp(-ln2/half_life)  ← span=period とは alpha 定義が異なる
-        #   - 2nd Stochastic + Final Smooth を省略せず完全実装
-        #   - smooth_period=3 は span=3 の EWM（学習側と同一）
-        for fast_period, slow_period_stc, cycle_period in [(23, 50, 10), (12, 26, 9)]:
-            n = len(close_arr)
-            # half_life EMA（学習側 ewm_mean(half_life=X, adjust=False) と等価）
-            alpha_f = 1.0 - np.exp(-np.log(2.0) / fast_period)
-            alpha_s = 1.0 - np.exp(-np.log(2.0) / slow_period_stc)
-            alpha3  = 2.0 / (3 + 1.0)  # span=3 の EWM（smooth_period=3）
-
-            fast_ma = np.zeros(n, dtype=np.float64)
-            slow_ma = np.zeros(n, dtype=np.float64)
-            fast_ma[0] = close_arr[0]
-            slow_ma[0] = close_arr[0]
-            for i in range(1, n):
-                fast_ma[i] = alpha_f * close_arr[i] + (1.0 - alpha_f) * fast_ma[i - 1]
-                slow_ma[i] = alpha_s * close_arr[i] + (1.0 - alpha_s) * slow_ma[i - 1]
-            macd_stc = fast_ma - slow_ma
-
-            # 1st Stochastic (%K of MACD) using rolling_min/max over cycle_period
-            stoch_macd = np.full(n, np.nan, dtype=np.float64)
-            for i in range(cycle_period - 1, n):
-                w = macd_stc[i - cycle_period + 1:i + 1]
-                mn, mx = np.min(w), np.max(w)
-                stoch_macd[i] = (macd_stc[i] - mn) / (mx - mn + 1e-10) * 100
-
-            # Smooth 1st Stochastic with EMA span=3
-            sm1 = np.full(n, np.nan, dtype=np.float64)
-            started = False
-            for i in range(n):
-                if np.isnan(stoch_macd[i]):
-                    continue
-                if not started:
-                    sm1[i] = stoch_macd[i]
-                    started = True
-                else:
-                    prev = sm1[i - 1] if not np.isnan(sm1[i - 1]) else stoch_macd[i]
-                    sm1[i] = alpha3 * stoch_macd[i] + (1.0 - alpha3) * prev
-
-            # 2nd Stochastic (%K of Smoothed)
-            # 【修正】NaN除外(w2f)を廃止。
-            # 学習側: Polars rolling_min/max はNaNを伝播させる。
-            # 旧: w2f = w2[~np.isnan(w2)] でNaNを除外 → 学習側と不一致。
-            # 新: w2内に非有限値が1本でもあればskip（NaN伝播と同一挙動）。
-            stoch2 = np.full(n, np.nan, dtype=np.float64)
-            for i in range(cycle_period - 1, n):
-                w2 = sm1[i - cycle_period + 1:i + 1]
-                if not np.all(np.isfinite(w2)):
-                    continue
-                mn2, mx2 = np.min(w2), np.max(w2)
-                if np.isnan(sm1[i]):
-                    continue
-                stoch2[i] = (sm1[i] - mn2) / (mx2 - mn2 + 1e-10) * 100
-
-            # Final Smooth with EMA span=3
-            stc_arr = np.full(n, np.nan, dtype=np.float64)
-            started2 = False
-            for i in range(n):
-                if np.isnan(stoch2[i]):
-                    continue
-                if not started2:
-                    stc_arr[i] = stoch2[i]
-                    started2 = True
-                else:
-                    prev2 = stc_arr[i - 1] if not np.isnan(stc_arr[i - 1]) else stoch2[i]
-                    stc_arr[i] = alpha3 * stoch2[i] + (1.0 - alpha3) * prev2
-
-            features[f"e1c_schaff_trend_cycle_{fast_period}_{slow_period_stc}_{cycle_period}"] = float(stc_arr[-1]) if np.isfinite(stc_arr[-1]) else np.nan
-
-        # Price Oscillator
-        for fast, slow in [(12, 26), (5, 35), (10, 20)]:
-            ema_f = _ema(close_arr, fast)
-            ema_s = _ema(close_arr, slow)
-            ema_s_last = _last(ema_s)
-            po = (_last(ema_f) - ema_s_last) / ema_s_last * 100 if ema_s_last != 0.0 else np.nan
-            features[f"e1c_price_oscillator_{fast}_{slow}"] = po
-
-        # RVI
-        for period in [10, 14, 20]:
-            if len(close_arr) >= period and len(open_arr) >= period and len(high_arr) >= period and len(low_arr) >= period:
-                rvi_arr = _rolling_mean(close_arr - open_arr, period) / (_rolling_mean(high_arr - low_arr, period) + 1e-10)
-                features[f"e1c_relative_vigor_index_{period}"] = _last(rvi_arr)
-                # 学習側: rvi_signal は period=[10,14,20] 全てに対して生成
-                w_rvi = _window(rvi_arr, 4)
-                features[f"e1c_rvi_signal_{period}"] = float(np.mean(w_rvi)) if len(w_rvi) >= 4 else np.nan
-            else:
-                features[f"e1c_relative_vigor_index_{period}"] = np.nan
-                features[f"e1c_rvi_signal_{period}"] = np.nan
-
-        # ---------------------------------------------------------
-        # 7. 移動平均系
-        # ---------------------------------------------------------
-        for period in [10, 20, 50, 100, 200]:
-            w = _window(close_arr, period)
-            # SMA
-            sma_val = float(np.mean(w)) if len(w) >= period else np.nan
-            features[f"e1c_sma_{period}"] = (sma_val - current_close) / atr_denom if (np.isfinite(sma_val) and atr_ok) else np.nan
-            features[f"e1c_sma_deviation_{period}"] = (current_close - sma_val) / (sma_val + 1e-10) * 100 if np.isfinite(sma_val) else np.nan
-            # EMA
-            ema_val = _last(_ema(close_arr, period))
-            features[f"e1c_ema_{period}"] = (ema_val - current_close) / atr_denom if (np.isfinite(ema_val) and atr_ok) else np.nan
-            features[f"e1c_ema_deviation_{period}"] = (current_close - ema_val) / (ema_val + 1e-10) * 100 if np.isfinite(ema_val) else np.nan
-            # WMA
-            wma_val = _last(calculate_wma_numba(close_arr, period))
-            features[f"e1c_wma_{period}"] = (wma_val - current_close) / atr_denom if (np.isfinite(wma_val) and atr_ok) else np.nan
-
-        # HMA
-        for period in [21, 34, 55]:
-            hma_val = _last(calculate_hma_numba(close_arr, period))
-            features[f"e1c_hma_{period}"] = (hma_val - current_close) / atr_denom if (np.isfinite(hma_val) and atr_ok) else np.nan
-
-        # KAMA
-        for period in [21, 34]:
-            kama_val = _last(calculate_kama_numba(close_arr, period))
-            features[f"e1c_kama_{period}"] = (kama_val - current_close) / atr_denom if (np.isfinite(kama_val) and atr_ok) else np.nan
-
-        # Trend Slope: OLS slope = 6*(WMA - SMA)/(period-1) / atr13
-        for period in [20, 50, 100]:
-            w = _window(close_arr, period)
-            if len(w) >= period and atr_ok:
-                sma_w = float(np.mean(w))
-                wma_w = _last(calculate_wma_numba(w, period))
-                if np.isfinite(wma_w):
-                    slope = 6.0 * (wma_w - sma_w) / (period - 1.0)
-                    features[f"e1c_trend_slope_{period}"] = slope / atr_denom
-                else:
-                    features[f"e1c_trend_slope_{period}"] = np.nan
-            else:
-                features[f"e1c_trend_slope_{period}"] = np.nan
-
-        # ----------------------------------------------------------
-        # 【修正4】QA処理 — 学習側 apply_quality_assurance と等価
-        #   学習側: fill_nan(0.0).fill_null(0.0).clip(ewm±5σ)
-        #   本番側: QAState が EWM を跨バー保持し逐次更新・クリップ
-        #   qa_state=None の場合: fill_nan/fill_null(0.0) のみ適用（後方互換）
-        # ----------------------------------------------------------
+        # QA 処理
         if qa_state is not None:
             qa_result: Dict[str, float] = {}
             for key, val in features.items():

@@ -135,6 +135,125 @@ def load_static_data() -> bool:
     return True
 
 
+def _run_gap_fill(
+    feature_engine: "RealtimeFeatureEngine",
+    bridge: "MQL5BridgePublisherV3",
+    market_proxy: pd.DataFrame,
+    last_processed_bar_time: int,
+) -> int:
+    """
+    [GAP-FILL] バッファの欠落期間を M0.5 バーで補填する共通関数。
+
+    フルウォームアップ後・スナップショット復帰後・EA再起動後・
+    市場閉鎖後・メインループ整合性チェックからの全シナリオで呼ばれる。
+
+    Returns:
+        更新後の g_last_processed_bar_time (int, unixtime秒)
+        充填バーが0本の場合は last_processed_bar_time をそのまま返す。
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    diff_minutes = int((now_ts - last_processed_bar_time) / 60)
+
+    if diff_minutes <= 0:
+        return last_processed_bar_time
+
+    logger.info(
+        f"[GAP-FILL] ギャップ {diff_minutes} 分を M0.5 で穴埋めします..."
+    )
+
+    diff_df = bridge.request_historical_data(
+        symbol=STRATEGY_SYMBOL,
+        timeframe_name="M0.5",
+        lookback_bars=diff_minutes * 2 + 60,
+    )
+
+    if diff_df is None or len(diff_df) == 0:
+        logger.warning("[GAP-FILL] 差分M0.5データの取得に失敗。ギャップ未充填のまま続行します。")
+        return last_processed_bar_time
+
+    new_m05_bars = diff_df[
+        diff_df["timestamp"]
+        > datetime.fromtimestamp(last_processed_bar_time, timezone.utc)
+    ]
+
+    if new_m05_bars.empty:
+        logger.info("[GAP-FILL] 穴埋め対象バーなし（既に最新）。")
+        return last_processed_bar_time
+
+    # [V=0 GUARD] 学習側 s1_1_B_build_ohlcv.py の filter(tick_count > 0) と
+    # 完全整合させるため、gap-fill 経路でも V=0 ghost bar を除外する。
+    # EA 側 CollectM05Bar の new-bucket 分岐に volume>0 ガードが欠落していた
+    # ため、ProcessHistoryRequest 経由で V=0 stub が混入していた。
+    # M0.5 buffer 起点でフィルタすることで、後続の M3 リサンプル close 汚染
+    # → TP_REVERSED_BY_LAG / Execution Failed の連鎖を根本から断つ。
+    if "volume" in new_m05_bars.columns:
+        _n_before = len(new_m05_bars)
+        new_m05_bars = new_m05_bars[new_m05_bars["volume"] > 0]
+        _n_after = len(new_m05_bars)
+        if _n_before != _n_after:
+            logger.info(
+                f"[V=0 GUARD] gap-fill から V=0 ghost {_n_before - _n_after} 本を除外 "
+                f"(残: {_n_after} / 元: {_n_before} 本)"
+            )
+
+    if new_m05_bars.empty:
+        logger.info("[GAP-FILL] V=0 ghost 除外後、穴埋め対象バーなし。")
+        return last_processed_bar_time
+
+    # [DISC-FLAG SSoT] disc 計算は feature_engine._compute_disc_flag に
+    # 一元化された (発見 #60、Phase 9d 修正)。gap-fill 経路でも
+    # process_new_m05_bar 内の _append_bar_to_buffer が deque 末尾との
+    # 差分から正しく disc を再計算するため、ここでの事前計算は不要。
+    # bar_dict["disc"] エントリ自体も廃止 (_append_bar_to_buffer 側で無視される)。
+    gap_fill_indexed = new_m05_bars.set_index("timestamp").sort_index()
+
+    _new_last_ts = last_processed_bar_time
+    for _ts, _row in gap_fill_indexed.iterrows():
+        _bar_dict = {
+            "timestamp": _ts,
+            "open": _row["open"],
+            "high": _row["high"],
+            "low": _row["low"],
+            "close": _row["close"],
+            "volume": float(_row["volume"]),
+            "spread": 36.0,
+        }
+        # market_proxy をインクリメンタルに更新
+        if len(feature_engine.m05_dataframe) >= 20:
+            _recent = pd.DataFrame(
+                list(feature_engine.m05_dataframe)[-20:]
+            ).set_index("timestamp")
+            _m5 = (
+                _recent["close"]
+                .resample("5min", closed="left", label="left")
+                .last()
+                .dropna()
+            )
+            if len(_m5) >= 2:
+                _new_proxy_val = (
+                    float(_m5.iloc[-1]) - float(_m5.iloc[-2])
+                ) / (float(_m5.iloc[-2]) + 1e-10)
+                _new_proxy_df = pd.DataFrame(
+                    {"market_proxy": [_new_proxy_val]},
+                    index=pd.DatetimeIndex([_m5.index[-1]], tz="UTC"),
+                )
+                if market_proxy.empty:
+                    market_proxy = _new_proxy_df
+                else:
+                    if _m5.index[-1] not in market_proxy.index:
+                        market_proxy = pd.concat([market_proxy, _new_proxy_df])
+
+        feature_engine.process_new_m05_bar(
+            _bar_dict, market_proxy, warmup_only=True
+        )
+        _new_last_ts = int(_ts.timestamp())
+
+    logger.info(
+        f"✓ [GAP-FILL] {len(new_m05_bars)} 本 (M0.5) の穴埋め完了。"
+    )
+    return _new_last_ts
+
+
 def initialize_data_buffer(
     engine: RealtimeFeatureEngine,
     bridge: MQL5BridgePublisherV3,  # [V11.0] V3を使用
@@ -193,6 +312,15 @@ def initialize_data_buffer(
             f"ZMQ {tf_name} 履歴データの取得に失敗しました。起動を中止します。"
         )
         return False
+
+    # [DIAG] 受信した生データの先頭・末尾タイムスタンプをログ出力
+    # → EA の CopyTicksRange + g_m05_bars 合成結果の実態を確認するための診断ログ
+    # → 末尾が現在時刻付近なら合成正常、数十分〜数時間前なら Tick 履歴欠落または合成バグ
+    logger.info(
+        f"[DIAG] M0.5 受信データ範囲: "
+        f"{df_rates_m05['timestamp'].iloc[0]} 〜 {df_rates_m05['timestamp'].iloc[-1]} "
+        f"({len(df_rates_m05)} 本)"
+    )
 
     # ▼▼▼ M0.5履歴データから市場プロキシ(M5)を動的生成 ▼▼▼
     global g_market_proxy
@@ -526,96 +654,14 @@ def main():
                             feature_engine.m05_dataframe[-1]["timestamp"].timestamp()
                         )
 
-                        # 差分（ギャップ）の時間を計算
-                        now_ts = int(datetime.now(timezone.utc).timestamp())
-                        diff_minutes = int((now_ts - g_last_processed_bar_time) / 60)
+                        # [GAP-FILL] スナップショット復帰後の差分追いつき
+                        g_last_processed_bar_time = _run_gap_fill(
+                            feature_engine, bridge, g_market_proxy, g_last_processed_bar_time
+                        )
 
-                        if diff_minutes > 0:
-                            logger.info(
-                                f"  -> 停止していた {diff_minutes} 分の差分データをM0.5(tick→resample)で取得して穴埋めします..."
-                            )
-                            # M0.5は30秒足なので diff_minutes × 2 本 + 余裕
-                            diff_df = bridge.request_historical_data(
-                                symbol=STRATEGY_SYMBOL,
-                                timeframe_name="M0.5",
-                                lookback_bars=diff_minutes * 2 + 60,
-                            )
-                            if diff_df is not None and len(diff_df) > 0:
-                                # まだ処理していない新しいM0.5バーだけを抽出
-                                new_m05_bars = diff_df[
-                                    diff_df["timestamp"]
-                                    > datetime.fromtimestamp(
-                                        g_last_processed_bar_time, timezone.utc
-                                    )
-                                ]
-                                # M0.5バーを直接エンジンに流し込む
-                                if not new_m05_bars.empty:
-                                    new_m05_bars = new_m05_bars.reset_index()
-                                    for _, row in new_m05_bars.iterrows():
-                                        bar_dict = {
-                                            "timestamp": row["timestamp"],
-                                            "open": row["open"],
-                                            "high": row["high"],
-                                            "low": row["low"],
-                                            "close": row["close"],
-                                            "volume": float(row["volume"]),
-                                            "spread": 36.0,
-                                        }
-                                        # [乖離④修正] M5の1バー前比リターン（学習側2Gと完全一致）
-                                        # m05_dataframeをリサンプリングしてM5クローズ2本を取得
-                                        # [乖離⑥修正 V2] 学習側 s1_1_B_build_ohlcv.py の整数除算と一致させる:
-                                        #   学習側: (ts_int // bucket_size_ns) * bucket_size_ns でfloor集約
-                                        #   学習側相当: closed="left", label="left"
-                                        if len(feature_engine.m05_dataframe) >= 20:
-                                            _recent = pd.DataFrame(
-                                                list(feature_engine.m05_dataframe)[-20:]
-                                            ).set_index("timestamp")
-                                            _m5 = (
-                                                _recent["close"]
-                                                .resample("5min", closed="left", label="left")
-                                                .last()
-                                                .dropna()
-                                            )
-                                            if len(_m5) >= 2:
-                                                new_proxy_val = (
-                                                    float(_m5.iloc[-1]) - float(_m5.iloc[-2])
-                                                ) / (float(_m5.iloc[-2]) + 1e-10)
-                                                new_proxy_df = pd.DataFrame(
-                                                    {"market_proxy": [new_proxy_val]},
-                                                    index=pd.DatetimeIndex(
-                                                        [_m5.index[-1]], tz="UTC"
-                                                    ),
-                                                )
-                                                if g_market_proxy.empty:
-                                                    g_market_proxy = new_proxy_df
-                                                else:
-                                                    # 同一タイムスタンプの重複追記を防止
-                                                    if _m5.index[-1] not in g_market_proxy.index:
-                                                        g_market_proxy = pd.concat(
-                                                            [g_market_proxy, new_proxy_df]
-                                                        )
-
-                                        # [STALE-GUARD] warmup_only=True を渡すことで
-                                        # シグナルチェック・Signal生成をエンジン内部で
-                                        # 根本からスキップ。バッファ更新・OLS更新・
-                                        # 特徴量キャッシュ更新のみ実行される。
-                                        feature_engine.process_new_m05_bar(
-                                            bar_dict, g_market_proxy, warmup_only=True
-                                        )
-                                        g_last_processed_bar_time = int(
-                                            row["timestamp"].timestamp()
-                                        )
-
-                                logger.info(
-                                    f"✓ 差分 {len(new_m05_bars)} 本(M0.5換算)の追いつき計算が完了しました！完全に同期しています。"
-                                )
-
-                            # ▼▼▼ 追加: 穴埋め完了直後に確実にセーブする ▼▼▼
-                            feature_engine.save_state(str(state_file))
-                            logger.info(
-                                "💾 追いつき後の最新状態をスナップショットに保存しました。"
-                            )
-                            # ▲▲▲ ここまで追加 ▲▲▲
+                        # 穴埋め完了後に最新状態をスナップショット保存
+                        feature_engine.save_state(str(state_file))
+                        logger.info("💾 追いつき後の最新状態をスナップショットに保存しました。")
 
                     is_warmed_up = True
 
@@ -637,7 +683,29 @@ def main():
         if not is_warmed_up:
             if not initialize_data_buffer(feature_engine, bridge, g_market_proxy):
                 raise RuntimeError("特徴量エンジンのマルチバッファ充填に失敗しました。")
-        # ▲▲▲ ここまで修正 ▲▲▲
+
+            # [GAP-FILL] フルウォームアップ後のバッファギャップ充填
+            # fill_all_buffers は T0 時点のデータでバッファを初期化するが、
+            # T0〜T2（ウォームアップ処理時間）の間に確定したリアルタイムバーが存在しない。
+            g_last_processed_bar_time = _run_gap_fill(
+                feature_engine, bridge, g_market_proxy, g_last_processed_bar_time
+            )
+
+            # フルウォームアップ完了状態をスナップショットに保存（次回起動を高速化）
+            feature_engine.save_state(str(state_file))
+            logger.info(
+                "💾 [GAP-FILL] フルウォームアップ後の状態をスナップショットに保存しました。"
+            )
+
+        # ─────────────────────────────────────────────────────────────────
+        # [Phase 9b 案 V] 診断 L2 (smoke test) を起動経路の合流地点で実行
+        # ─────────────────────────────────────────────────────────────────
+        # 旧: `fill_all_buffers()` 内で呼んでいた → フルウォームアップ時しか
+        #     実行されず、スナップショット爆速復帰時は smoke test が走らない
+        #     → 案 W の verbose ログが得られず、実機の死蔵バグ調査に支障
+        # 新: 両ルート (フルウォームアップ / スナップショット復帰) の合流点で
+        #     1 回だけ呼ぶ形に統一。起動経路によらず必ず実行される
+        feature_engine.run_smoke_test()
 
         # [STALE-GUARD] 両ルート（スナップショット復帰・フルウォームアップ）共通:
         # ウォームアップ・差分追いつきが完全に完了した時点でis_python_readyフラグをセット。
@@ -656,16 +724,43 @@ def main():
         last_config_mtime = os.path.getmtime(config.CONFIG_RISK)
         # ▼追加: 定期セーブ用のタイマー
         last_snapshot_time = time.time()
+        # ▼追加: BUFFER-INTEGRITY チェック用タイマー
+        last_buffer_check_time = time.time()
+        last_gap_fill_time = 0.0
+        _BUFFER_CHECK_INTERVAL_SEC = 30.0
+        _GAP_FILL_COOLDOWN_SEC = 30.0
+        # [LAG-FIX] 重い ZMQ リクエスト (broker_state, recent_history) の間引き用タイマー
+        # 旧: 毎ループ (~100ms 周期) 実行 → poll_m3_bar の応答性を阻害してラグ増大
+        # 新: M3 未確定中は 1 秒に 1 回だけ実行。M3 確定時は通常通り実行。
+        # 1秒間隔: 口座残高/ポジション同期の鮮度を確保しつつ、EA OnTimer 50ms に対しては
+        #          20回に1回の REQ なので負荷増加は無視できる。
+        last_periodic_sync_time = 0.0
+        _PERIODIC_SYNC_INTERVAL_SEC = 1.0
+        # ▼追加: M3通知受信時刻トラッカー
+        last_m3_received_time = time.time()
+        # ▼追加: 起動後安定化クールダウン（防衛的シグナルスキップ）
+        # バッファ充填直後・EA再起動後・市場閉鎖明けはOLS状態が不完全な場合があるため
+        # 最初のN回のM3確定シグナルをスキップして安定化を待つ。
+        # スキップ中もprocess_new_m05_barは正常実行（バッファ・OLS更新は継続）。
+        # M3確定 = last_bar_timestamps["M3"] が変化した瞬間をカウント。
+        #   起動時（フルウォームアップ/スナップショット復帰）: 1回
+        #   EA再起動（needs_notify）: 2回
+        #   BUFFER-INTEGRITY gap-fill（市場閉鎖・月曜再開等）: 1回
+        _skip_signals_count = 1
+        logger.info(f"[COOLDOWN] 起動後安定化クールダウン設定: {_skip_signals_count} M3確定スキップ")
 
         while True:
             try:
                 # M3確定通知をポーリング（最大1秒待機）
-                new_m05_bar = bridge.poll_m3_bar(timeout_ms=100)
+                # [Phase 9d 発見 #61] poll_m3_bar 戻り値が
+                # Optional[Dict] → Optional[List[Dict]] に変更。
+                # 通常 6 本 (EA buf_size 不足時は利用可能分のみ) のリストが返る。
+                new_m05_bars = bridge.poll_m3_bar(timeout_ms=100)
 
                 # 毎秒実行される定期処理
                 current_time_sec = time.time()
 
-                # [STALE-GUARD] EA再起動検知 → notify_python_ready()再送
+                # [STALE-GUARD] EA再起動検知 → notify_python_ready()再送 + gap-fill
                 # Heartbeatスレッドがタイムアウトを検知するとneeds_notifyをセットする。
                 # メインループがここで検知してnotify_python_ready()（needs_notifyクリア）を呼ぶ。
                 # これによりHeartbeatが次のサイクルでPING:READYを送信しEA側のM3通知が解禁される。
@@ -674,6 +769,38 @@ def main():
                         "⚠️ [STALE-GUARD] EA再起動を検知。notify_python_ready()を再送します..."
                     )
                     bridge.notify_python_ready()
+                    # [GAP-FILL] EA停止中のバッファ欠落を補填
+                    g_last_processed_bar_time = _run_gap_fill(
+                        feature_engine, bridge, g_market_proxy, g_last_processed_bar_time
+                    )
+                    # [COOLDOWN] EA再起動後はOLS欠落が大きいため2M3確定スキップ
+                    _skip_signals_count = max(_skip_signals_count, 2)
+                    logger.info(f"[COOLDOWN] EA再起動検知: {_skip_signals_count} M3確定スキップに設定")
+
+                # [BUFFER-INTEGRITY] メインループ整合性チェック & 自動 gap-fill
+                # 「最後にM3通知を受け取った時刻」で判定する。
+                # last_bar_timestamps["M0.5"]はEAが常に30〜60秒前のバーを送るため
+                # 構造的にノイズが大きく、正常運転中でも閾値を超えてしまう。
+                # M3通知受信時刻ベースなら「M3通知が途絶えた = EA停止/市場閉鎖」を
+                # ノイズゼロで検知できる。閾値は M3 間隔 × 2（360秒）。
+                if current_time_sec - last_buffer_check_time >= _BUFFER_CHECK_INTERVAL_SEC:
+                    last_buffer_check_time = current_time_sec
+                    _m3_silence_sec = current_time_sec - last_m3_received_time
+                    if (
+                        _m3_silence_sec > 360  # M3 間隔(180s) × 2
+                        and current_time_sec - last_gap_fill_time >= _GAP_FILL_COOLDOWN_SEC
+                    ):
+                        logger.warning(
+                            f"⚠️ [BUFFER-INTEGRITY] M3通知が {_m3_silence_sec:.0f}秒 途絶えています。"
+                            f"自動 gap-fill を発動します..."
+                        )
+                        g_last_processed_bar_time = _run_gap_fill(
+                            feature_engine, bridge, g_market_proxy, g_last_processed_bar_time
+                        )
+                        last_gap_fill_time = current_time_sec
+                        # [COOLDOWN] 市場閉鎖・月曜再開等の復帰後は1M3確定スキップ
+                        _skip_signals_count = max(_skip_signals_count, 1)
+                        logger.info(f"[COOLDOWN] BUFFER-INTEGRITY復帰: {_skip_signals_count} M3確定スキップに設定")
 
                 # 15分間隔でスナップショットを強制保存
                 if current_time_sec - last_snapshot_time > 900:
@@ -700,108 +827,140 @@ def main():
 
                 # ==========================================================
                 # 【シミュレーター完全同期 1】 タイムアウト(TO)決済の監視と実行
+                # [LAG-FIX] M3 未確定中は 1 秒間隔に間引く (口座残高鮮度確保)
+                # M3 確定時 (new_m05_bars is not None) は必ず実行する。
+                # [LAG-FIX-4] M3 境界 (180秒) 前後 3 秒間は重い処理をスキップ。
+                # 旧: 1秒間隔の sync が M3 close 直前に発火して REQ-REP × 2 で
+                #     M3 通知の受信が最大 215ms 遅延する問題があった
+                #     (実機ログで 11:51:00.176 通知 → 11:51:00.391 受信を確認)
+                # 新: M3 close 前後 3 秒間 (= 全体の 3.3%) は sync を見送る
+                #     代わりに M3 通知が来た時 (new_m05_bars is not None) に実行する
                 # ==========================================================
-                current_time = datetime.now(timezone.utc)
-                if state_manager and state_manager.current_state:
-                    for trade in state_manager.current_state.trades:
-                        duration_mins = trade.get_duration_minutes(current_time)
-                        is_timeout = False
-                        td_long = risk_engine.config.get("td_minutes_long", 30.0)
-                        td_short = risk_engine.config.get("td_minutes_short", 30.0)
-                        if trade.direction == "BUY" and duration_mins >= td_long:
-                            is_timeout = True
-                        elif trade.direction == "SELL" and duration_mins >= td_short:
-                            is_timeout = True
-                        if is_timeout:
-                            logger.info(
-                                f"⏱️ タイムアウト(TO)条件到達。強制決済を実行: Ticket={trade.ticket}, Direction={trade.direction}, Duration={duration_mins:.1f}分"
-                            )
-                            success = bridge.send_trade_command(
-                                {
-                                    "action": "CLOSE",
-                                    "ticket": trade.ticket,
-                                    "magic": 77777,
-                                }
-                            )
-                            if success:
-                                event_data = {
-                                    "ticket": trade.ticket,
-                                    "close_reason": "TO",
-                                    "max_consecutive_sl": risk_engine.config.get(
-                                        "max_consecutive_sl", 2
-                                    ),
-                                    "cooldown_minutes_after_sl": risk_engine.config.get(
-                                        "cooldown_minutes_after_sl", 30
-                                    ),
-                                }
-                                state_manager.apply_event_and_update(
-                                    EventType.POSITION_CLOSED, event_data
-                                )
-                            else:
-                                logger.warning(
-                                    f"⚠️ タイムアウト決済コマンドの送信に失敗しました。次ループで再試行します: Ticket={trade.ticket}"
-                                )
+                _now_in_m3_cycle = current_time_sec % 180.0
+                _near_m3_boundary = (_now_in_m3_cycle > 177.0) or (_now_in_m3_cycle < 3.0)
 
-                # ==========================================================
-                # 【シミュレーター完全同期 2】 サイレント・クローズ(SL/PT)の確実な捕捉
-                # ==========================================================
-                if hasattr(bridge, "request_recent_history"):
-                    recent_history = bridge.request_recent_history()
-                    if recent_history:
-                        for closed_pos in recent_history:
-                            ticket = closed_pos.get("ticket")
-                            active_trade = next(
-                                (
-                                    t
-                                    for t in state_manager.current_state.trades
-                                    if t.ticket == ticket
-                                ),
-                                None,
-                            )
-                            if active_trade:
-                                reason = closed_pos.get("close_reason", "UNKNOWN")
-                                logger.warning(
-                                    f"🔔 ブローカー側での決済を検知 (サイレントクローズ捕捉): Ticket={ticket}, Reason={reason}"
+                _do_periodic_sync = (
+                    new_m05_bars is not None
+                    or (
+                        not _near_m3_boundary
+                        and (current_time_sec - last_periodic_sync_time) >= _PERIODIC_SYNC_INTERVAL_SEC
+                    )
+                )
+                if _do_periodic_sync:
+                    last_periodic_sync_time = current_time_sec
+                    current_time = datetime.now(timezone.utc)
+                    if state_manager and state_manager.current_state:
+                        for trade in state_manager.current_state.trades:
+                            duration_mins = trade.get_duration_minutes(current_time)
+                            is_timeout = False
+                            td_long = risk_engine.config.get("td_minutes_long", 30.0)
+                            td_short = risk_engine.config.get("td_minutes_short", 30.0)
+                            if trade.direction == "BUY" and duration_mins >= td_long:
+                                is_timeout = True
+                            elif trade.direction == "SELL" and duration_mins >= td_short:
+                                is_timeout = True
+                            if is_timeout:
+                                logger.info(
+                                    f"⏱️ タイムアウト(TO)条件到達。強制決済を実行: Ticket={trade.ticket}, Direction={trade.direction}, Duration={duration_mins:.1f}分"
                                 )
-                                event_data = {
-                                    "ticket": ticket,
-                                    "close_reason": reason,
-                                    "max_consecutive_sl": risk_engine.config.get(
-                                        "max_consecutive_sl", 2
-                                    ),
-                                    "cooldown_minutes_after_sl": risk_engine.config.get(
-                                        "cooldown_minutes_after_sl", 30
-                                    ),
-                                }
-                                state_manager.apply_event_and_update(
-                                    EventType.POSITION_CLOSED, event_data
+                                success = bridge.send_trade_command(
+                                    {
+                                        "action": "CLOSE",
+                                        "ticket": trade.ticket,
+                                        "magic": 77777,
+                                    }
                                 )
+                                if success:
+                                    event_data = {
+                                        "ticket": trade.ticket,
+                                        "close_reason": "TO",
+                                        "max_consecutive_sl": risk_engine.config.get(
+                                            "max_consecutive_sl", 2
+                                        ),
+                                        "cooldown_minutes_after_sl": risk_engine.config.get(
+                                            "cooldown_minutes_after_sl", 30
+                                        ),
+                                    }
+                                    state_manager.apply_event_and_update(
+                                        EventType.POSITION_CLOSED, event_data
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ タイムアウト決済コマンドの送信に失敗しました。次ループで再試行します: Ticket={trade.ticket}"
+                                    )
 
-                # ブローカーと最終同期
-                broker_state_sync = bridge.request_broker_state()
-                if broker_state_sync:
-                    state_manager.reconcile_with_broker(broker_state_sync)
+                    # ==========================================================
+                    # 【シミュレーター完全同期 2】 サイレント・クローズ(SL/PT)の確実な捕捉
+                    # [BUGFIX] state_manager.current_state が None のとき (起動直後等) に
+                    #          .trades アクセスで AttributeError が出る問題を修正。
+                    # ==========================================================
+                    if (
+                        hasattr(bridge, "request_recent_history")
+                        and state_manager
+                        and state_manager.current_state
+                    ):
+                        recent_history = bridge.request_recent_history()
+                        if recent_history:
+                            for closed_pos in recent_history:
+                                ticket = closed_pos.get("ticket")
+                                active_trade = next(
+                                    (
+                                        t
+                                        for t in state_manager.current_state.trades
+                                        if t.ticket == ticket
+                                    ),
+                                    None,
+                                )
+                                if active_trade:
+                                    reason = closed_pos.get("close_reason", "UNKNOWN")
+                                    logger.warning(
+                                        f"🔔 ブローカー側での決済を検知 (サイレントクローズ捕捉): Ticket={ticket}, Reason={reason}"
+                                    )
+                                    event_data = {
+                                        "ticket": ticket,
+                                        "close_reason": reason,
+                                        "max_consecutive_sl": risk_engine.config.get(
+                                            "max_consecutive_sl", 2
+                                        ),
+                                        "cooldown_minutes_after_sl": risk_engine.config.get(
+                                            "cooldown_minutes_after_sl", 30
+                                        ),
+                                    }
+                                    state_manager.apply_event_and_update(
+                                        EventType.POSITION_CLOSED, event_data
+                                    )
+
+                    # ブローカーと最終同期
+                    broker_state_sync = bridge.request_broker_state()
+                    if broker_state_sync:
+                        state_manager.reconcile_with_broker(broker_state_sync)
 
                 # M3未確定の場合はここで次のループへ
-                if new_m05_bar is None:
+                # [Phase 9d 発見 #61] new_m05_bars は List[Dict] または None
+                if new_m05_bars is None or len(new_m05_bars) == 0:
                     continue
 
-                # [STALE-GUARD] ウォームアップ中にキューに溜まった古いバーを破棄する。
+                # [STALE-GUARD] ウォームアップ中にキューに溜まった古い通知を破棄する。
                 # ウォームアップ（JIT+OLS初期化）に最大30分かかる場合がある。
                 # そのままシグナル処理すると同一秒に大量のオーダーが一斉発射される事故につながる。
-                # M0.5(30秒)足なので、120秒より古ければ確実に「溜まりもの」と判断して読み飛ばす。
-                _bar_ts = new_m05_bar.get("timestamp")
-                if _bar_ts is not None:
+                # M3 通知の最後のバー (= M3 close 時点の M0.5 バー) で年齢判定する。
+                # 120秒より古ければ確実に「溜まりもの」と判断して読み飛ばす。
+                _last_bar_ts = new_m05_bars[-1].get("timestamp")
+                if _last_bar_ts is not None:
                     _now_utc = datetime.now(timezone.utc)
-                    if _bar_ts.tzinfo is None:
-                        _bar_ts = _bar_ts.replace(tzinfo=timezone.utc)
-                    _age_sec = (_now_utc - _bar_ts).total_seconds()
+                    if _last_bar_ts.tzinfo is None:
+                        _last_bar_ts = _last_bar_ts.replace(tzinfo=timezone.utc)
+                    _age_sec = (_now_utc - _last_bar_ts).total_seconds()
                     if _age_sec > 120:
                         logger.warning(
-                            f"⚠️ [STALE-GUARD] 古いM0.5バーを破棄 "
-                            f"(age={_age_sec:.0f}秒 / ts={_bar_ts})"
+                            f"⚠️ [STALE-GUARD] 古いM3通知を破棄 "
+                            f"(age={_age_sec:.0f}秒 / 最終ts={_last_bar_ts} / "
+                            f"バー数={len(new_m05_bars)})"
                         )
                         continue
+
+                # [BUFFER-INTEGRITY] 有効なM3通知を受信した時刻を記録
+                last_m3_received_time = current_time_sec
 
                 # 市場プロキシの更新（M5の1バー前比リターン、学習側2Gと完全一致）
                 # m05_dataframeをM5にリサンプリングしてM5クローズ2本を取得
@@ -809,6 +968,12 @@ def main():
                 # [乖離⑥修正 V2] 学習側 s1_1_B_build_ohlcv.py の整数除算と一致させる:
                 #   学習側: (ts_int // bucket_size_ns) * bucket_size_ns でfloor集約
                 #   学習側相当: closed="left", label="left"
+                #
+                # [Phase 9d 発見 #61] 6 本ループ前にプロキシを更新する設計を維持。
+                # 既存仕様 (1 バー単位) と同等のセマンティクス: process_new_m05_bar
+                # に渡る market_proxy は m05_dataframe の現状態 (新バッチ未追加) から
+                # derived される。新バッチ 6 本処理後の M3 close 時点で OLS 更新は
+                # この market_proxy で行われる (off-by-one は既存仕様と同じ)。
                 if feature_engine and len(feature_engine.m05_dataframe) >= 20:
                     _recent = pd.DataFrame(
                         list(feature_engine.m05_dataframe)[-20:]
@@ -838,10 +1003,47 @@ def main():
                         if len(g_market_proxy) > 10000:
                             g_market_proxy = g_market_proxy.iloc[-5000:]
 
-                # M0.5バーをエンジンに渡し、シグナルを待つ
-                signal_list = feature_engine.process_new_m05_bar(
-                    new_m05_bar, g_market_proxy
-                )
+                # ─────────────────────────────────────────────────────────
+                # [Phase 9d 発見 #61] M0.5 バーをエンジンに順次渡す
+                # ─────────────────────────────────────────────────────────
+                # 案 X (EA 6 本送信) + 方針 2 (engine 側 timestamp ベース close 検知)
+                # との併用で、M3 close 時に学習側と数学的に等価な OHLCV 集約 +
+                # 即時シグナル発火を達成する。
+                #
+                # 設計:
+                #   - 最初の n-1 本: warmup_only=True (バッファ/OLS 更新のみ、シグナル無し)
+                #   - 最後の 1 本   : warmup_only=False (M3 close 検知 + シグナル発火)
+                #
+                # 最後のバー (= 直近の M0.5 = M3 boundary 時点) で
+                # _resample_and_update_buffer がタイムスタンプ判定により
+                # 当該 M3 bucket を closed と判定 → newly_closed_timeframes["M3"]
+                # に登録 → 再計算 + シグナル発火。
+                #
+                # 中間バーでも各 TF (M1 等) の close は適切に検知され、
+                # その都度 OLS 更新 + 特徴量キャッシュ更新が走る (process_new_m05_bar
+                # 内部の M3 close 判定でのみシグナルが発火する設計)。
+                # ─────────────────────────────────────────────────────────
+                _m3_ts_before = feature_engine.last_bar_timestamps.get("M3")
+                signal_list = []
+                _n_bars = len(new_m05_bars)
+                for _i, _bar in enumerate(new_m05_bars):
+                    _is_last = (_i == _n_bars - 1)
+                    _sl = feature_engine.process_new_m05_bar(
+                        _bar, g_market_proxy, warmup_only=not _is_last
+                    )
+                    if _is_last:
+                        signal_list = _sl
+                _m3_ts_after = feature_engine.last_bar_timestamps.get("M3")
+
+                # [COOLDOWN] M3確定を検知してスキップカウントをデクリメント
+                # M3確定 = last_bar_timestamps["M3"] が変化した瞬間
+                if _skip_signals_count > 0 and _m3_ts_after != _m3_ts_before:
+                    _skip_signals_count -= 1
+                    logger.info(
+                        f"[COOLDOWN] 安定化クールダウン中のためシグナルをスキップ"
+                        f"（残り {_skip_signals_count} M3確定待ち）"
+                    )
+                    continue  # バッファ・OLS更新は完了済み、シグナル処理のみスキップ
 
                 if not signal_list:
                     continue  # シグナルなし
@@ -1148,7 +1350,11 @@ def main():
                     # ★追加確認: atr_ratioもmarket_infoから取得してrisk_engineに渡す
                     current_atr_ratio = signal.market_info.get("atr_ratio", 0.0)
                     # ▼追加: M0.5バーから取得したリアルタイムスプレッド
-                    current_spread = new_m05_bar.get("spread", 999.0)
+                    # [Phase 9d 発見 #61] new_m05_bars はリスト。最終バー (= M3 close
+                    # 直近の M0.5) が現在価格に最も近いので、その spread を使う。
+                    # spread は EA 側で payload 単位 1 つだけ送られ、各バー dict に
+                    # 同値で複製されているため、どのバーから取得しても結果は同じ。
+                    current_spread = new_m05_bars[-1].get("spread", 999.0)
 
                     # ▼▼▼ 修正: Long/Shortで独立したSL/PT倍率をコンフィグから取得 ▼▼▼
                     if direction == "BUY":

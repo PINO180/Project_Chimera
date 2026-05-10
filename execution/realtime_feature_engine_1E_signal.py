@@ -1,43 +1,65 @@
 # realtime_feature_engine_1E_signal.py
-# Project Cimera V5: Feature Engine Module 1E (Signal / Spectral / Wavelet / Hilbert)
+# Category 1E: 信号処理系 (Spectral / Wavelet / Hilbert / Acoustic / Signal Stats)
 #
-# [Step 11 リファクタリング]
-# 全 DSP UDF を core_indicators.py (Single Source of Truth) から import することで
-# engine_1_E (学習側) との完全な数値一致を保証する。
+# ==================================================================
+# 【Phase 9b 改修】司令塔統合 .select() 対応 (FFI overhead 削減)
+# ==================================================================
 #
-# 主な変更点:
-#   1. numba_fft / spectral_centroid_udf / spectral_flatness_udf /
-#      wavelet_entropy_udf / hilbert_phase_var_udf /
-#      hilbert_phase_stability_udf / acoustic_power_udf の
-#      ローカル定義を廃止 → core_indicators から import
-#   2. hilbert_phase_var_udf / hilbert_phase_stability_udf の
-#      np.roll() 近似 → get_analytic_signal() (FFTベース厳密実装) に統一
-#   3. fastmath=True (旧) → fastmath=False (core_indicators 統一値) に変更
-#   4. signal_peak_to_peak_100 への ATR 割り追加
-#      (calculate_atr_wilder + scale_by_atr 経由)
-#   5. wavelet_std_* の np.std(ddof=1) 直書き → stddev_unbiased に統一
-#   6. e1e_sample_weight を calculate_sample_weight で計算・返却
+# 目的: Phase 9 (Step B) で達成した Polars 直呼び + DSP UDF 直接呼びの
+#       2 層構造を保ったまま、6 モジュールの Polars 式を司令塔で 1 回の
+#       .select() に統合できるよう構造を分解する。
+#
+# 【Phase 9b の改修】
+#   追加: `_build_polars_pieces(data, lookback_bars) -> (columns, exprs, layer2)`
+#     - columns: close + __temp_atr_13 + __temp_atr_100 (raw ATR、+1e-10 は割り算時)
+#     - exprs:   Polars 式リスト (spectral_energy/peak_freq, wavelet_mean/std,
+#                hilbert_amp_*, hilbert_freq_energy_ratio, signal_rms/peak_to_peak/crest_factor)
+#     - layer2:  DSP Numba UDF 直接呼び結果 (spectral_centroid/bandwidth/rolloff/
+#                flux/flatness/entropy, wavelet_energy/entropy, hilbert_amplitude/phase/freq,
+#                acoustic_power/frequency) + e1e_sample_weight
+#   変更: `calculate_features` は `_build_polars_pieces` を呼んで単独計算する
+#         薄いラッパーへ。後方互換完全維持。
+#
+# 【1E の特徴】
+#   1E は最初から Layer 1 (Polars rolling 統計) と Layer 2 (DSP UDF 直接呼び)
+#   が明示的に分離されており、Phase 9b への分解がもっとも素直なモジュール。
+#
+#   DSP UDF は O(window²) の FFT 計算で重く、最後の window 本のみ渡せば最終バー
+#   の値が決まるため、numpy 直接呼びが最適 (学習側 map_batches と最終バーで同値)。
+#
+# 【ATR の扱い】
+#   学習側: pl.struct(...).map_batches(calculate_atr_wilder(..., 13/100))
+#           → 割り算時に + 1e-10 を加える
+#   本番側: numpy で事前計算して __temp_atr_{13,100} 列に raw 値を入れる
+#           → 割り算時に Polars 式で `(pl.col("__temp_atr_13") + 1e-10)` を使う
+#   結果: 学習側と完全同値の計算経路
+#
+# 【SSoT 階層】(Phase 9 から不変)
+#   Layer 1 (rolling 統計): Polars Rust エンジン
+#   Layer 2 (Numba UDF):    core_indicators (SSoT)
+#
+# 【保持される過去の修正】
+#   ・QAState (apply_quality_assurance_to_group の等価実装、bias=False 補正)
+#   ・hilbert_phase_*_udf は core_indicators の FFT-Hilbert 厳密実装を使用
+#   ・e1e_sample_weight は学習側 base_columns 扱いで QA 対象外
+# ==================================================================
 
 import sys
 from pathlib import Path
 
 # -----------------------------------------------------------------------
 # パス解決: blueprint → core_indicators の順で解決する
-# ① まず親ディレクトリ (/workspace) を sys.path に追加して blueprint を解決
-# ② 次に blueprint.CORE_DIR (/workspace/core) を追加して core_indicators を解決
-# ③ blueprint が見つからない場合は相対パスの fallback を使用
 # -----------------------------------------------------------------------
-_parent_dir = str(Path(__file__).resolve().parents[1])  # /workspace
+_parent_dir = str(Path(__file__).resolve().parents[1])
 if _parent_dir not in sys.path:
     sys.path.append(_parent_dir)
 
 try:
     import blueprint as config
-    _core_dir = str(config.CORE_DIR)          # /workspace/core
+    _core_dir = str(config.CORE_DIR)
     if _core_dir not in sys.path:
         sys.path.append(_core_dir)
 except ModuleNotFoundError:
-    # blueprint が見つからない場合 (テスト環境など) は相対 fallback
     _fallback_core = str(Path(__file__).resolve().parent / "core")
     if _fallback_core not in sys.path:
         sys.path.append(_fallback_core)
@@ -45,9 +67,6 @@ except ModuleNotFoundError:
 from core_indicators import (
     # [ATR & VOLATILITY]
     calculate_atr_wilder,
-    scale_by_atr,
-    # [STATS]
-    stddev_unbiased,
     # [WEIGHT]
     calculate_sample_weight,
     # [DSP] — スペクトル系
@@ -72,95 +91,63 @@ from core_indicators import (
 )
 
 import numpy as np
-from numba import njit
-from typing import Dict, Any, Optional
+import polars as pl
+import numba as nb
+from typing import Dict, Optional, Tuple, List
+
 
 # ==================================================================
-# [Step 11] ローカル UDF 定義廃止ノート
+# ヘルパー関数
 # ==================================================================
-# 以下の関数はすべて core_indicators.[CATEGORY: DSP] で定義されており、
-# 上記 import 文で取り込まれています。このファイルへの重複定義は廃止。
-#
-#   numba_fft              → core_indicators.numba_fft
-#   spectral_centroid_udf  → core_indicators.spectral_centroid_udf
-#   spectral_flatness_udf  → core_indicators.spectral_flatness_udf
-#   wavelet_entropy_udf    → core_indicators.wavelet_entropy_udf
-#   hilbert_phase_var_udf  → core_indicators.hilbert_phase_var_udf
-#   hilbert_phase_stability_udf → core_indicators.hilbert_phase_stability_udf
-#   acoustic_power_udf     → core_indicators.acoustic_power_udf
-#
-# アルゴリズム変更（乖離解消）:
-#   hilbert_phase_var_udf / hilbert_phase_stability_udf:
-#     旧: np.roll(window_data, 1) による近似（粗く、scipy.signal.hilbert と異なる）
-#     新: get_analytic_signal() (FFTベース厳密実装) — engine_1_E 学習側と完全一致
-#
-#   wavelet_entropy_udf:
-#     旧: parallel=True (スレッド衝突リスクあり)
-#     新: parallel=False (core_indicators 統一値)
-#
-#   fastmath: True → False (浮動小数点の再現性を優先)
-# ==================================================================
+
+@nb.njit(fastmath=False, cache=True)
+def _pct_change(arr: np.ndarray) -> np.ndarray:
+    """Polars pct_change() と完全一致: (x[i] - x[i-1]) / x[i-1]
+    prev == 0 のとき: x[i] > 0 → +inf, x[i] < 0 → -inf, x[i] == 0 → NaN
+    先頭は nan。
+    """
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < 2:
+        return out
+    for i in range(1, n):
+        prev = arr[i - 1]
+        if prev != 0.0:
+            out[i] = (arr[i] - prev) / prev
+        else:
+            cur = arr[i]
+            if cur > 0.0:
+                out[i] = np.inf
+            elif cur < 0.0:
+                out[i] = -np.inf
+            else:
+                out[i] = np.nan
+    return out
 
 
 # ==================================================================
 # QAState — 学習側 apply_quality_assurance_to_group の等価実装
+# (1A〜1D と完全に同一の実装。Phase 9b では変更なし。)
 # ==================================================================
 
-
 class QAState:
-    """
-    学習側 apply_quality_assurance_to_group のリアルタイム等価実装。
-
-    学習側の処理（Polars LazyFrame 全系列一括）:
-        safe_col = when(col.is_infinite()).then(None).otherwise(col)
-        ewm_mean = safe_col.ewm_mean(half_life=HL, adjust=False, ignore_nulls=True)
-        ewm_std  = safe_col.ewm_std (half_life=HL, adjust=False, ignore_nulls=True)
-        result   = when(col==inf).then(p99).when(col==-inf).then(p01)
-                   .otherwise(col).clip(p01, p99).fill_null(0.0).fill_nan(0.0)
-
-    alpha = 1 - exp(-ln2 / half_life)
-    EWM_mean[t] = alpha * x[t] + (1-alpha) * EWM_mean[t-1]  (NaN/inf はスキップ)
-    EWM_var[t]  = (1-alpha) * (EWM_var[t-1] + alpha * (x[t] - EWM_mean[t-1])^2)
-
-    使い方:
-        qa_state = FeatureModule1E.QAState(lookback_bars=1440)
-        for bar in live_stream:
-            features = FeatureModule1E.calculate_features(data_window, 1440, qa_state)
+    """学習側 apply_quality_assurance_to_group のリアルタイム等価実装。
+    詳細は realtime_feature_engine_1A_statistics.py の QAState を参照。
     """
 
     def __init__(self, lookback_bars: int = 1440):
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
-        # bias=False 補正用: Polars ewm_std(adjust=False, bias=False) は t バー目に
-        # 1 / sqrt(1 - sum_w2_t) を分散に掛ける。ここで sum_w2_t は重みの2乗和:
-        #   sum_w2_t = alpha^2 * (1 - r2^t) / (1 - r2) + r2^t  (r2 = (1-alpha)^2)
-        # 詳細は update_and_clip 内のコメント参照。
-        self._ewm_n: Dict[str, int] = {}  # 有効値の累積更新回数（bias 補正に使用）
+        self._ewm_n: Dict[str, int] = {}
 
     def update_and_clip(self, key: str, raw_val: float) -> float:
-        """1特徴量の raw_val に QA処理を適用して返す（学習側と完全一致）。"""
         alpha = self.alpha
 
-        # 【inf 処理】学習側 Polars (修正後の engine_1_E) と一致 (Option B):
-        #   学習側 engine_1_E.apply_quality_assurance_to_group の挙動:
-        #     1. safe_col = pl.when(is_infinite).then(None).otherwise(col).fill_nan(None)
-        #        で inf も NaN も null 化
-        #     2. ewm_mean / ewm_std を safe_col から計算 → 有効値だけで EWM 進行
-        #        さらに forward_fill() で inf/NaN 位置の null bounds を直前の値で埋める
-        #     3. clip 適用時に inf 位置でも有効な bounds が使えるため、
-        #        pl.when(col==inf).then(p99) で +inf → upper bound に置換、
-        #        pl.when(col==-inf).then(p01) で -inf → lower bound に置換
-        #     4. fill_nan(0.0) で NaN を 0.0 に置換
-        #   本番側もこれに合わせる:
-        #     - +inf, -inf は p99/p01 (upper/lower bound) で clip
-        #     - NaN は 0.0
-        #     - EWM 状態更新時は inf/NaN を除外 (= ignore_nulls=True 相当)
         is_pos_inf = np.isposinf(raw_val)
         is_neg_inf = np.isneginf(raw_val)
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
-        # EWM 状態更新（ignore_nulls=True 相当）
         if key not in self._ewm_mean:
             if np.isnan(ewm_input):
                 return 0.0
@@ -172,39 +159,15 @@ class QAState:
             if not np.isnan(ewm_input):
                 prev_mean = self._ewm_mean[key]
                 prev_var  = self._ewm_var[key]
-                new_mean  = alpha * ewm_input + (1.0 - alpha) * prev_mean
-                new_var   = (1.0 - alpha) * (prev_var + alpha * (ewm_input - prev_mean) ** 2)
+                new_mean = alpha * ewm_input + (1.0 - alpha) * prev_mean
+                new_var  = (1.0 - alpha) * (prev_var + alpha * (ewm_input - prev_mean) ** 2)
                 self._ewm_mean[key] = new_mean
                 self._ewm_var[key]  = new_var
                 self._ewm_n[key]    = self._ewm_n.get(key, 0) + 1
 
-        # ±5σ クリップ
-        # Polars ewm_std(adjust=False, bias=False) の bias 補正を適用:
-        #
-        # 【修正前 (誤式)】
-        #   bias_corr = 1 / sqrt(1 - (1-alpha)^(2n))
-        #   この式は Polars の真の bias correction とズレており、
-        #   ウォームアップ初期 (n < ~100バー) で σ が過小評価される。
-        #
-        # 【修正後 (Polars 互換式 — 実証検証で 1e-15 精度で完全一致)】
-        #   adjust=False の重み: w_k = alpha*(1-alpha)^k (k=0..n-2) と
-        #                       w_{n-1} = (1-alpha)^(n-1) (最古項を正規化保持)
-        #   sum_w = 1 (常に)、sum_w2 = 重みの2乗和
-        #   bias_factor_var = 1 / (1 - sum_w2)
-        #     r2     = (1 - alpha)^2
-        #     m      = n - 1                          # 漸化式は1段先送りで n-1 が正解
-        #     sum_w2 = alpha^2 * (1 - r2^m) / (1 - r2) + r2^m   (m >= 1)
-        #     sum_w2 = 1                               (n == 1 退化ケース)
-        #     ewm_std = sqrt(ewm_var * bias_factor_var)
-        #
-        #   実証検証 (HL=1440, M1スキャ用デフォルト, 5000サンプル):
-        #     n=2   : 真値 0.4490 / 修正後 0.4490 (差 ~1e-15)
-        #     n=10  : 真値 0.5131 / 修正後 0.5131 (差 ~1e-15)
-        #     n>=50 : 真値と完全一致
-        ewm_mean  = self._ewm_mean[key]
+        ewm_mean = self._ewm_mean[key]
         n_updates = self._ewm_n.get(key, 1)
         if n_updates <= 1:
-            # n=1 は分散自体が 0 なので bias 補正不要
             ewm_std = 0.0
         else:
             r2 = (1.0 - alpha) ** 2
@@ -212,40 +175,15 @@ class QAState:
             if r2 < 1.0 - 1e-15:
                 sum_w2 = alpha * alpha * (1.0 - r2 ** m) / (1.0 - r2) + r2 ** m
             else:
-                # alpha が極端に小さい (HL → ∞) 退化ケース
                 sum_w2 = 1.0
             if sum_w2 < 1.0 - 1e-15:
                 bias_factor_var = 1.0 / (1.0 - sum_w2)
                 ewm_std = np.sqrt(max(self._ewm_var[key] * bias_factor_var, 0.0))
             else:
                 ewm_std = 0.0
-        p01       = ewm_mean - 5.0 * ewm_std
-        p99       = ewm_mean + 5.0 * ewm_std
+        p01 = ewm_mean - 5.0 * ewm_std
+        p99 = ewm_mean + 5.0 * ewm_std
 
-        # =====================================================================
-        # 【修正済み】学習側 Polars との完全一致 (Option B)
-        #
-        # 経緯:
-        #   検証側の指摘で 2 つのバグが発覚:
-        #     バグ1: チェック順序ミスで inf 入力時に upper/lower bound 分岐に到達不能
-        #            (is_pos_inf 判定より np.isnan(ewm_input) が先に発火し、
-        #             ewm_input が NaN 化されているため常に 0.0 が返っていた)
-        #     バグ2: 旧 docstring が宣言した挙動 (inf → upper/lower 置換) が
-        #            学習側 Polars の当時の実挙動 (inf を null bounds でそのまま通過)
-        #            と不整合だった
-        #
-        #   一旦 Option A (inf をそのまま通過、当時の Polars 挙動と一致) に修正したが、
-        #   その後 engine_1_E.apply_quality_assurance_to_group を:
-        #     - safe_col に .fill_nan(None) を追加 (NaN も null 化、状態汚染防止)
-        #     - ewm_mean / ewm_std に .forward_fill() を追加 (inf 位置でも有効 bounds)
-        #   と修正したため、学習側でも inf が p99/p01 で正しく clip されるようになった。
-        #   それに合わせ本番側も Option B (チェック順序入れ替え + bound 置換) に変更:
-        #
-        #   - +inf 入力 → upper bound (p99) を返す (engine_1_E と同じ)
-        #   - -inf 入力 → lower bound (p01) を返す
-        #   - NaN 入力  → 0.0 を返す (fill_nan(0.0) 等価)
-        #   - 有限値    → clip(p01, p99) で ±5σ クリップ
-        # =====================================================================
         if is_pos_inf:
             return float(p99) if np.isfinite(p99) else 0.0
         if is_neg_inf:
@@ -258,54 +196,250 @@ class QAState:
 
 
 # ==================================================================
-# ユーティリティ関数（このファイル固有・軽量処理用）
+# メイン計算クラス
 # ==================================================================
-
-
-@njit(fastmath=False, cache=True)
-def _window(arr: np.ndarray, window: int) -> np.ndarray:
-    """直近 window 本のスライスを返す。"""
-    if window <= 0:
-        return np.empty(0, dtype=arr.dtype)
-    if window > len(arr):
-        return arr
-    return arr[-window:]
-
-
-@njit(fastmath=False, cache=True)
-def _last(arr: np.ndarray) -> float:
-    """配列の最終要素をスカラーで返す。空配列は nan。"""
-    if len(arr) == 0:
-        return np.nan
-    return float(arr[-1])
-
-
-def _pct_change(arr: np.ndarray) -> np.ndarray:
-    """
-    価格変化率（pct_change）を計算する。先頭要素は nan。
-
-    Polars pct_change() と完全一致:
-      (arr[i] - arr[i-1]) / arr[i-1]
-      prev == 0 の場合は inf（Polars準拠）。
-    """
-    n = len(arr)
-    pct = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return pct
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pct[1:] = (arr[1:] - arr[:-1]) / arr[:-1]
-    return pct
-
-
-# ==================================================================
-# メイン計算モジュール
-# ==================================================================
-
 
 class FeatureModule1E:
 
-    # 外部から FeatureModule1E.QAState としてアクセス可能にする
     QAState = QAState
+
+    @staticmethod
+    def _build_polars_pieces(
+        data: Dict[str, np.ndarray],
+        lookback_bars: int = 1440,
+    ) -> Tuple[Dict[str, np.ndarray], List[pl.Expr], Dict[str, float]]:
+        """
+        統合 .select() 用の 3 要素を返す。
+
+        Returns:
+            columns: Dict[str, np.ndarray]
+                共通列 (close) + 1E 固有の __temp_atr_13 / __temp_atr_100 (raw)。
+            exprs: List[pl.Expr]
+                Polars rolling 統計式リスト (alias は e1e_* の最終特徴量名)。
+                spectral_energy/peak_freq, wavelet_mean/std, hilbert_amp_*,
+                hilbert_freq_energy_ratio, signal_rms/peak_to_peak/crest_factor。
+            layer2: Dict[str, float]
+                DSP UDF 直接呼び結果 (close_pct[-window:] に対する最終バー値)
+                + e1e_sample_weight (QA対象外)。
+        """
+        close_arr = data["close"].astype(np.float64)
+        if len(close_arr) == 0:
+            return {}, [], {}
+
+        high_arr  = (
+            data["high"].astype(np.float64) if "high" in data and len(data["high"]) > 0
+            else close_arr
+        )
+        low_arr   = (
+            data["low"].astype(np.float64) if "low" in data and len(data["low"]) > 0
+            else close_arr
+        )
+
+        # ---------------------------------------------------------
+        # ATR 系列の事前計算 (学習側 atr_13_expr_hilbert / atr_100_expr と完全一致)
+        # 学習側は割り算時に + 1e-10 を加えるため、ここでは raw ATR を保持する。
+        # ---------------------------------------------------------
+        atr13_arr  = calculate_atr_wilder(high_arr, low_arr, close_arr, 13)
+        atr100_arr = calculate_atr_wilder(high_arr, low_arr, close_arr, 100)
+
+        # close_pct を numpy で 1 度だけ計算 (学習側 Polars pct_change と semantics 一致)
+        close_pct = _pct_change(close_arr)
+        n = len(close_pct)
+
+        # ===== columns =====
+        columns: Dict[str, np.ndarray] = {
+            "close":         close_arr,
+            "__temp_atr_13":  atr13_arr,
+            "__temp_atr_100": atr100_arr,
+        }
+
+        # ===== exprs (Layer 1: Polars rolling 統計) =====
+        # 学習側 engine_1_E のうち rolling 統計に該当する式を集約。
+        exprs: List[pl.Expr] = []
+
+        # ----- Spectral group (Polars 部分) -----
+        # spectral_energy: (pct_change ** 2).rolling_sum(window)
+        # 参照: engine_1_E L1166-1171
+        for window in [64, 128, 256, 512]:
+            exprs.append(
+                (pl.col("close").pct_change() ** 2)
+                .rolling_sum(window)
+                .alias(f"e1e_spectral_energy_{window}")
+            )
+
+        # spectral_peak_freq_128: rolling_max / (rolling_std + 1e-10)
+        # 参照: engine_1_E L1175-1180
+        exprs.append(
+            (
+                pl.col("close").pct_change().rolling_max(128)
+                / (pl.col("close").pct_change().rolling_std(128, ddof=1) + 1e-10)
+            ).alias("e1e_spectral_peak_freq_128")
+        )
+
+        # ----- Wavelet group (Polars 部分) -----
+        # wavelet_mean / wavelet_std (Polars-native rolling stats)
+        # 参照: engine_1_E L1202-1215
+        for window in [32, 64, 128, 256]:
+            exprs.append(
+                pl.col("close").pct_change().rolling_mean(window)
+                .alias(f"e1e_wavelet_mean_{window}")
+            )
+            exprs.append(
+                pl.col("close").pct_change().rolling_std(window, ddof=1)
+                .alias(f"e1e_wavelet_std_{window}")
+            )
+
+        # ----- Hilbert group (Polars 部分) -----
+        # hilbert_amp_mean_100 / std_100 / cv_100 (Polars-native rolling stats on |pct_change|)
+        # 参照: engine_1_E L1252-1273
+        exprs.append(
+            pl.col("close").pct_change().abs().rolling_mean(100)
+            .alias("e1e_hilbert_amp_mean_100")
+        )
+        exprs.append(
+            pl.col("close").pct_change().abs().rolling_std(100, ddof=1)
+            .alias("e1e_hilbert_amp_std_100")
+        )
+        exprs.append(
+            (
+                pl.col("close").pct_change().abs().rolling_std(100, ddof=1)
+                / (pl.col("close").pct_change().abs().rolling_mean(100) + 1e-10)
+            ).alias("e1e_hilbert_amp_cv_100")
+        )
+
+        # hilbert_freq_energy_ratio_100:
+        #   学習側: (close.pct_change()^2).rolling_sum(100) / ((atr_13/close)^2 * 100 + 1e-10)
+        # 参照: engine_1_E L1335-1342
+        atr_13_pct_expr = pl.col("__temp_atr_13") / (pl.col("close") + 1e-10)
+        exprs.append(
+            (
+                (pl.col("close").pct_change() ** 2).rolling_sum(100)
+                / (atr_13_pct_expr.pow(2) * 100 + 1e-10)
+            ).alias("e1e_hilbert_freq_energy_ratio_100")
+        )
+
+        # ----- Signal Stats group (Polars 部分) -----
+        # signal_rms_50: sqrt(rolling_mean(pct_change^2, 50))
+        # 参照: engine_1_E L1397-1402
+        exprs.append(
+            (pl.col("close").pct_change() ** 2)
+            .rolling_mean(50)
+            .sqrt()
+            .alias("e1e_signal_rms_50")
+        )
+
+        # signal_peak_to_peak_100: (close.rolling_max(100) - close.rolling_min(100)) / (atr_100 + 1e-10)
+        # 参照: engine_1_E L1404-1410
+        exprs.append(
+            (
+                (pl.col("close").rolling_max(100) - pl.col("close").rolling_min(100))
+                / (pl.col("__temp_atr_100") + 1e-10)
+            ).alias("e1e_signal_peak_to_peak_100")
+        )
+
+        # signal_crest_factor_50:
+        #   学習側: pct_change.rolling_max(50).abs() / ((pct_change^2).rolling_mean(50).sqrt() + 1e-10)
+        # 参照: engine_1_E L1412-1418
+        exprs.append(
+            (
+                pl.col("close").pct_change().rolling_max(50).abs()
+                / ((pl.col("close").pct_change() ** 2).rolling_mean(50).sqrt() + 1e-10)
+            ).alias("e1e_signal_crest_factor_50")
+        )
+
+        # ===== layer2 (Layer 2: DSP UDF 直接呼び + sample_weight) =====
+        # 各 UDF は rolling 計算であり、最終バー (index = window-1 in slice) の値は
+        # 直近 window 本のみで決まる。学習側は全系列に対して UDF を呼び、その最終
+        # 要素を採用するが、本番側は最終 window 本のみ渡しても同一値。
+        layer2: Dict[str, float] = {}
+
+        # ----- Spectral UDFs (window=[64,128,256,512]) -----
+        # 参照: engine_1_E._create_spectral_features L1098-1163
+        for window in [64, 128, 256, 512]:
+            if n >= window:
+                w_arr = close_pct[-window:]
+                layer2[f"e1e_spectral_centroid_{window}"]  = float(spectral_centroid_udf(w_arr, window)[-1])
+                layer2[f"e1e_spectral_bandwidth_{window}"] = float(spectral_bandwidth_udf(w_arr, window)[-1])
+                layer2[f"e1e_spectral_rolloff_{window}"]   = float(spectral_rolloff_udf(w_arr, window)[-1])
+                layer2[f"e1e_spectral_flatness_{window}"]  = float(spectral_flatness_udf(w_arr, window)[-1])
+                layer2[f"e1e_spectral_entropy_{window}"]   = float(spectral_entropy_udf(w_arr, window)[-1])
+            else:
+                layer2[f"e1e_spectral_centroid_{window}"]  = np.nan
+                layer2[f"e1e_spectral_bandwidth_{window}"] = np.nan
+                layer2[f"e1e_spectral_rolloff_{window}"]   = np.nan
+                layer2[f"e1e_spectral_flatness_{window}"]  = np.nan
+                layer2[f"e1e_spectral_entropy_{window}"]   = np.nan
+
+            # spectral_flux は隣接 2 フレーム必要 (window*2 本)
+            if n >= window * 2:
+                w_arr2 = close_pct[-(window * 2):]
+                layer2[f"e1e_spectral_flux_{window}"] = float(spectral_flux_udf(w_arr2, window)[-1])
+            else:
+                layer2[f"e1e_spectral_flux_{window}"] = np.nan
+
+        # ----- Wavelet UDFs -----
+        # 参照: engine_1_E._create_wavelet_features L1190-1227
+        for window in [32, 64, 128, 256]:
+            if n >= window:
+                layer2[f"e1e_wavelet_energy_{window}"] = float(
+                    wavelet_energy_udf(close_pct[-window:], window)[-1]
+                )
+            else:
+                layer2[f"e1e_wavelet_energy_{window}"] = np.nan
+
+        # wavelet_entropy_64
+        if n >= 64:
+            layer2["e1e_wavelet_entropy_64"] = float(
+                wavelet_entropy_udf(close_pct[-64:], 64)[-1]
+            )
+        else:
+            layer2["e1e_wavelet_entropy_64"] = np.nan
+
+        # ----- Hilbert UDFs -----
+        # 参照: engine_1_E._create_hilbert_features L1237-1296
+        for window in [50, 100, 200]:
+            if n >= window:
+                layer2[f"e1e_hilbert_amplitude_{window}"] = float(
+                    hilbert_amplitude_udf(close_pct[-window:], window)[-1]
+                )
+            else:
+                layer2[f"e1e_hilbert_amplitude_{window}"] = np.nan
+
+        # phase_var_50, phase_stability_50
+        if n >= 50:
+            layer2["e1e_hilbert_phase_var_50"]       = float(hilbert_phase_var_udf(close_pct[-50:], 50)[-1])
+            layer2["e1e_hilbert_phase_stability_50"] = float(hilbert_phase_stability_udf(close_pct[-50:], 50)[-1])
+        else:
+            layer2["e1e_hilbert_phase_var_50"]       = np.nan
+            layer2["e1e_hilbert_phase_stability_50"] = np.nan
+
+        # freq_mean_100, freq_std_100
+        if n >= 100:
+            layer2["e1e_hilbert_freq_mean_100"] = float(hilbert_freq_mean_udf(close_pct[-100:], 100)[-1])
+            layer2["e1e_hilbert_freq_std_100"]  = float(hilbert_freq_std_udf(close_pct[-100:], 100)[-1])
+        else:
+            layer2["e1e_hilbert_freq_mean_100"] = np.nan
+            layer2["e1e_hilbert_freq_std_100"]  = np.nan
+
+        # ----- Acoustic UDFs (window=[128,256,512]) -----
+        # 参照: engine_1_E._create_acoustic_features L1352-1373
+        for window in [128, 256, 512]:
+            if n >= window:
+                w_arr = close_pct[-window:]
+                layer2[f"e1e_acoustic_power_{window}"]     = float(acoustic_power_udf(w_arr, window)[-1])
+                layer2[f"e1e_acoustic_frequency_{window}"] = float(acoustic_frequency_udf(w_arr, window)[-1])
+            else:
+                layer2[f"e1e_acoustic_power_{window}"]     = np.nan
+                layer2[f"e1e_acoustic_frequency_{window}"] = np.nan
+
+        # ----- サンプルウェイト (学習側 base_columns 扱いと一致、QA対象外) -----
+        # 参照: engine_1_E L1733-1742
+        sample_weight_arr = calculate_sample_weight(high_arr, low_arr, close_arr)
+        layer2["e1e_sample_weight"] = (
+            float(sample_weight_arr[-1]) if len(sample_weight_arr) > 0 else 1.0
+        )
+
+        return columns, exprs, layer2
 
     @staticmethod
     def calculate_features(
@@ -314,235 +448,30 @@ class FeatureModule1E:
         qa_state: Optional[QAState] = None,
     ) -> Dict[str, float]:
         """
-        リアルタイム特徴量計算。学習側 engine_1_E と完全一致。
-
-        Args:
-            data        : {"close": np.ndarray, "high": np.ndarray, "low": np.ndarray}
-            lookback_bars: タイムフレームに応じた1日あたりのバー数（QA EWM半減期）
-            qa_state    : QAState インスタンス。本番稼働時は必ず渡し、毎バー使い回すこと。
-                          None の場合は QA 処理をスキップ（後方互換）。
-
-        Returns:
-            特徴量名 → スカラー値 の辞書。e1e_sample_weight も含む。
+        【Phase 9b 改修版】単独計算用ラッパー。
+        司令塔は _build_polars_pieces を直接呼んで全モジュール統合 .select() を
+        行うが、本メソッドは後方互換のためモジュール単独で動作する形を維持する。
         """
+        columns, exprs, layer2 = FeatureModule1E._build_polars_pieces(data, lookback_bars)
+        if not columns:
+            return {}
+
+        df = pl.DataFrame(columns)
+        result_df = df.lazy().select(exprs).tail(1).collect()
+        polars_result = result_df.to_dicts()[0]
+
         features: Dict[str, float] = {}
+        for k, v in polars_result.items():
+            features[k] = float(v) if v is not None else np.nan
+        features.update(layer2)
 
-        close_arr = data["close"]
-        high_arr  = data.get("high", close_arr)
-        low_arr   = data.get("low",  close_arr)
-
-        if len(close_arr) == 0:
-            return features
-
-        close_pct = _pct_change(close_arr)
-
-        # ---------------------------------------------------------
-        # 0. サンプルウェイト
-        # ---------------------------------------------------------
-        sw_arr = calculate_sample_weight(
-            high_arr.astype(np.float64),
-            low_arr.astype(np.float64),
-            close_arr.astype(np.float64),
-        )
-        features["e1e_sample_weight"] = float(sw_arr[-1]) if len(sw_arr) > 0 else 1.0
-
-        # ---------------------------------------------------------
-        # 1. スペクトル系 (window=[64,128,256,512])
-        #    学習側: _create_spectral_features
-        # ---------------------------------------------------------
-        for window in [64, 128, 256, 512]:
-            features[f"e1e_spectral_centroid_{window}"] = _last(
-                spectral_centroid_udf(_window(close_pct, window), window)
-            )
-            features[f"e1e_spectral_bandwidth_{window}"] = _last(
-                spectral_bandwidth_udf(_window(close_pct, window), window)
-            )
-            features[f"e1e_spectral_rolloff_{window}"] = _last(
-                spectral_rolloff_udf(_window(close_pct, window), window)
-            )
-            # spectral_flux_udf は隣接2フレーム分（window*2本）が必要
-            features[f"e1e_spectral_flux_{window}"] = _last(
-                spectral_flux_udf(_window(close_pct, window * 2), window)
-            )
-            features[f"e1e_spectral_flatness_{window}"] = _last(
-                spectral_flatness_udf(_window(close_pct, window), window)
-            )
-            features[f"e1e_spectral_entropy_{window}"] = _last(
-                spectral_entropy_udf(_window(close_pct, window), window)
-            )
-            # spectral_energy: sum(pct_change^2) over window（Polarsネイティブと等価）
-            w_e = _window(close_pct, window)
-            features[f"e1e_spectral_energy_{window}"] = (
-                float(np.sum(w_e ** 2)) if len(w_e) >= window else np.nan
-            )
-
-        # spectral_peak_freq_128: rolling_max(128) / (rolling_std(128, ddof=1) + 1e-10)
-        w_pf = _window(close_pct, 128)
-        if len(w_pf) >= 128:
-            features["e1e_spectral_peak_freq_128"] = (
-                float(np.max(w_pf)) / (float(np.std(w_pf, ddof=1)) + 1e-10)
-            )
-        else:
-            features["e1e_spectral_peak_freq_128"] = np.nan
-
-        # ---------------------------------------------------------
-        # 2. ウェーブレット系 (window=[32,64,128,256])
-        #    学習側: _create_wavelet_features
-        # ---------------------------------------------------------
-        for window in [32, 64, 128, 256]:
-            features[f"e1e_wavelet_energy_{window}"] = _last(
-                wavelet_energy_udf(_window(close_pct, window), window)
-            )
-            w_wv = _window(close_pct, window)
-            features[f"e1e_wavelet_mean_{window}"] = (
-                float(np.mean(w_wv)) if len(w_wv) >= window else np.nan
-            )
-            # wavelet_std: rolling_std(ddof=1) 学習側と一致
-            # 【修正】stddev_unbiased → np.std(ddof=1) に変更。
-            # stddev_unbiased はNaN要素を除外して計算するため、
-            # len(close_arr)==window のとき close_pct[0](NaN)が混入し
-            # 学習側 Polars rolling_std（NaN1本でもNaN返却）と不一致。
-            # np.std はNaN伝播するため学習側と完全一致。
-            if len(w_wv) >= window:
-                std_val = float(np.std(w_wv, ddof=1))
-                features[f"e1e_wavelet_std_{window}"] = (
-                    float(std_val) if np.isfinite(std_val) else np.nan
-                )
-            else:
-                features[f"e1e_wavelet_std_{window}"] = np.nan
-
-        features["e1e_wavelet_entropy_64"] = _last(
-            wavelet_entropy_udf(_window(close_pct, 64), 64)
-        )
-
-        # ---------------------------------------------------------
-        # 3. ヒルベルト系 (window=[50,100,200])
-        #    学習側: _create_hilbert_features
-        # ---------------------------------------------------------
-        for window in [50, 100, 200]:
-            features[f"e1e_hilbert_amplitude_{window}"] = _last(
-                hilbert_amplitude_udf(_window(close_pct, window), window)
-            )
-
-        # hilbert_amp_mean_100 / std_100 / cv_100: |pct_change|のrolling統計
-        w_amp = _window(np.abs(close_pct), 100)
-        if len(w_amp) >= 100:
-            amp_mean = float(np.mean(w_amp))
-            features["e1e_hilbert_amp_mean_100"] = amp_mean
-            # 【修正】stddev_unbiased → np.std(ddof=1) に変更（NaN伝播を学習側と一致させる）
-            amp_std = float(np.std(w_amp, ddof=1))
-            amp_std = float(amp_std) if np.isfinite(amp_std) else np.nan
-            features["e1e_hilbert_amp_std_100"] = amp_std
-            features["e1e_hilbert_amp_cv_100"] = (
-                amp_std / (amp_mean + 1e-10) if np.isfinite(amp_mean) else np.nan
-            )
-        else:
-            amp_mean = np.nan
-            features["e1e_hilbert_amp_mean_100"] = np.nan
-            features["e1e_hilbert_amp_std_100"]  = np.nan
-            features["e1e_hilbert_amp_cv_100"]   = np.nan
-
-        features["e1e_hilbert_phase_stability_50"] = _last(
-            hilbert_phase_stability_udf(_window(close_pct, 50), 50)
-        )
-        features["e1e_hilbert_phase_var_50"] = _last(
-            hilbert_phase_var_udf(_window(close_pct, 50), 50)
-        )
-
-        features["e1e_hilbert_freq_mean_100"] = _last(
-            hilbert_freq_mean_udf(_window(close_pct, 100), 100)
-        )
-        features["e1e_hilbert_freq_std_100"] = _last(
-            hilbert_freq_std_udf(_window(close_pct, 100), 100)
-        )
-
-        # hilbert_freq_energy_ratio_100:
-        # sum(pct_change^2, 100) / ((atr_13/close)^2 * 100 + 1e-10)
-        w_fe = _window(close_pct, 100)
-        pct_energy = float(np.sum(w_fe ** 2)) if len(w_fe) >= 100 else np.nan
-        atr13_full = calculate_atr_wilder(
-            high_arr.astype(np.float64),
-            low_arr.astype(np.float64),
-            close_arr.astype(np.float64),
-            13,
-        )
-        atr13_last = float(atr13_full[-1]) if len(atr13_full) > 0 else np.nan
-        close_last = float(close_arr[-1])
-        atr13_pct  = atr13_last / (close_last + 1e-10)
-        features["e1e_hilbert_freq_energy_ratio_100"] = (
-            pct_energy / (atr13_pct ** 2 * 100 + 1e-10)
-            if (np.isfinite(pct_energy) and np.isfinite(atr13_pct))
-            else np.nan
-        )
-
-        # ---------------------------------------------------------
-        # 4. 音響系 (window=[128,256,512])
-        #    学習側: _create_acoustic_features
-        # ---------------------------------------------------------
-        for window in [128, 256, 512]:
-            features[f"e1e_acoustic_power_{window}"] = _last(
-                acoustic_power_udf(_window(close_pct, window), window)
-            )
-            features[f"e1e_acoustic_frequency_{window}"] = _last(
-                acoustic_frequency_udf(_window(close_pct, window), window)
-            )
-
-        # ---------------------------------------------------------
-        # 5. 信号統計系 (Signal Stats)
-        #    学習側: _create_signal_stats_features
-        # ---------------------------------------------------------
-        # signal_rms_50: sqrt(rolling_mean(pct_change^2, 50))
-        w_rms_50 = _window(close_pct, 50)
-        features["e1e_signal_rms_50"] = (
-            float(np.sqrt(np.mean(w_rms_50 ** 2))) if len(w_rms_50) >= 50 else np.nan
-        )
-
-        # signal_peak_to_peak_100: (rolling_max(close,100) - rolling_min(close,100)) / atr_wilder(100)
-        # 学習側と一致: atr_wilder(100) は全系列から計算した最終値を使う（末尾100本で再計算しない）
-        w_sig_100 = _window(close_arr, 100)
-        if len(w_sig_100) >= 100:
-            atr_100_full = calculate_atr_wilder(
-                high_arr.astype(np.float64),
-                low_arr.astype(np.float64),
-                close_arr.astype(np.float64),
-                100,
-            )
-            atr_last_val = float(atr_100_full[-1]) if len(atr_100_full) > 0 else np.nan
-            if np.isfinite(atr_last_val) and atr_last_val > 0:
-                features["e1e_signal_peak_to_peak_100"] = (
-                    (float(np.max(w_sig_100)) - float(np.min(w_sig_100)))
-                    / (atr_last_val + 1e-10)
-                )
-            else:
-                features["e1e_signal_peak_to_peak_100"] = np.nan
-        else:
-            features["e1e_signal_peak_to_peak_100"] = np.nan
-
-        # signal_crest_factor_50:
-        # 学習側: rolling_max(|pct_change|, 50) / (sqrt(rolling_mean(pct_change^2, 50)) + 1e-10)
-        # 注意: 学習側は pct_change().rolling_max(50).abs() = abs(rolling_max)
-        #       = ウィンドウ内最大値の絶対値（max(abs) とは異なる）
-        w_cf = _window(close_pct, 50)
-        if len(w_cf) >= 50:
-            rms_cf = float(np.sqrt(np.mean(w_cf ** 2)))
-            # 学習側と一致: abs(rolling_max) = abs(max of signed values)
-            features["e1e_signal_crest_factor_50"] = (
-                abs(float(np.max(w_cf))) / (rms_cf + 1e-10)
-            )
-        else:
-            features["e1e_signal_crest_factor_50"] = np.nan
-
-        # ----------------------------------------------------------
-        # QA処理 — 学習側 apply_quality_assurance_to_group と等価
-        #   学習側: inf→null → EWM(half_life=lookback_bars)±5σクリップ → fill_null/nan(0.0)
-        #   e1e_sample_weight は QA 対象外（学習側と同一設計）
-        #   qa_state=None の場合: inf/NaN → 0.0 のみ（後方互換）
-        # ----------------------------------------------------------
+        # QA 処理
+        # e1e_sample_weight は学習側 base_columns 扱いで QA 対象外
         if qa_state is not None:
             qa_result: Dict[str, float] = {}
             for key, val in features.items():
                 if key == "e1e_sample_weight":
-                    qa_result[key] = val  # sample_weight は QA 対象外
+                    qa_result[key] = val
                 else:
                     qa_result[key] = qa_state.update_and_clip(key, val)
             features = qa_result

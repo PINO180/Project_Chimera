@@ -6,17 +6,37 @@ Chapter 2 - Alpha Neutralization
 旧 05_alpha_decay_analyzer.py と 05_alpha_decay_analyzer_stage_first.py を統合。
 時間足スケール別プロキシを使用した純化処理を実装する。
 
-【設計変更】
-- 旧設計: 全特徴量をM5プロキシで固定
-- 新設計: blueprintの NEUTRALIZATION_CONFIG に従い、時間足グループごとに
-          プロキシ時間足とローリングウィンドウを切り替える
+【設計変更履歴】
+
+旧設計 (Phase 9b 以前): 全特徴量を M5 プロキシで固定、HF グループは window=2016 (固定)
 
   グループ    | プロキシ | ウィンドウ
   ------------|----------|----------
-  HF (H1以下) | M5       | 2016
+  HF (H1以下) | M5       | 2016 (TF 共通固定)
   LF_SHORT    | H4       | 504
   LF_MID      | D1       | 90
   LF_LONG     | W1/MN    | 52
+
+新設計 (Phase 10): HF グループの window を TF 毎可変化 (2 日案)。
+                   LF 系は AI 入力対象外のため純化計算自体を skip。
+                   M30/H1 は OLS 充填不足のため一時除外 (1 週間案以上で復活可)。
+
+  グループ    | プロキシ | ウィンドウ                          | 純化実行
+  ------------|----------|--------------------------------------|---------
+  HF          | M5       | TF 毎可変 (window_per_tf) 2 日案     | ○
+              |          | M0.5: 5760, M1:  2880, M3:   960     |
+              |          | M5:    576, M8:   360, M15:  192     |
+              |          | M30/H1 は EXCLUDED_HF_TIMEFRAMES     | ×
+  LF_SHORT    | H4       | (AI 入力対象外、純化スキップ)         | ×
+  LF_MID      | D1       | (同上)                               | ×
+  LF_LONG     | W1/MN    | (同上)                               | ×
+
+  ※ window_per_tf の値は blueprint.NEUTRALIZATION_CONFIG["HF"]["window_per_tf"] が
+    唯一の参照源。本番側 realtime_feature_engine.OLS_WINDOW_PER_TF と完全一致させる。
+  ※ LF 系の skip は split_features_first_orthogonal.py の
+    EXCLUDE_TIMEFRAME_SUFFIXES と整合。LF を復活させる場合は両方を変更すること。
+  ※ M30/H1 を復活させる場合は blueprint.HF_TIMEFRAMES に戻し、
+    blueprint.EXCLUDED_HF_TIMEFRAMES から削除し、window_per_tf にも追加すること。
 
 - データ型: このスクリプトのみ例外的に Float64 を維持する
   （ベータ推定の分子・分母が非常に小さくなりうるため、Float32では丸め誤差が蓄積する）
@@ -53,9 +73,7 @@ def parse_suffixed_feature_name(suffixed_name: str) -> tuple[str, str, str]:
       "some_feature_H4"     → ("base", "some_feature", "H4")
     """
     parts = suffixed_name.split("_")
-    timeframe_pattern = re.compile(
-        r"^(M[0-9\.]+|H[0-9]+|D[0-9]+|W[0-9]+|MN|tick)$"
-    )
+    timeframe_pattern = re.compile(r"^(M[0-9\.]+|H[0-9]+|D[0-9]+|W[0-9]+|MN|tick)$")
     if (
         parts[0].startswith("e")
         and len(parts) > 2
@@ -76,6 +94,9 @@ def get_group(tf: str) -> str:
     """
     時間足文字列から neutralization グループを返す。
     blueprintの HF_TIMEFRAMES / LF_*_TIMEFRAMES を参照する。
+
+    Phase 10: EXCLUDED_HF_TIMEFRAMES (M30/H1 等) は専用メッセージで ValueError を raise。
+              呼び出し側は ValueError をキャッチして当該特徴量を skip する設計。
     """
     if tf in blueprint.HF_TIMEFRAMES:
         return "HF"
@@ -85,6 +106,11 @@ def get_group(tf: str) -> str:
         return "LF_MID"
     elif tf in blueprint.LF_LONG_TIMEFRAMES:
         return "LF_LONG"
+    elif tf in blueprint.EXCLUDED_HF_TIMEFRAMES:
+        raise ValueError(
+            f"Phase 10 で一時除外中の TF: {tf} "
+            f"(EXCLUDED_HF_TIMEFRAMES に登録済み、純化対象外)"
+        )
     else:
         raise ValueError(f"未知の時間足: {tf}")
 
@@ -122,7 +148,9 @@ def build_proxy_lazyframe(proxy_tf: str) -> Optional[pl.LazyFrame]:
     lf = (
         pl.scan_parquet(str(price_dir / "*.parquet"))
         .select(["timestamp", "close"])
-        .with_columns(pl.col("timestamp").cast(pl.Datetime("us")))  # S1はns、S2はus — 統一
+        .with_columns(
+            pl.col("timestamp").cast(pl.Datetime("us"))
+        )  # S1はns、S2はus — 統一
         .sort("timestamp")
         .with_columns(
             # 過去1バーに対するリターン（shift(1) = 1バー前 = 過去方向のみ: ルール1）
@@ -159,11 +187,15 @@ def find_features_by_file(
         except Exception:
             continue
 
-    print(f"Searching {len(final_features)} features across {len(all_sources_with_schema)} source files...")
+    print(
+        f"Searching {len(final_features)} features across {len(all_sources_with_schema)} source files..."
+    )
     for suffixed_feature in tqdm(final_features, desc="Mapping features"):
         engine_id, base_name, timeframe = parse_suffixed_feature_name(suffixed_feature)
         if timeframe == "unknown":
-            print(f"[WARN] Could not determine timeframe for '{suffixed_feature}'. Skipping.")
+            print(
+                f"[WARN] Could not determine timeframe for '{suffixed_feature}'. Skipping."
+            )
             continue
 
         found_path: Optional[Path] = None
@@ -261,10 +293,9 @@ def neutralize_lazyframe(
         y_mean = y.rolling_mean(window_size=window, min_samples=MIN_SAMPLES)
 
         # ローリング共分散: E[XY] - E[X]E[Y]（ルール1: 過去方向のみ）
-        cov_xy = (
-            (x * y).rolling_mean(window_size=window, min_samples=MIN_SAMPLES)
-            - x_mean * y_mean
-        )
+        cov_xy = (x * y).rolling_mean(
+            window_size=window, min_samples=MIN_SAMPLES
+        ) - x_mean * y_mean
 
         # ベータ・アルファ推定
         # +1e-10 でゼロ除算を保護（ルール4）
@@ -300,11 +331,15 @@ def main(test_mode: bool) -> None:
     clean_flag = getattr(main, "_clean_flag", False)
     if blueprint.S5_NEUTRALIZED_ALPHA_SET.exists():
         if clean_flag:
-            print(f"[INFO] --clean: Removing existing output: {blueprint.S5_NEUTRALIZED_ALPHA_SET}")
+            print(
+                f"[INFO] --clean: Removing existing output: {blueprint.S5_NEUTRALIZED_ALPHA_SET}"
+            )
             shutil.rmtree(blueprint.S5_NEUTRALIZED_ALPHA_SET)
             blueprint.S5_NEUTRALIZED_ALPHA_SET.mkdir(parents=True, exist_ok=True)
         else:
-            print(f"[INFO] Resume mode: existing output kept at {blueprint.S5_NEUTRALIZED_ALPHA_SET}")
+            print(
+                f"[INFO] Resume mode: existing output kept at {blueprint.S5_NEUTRALIZED_ALPHA_SET}"
+            )
             print(f"[INFO] 0-byte (failed) files will be removed and reprocessed")
             # 0 KB の失敗ファイルだけは削除
             for p in blueprint.S5_NEUTRALIZED_ALPHA_SET.rglob("*.parquet"):
@@ -338,14 +373,20 @@ def main(test_mode: bool) -> None:
     # ----------------------------------------------------------------
     proxy_cache: dict[str, pl.LazyFrame] = {}
     for group, cfg in blueprint.NEUTRALIZATION_CONFIG.items():
+        # Phase 10: LF 系は純化スキップのため、プロキシファイル読み込みも省略。
+        if group != "HF":
+            print(f"[SKIP] Proxy build for group={group} (Phase 10: LF 純化スキップ)")
+            continue
         proxy_tf = cfg["proxy_tf"]
         if proxy_tf in proxy_cache:
             continue
         print(f"[INFO] Building proxy LazyFrame: {proxy_tf} (for group={group})")
         lf = build_proxy_lazyframe(proxy_tf)
         if lf is None:
-            print(f"[WARN] Proxy file for {proxy_tf} not found in S2_FEATURES_VALIDATED. "
-                  f"Features in group {group} may be skipped.")
+            print(
+                f"[WARN] Proxy file for {proxy_tf} not found in S2_FEATURES_VALIDATED. "
+                f"Features in group {group} may be skipped."
+            )
         else:
             proxy_cache[proxy_tf] = lf
 
@@ -362,7 +403,9 @@ def main(test_mode: bool) -> None:
 
     for i, input_path in enumerate(source_files_to_process):
         features_in_file = features_by_source_file[input_path]
-        print(f"--- [{i + 1}/{total}] {input_path.name} ({len(features_in_file)} features) ---")
+        print(
+            f"--- [{i + 1}/{total}] {input_path.name} ({len(features_in_file)} features) ---"
+        )
 
         # [Phase 6] resume サポート: 既に有効な出力 (size > 0) があればスキップ
         skip_output_path = get_output_path(input_path)
@@ -371,13 +414,17 @@ def main(test_mode: bool) -> None:
             and not skip_output_path.is_dir()
             and skip_output_path.stat().st_size > 0
         ):
-            print(f"  [SKIP] Already exists: {skip_output_path} ({skip_output_path.stat().st_size:,} bytes)")
+            print(
+                f"  [SKIP] Already exists: {skip_output_path} ({skip_output_path.stat().st_size:,} bytes)"
+            )
             continue
         # tick データ (Hive ディレクトリ) の場合は中身があるか確認
         if skip_output_path.exists() and skip_output_path.is_dir():
             existing_files = list(skip_output_path.rglob("*.parquet"))
             if existing_files and all(p.stat().st_size > 0 for p in existing_files):
-                print(f"  [SKIP] Already exists (Hive): {skip_output_path} ({len(existing_files)} files)")
+                print(
+                    f"  [SKIP] Already exists (Hive): {skip_output_path} ({len(existing_files)} files)"
+                )
                 continue
 
         # 4-a. 特徴量をグループ別に分類
@@ -415,12 +462,32 @@ def main(test_mode: bool) -> None:
             cfg = blueprint.NEUTRALIZATION_CONFIG[group]
             proxy_tf: str = cfg["proxy_tf"]
 
-            if proxy_tf not in proxy_cache:
-                print(f"  [WARN] Proxy {proxy_tf} not available. Skipping group={group}.")
+            # Phase 10: LF 系 (H4/H6/H12/D1/W1/MN) は split_features_first_orthogonal.py の
+            # EXCLUDE_TIMEFRAME_SUFFIXES で除外され AI に渡らないため、純化計算自体をスキップ。
+            # 復活させる場合は本ガード削除 + split_features 側の除外リストからも削除すること。
+            if group != "HF":
+                print(
+                    f"  [SKIP] Group={group} は AI 入力対象外 (純化スキップ、{len(group_features)} features)"
+                )
                 continue
 
-            print(f"  [INFO] Group={group}, proxy={proxy_tf}, window={cfg['window']}, "
-                  f"features={len(group_features)}")
+            if proxy_tf not in proxy_cache:
+                print(
+                    f"  [WARN] Proxy {proxy_tf} not available. Skipping group={group}."
+                )
+                continue
+
+            # Phase 10: HF は window_per_tf、LF は window (単一値) でログ表示を切替
+            if "window_per_tf" in cfg:
+                wstr = "TF毎: " + ", ".join(
+                    f"{tf}={w}" for tf, w in cfg["window_per_tf"].items()
+                )
+            else:
+                wstr = f"window={cfg['window']}"
+            print(
+                f"  [INFO] Group={group}, proxy={proxy_tf}, {wstr}, "
+                f"features={len(group_features)}"
+            )
 
             for suffixed_feature in group_features:
                 _, base_name, _ = parse_suffixed_feature_name(suffixed_feature)
@@ -446,8 +513,11 @@ def main(test_mode: bool) -> None:
         for group, group_features in groups_in_file.items():
             cfg = blueprint.NEUTRALIZATION_CONFIG[group]
             proxy_tf = cfg["proxy_tf"]
-            window = cfg["window"]
             proxy_col = f"proxy_{proxy_tf}"
+
+            # Phase 10: LF 系は 4-c で all_neutralized_exprs から除外済み。ここでも skip。
+            if group != "HF":
+                continue
 
             if proxy_tf not in proxy_cache:
                 continue
@@ -456,19 +526,55 @@ def main(test_mode: bool) -> None:
             lf_with_proxy = lf_base.join_asof(
                 proxy_lf, on="timestamp", strategy="backward"
             )
-            neutralized_lf = neutralize_lazyframe(
-                lf_with_proxy,
-                feature_names=group_features,
-                proxy_col=proxy_col,
-                window=window,
-            )
 
-            # timestamp + このグループの純化列のみを残す
-            neutralized_cols = [
-                f"{parse_suffixed_feature_name(f)[1]}_neutralized"
-                for f in group_features
-            ]
-            group_dfs.append(neutralized_lf.select(["timestamp"] + neutralized_cols))
+            # Phase 10: HF は TF 別に window が異なるためサブグループ化して処理。
+            # LF (LF_SHORT/LF_MID/LF_LONG) は従来通りグループ一括 (window 単一値)。
+            if "window_per_tf" in cfg:
+                # HF: TF 別にサブグループ化して個別 window で純化
+                features_by_tf: dict[str, list[str]] = {}
+                for f in group_features:
+                    _, _, ftf = parse_suffixed_feature_name(f)
+                    features_by_tf.setdefault(ftf, []).append(f)
+
+                for ftf, tf_features in features_by_tf.items():
+                    window = cfg["window_per_tf"].get(ftf)
+                    if window is None:
+                        # window_per_tf に未登録の TF (Phase 10 一時除外含む) はスキップ
+                        print(
+                            f"  [SKIP] Group={group}, TF={ftf}: "
+                            f"window_per_tf に未登録のため純化スキップ "
+                            f"({len(tf_features)} features)"
+                        )
+                        continue
+                    neutralized_lf = neutralize_lazyframe(
+                        lf_with_proxy,
+                        feature_names=tf_features,
+                        proxy_col=proxy_col,
+                        window=window,
+                    )
+                    neutralized_cols = [
+                        f"{parse_suffixed_feature_name(f)[1]}_neutralized"
+                        for f in tf_features
+                    ]
+                    group_dfs.append(
+                        neutralized_lf.select(["timestamp"] + neutralized_cols)
+                    )
+            else:
+                # LF: 従来通りグループ一括
+                window = cfg["window"]
+                neutralized_lf = neutralize_lazyframe(
+                    lf_with_proxy,
+                    feature_names=group_features,
+                    proxy_col=proxy_col,
+                    window=window,
+                )
+                neutralized_cols = [
+                    f"{parse_suffixed_feature_name(f)[1]}_neutralized"
+                    for f in group_features
+                ]
+                group_dfs.append(
+                    neutralized_lf.select(["timestamp"] + neutralized_cols)
+                )
 
         if not group_dfs:
             continue
@@ -494,7 +600,9 @@ def main(test_mode: bool) -> None:
             )
             output_path.mkdir(parents=True, exist_ok=True)
             partitions = list(grouped)
-            for (year, month, day), data_group in tqdm(partitions, total=len(partitions), desc="  Writing partitions"):
+            for (year, month, day), data_group in tqdm(
+                partitions, total=len(partitions), desc="  Writing partitions"
+            ):
                 partition_dir = output_path / f"year={year}/month={month}/day={day}"
                 partition_dir.mkdir(parents=True, exist_ok=True)
                 data_group.write_parquet(
@@ -542,6 +650,7 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
     try:
         from polars.exceptions import PolarsInefficientMapWarning
+
         warnings.filterwarnings("ignore", category=PolarsInefficientMapWarning)
     except ImportError:
         pass

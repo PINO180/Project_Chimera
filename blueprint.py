@@ -45,7 +45,17 @@ S2_FEATURES_VALIDATED = _SYM / "stratum_2_features_validated"
 # S2_FEATURES_FIXED は廃止（後方互換のため残す場合はコメントアウト）
 
 # --- Chapter 2 バケツ定義 ---
-HF_TIMEFRAMES = ["M0.5", "M1", "M3", "M5", "M8", "M15", "M30", "H1"]
+HF_TIMEFRAMES = [
+    "M0.5", "M1", "M3", "M5", "M8", "M15",
+    # "M30", "H1",  # Phase 10: OLS_WINDOW=2日案では充填不足のため一時除外。
+                   # 1週間案以上 (M30=336本, H1=168本) なら復活可能。
+                   # 復活時はここに戻し、EXCLUDED_HF_TIMEFRAMES から削除し、
+                   # NEUTRALIZATION_CONFIG["HF"]["window_per_tf"] にも追加すること。
+]
+
+# Phase 10: 一時除外中の HF TF。get_group() で明示的に検出して skip させるため。
+# 上の HF_TIMEFRAMES と本リストの両方をメンテナンスすること。
+EXCLUDED_HF_TIMEFRAMES = ["M30", "H1"]
 LF_SHORT_TIMEFRAMES = ["H4", "H6", "H12"]
 LF_MID_TIMEFRAMES = ["D1"]
 LF_LONG_TIMEFRAMES = ["W1", "MN"]
@@ -98,11 +108,30 @@ KS_SAMPLE_SIZE = 100_000  # KS検定のサンプル数
 
 # --- Chapter 2 純化設定 ---
 # グループ別：プロキシ時間足とローリングウィンドウ
+#
+# Phase 10: HF グループの window を全 TF 一律 2016 → TF 毎可変 (2 日案) に変更。
+#           LF_SHORT/LF_MID/LF_LONG は従来通り (window 単一値、グループ全体で共通)。
+#
+# 1 週間案など別の設計に切り替える際は HF.window_per_tf を書き換える。
+# M30/H1 等の TF を復活させる場合は HF_TIMEFRAMES から外したコメントを戻し、
+# EXCLUDED_HF_TIMEFRAMES から削除し、window_per_tf にも追加すること。
 NEUTRALIZATION_CONFIG = {
-    "HF": {"proxy_tf": "M5", "window": 2016},
+    "HF": {
+        "proxy_tf": "M5",
+        "window_per_tf": {
+            "M0.5": 5760,  # 2 日 = 30秒  × 5760
+            "M1":   2880,  # 2 日 = 60秒  × 2880
+            "M3":    960,  # 2 日 = 180秒 × 960
+            "M5":    576,  # 2 日 = 300秒 × 576
+            "M8":    360,  # 2 日 = 480秒 × 360
+            "M15":   192,  # 2 日 = 900秒 × 192
+            # "M30":   96,  # Phase 10: 充填不足で除外。1 週間案 (336 本) なら復活可
+            # "H1":    48,  # 同上 (1 週間案で 168 本)
+        },
+    },
     "LF_SHORT": {"proxy_tf": "H4", "window": 504},
-    "LF_MID": {"proxy_tf": "D1", "window": 90},
-    "LF_LONG": {"proxy_tf": "W1", "window": 52},
+    "LF_MID":   {"proxy_tf": "D1", "window": 90},
+    "LF_LONG":  {"proxy_tf": "W1", "window": 52},
 }
 
 # --- Chapter 2 その他定数 ---
