@@ -637,7 +637,61 @@ def main():
             f" -> {_tmp_feature_list.name}"
         )
 
-        feature_engine = RealtimeFeatureEngine(feature_list_path=_tmp_feature_list.name)
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #66 Phase D-3] QAState seed artifact の load
+        # ─────────────────────────────────────────────────────────────
+        # 学習側 engine_1_A〜1_F が出力する qa_state_e1{a..f}.pkl を
+        # S3_QA_STATES_DIR から読み込み、engine 別 dict として集約する。
+        # この dict は RealtimeFeatureEngine(qa_state_artifacts=...) に
+        # 渡され、各 QAState を学習側 5 年分の EWM 成熟状態で初期化する。
+        # → 本番側 warmup 不足 (n=577) による Train-Serve Skew の根治。
+        #
+        # フォールバック設計:
+        #   1 つでも engine の pickle が欠落すると、その engine の QAState は
+        #   旧挙動 (warmup loop で seed) で fallback する。これは初回 deploy
+        #   時 (artifact 未生成) のセーフティネットとして必要。
+        #   ただし silent ではなく ERROR ログを残し、Train-Serve Skew が
+        #   残存することを運用上明示する。
+        # ─────────────────────────────────────────────────────────────
+        import pickle as _pkl_qastate
+        _qa_state_artifacts: Dict[str, Dict] = {}
+        _all_loaded = True
+        for _engine_id in ["e1a", "e1b", "e1c", "e1d", "e1e", "e1f"]:
+            _path = config.S3_QA_STATES_DIR / f"qa_state_{_engine_id}.pkl"
+            if _path.exists():
+                try:
+                    with _path.open("rb") as _f:
+                        _qa_state_artifacts[_engine_id] = _pkl_qastate.load(_f)
+                    logger.info(
+                        f"[Phase D-3] QAState artifact load OK: {_path.name} "
+                        f"({len(_qa_state_artifacts[_engine_id])} entries)"
+                    )
+                except Exception as _e:
+                    # silent fallback を避ける: load 失敗は ERROR ログ + 当該
+                    # engine だけ旧挙動 fallback (他 engine は正常 load 済)。
+                    logger.error(
+                        f"[Phase D-3] QAState artifact load 失敗: {_path}: {_e}. "
+                        f"engine={_engine_id} は旧挙動で fallback。"
+                    )
+                    _all_loaded = False
+            else:
+                logger.error(
+                    f"[Phase D-3] QAState artifact 不在: {_path}. "
+                    f"engine={_engine_id} は旧挙動で fallback "
+                    f"(Train-Serve Skew が残存します)。"
+                )
+                _all_loaded = False
+        if not _all_loaded:
+            logger.warning(
+                "[Phase D-3] QAState artifact が一部欠落しています。"
+                "初回 deploy 直後で artifact 未生成の場合は次回学習後に "
+                "解消されますが、それ以外の場合は S3_QA_STATES_DIR を確認。"
+            )
+
+        feature_engine = RealtimeFeatureEngine(
+            feature_list_path=_tmp_feature_list.name,
+            qa_state_artifacts=_qa_state_artifacts if _qa_state_artifacts else None,
+        )
 
         # ▼▼▼ 修正: スナップショットからの爆速復帰と差分取得 ▼▼▼
         state_file = config.STATE_CHECKPOINT_DIR / "feature_engine_state.pkl"
@@ -752,10 +806,7 @@ def main():
         while True:
             try:
                 # M3確定通知をポーリング（最大1秒待機）
-                # [Phase 9d 発見 #61] poll_m3_bar 戻り値が
-                # Optional[Dict] → Optional[List[Dict]] に変更。
-                # 通常 6 本 (EA buf_size 不足時は利用可能分のみ) のリストが返る。
-                new_m05_bars = bridge.poll_m3_bar(timeout_ms=100)
+                new_m05_bar = bridge.poll_m3_bar(timeout_ms=100)
 
                 # 毎秒実行される定期処理
                 current_time_sec = time.time()
@@ -828,19 +879,19 @@ def main():
                 # ==========================================================
                 # 【シミュレーター完全同期 1】 タイムアウト(TO)決済の監視と実行
                 # [LAG-FIX] M3 未確定中は 1 秒間隔に間引く (口座残高鮮度確保)
-                # M3 確定時 (new_m05_bars is not None) は必ず実行する。
+                # M3 確定時 (new_m05_bar is not None) は必ず実行する。
                 # [LAG-FIX-4] M3 境界 (180秒) 前後 3 秒間は重い処理をスキップ。
                 # 旧: 1秒間隔の sync が M3 close 直前に発火して REQ-REP × 2 で
                 #     M3 通知の受信が最大 215ms 遅延する問題があった
                 #     (実機ログで 11:51:00.176 通知 → 11:51:00.391 受信を確認)
                 # 新: M3 close 前後 3 秒間 (= 全体の 3.3%) は sync を見送る
-                #     代わりに M3 通知が来た時 (new_m05_bars is not None) に実行する
+                #     代わりに M3 通知が来た時 (new_m05_bar is not None) に実行する
                 # ==========================================================
                 _now_in_m3_cycle = current_time_sec % 180.0
                 _near_m3_boundary = (_now_in_m3_cycle > 177.0) or (_now_in_m3_cycle < 3.0)
 
                 _do_periodic_sync = (
-                    new_m05_bars is not None
+                    new_m05_bar is not None
                     or (
                         not _near_m3_boundary
                         and (current_time_sec - last_periodic_sync_time) >= _PERIODIC_SYNC_INTERVAL_SEC
@@ -936,26 +987,23 @@ def main():
                         state_manager.reconcile_with_broker(broker_state_sync)
 
                 # M3未確定の場合はここで次のループへ
-                # [Phase 9d 発見 #61] new_m05_bars は List[Dict] または None
-                if new_m05_bars is None or len(new_m05_bars) == 0:
+                if new_m05_bar is None:
                     continue
 
-                # [STALE-GUARD] ウォームアップ中にキューに溜まった古い通知を破棄する。
+                # [STALE-GUARD] ウォームアップ中にキューに溜まった古いバーを破棄する。
                 # ウォームアップ（JIT+OLS初期化）に最大30分かかる場合がある。
                 # そのままシグナル処理すると同一秒に大量のオーダーが一斉発射される事故につながる。
-                # M3 通知の最後のバー (= M3 close 時点の M0.5 バー) で年齢判定する。
-                # 120秒より古ければ確実に「溜まりもの」と判断して読み飛ばす。
-                _last_bar_ts = new_m05_bars[-1].get("timestamp")
-                if _last_bar_ts is not None:
+                # M0.5(30秒)足なので、120秒より古ければ確実に「溜まりもの」と判断して読み飛ばす。
+                _bar_ts = new_m05_bar.get("timestamp")
+                if _bar_ts is not None:
                     _now_utc = datetime.now(timezone.utc)
-                    if _last_bar_ts.tzinfo is None:
-                        _last_bar_ts = _last_bar_ts.replace(tzinfo=timezone.utc)
-                    _age_sec = (_now_utc - _last_bar_ts).total_seconds()
+                    if _bar_ts.tzinfo is None:
+                        _bar_ts = _bar_ts.replace(tzinfo=timezone.utc)
+                    _age_sec = (_now_utc - _bar_ts).total_seconds()
                     if _age_sec > 120:
                         logger.warning(
-                            f"⚠️ [STALE-GUARD] 古いM3通知を破棄 "
-                            f"(age={_age_sec:.0f}秒 / 最終ts={_last_bar_ts} / "
-                            f"バー数={len(new_m05_bars)})"
+                            f"⚠️ [STALE-GUARD] 古いM0.5バーを破棄 "
+                            f"(age={_age_sec:.0f}秒 / ts={_bar_ts})"
                         )
                         continue
 
@@ -968,12 +1016,6 @@ def main():
                 # [乖離⑥修正 V2] 学習側 s1_1_B_build_ohlcv.py の整数除算と一致させる:
                 #   学習側: (ts_int // bucket_size_ns) * bucket_size_ns でfloor集約
                 #   学習側相当: closed="left", label="left"
-                #
-                # [Phase 9d 発見 #61] 6 本ループ前にプロキシを更新する設計を維持。
-                # 既存仕様 (1 バー単位) と同等のセマンティクス: process_new_m05_bar
-                # に渡る market_proxy は m05_dataframe の現状態 (新バッチ未追加) から
-                # derived される。新バッチ 6 本処理後の M3 close 時点で OLS 更新は
-                # この market_proxy で行われる (off-by-one は既存仕様と同じ)。
                 if feature_engine and len(feature_engine.m05_dataframe) >= 20:
                     _recent = pd.DataFrame(
                         list(feature_engine.m05_dataframe)[-20:]
@@ -1003,36 +1045,11 @@ def main():
                         if len(g_market_proxy) > 10000:
                             g_market_proxy = g_market_proxy.iloc[-5000:]
 
-                # ─────────────────────────────────────────────────────────
-                # [Phase 9d 発見 #61] M0.5 バーをエンジンに順次渡す
-                # ─────────────────────────────────────────────────────────
-                # 案 X (EA 6 本送信) + 方針 2 (engine 側 timestamp ベース close 検知)
-                # との併用で、M3 close 時に学習側と数学的に等価な OHLCV 集約 +
-                # 即時シグナル発火を達成する。
-                #
-                # 設計:
-                #   - 最初の n-1 本: warmup_only=True (バッファ/OLS 更新のみ、シグナル無し)
-                #   - 最後の 1 本   : warmup_only=False (M3 close 検知 + シグナル発火)
-                #
-                # 最後のバー (= 直近の M0.5 = M3 boundary 時点) で
-                # _resample_and_update_buffer がタイムスタンプ判定により
-                # 当該 M3 bucket を closed と判定 → newly_closed_timeframes["M3"]
-                # に登録 → 再計算 + シグナル発火。
-                #
-                # 中間バーでも各 TF (M1 等) の close は適切に検知され、
-                # その都度 OLS 更新 + 特徴量キャッシュ更新が走る (process_new_m05_bar
-                # 内部の M3 close 判定でのみシグナルが発火する設計)。
-                # ─────────────────────────────────────────────────────────
+                # M0.5バーをエンジンに渡し、シグナルを待つ
                 _m3_ts_before = feature_engine.last_bar_timestamps.get("M3")
-                signal_list = []
-                _n_bars = len(new_m05_bars)
-                for _i, _bar in enumerate(new_m05_bars):
-                    _is_last = (_i == _n_bars - 1)
-                    _sl = feature_engine.process_new_m05_bar(
-                        _bar, g_market_proxy, warmup_only=not _is_last
-                    )
-                    if _is_last:
-                        signal_list = _sl
+                signal_list = feature_engine.process_new_m05_bar(
+                    new_m05_bar, g_market_proxy
+                )
                 _m3_ts_after = feature_engine.last_bar_timestamps.get("M3")
 
                 # [COOLDOWN] M3確定を検知してスキップカウントをデクリメント
@@ -1075,12 +1092,40 @@ def main():
                     # 例: feature_dict = dict(zip(feature_engine.feature_names, signal.features))
                     feature_dict = signal.feature_dict.copy()
 
+                    # ════════════════════════════════════════════════════
+                    # [DTYPE-ALIGN 段2] Train-Serve Skew 排除 — 学習側
+                    # 2_A_ks_stability_filter の cast(pl.Float32) と等価な
+                    # 量子化を LightGBM 推論入力に適用する。
+                    #
+                    # 学習側経路:
+                    #   S2_FEATURES (Float64) → 2_A: cast(pl.Float32)
+                    #     → S2_VALIDATED (Float32 dtype, Float32 量子化値)
+                    #     → 2_B/2_C/2_E: Float32 維持
+                    #     → Ax/Bx/Cx の to_numpy() で Float32 ndarray
+                    #     → lgb.Dataset(X_train) ← Float32 ndarray で受け取り
+                    #
+                    # 本番側経路 (本パッチ適用前):
+                    #   rfe Float64 出力 → np.array([[...]]) で dtype=Float64
+                    #   → model.predict(Float64) ← 学習時と dtype が違う
+                    #
+                    # 本パッチ適用後:
+                    #   feature_dict の値 (Float64) → np.array(..., dtype=np.float32)
+                    #   → model.predict(Float32) ← 学習時と完全に同じ dtype 順序
+                    #
+                    # 注意:
+                    # - dtype=np.float32 で配列を作る順序が重要
+                    #   (Float64 で作って後で astype すると LightGBM 内部の
+                    #    Float32 化タイミングが学習時とズレる可能性)
+                    # - Float32 量子化により bin 境界判定が学習時と完全一致する
+                    # ════════════════════════════════════════════════════
+
                     # --------------------------------------------------
                     # 【Long側】 Two-Brain 推論
                     # --------------------------------------------------
                     # 1. M1モデル (生の予測値のみ)
                     X_long_m1 = np.array(
-                        [[feature_dict.get(f, 0.0) or 0.0 for f in feature_lists["long_m1"]]]
+                        [[feature_dict.get(f, 0.0) or 0.0 for f in feature_lists["long_m1"]]],
+                        dtype=np.float32,  # [DTYPE-ALIGN 段2]
                     )
                     p_long_m1_raw = models["long_m1"].predict(X_long_m1)[0]
 
@@ -1101,7 +1146,8 @@ def main():
                                     feature_dict_long.get(f, 0.0) or 0.0
                                     for f in feature_lists["long_m2"]
                                 ]
-                            ]
+                            ],
+                            dtype=np.float32,  # [DTYPE-ALIGN 段2]
                         )
                         p_long_m2_raw = models["long_m2"].predict(X_long_m2)[0]
                     else:
@@ -1112,7 +1158,8 @@ def main():
                     # --------------------------------------------------
                     # 1. M1モデル (生の予測値のみ)
                     X_short_m1 = np.array(
-                        [[feature_dict.get(f, 0.0) or 0.0 for f in feature_lists["short_m1"]]]
+                        [[feature_dict.get(f, 0.0) or 0.0 for f in feature_lists["short_m1"]]],
+                        dtype=np.float32,  # [DTYPE-ALIGN 段2]
                     )
                     p_short_m1_raw = models["short_m1"].predict(X_short_m1)[0]
 
@@ -1133,7 +1180,8 @@ def main():
                                     feature_dict_short.get(f, 0.0) or 0.0
                                     for f in feature_lists["short_m2"]
                                 ]
-                            ]
+                            ],
+                            dtype=np.float32,  # [DTYPE-ALIGN 段2]
                         )
                         p_short_m2_raw = models["short_m2"].predict(X_short_m2)[0]
                     else:
@@ -1350,11 +1398,7 @@ def main():
                     # ★追加確認: atr_ratioもmarket_infoから取得してrisk_engineに渡す
                     current_atr_ratio = signal.market_info.get("atr_ratio", 0.0)
                     # ▼追加: M0.5バーから取得したリアルタイムスプレッド
-                    # [Phase 9d 発見 #61] new_m05_bars はリスト。最終バー (= M3 close
-                    # 直近の M0.5) が現在価格に最も近いので、その spread を使う。
-                    # spread は EA 側で payload 単位 1 つだけ送られ、各バー dict に
-                    # 同値で複製されているため、どのバーから取得しても結果は同じ。
-                    current_spread = new_m05_bars[-1].get("spread", 999.0)
+                    current_spread = new_m05_bar.get("spread", 999.0)
 
                     # ▼▼▼ 修正: Long/Shortで独立したSL/PT倍率をコンフィグから取得 ▼▼▼
                     if direction == "BUY":

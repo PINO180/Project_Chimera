@@ -156,6 +156,13 @@ S3_FEATURES_FOR_TRAINING_V5 = S3_ARTIFACTS / "final_feature_set_v5.txt"
 S3_FEATURES_FOR_TRAINING_XV = S3_ARTIFACTS / "final_feature_set_xv.txt"  # ★XV追加
 S3_SELECTED_FEATURES_DIR = S3_ARTIFACTS / "selected_features_v5"
 S3_SELECTED_FEATURES_PURIFIED_DIR = S3_ARTIFACTS / "selected_features_purified_v5"
+# --- Phase 9d 発見 #66 Phase D-3: QAState seed artifact ---
+# 学習側 engine_1_A〜1_F が apply_quality_assurance_to_group の最後で
+# 各 (timeframe, feature) の EWM 内部状態 (mean / var / n) を出力する場所。
+# 本番側 (production) は QAState 初期化時に該当 engine の pickle を load し、
+# 学習側 5 年分の EWM 成熟状態を継承することで Train-Serve Skew を根治する。
+S3_QA_STATES_DIR = S3_ARTIFACTS / "qa_states_v5"
+
 S3_SELECTED_FEATURES_ORTHOGONAL_DIR = (
     S3_ARTIFACTS / "selected_features_orthogonal_v5"
 )  # ★追加: M1/M2直交分割版

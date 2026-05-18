@@ -107,10 +107,30 @@ class ShadowEngine(RealtimeFeatureEngine):
     # --------------------------------------------------------------- hook
 
     def _calculate_base_features(
-        self, data: Dict[str, np.ndarray], tf_name: str
+        self,
+        data: Dict[str, np.ndarray],
+        tf_name: str,
+        skip_qa_update: bool = False,
     ) -> Dict[str, float]:
-        """親実装を呼んだ後、戻り値を捕捉する。挙動変化なし。"""
-        base_features = super()._calculate_base_features(data, tf_name)
+        """親実装を呼んだ後、戻り値を捕捉する。挙動変化なし。
+
+        [Phase 9d 発見 #66 Phase D-3] skip_qa_update 引数を親
+        (RealtimeFeatureEngine._calculate_base_features) と同じ signature で
+        受け取り、そのまま super に transit する。warmup / smoke test 経路
+        から「QAState を update せずに clip のみかける」呼び出しに対応する。
+
+        この引数を落とすと:
+          - 親 (Python 3.x) では位置引数余剰で TypeError → 例外でハード fail、
+            あるいは
+          - キーワード渡しで silent に skip_update=False に化けて artifact
+            状態を破壊し、Layer 1 Shadow Mode の比較結果が本番ライブから
+            乖離する。
+        どちらも検出が困難な silent failure を生むため、親と signature を
+        揃えることが必須。
+        """
+        base_features = super()._calculate_base_features(
+            data, tf_name, skip_qa_update=skip_qa_update
+        )
 
         if not self._capture_enabled:
             return base_features

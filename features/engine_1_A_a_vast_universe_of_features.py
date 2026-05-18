@@ -46,6 +46,20 @@ from core_indicators import (
     basic_stabilization_numba,
     robust_stabilization_numba,
 )
+# ─────────────────────────────────────────────────────────────
+# [Phase E (stable_rolling SSoT)] Polars rolling running 実装の
+# context 長依存性を排除するため、両側で共通の Numba 関数を import。
+# /workspace/core/stable_rolling.py に SSoT 配置。
+# ─────────────────────────────────────────────────────────────
+from stable_rolling import (
+    stable_rolling_mean,
+    stable_rolling_var,
+    stable_rolling_std,
+    stable_rolling_skew,
+    stable_kurtosis_engine_formula,
+    stable_moment_k_engine_formula,
+)
+
 
 import os, time, warnings, json, logging, math, tempfile, datetime
 from pathlib import Path
@@ -166,6 +180,19 @@ class ProcessingConfig:
         }
     )
     # ▲▲
+
+    # ─────────────────────────────────────────────────────
+    # [Phase 9d 発見 #66 Phase D-3] Layer 1 検証用 cut_off_date
+    # ─────────────────────────────────────────────────────
+    # 学習データ全期間 (parquet) はそのまま処理し、QAState seed artifact
+    # 抽出時に「cut_off_date 以前の最後の行」の EWM 値を取り出す。
+    #   None (default) : 全期間最終 (本番ライブ運用用)
+    #                    → S3_QA_STATES_DIR/qa_state_{engine_id}.pkl
+    #   date 指定      : 指定日以前の最後の EWM 状態 (Layer 1 検証用)
+    #                    → S3_QA_STATES_DIR/cutoff_YYYYMMDD/qa_state_{engine_id}.pkl
+    # 影響範囲: artifact pickle の slice 位置と出力 dir のみ。
+    # 出力 parquet (= S2 features) は cut_off_date によらず byte-identical。
+    cut_off_date: Optional[Any] = None
 
     def validate(self) -> bool:
         """設定検証"""
@@ -399,6 +426,52 @@ class DataEngine:
 # 修正後
 # 修正後
 # 修正後
+
+# ════════════════════════════════════════════════════════════════
+# [Phase E (stable_rolling SSoT)] Polars expression helpers
+# ────────────────────────────────────────────────────────────────
+# 学習側 (engine_1_A) と本番側 (rfe_1A) で完全同一の Numba 関数を
+# map_batches 経由で呼ぶ。これで Polars rolling_skew 等の context 依存
+# (running 累積誤差) を排除し、bit-identical を保証する。
+# ════════════════════════════════════════════════════════════════
+def _srm_expr(col: str, window: int):
+    """stable rolling mean を Polars expr に lift"""
+    return pl.col(col).map_batches(
+        lambda s: pl.Series(stable_rolling_mean(s.to_numpy().astype(np.float64), window)),
+        return_dtype=pl.Float64,
+    )
+
+def _srv_expr(col: str, window: int, ddof: int = 1):
+    return pl.col(col).map_batches(
+        lambda s: pl.Series(stable_rolling_var(s.to_numpy().astype(np.float64), window, ddof)),
+        return_dtype=pl.Float64,
+    )
+
+def _srs_expr(col: str, window: int, ddof: int = 1):
+    return pl.col(col).map_batches(
+        lambda s: pl.Series(stable_rolling_std(s.to_numpy().astype(np.float64), window, ddof)),
+        return_dtype=pl.Float64,
+    )
+
+def _sskew_expr(col: str, window: int):
+    return pl.col(col).map_batches(
+        lambda s: pl.Series(stable_rolling_skew(s.to_numpy().astype(np.float64), window)),
+        return_dtype=pl.Float64,
+    )
+
+def _skurt_expr(col: str, window: int):
+    return pl.col(col).map_batches(
+        lambda s: pl.Series(stable_kurtosis_engine_formula(s.to_numpy().astype(np.float64), window)),
+        return_dtype=pl.Float64,
+    )
+
+def _smom_expr(col: str, window: int, moment: int):
+    return pl.col(col).map_batches(
+        lambda s: pl.Series(stable_moment_k_engine_formula(s.to_numpy().astype(np.float64), window, moment)),
+        return_dtype=pl.Float64,
+    )
+
+
 class CalculationEngine:
     """
     計算核心クラス（60%）- Project Forge統合版（修正版：ディスクベース垂直分割）
@@ -421,6 +494,21 @@ class CalculationEngine:
         self.temp_dir = Path(tempfile.mkdtemp(prefix=f"features_{config.engine_id}_"))
         logger.info(f"一時ディレクトリ作成: {self.temp_dir}")
 
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #66 Phase D-3] QAState seed artifact 蓄積用 dict
+        # ─────────────────────────────────────────────────────────────
+        # 学習側 (この engine) の apply_quality_assurance_to_group で各 (timeframe,
+        # feature) の EWM 最終状態 (ewm_mean / ewm_var / ewm_n) を蓄積する。
+        # process_single_timeframe の末尾で metadata に詰めて返却 → main で
+        # 全 TF を集約して engine 別 pickle ファイルに保存 (= qa_state_e1a.pkl)。
+        # 本番側 (production) は QAState 初期化時にこれを load して、学習側
+        # 5 年分の EWM 成熟状態を継承する。
+        #
+        # キー: (timeframe: str, feature_name: str)
+        # 値:   {"ewm_mean": float, "ewm_var": float, "ewm_n": int}
+        # ─────────────────────────────────────────────────────────────
+        self._qa_state_artifact: Dict[Tuple[str, str], Dict[str, float]] = {}
+
     # 修正後
     def _get_all_feature_expressions(self, timeframe: str = "M1") -> Dict[str, pl.Expr]:
         """
@@ -438,53 +526,41 @@ class CalculationEngine:
 
         # --- Moments, Skew, Kurtosis Features ---
         # __temp_atr_13 は calculate_one_group 内で事前注入済み
+        # ▼▼ [Phase E (stable_rolling SSoT)] Polars rolling_* の context 長依存を排除 ▼▼
+        # 旧: pl.col("close").rolling_skew(window_size=20) 等の Polars 内部 running 実装
+        # 新: stable_rolling_skew 等の Numba two-pass (context 非依存) を map_batches で lift
+        # 学習側 3.4M 行と本番側 ~2980 行 deque で bit-identical を保証する。
         for window in [10, 20, 50]:
             expressions[f"{p}statistical_mean_{window}"] = (
-                (pl.col("close") - pl.col("close").rolling_mean(window))
+                (pl.col("close") - _srm_expr("close", window))
                 / pl.col("__temp_atr_13")
             ).alias(f"{p}statistical_mean_{window}")
-            # 修正後
             expressions[f"{p}statistical_variance_{window}"] = (
-                pl.col("close").rolling_var(window, ddof=1)
+                _srv_expr("close", window, ddof=1)
                 / pl.col("__temp_atr_13").pow(2)
             ).alias(f"{p}statistical_variance_{window}")
             expressions[f"{p}statistical_std_{window}"] = (
-                pl.col("close").rolling_std(window, ddof=1) / pl.col("__temp_atr_13")
+                _srs_expr("close", window, ddof=1) / pl.col("__temp_atr_13")
             ).alias(f"{p}statistical_std_{window}")
             expressions[f"{p}statistical_cv_{window}"] = (
-                pl.col("close").rolling_std(window, ddof=1)
-                / (pl.col("close").rolling_mean(window) + 1e-10)
+                _srs_expr("close", window, ddof=1)
+                / (_srm_expr("close", window) + 1e-10)
             ).alias(f"{p}statistical_cv_{window}")
 
-        # 修正後
-        # --- Skew, Kurtosis, High-order Moments Features ---
+        # --- Skew, Kurtosis, High-order Moments Features (stable Numba) ---
         for window in [20, 50]:
             expressions[f"{p}statistical_skewness_{window}"] = (
-                pl.col("close")
-                .rolling_skew(window_size=window)
-                .alias(f"{p}statistical_skewness_{window}")
+                _sskew_expr("close", window).alias(f"{p}statistical_skewness_{window}")
             )
-
-            var_ddof0 = pl.col("close").rolling_var(window, ddof=1) * (
-                (window - 1.0) / window
-            )
-            std_ddof0_pow4 = var_ddof0.pow(2)
             expressions[f"{p}statistical_kurtosis_{window}"] = (
-                (pl.col("close") - pl.col("close").rolling_mean(window))
-                .pow(4)
-                .rolling_mean(window)
-                / (std_ddof0_pow4 + 1e-10)
-                - 3
-            ).alias(f"{p}statistical_kurtosis_{window}")
-
-            mean_col = pl.col("close").rolling_mean(window)
-            std_ddof0 = (var_ddof0 + 1e-10).sqrt()
+                _skurt_expr("close", window).alias(f"{p}statistical_kurtosis_{window}")
+            )
             for moment in [5, 6, 7, 8]:
                 expressions[f"{p}statistical_moment_{moment}_{window}"] = (
-                    ((pl.col("close") - mean_col) / std_ddof0)
-                    .pow(moment)
-                    .rolling_mean(window)
-                ).alias(f"{p}statistical_moment_{moment}_{window}")
+                    _smom_expr("close", window, moment)
+                    .alias(f"{p}statistical_moment_{moment}_{window}")
+                )
+        # ▲▲ [Phase E (stable_rolling SSoT)] ▲▲
 
         # --- Robust Statistics Features ---
         for window in [10, 20, 50]:
@@ -784,6 +860,7 @@ class CalculationEngine:
         )
 
         stabilization_exprs = []
+        aux_artifact_exprs = []
         half_life = self.config.timeframe_bars_per_day.get(timeframe, 1440)
 
         for col_name in feature_columns:
@@ -831,7 +908,39 @@ class CalculationEngine:
 
             stabilization_exprs.append(stabilized_col)
 
-        result = lazy_frame.with_columns(stabilization_exprs)
+            # ─────────────────────────────────────────────────────────────
+            # [Phase 9d 発見 #66 Phase D-3] QAState seed artifact 用 aux 列
+            # ─────────────────────────────────────────────────────────────
+            # 修正履歴:
+            #   v1: lazy_frame.select(...).collect() で別 collect を強制 → hang
+            #   v2: aux_artifact_exprs を別 for ループで col_expr_qa を新規作成
+            #       → Polars が map_batches を別 expression と認識し CSE が効かず
+            #          EWM 計算が 2 回走って M0.5 で 5x 遅延
+            #   v3 (現): 同一 for ループ内で col_expr を再利用 → CSE で確実に
+            #            1 回計算に統合され元の性能 (~700s/engine) を維持
+            #
+            # 後段の通常 collect (streaming) で 1 回だけ計算する。
+            # process_single_timeframe 側で collect 後に aux 列の末尾値を
+            # 読み出して self._qa_state_artifact に保存し、parquet 書き出し前に
+            # drop する (出力 parquet は byte-identical を維持)。
+            # ─────────────────────────────────────────────────────────────
+            aux_artifact_exprs.append(
+                col_expr.ewm_mean(
+                    half_life=half_life, ignore_nulls=True, adjust=False
+                ).forward_fill().alias(f"__qa_mean__{col_name}")
+            )
+            aux_artifact_exprs.append(
+                col_expr.ewm_var(
+                    half_life=half_life, ignore_nulls=True, adjust=False, bias=True
+                ).forward_fill().alias(f"__qa_var__{col_name}")
+            )
+            aux_artifact_exprs.append(
+                col_expr.is_not_null().alias(f"__qa_valid__{col_name}")
+            )
+
+        # stab + artifact aux を 1 つの with_columns で追加 → 1 回の collect で計算
+        result = lazy_frame.with_columns(stabilization_exprs + aux_artifact_exprs)
+
         return result
 
     # 修正後
@@ -1041,32 +1150,29 @@ class CalculationEngine:
 
         # ▼▼ 修正前: 絶対値のまま出力、CVにゼロ除算リスクあり
         # ▼▼ 修正後: 現在価格との乖離をATR割り(スケール不変)。分散・標準偏差もATRで正規化。分母を保護。
+        # ▼▼ [Phase E (stable_rolling SSoT)] active path ▼▼
         for window in [10, 20, 50]:
             exprs.append(
-                (
-                    (pl.col("close") - pl.col("close").rolling_mean(window))
-                    / pl.col("__temp_atr_13")
-                ).alias(f"{p}statistical_mean_{window}")
-            )
-            # 修正後
-            exprs.append(
-                (
-                    pl.col("close").rolling_var(window, ddof=1)
-                    / pl.col("__temp_atr_13").pow(2)
-                ).alias(f"{p}statistical_variance_{window}")
+                ((pl.col("close") - _srm_expr("close", window))
+                 / pl.col("__temp_atr_13"))
+                .alias(f"{p}statistical_mean_{window}")
             )
             exprs.append(
-                (
-                    pl.col("close").rolling_std(window, ddof=1)
-                    / pl.col("__temp_atr_13")
-                ).alias(f"{p}statistical_std_{window}")
+                (_srv_expr("close", window, ddof=1)
+                 / pl.col("__temp_atr_13").pow(2))
+                .alias(f"{p}statistical_variance_{window}")
             )
             exprs.append(
-                (
-                    pl.col("close").rolling_std(window, ddof=1)
-                    / (pl.col("close").rolling_mean(window) + 1e-10)
-                ).alias(f"{p}statistical_cv_{window}")
+                (_srs_expr("close", window, ddof=1)
+                 / pl.col("__temp_atr_13"))
+                .alias(f"{p}statistical_std_{window}")
             )
+            exprs.append(
+                (_srs_expr("close", window, ddof=1)
+                 / (_srm_expr("close", window) + 1e-10))
+                .alias(f"{p}statistical_cv_{window}")
+            )
+        # ▲▲ [Phase E (stable_rolling SSoT)] ▲▲
 
         return lazy_frame.with_columns(exprs)
 
@@ -1075,40 +1181,22 @@ class CalculationEngine:
         exprs = []
         p = self.prefix
 
+        # ▼▼ [Phase E (stable_rolling SSoT)] active path ▼▼
         for window in [20, 50]:
             exprs.append(
-                pl.col("close")
-                .rolling_skew(window_size=window)
+                _sskew_expr("close", window)
                 .alias(f"{p}statistical_skewness_{window}")
             )
-
-            # ▼▼ 修正前: 分母に(n-1)割りの rolling_std をそのまま使用し、分子(n割り)と不整合を起こしていた
-            # exprs.append(((pl.col("close") - pl.col("close").rolling_mean(window)).pow(4).rolling_mean(window) / (pl.col("close").rolling_std(window).pow(4) + 1e-10) - 3).alias(f"{p}statistical_kurtosis_{window}"))
-
-            # ▼▼ 修正後: 学術的定義に従い、分母を ddof=0 の標本分散・標本標準偏差に補正してスケールを完全一致させる
-            # (n-1)/n を掛けることで ddof=0 の分散を復元
-            var_ddof0 = pl.col("close").rolling_var(window) * ((window - 1.0) / window)
-            std_ddof0_pow4 = var_ddof0.pow(2)
             exprs.append(
-                (
-                    (pl.col("close") - pl.col("close").rolling_mean(window))
-                    .pow(4)
-                    .rolling_mean(window)
-                    / (std_ddof0_pow4 + 1e-10)
-                    - 3
-                ).alias(f"{p}statistical_kurtosis_{window}")
+                _skurt_expr("close", window)
+                .alias(f"{p}statistical_kurtosis_{window}")
             )
-
-            # 高次モーメント
-            mean_col = pl.col("close").rolling_mean(window)
-            std_ddof0 = (var_ddof0 + 1e-10).sqrt()  # ddof=0の標準偏差
             for moment in [5, 6, 7, 8]:
-                expr = (
-                    ((pl.col("close") - mean_col) / std_ddof0)
-                    .pow(moment)
-                    .rolling_mean(window)
+                exprs.append(
+                    _smom_expr("close", window, moment)
+                    .alias(f"{p}statistical_moment_{moment}_{window}")
                 )
-                exprs.append(expr.alias(f"{p}statistical_moment_{moment}_{window}"))
+        # ▲▲ [Phase E (stable_rolling SSoT)] ▲▲
 
         return lazy_frame.with_columns(exprs)
 
@@ -1253,27 +1341,24 @@ class CalculationEngine:
         p = self.prefix
         lookback_bars = self.config.timeframe_bars_per_day.get(timeframe, 1440)
 
-        # ▼▼ 関数丸ごと修正: 平均系はATR割りDPO化。Volumeは過去24時間（1440期間）の平均で割ったRelative Volume化。
+        # ▼▼ [Phase E (stable_rolling SSoT)] fast_rolling active path ▼▼
         for window in [5, 10, 20, 50, 100]:
             exprs.append(
-                (
-                    (pl.col("close") - pl.col("close").rolling_mean(window))
-                    / pl.col("__temp_atr_13")
-                ).alias(f"{p}fast_rolling_mean_{window}")
+                ((pl.col("close") - _srm_expr("close", window))
+                 / pl.col("__temp_atr_13"))
+                .alias(f"{p}fast_rolling_mean_{window}")
             )
             exprs.append(
-                (
-                    pl.col("close").rolling_std(window, ddof=1)
-                    / pl.col("__temp_atr_13")
-                ).alias(f"{p}fast_rolling_std_{window}")
+                (_srs_expr("close", window, ddof=1)
+                 / pl.col("__temp_atr_13"))
+                .alias(f"{p}fast_rolling_std_{window}")
             )
-            # Volumeのスケール不変化 (Relative Volume: timeframeに対応した期間平均との比率)
             exprs.append(
-                (
-                    pl.col("volume").rolling_mean(window)
-                    / (pl.col("volume").rolling_mean(lookback_bars) + 1e-10)
-                ).alias(f"{p}fast_volume_mean_{window}")
+                (_srm_expr("volume", window)
+                 / (_srm_expr("volume", lookback_bars) + 1e-10))
+                .alias(f"{p}fast_volume_mean_{window}")
             )
+        # ▲▲ [Phase E (stable_rolling SSoT)] ▲▲
 
         return lazy_frame.with_columns(exprs)
 
@@ -1840,6 +1925,109 @@ def process_single_timeframe(config: ProcessingConfig, timeframe: str):
 
             group_result_df = group_result_lf.collect(engine="streaming")
 
+            # ─────────────────────────────────────────────────────────────
+            # [Phase 9d 発見 #66 Phase D-3] artifact 用 aux 列を抽出して dict 保存
+            # ─────────────────────────────────────────────────────────────
+            # apply_quality_assurance_to_group が with_columns で追加した
+            # __qa_mean__/__qa_var__/__qa_valid__ 列を読み出し、末尾値を取得して
+            # calc_engine._qa_state_artifact に保存する。
+            # その後 parquet 書き出し前に aux 列を drop して byte-identical を維持。
+            artifact_mean_cols = [c for c in group_result_df.columns if c.startswith("__qa_mean__")]
+
+            # ─────────────────────────────────────────────────────────
+            # [Phase 9d 発見 #66 Phase D-3] cut_off_date 対応 slice 位置決定
+            # ─────────────────────────────────────────────────────────
+            # config.cut_off_date が指定された場合は、その日付以前の最後の
+            # 行を artifact source として使う (Layer 1 検証で test 期間と
+            # 整合する artifact を生成するため)。
+            #   None (default)         : 末尾 [-1] = 全期間最終 (本番ライブ用)
+            #   datetime.date 指定     : cut_off_date 以前の最後のインデックス
+            # 同時に valid (= not null) のカウントも slice 範囲内で集計する。
+            # ─────────────────────────────────────────────────────────
+            _slice_idx = -1            # default: 末尾
+            _n_for_valid_count = None  # None = 全期間集計 (現状動作)
+            if (
+                getattr(config, "cut_off_date", None) is not None
+                and artifact_mean_cols
+                and "timestamp" in group_result_df.columns
+            ):
+                import datetime as _dt_p2
+                # 学習データ timestamp の timezone (naive or aware) に合わせて
+                # _cut_dt を構築する。学習側 Polars は通常 naive datetime で
+                # timestamp を扱うが (shadow_mode 側は tz=UTC 明示)、念のため
+                # Series 側の dtype を見て動的に決定する。
+                # この動的判定により naive/aware どちらの学習データでも動作する。
+                _ts_col_p2 = group_result_df["timestamp"]
+                _ts_tz_p2 = None
+                try:
+                    if isinstance(_ts_col_p2.dtype, pl.Datetime):
+                        _ts_tz_p2 = _ts_col_p2.dtype.time_zone
+                except Exception:
+                    _ts_tz_p2 = None
+                if _ts_tz_p2 is None:
+                    # naive Series → cut_off も naive で比較 (tzinfo 渡さない)
+                    _cut_dt = _dt_p2.datetime.combine(
+                        config.cut_off_date,
+                        _dt_p2.time(23, 59, 59, 999999),
+                    )
+                else:
+                    # tz-aware Series → UTC を default として _cut_dt も tz-aware
+                    _cut_dt = _dt_p2.datetime.combine(
+                        config.cut_off_date,
+                        _dt_p2.time(23, 59, 59, 999999),
+                        tzinfo=_dt_p2.timezone.utc,
+                    )
+                _mask = _ts_col_p2 <= _cut_dt
+                _n_cut = int(_mask.sum())
+                if _n_cut <= 0:
+                    logger.warning(
+                        f"[Phase D-3] cut_off_date={config.cut_off_date} 以前のデータが "
+                        f"{group_name} に存在せず。fallback で末尾を使う。"
+                    )
+                    _slice_idx = -1
+                    _n_for_valid_count = None
+                else:
+                    _slice_idx = _n_cut - 1  # 0-based の最後のインデックス
+                    _n_for_valid_count = _n_cut
+                    logger.info(
+                        f"[Phase D-3] cut_off_date={config.cut_off_date}, "
+                        f"slice_idx={_slice_idx} (該当 {_n_cut} 行)"
+                    )
+
+            for mean_col in artifact_mean_cols:
+                col_name = mean_col.replace("__qa_mean__", "")
+                var_col = f"__qa_var__{col_name}"
+                valid_col = f"__qa_valid__{col_name}"
+                if var_col in group_result_df.columns and valid_col in group_result_df.columns:
+                    mean_v = group_result_df[mean_col][_slice_idx]
+                    var_v = group_result_df[var_col][_slice_idx]
+                    if _n_for_valid_count is not None:
+                        n_v = int(group_result_df[valid_col].slice(0, _n_for_valid_count).sum())
+                    else:
+                        n_v = int(group_result_df[valid_col].sum())
+                    calc_engine._qa_state_artifact[(timeframe, col_name)] = {
+                        "ewm_mean": float(mean_v) if mean_v is not None and not (
+                            isinstance(mean_v, float) and (mean_v != mean_v)
+                        ) else 0.0,
+                        "ewm_var": float(var_v) if var_v is not None and not (
+                            isinstance(var_v, float) and (var_v != var_v)
+                        ) else 0.0,
+                        "ewm_n": n_v,
+                    }
+            if artifact_mean_cols:
+                logger.info(
+                    f"[Phase D-3] artifact 抽出完了: "
+                    f"{len(artifact_mean_cols)} features ({group_name})"
+                )
+
+            # artifact 用 aux 列を drop してから parquet 書き出し (byte-identical 維持)
+            artifact_aux_cols = [c for c in group_result_df.columns
+                                 if c.startswith("__qa_mean__")
+                                 or c.startswith("__qa_var__")
+                                 or c.startswith("__qa_valid__")]
+            if artifact_aux_cols:
+                group_result_df = group_result_df.drop(artifact_aux_cols)
+
             temp_file = temp_dir / f"group_{group_idx:02d}_{group_name}.parquet"
             group_result_df.write_parquet(str(temp_file), compression="snappy")
             temp_files.append(temp_file)
@@ -1883,6 +2071,11 @@ def process_single_timeframe(config: ProcessingConfig, timeframe: str):
 
         elapsed_time = time.time() - start_time
         metadata["processing_time"] = elapsed_time
+
+        # [Phase 9d 発見 #66 Phase D-3] CalculationEngine が蓄積した QAState
+        # artifact を metadata に詰めて main() に返す。main() 側で全 timeframe を
+        # 集約してから engine 別 pickle ファイル (qa_state_e1a.pkl 等) に保存する。
+        metadata["_qa_state_artifact"] = dict(calc_engine._qa_state_artifact)
 
         logger.info(f"=== 通常処理完了: {timeframe} - {elapsed_time:.2f}秒 ===")
         return metadata
@@ -2043,7 +2236,48 @@ def main():
     print("🔧 【修正】物理的垂直分割によるメモリ・スラッシング回避")
     print("=" * 70)
 
+    # [Phase 9d 発見 #66 Phase D-3] artifact 保存に使う import を main 内で
+    # 明示的に取得。`import blueprint as config` の別名は main の local 変数
+    # `config` (ProcessingConfig) と衝突するため、module 本体は `blueprint_module`
+    # として独立に保持する。
+    import pickle
+    import blueprint as blueprint_module
+
     config = ProcessingConfig()
+
+    # ─────────────────────────────────────────────────────────────
+    # [Phase 9d 発見 #66 Phase D-3] cut_off_date を CLI 引数から取得
+    # ─────────────────────────────────────────────────────────────
+    # argparse.parse_known_args() を使うことで対話入力経路を一切壊さず、
+    # CLI 引数だけ先取りする。対話入力プロンプトには cut_off_date は出ない。
+    #   python engine_1_X.py                            → cut_off_date=None (現状動作)
+    #   python engine_1_X.py --cut-off-date 2026-03-31  → Layer 1 検証用 artifact 生成モード
+    # ─────────────────────────────────────────────────────────────
+    import argparse as _argparse_d3
+    import datetime as _dt_d3
+    _parser_d3 = _argparse_d3.ArgumentParser(
+        description=f"Engine {config.engine_id.upper()} (Phase D-3 cut_off_date 対応)",
+        add_help=False,  # 対話入力経路を壊さないため -h は無効化
+    )
+    _parser_d3.add_argument(
+        "--cut-off-date",
+        type=str,
+        default=None,
+        help="YYYY-MM-DD 形式。Layer 1 検証用 artifact 生成モード。",
+    )
+    _args_d3, _ = _parser_d3.parse_known_args()
+    if _args_d3.cut_off_date is not None:
+        try:
+            config.cut_off_date = _dt_d3.datetime.strptime(
+                _args_d3.cut_off_date, "%Y-%m-%d"
+            ).date()
+            print(f"\n[Phase D-3] cut_off_date 指定: {config.cut_off_date}")
+            print(f"  -> pickle 出力先: S3_QA_STATES_DIR/cutoff_"
+                  f"{config.cut_off_date.strftime('%Y%m%d')}/")
+            print(f"  -> 出力 parquet (= S2 features) は cut_off_date によらず byte-identical")
+        except ValueError as _e_d3:
+            print(f"[Phase D-3] ERROR: --cut-off-date の日付形式が不正: {_args_d3.cut_off_date}: {_e_d3}")
+            return 1
 
     if not config.validate():
         return 1
@@ -2167,9 +2401,68 @@ def main():
         run_on_partitions_mode(config, resume_date=resume_date)
 
     other_timeframes = [tf for tf in selected_timeframes if tf != "tick"]
+    # ─────────────────────────────────────────────────────────────
+    # [Phase 9d 発見 #66 Phase D-3] 全 timeframe の QAState seed artifact を
+    # 集約して engine 別 pickle ファイル (qa_state_e1a.pkl) に保存。
+    # ─────────────────────────────────────────────────────────────
+    # process_single_timeframe は metadata に "_qa_state_artifact" キーで
+    # 各 (tf, feature) の EWM 最終状態を返す。これを engine 単位で 1 つの
+    # dict にまとめ、blueprint.S3_QA_STATES_DIR に書き出す。
+    # 本番側 (production main.py) は起動時にこの pickle を load し、QAState を
+    # 学習側 5 年分の EWM 成熟状態で初期化する。
+    qa_state_artifact_all_tfs: Dict[Tuple[str, str], Dict[str, float]] = {}
+
     if other_timeframes:
         for tf in other_timeframes:
-            process_single_timeframe(config, tf)
+            metadata = process_single_timeframe(config, tf)
+            # 異常時 (process_single_timeframe が error dict を返した場合) は skip
+            if isinstance(metadata, dict) and "_qa_state_artifact" in metadata:
+                qa_state_artifact_all_tfs.update(metadata["_qa_state_artifact"])
+
+    # ─── QAState artifact の pickle 保存 ────────────────────────────
+    if qa_state_artifact_all_tfs:
+        try:
+            # [Phase D-3] cut_off_date 指定時は別 dir に分離
+            #   None (本番ライブ用): S3_QA_STATES_DIR/qa_state_e1X.pkl (現状)
+            #   cut_off 指定        : S3_QA_STATES_DIR/cutoff_YYYYMMDD/qa_state_e1X.pkl
+            if getattr(config, "cut_off_date", None) is not None:
+                _cutoff_subdir = f"cutoff_{config.cut_off_date.strftime('%Y%m%d')}"
+                qa_state_path = (
+                    blueprint_module.S3_QA_STATES_DIR
+                    / _cutoff_subdir
+                    / f"qa_state_{config.engine_id}.pkl"
+                )
+            else:
+                qa_state_path = (
+                    blueprint_module.S3_QA_STATES_DIR
+                    / f"qa_state_{config.engine_id}.pkl"
+                )
+            qa_state_path.parent.mkdir(parents=True, exist_ok=True)
+            with qa_state_path.open("wb") as f:
+                pickle.dump(qa_state_artifact_all_tfs, f, protocol=4)
+            logger.info(
+                f"[Phase D-3] QAState artifact 保存完了: "
+                f"{qa_state_path} ({len(qa_state_artifact_all_tfs)} entries, "
+                f"{len(other_timeframes)} timeframes)"
+            )
+        except Exception as e:
+            # Phase D-3 改修部では silent fallback を避ける。
+            # artifact 保存失敗は production 起動を阻害する致命的エラーなので、
+            # 例外を握り潰さずログに記録して上に伝播させる。
+            logger.error(
+                f"[Phase D-3] QAState artifact 保存失敗: {e}", exc_info=True
+            )
+            raise
+    else:
+        # artifact が 1 件も生成されなかった = engine が何も処理しなかった、
+        # または apply_quality_assurance_to_group が呼ばれなかった等の異常。
+        # 警告だけ出して main 自体は失敗扱いにしない (TF 選択ミス等で正常な
+        # ケースもあり得るため)。
+        logger.warning(
+            "[Phase D-3] QAState artifact が 1 件も生成されませんでした。"
+            "対象 timeframe で apply_quality_assurance_to_group が呼ばれて "
+            "いない可能性があります。"
+        )
 
     overall_elapsed_time = time.time() - overall_start_time
 

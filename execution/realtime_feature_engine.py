@@ -168,7 +168,175 @@ class RealtimeFeatureEngine:
             pass
         return cls.OLS_WINDOW_DEFAULT
 
-                               # 全 TF 共通固定。Phase 10 で TF 毎可変化を検討予定。
+    @classmethod
+    def _filter_to_closed_buckets_warmup(
+        cls,
+        resampled_df: pd.DataFrame,
+        tf_name: str,
+        m05_history_pd: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """[Phase 9d 発見 #64] warmup resample 結果から「形成中の最後のバー」を除外。
+
+        `_resample_and_update_buffer` (runtime, 発見 #62) と同じ timestamp ベース
+        close 判定を、warmup の一括 resample にも適用する。
+
+        判定式:
+            bucket_close_ts = m05_history_pd.index[-1] + M0.5_freq_sec  (= +30s)
+            bucket [label, label + tf_freq_sec) は次の条件で closed:
+                label + tf_freq_sec <= bucket_close_ts
+
+        例: warmup の最後の M0.5 が 2026-04-01 00:00:00 のとき、
+            bucket_close_ts = 00:00:30
+            M1 [00:00, 00:01): 00:00 + 60s = 00:01 ≤ 00:00:30? NO → 除外
+            M15 [00:00, 00:15): 00:00 + 900s = 00:15 ≤ 00:00:30? NO → 除外
+            M15 [23:45, 00:00): 23:45 + 900s = 00:00 ≤ 00:00:30? YES → 残る
+
+        Args:
+            resampled_df: TF にリサンプル済み (index=timestamp, OHLCV columns)
+            tf_name: 当該 TF 名 (M1/M3/M5/M8/M15 等)
+            m05_history_pd: warmup の M0.5 履歴 (index=timestamp, sorted)
+
+        Returns:
+            形成中の最後のバーを除外した DataFrame
+        """
+        if resampled_df.empty or m05_history_pd.empty:
+            return resampled_df
+        m05_latest_ts = m05_history_pd.index[-1]
+        m05_freq_sec = cls._TF_FREQ_SECONDS.get("M0.5", 30)
+        bucket_close_ts = m05_latest_ts + pd.Timedelta(seconds=m05_freq_sec)
+
+        tf_freq_sec = cls._TF_FREQ_SECONDS.get(tf_name, 0)
+        if tf_freq_sec <= 0:
+            # 未知 TF: 安全側で旧来の iloc[:-1] 同等 (最後を除外)
+            return resampled_df.iloc[:-1] if len(resampled_df) > 0 else resampled_df
+
+        tf_freq_td = pd.Timedelta(seconds=tf_freq_sec)
+        closed_mask = (resampled_df.index + tf_freq_td) <= bucket_close_ts
+        return resampled_df[closed_mask]
+
+    @staticmethod
+    def _ffill_lookup_market_proxy(
+        market_proxy_cache: pd.DataFrame,
+        search_ts: datetime,
+    ) -> float:
+        """[Phase 9d 発見 #65] thread-safe な ffill lookup を numpy で実装。
+
+        pandas DatetimeIndex.get_indexer(method="ffill") の代替実装。
+        pandas Index 機構 (lazy hashtable initialization) を完全に迂回し、
+        並列実行下でも race condition が発生しない。
+
+        セマンティクスは pandas 版と完全に同等:
+            旧: proxy_cache_unique = market_proxy_cache[
+                    ~market_proxy_cache.index.duplicated(keep="last")
+                ].sort_index()
+                idx = proxy_cache_unique.index.get_indexer(
+                    [search_ts], method="ffill"
+                )[0]
+                return iloc[idx]["market_proxy"] if idx != -1 else 0.0
+
+            新: numpy snapshot → stable sort → keep_last dedup →
+                searchsorted(side="right") - 1 → 該当値 or 0.0
+
+        学習側 2_G の `join_asof(strategy="backward") + fill_null(0.0)` と
+        数値完全一致を維持する。
+
+        Args:
+            market_proxy_cache: index=DatetimeIndex (tz-aware), columns=["market_proxy"]
+            search_ts: 検索対象 timestamp (tz-aware datetime)
+
+        Returns:
+            float: search_ts 以前の最新 proxy 値。該当なし or 非有限値の場合 0.0
+        """
+        if market_proxy_cache.empty:
+            return 0.0
+
+        # ── 1. timestamp と value を numpy ndarray にスナップショット ───
+        # pandas 2.x で DatetimeIndex の内部単位が "ns" でなく "us" (μs) や
+        # "ms" の場合がある (特に tz-aware index)。`asi8` はその単位の int を
+        # 返すため、`pd.Timestamp.value` (常に ns) と比較できない。
+        # → dtype.unit を判定して ns にスケール統一する。
+        # `.values.astype(np.int64)` は tz-aware で object 配列を返して
+        # silent に壊れるので使用しない。
+        idx = market_proxy_cache.index
+        if isinstance(idx, pd.DatetimeIndex) and hasattr(idx, "asi8"):
+            asi8 = np.asarray(idx.asi8, dtype=np.int64)
+            unit = getattr(idx.dtype, "unit", "ns")
+            scale_map = {
+                "ns": np.int64(1),
+                "us": np.int64(1_000),
+                "ms": np.int64(1_000_000),
+                "s":  np.int64(1_000_000_000),
+            }
+            scale = scale_map.get(unit, None)
+            if scale is None:
+                # 未知の unit → 安全側に per-element 変換
+                ts_ns = np.fromiter(
+                    (pd.Timestamp(t).value for t in idx),
+                    dtype=np.int64,
+                    count=len(idx),
+                )
+            else:
+                ts_ns = asi8 * scale
+        else:
+            # フォールバック (DatetimeIndex 以外)
+            ts_ns = np.fromiter(
+                (pd.Timestamp(t).value for t in idx),
+                dtype=np.int64,
+                count=len(idx),
+            )
+        proxy_arr = market_proxy_cache["market_proxy"].to_numpy(
+            dtype=np.float64, copy=False
+        )
+
+        if ts_ns.size == 0:
+            return 0.0
+
+        # ── 2. timestamp で stable sort ──────────────────────────────────
+        # stable sort により、同 timestamp は元の順序が保持される。
+        # この性質が次ステップの "keep last" 等価性を保証する。
+        sort_idx = np.argsort(ts_ns, kind="stable")
+        sorted_ts_ns = ts_ns[sort_idx]
+        sorted_proxy = proxy_arr[sort_idx]
+
+        # ── 3. 重複除去: 同 timestamp の "最後" を残す ──────────────────
+        # pandas duplicated(keep="last") = 最後の出現以外を duplicate 扱い。
+        # stable sort 後、同 timestamp グループの末尾要素 = 元データの最新出現。
+        # → "次の要素と timestamp が違う" もしくは "最後の要素" のみ残す mask。
+        n = sorted_ts_ns.size
+        if n > 1:
+            keep_mask = np.empty(n, dtype=np.bool_)
+            keep_mask[-1] = True
+            keep_mask[:-1] = sorted_ts_ns[:-1] != sorted_ts_ns[1:]
+            sorted_ts_ns = sorted_ts_ns[keep_mask]
+            sorted_proxy = sorted_proxy[keep_mask]
+
+        # ── 4. binary search (numpy, thread-safe) ────────────────────────
+        # search_ts を UTC ns に変換。pd.Timestamp.value は常に UTC ns。
+        # tz-naive の場合は UTC として扱う (元コードと同じ挙動)。
+        from datetime import timezone as _tz
+        if isinstance(search_ts, pd.Timestamp):
+            if search_ts.tzinfo is None:
+                search_ts_pd = search_ts.tz_localize("UTC")
+            else:
+                search_ts_pd = search_ts.tz_convert("UTC")
+        else:
+            # 通常の datetime
+            if search_ts.tzinfo is None:
+                search_ts_pd = pd.Timestamp(search_ts).tz_localize("UTC")
+            else:
+                search_ts_pd = pd.Timestamp(search_ts).tz_convert("UTC")
+        search_ns = np.int64(search_ts_pd.value)
+
+        # side="right" → search_ns 以下の最後の位置 + 1 を返す
+        # -1 で「search_ns 以下の最後の位置」になる (= ffill)
+        idx = int(np.searchsorted(sorted_ts_ns, search_ns, side="right")) - 1
+        if idx < 0:
+            return 0.0
+        val = float(sorted_proxy[idx])
+        if not np.isfinite(val):
+            return 0.0
+        return val
+
 
     # ─────────────────────────────────────────────────────────────────
     # [DISC-FLAG SSoT] 学習側 s1_1_B_build_ohlcv.py の TIMEFRAME_FREQ_SECONDS
@@ -205,8 +373,22 @@ class RealtimeFeatureEngine:
     def __init__(
         self,
         feature_list_path: str = str(config.S3_FEATURES_FOR_TRAINING_V5),
+        qa_state_artifacts: Optional[Dict[str, Dict]] = None,
     ):
+        """
+        Args:
+            feature_list_path: 特徴量名簿ファイル
+            qa_state_artifacts: [Phase 9d 発見 #66 Phase D-3] 学習側で生成された
+                QAState 最終 EWM 状態の dict。形式:
+                  {engine_id: {(tf, feat): {ewm_mean, ewm_var, ewm_n}}}
+                main.py 起動時に S3_QA_STATES_DIR/qa_state_e1{a..f}.pkl を load
+                して渡す。None の場合は旧挙動 (warmup loop で seed) で fallback。
+        """
         self.logger = logging.getLogger("ProjectCimera.FeatureEngine")
+
+        # [Phase 9d 発見 #66 Phase D-3] artifact を instance var に保持。
+        # 後段 (qa_states 初期化箇所) で _extract_artifact が参照する。
+        self._qa_state_artifacts = qa_state_artifacts
 
         # risk_config.json を読み込み (min_atr_threshold等を動的取得)
         try:
@@ -317,20 +499,73 @@ class RealtimeFeatureEngine:
         # 7. 各時間足・各モジュール(1A〜1F)のQAStateを初期化
         # [乖離①修正] 学習側 apply_quality_assurance_to_group と等価のQA処理を有効化
         # lookback_barsは時間足ごとの1日バー数（M3=480等）を使用
+        #
+        # [Phase 9d 発見 #66 Phase D-3] artifact load 経路:
+        #   self._qa_state_artifacts は __init__ 直前に main.py から渡される
+        #   学習側 5 年分の EWM 最終状態 dict。形式:
+        #     {engine_id: {(tf, feat): {ewm_mean, ewm_var, ewm_n}}}
+        #   QAState 構築時に該当 engine × TF の artifact を抽出して渡す。
+        #   artifact 不在の場合 (= self._qa_state_artifacts is None or 該当エントリ無し)
+        #   は旧挙動 (warmup loop で 577 update 経由の seed) で fallback。
         self.qa_states: Dict[str, Dict[str, Any]] = {}
         for tf_name in self.ALL_TIMEFRAMES.keys():
             if self.ALL_TIMEFRAMES[tf_name] is None:
                 continue
             lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
+
+            # 各 engine 別に該当 TF の artifact を抽出 (None なら旧挙動)
+            def _extract_artifact(engine_id: str) -> Optional[Dict[str, Dict[str, float]]]:
+                if not getattr(self, "_qa_state_artifacts", None):
+                    return None
+                engine_artifact = self._qa_state_artifacts.get(engine_id)
+                if not engine_artifact:
+                    return None
+                # engine_artifact: {(tf, feat): {ewm_mean, ewm_var, ewm_n}}
+                # → 該当 TF の {feat: {...}} に変換
+                return {
+                    feat: state
+                    for (t, feat), state in engine_artifact.items()
+                    if t == tf_name
+                }
+
             self.qa_states[tf_name] = {
-                "1A": FeatureModule1A.QAState(lookback_bars=lb),
-                "1B": FeatureModule1B.QAState(lookback_bars=lb),
-                "1C": FeatureModule1C.QAState(lookback_bars=lb),
-                "1D": FeatureModule1D.QAState(lookback_bars=lb),
-                "1E": FeatureModule1E.QAState(lookback_bars=lb),
-                "1F": FeatureModule1F.QAState(lookback_bars=lb),
+                "1A": FeatureModule1A.QAState(
+                    lookback_bars=lb, artifact=_extract_artifact("e1a")
+                ),
+                "1B": FeatureModule1B.QAState(
+                    lookback_bars=lb, artifact=_extract_artifact("e1b")
+                ),
+                "1C": FeatureModule1C.QAState(
+                    lookback_bars=lb, artifact=_extract_artifact("e1c")
+                ),
+                "1D": FeatureModule1D.QAState(
+                    lookback_bars=lb, artifact=_extract_artifact("e1d")
+                ),
+                "1E": FeatureModule1E.QAState(
+                    lookback_bars=lb, artifact=_extract_artifact("e1e")
+                ),
+                "1F": FeatureModule1F.QAState(
+                    lookback_bars=lb, artifact=_extract_artifact("e1f")
+                ),
             }
         self.logger.info("✓ 全時間足のQAStateを初期化しました。")
+
+        # Phase D-3 artifact load 状況のサマリーをログ出力
+        if getattr(self, "_qa_state_artifacts", None):
+            engines_loaded = sorted(self._qa_state_artifacts.keys())
+            total_entries = sum(
+                len(art) for art in self._qa_state_artifacts.values()
+            )
+            self.logger.info(
+                f"[Phase D-3] QAState artifact load 済: "
+                f"engines={engines_loaded}, total_entries={total_entries}"
+            )
+        else:
+            self.logger.warning(
+                "[Phase D-3] QAState artifact なし → 旧挙動 "
+                "(warmup loop で seed) で fallback します。"
+                "Train-Serve Skew が残存する可能性があります。"
+            )
 
         # [LAG-FIX-3] 6 TF 並列計算用の ThreadPoolExecutor を初期化
         # process_new_m05_bar の step3 (全 TF 強制再計算) を並列化することで、
@@ -447,19 +682,47 @@ class RealtimeFeatureEngine:
         # → 数値固定窓の絶対最大は 1440 (1D rolling_quantile)。
         # → 全 TF で最低 1440 本のバッファが必要。
         #
+        # 【Phase E+ EMA: recurrence 系の warmup 要件追加】
+        # rolling_*(N) の N と「特徴量計算に必要な本数」だけでなく、recurrence
+        # 系 (EMA, Wilder smoothing 等) の収束 warmup も考慮が必要。
+        # 各 recurrence の α と必要 warmup (rtol=1e-7 通過):
+        #   - EMA span=200 (1C: ema_200 / ema_deviation_200):
+        #       α=2/201≈0.00995 → warmup ≈ 1620 bar  ← 今回の真因
+        #       ※特に ema_deviation_200 = (close-ema)/ema*100 は ema が close に
+        #          肉薄する瞬間に分母小特異点で rel_diff が増幅される。これを
+        #          shadow_mode rtol=1e-7 で通すには ULP オーダーまで warmup
+        #          完全収束させる必要 (3500 bar 程度)。
+        #   - EMA span≤100 (MACD/PO/Wilder/KAMA/TRIX/TSI):
+        #       warmup ≤ 880 bar → 旧 maxlen 1540 で吸収済
+        #   - QA bounds EWM (half_life=bars/day, 最大 M0.5 で 66907 bar 必要):
+        #       Phase D-3 で artifact ロード方式で構造的に解決済 (本ファイル
+        #       L98-119 の QAState seed artifact、from scratch ではなく学習側
+        #       成熟状態からの stream 増分更新)
+        #
         # 修正履歴:
         #   旧 (Phase 9b 初期 hotfix): M3-M15 = 1024 (1E spectral_flux のみ考慮)
         #   新 (Phase 9b 案 A): M3-M15 = 1440 (1D rolling_quantile を追加考慮)
         #     → e1d_hv_regime_50 が学習側と整合 (現在 gain=0 で AI 未使用、構造的整合のみ)
+        #   新 (Phase E+ EMA, today phase 1):
+        #     M0.5: 2880 → 3500, M1-M15: 1440 → 2000
+        #     → e1c failing 3,182 → 16 (M1: 14, M3: 2)
+        #     → 残 16 cells は ema_deviation_200 の分母小特異点で warmup 残差
+        #        (8e-10 オーダー) が rel_diff に増幅される現象
+        #   新 (Phase E+ EMA, today phase 2 = 確定):
+        #     全 TF: 3500 統一
+        #     → warmup 3499 → (1-α)^N ≈ 8e-16 (M0.5 と同等の ULP 完全収束)
+        #     → e1c failing 16 → 0 確定 (Phase E+ EMA 完全合格)
+        #     → M5-M15 も予防的に 3500 に統一 (将来の test 期間延長や別 EMA-200
+        #        系 feature 追加時のリスク排除、設定統一でシンプル化)
         PER_TF_FEATURE_MAX = {
-            "M0.5": 2880,  # 1D vol_ma1440 (= bars_per_day) 由来
-            "M1":   1440,  # 1D vol_ma1440 + 1D rolling_quantile(1440)
-            "M3":   1440,  # 1D rolling_quantile(1440) ← Phase 9b 案 A で 1024→1440
-            "M5":   1440,  # 同上
-            "M8":   1440,  # 同上
-            "M15":  1440,  # 同上
+            "M0.5": 3500,   # EMA-200 warmup 3499 → (1-α)^N ≈ 8e-16 (完全 ULP)
+            "M1":   3500,   # 同上 (旧 2000 → 3500、14 cells failing を解消)
+            "M3":   3500,   # 同上 (旧 2000 → 3500、 2 cells failing を解消)
+            "M5":   3500,   # 同上 (現状 failing 0 だが予防的に統一)
+            "M8":   3500,   # 同上
+            "M15":  3500,   # 同上
         }
-        DEFAULT_FEATURE_MAX = 1440  # 未知 TF のフォールバック (1D rolling_quantile に合わせる)
+        DEFAULT_FEATURE_MAX = 3500  # 未知 TF のフォールバック (EMA-200 ULP 完全収束に必要な値)
 
         final_lookbacks = {}
         # PER_TF_FEATURE_MAX の dict 定義順で処理 → ログも M0.5 → M15 の順になる
@@ -643,7 +906,13 @@ class RealtimeFeatureEngine:
                     col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
                     for col in self.OHLCV_COLS
                 }
-                features = self._calculate_base_features(data, tf_name)
+                # [Phase 9d 発見 #66 Phase D-3] smoke test は QAState を update
+                # すべきでない。artifact load 済の場合は状態を維持し、未 load の
+                # 場合も smoke test で余計な update を入れない (warmup loop で
+                # 既に成熟済の状態を保持)。
+                features = self._calculate_base_features(
+                    data, tf_name, skip_qa_update=True
+                )
 
                 # (a) 全特徴量の 0 値集計 (Phase 9b 案 A: EXPECTED_ZERO_FEATURES 除外)
                 zero_features = sorted([
@@ -1045,7 +1314,15 @@ class RealtimeFeatureEngine:
                 "volume": arr_vol[window_start : i + 1],
             }
 
-            base_features = self._calculate_base_features(data, tf_name)
+            # [Phase 9d 発見 #66 Phase D-3] warmup loop は QAState を成熟させる
+            # ことが本来の目的だが、artifact から学習側 5 年分の成熟状態を継承
+            # 済みの場合は warmup の 577 回 update で artifact 状態を破壊しない
+            # よう skip_update=True を渡す。artifact 不在のフォールバック経路では
+            # 旧挙動 (warmup loop で 2 半減期分まで成熟させる) を維持する。
+            _skip_qa = self._any_artifact_loaded(tf_name)
+            base_features = self._calculate_base_features(
+                data, tf_name, skip_qa_update=_skip_qa
+            )
 
             # (3) 固定ウィンドウ特徴量値で OLS 状態を更新
             self._update_incremental_ols(
@@ -1145,6 +1422,23 @@ class RealtimeFeatureEngine:
             )
             .dropna()  # 学習側 filter(tick_count>0) と完全一致
         )
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #64] warmup resample 末尾の「形成中バー」を除外
+        # ─────────────────────────────────────────────────────────────
+        # 旧実装: dropna() のみ。M0.5 履歴の末端 (warmup_end_ts) に位置する
+        #   M1 bucket は、当該 bucket 内の M0.5 が一部しか存在しなくても
+        #   resample 結果に含まれてしまう (1 本だけから derived された
+        #   M1 OHLCV)。これが production deque の末尾に残り、その後の
+        #   M1 close 検知 (発見 #62 の timestamp ベース判定) で
+        #   last_known >= 該当 timestamp となり、正しい M1 バーで上書きされない。
+        #   結果として、長窓特徴量 (e.g. rolling_20) が 20 本の窓を通過する
+        #   間ずっと汚染値を参照する構造的バグ。
+        # 新実装: `_resample_and_update_buffer` (runtime, 発見 #62) と同じ
+        #   timestamp ベース close 判定を適用して、警報の「形成中バー」を除外。
+        # ─────────────────────────────────────────────────────────────
+        m1_history_pd = self._filter_to_closed_buckets_warmup(
+            m1_history_pd, "M1", m05_history_pd
+        )
         # [DISC-FLAG] タイムスタンプ差から不連続フラグを推定
         #   学習側 s1_1_B の DISC-FLAG 付与ロジックと完全一致させる。
         m1_history_pd = self._add_disc_column(m1_history_pd, freq_seconds=60)
@@ -1181,6 +1475,18 @@ class RealtimeFeatureEngine:
 
                 if resampled_df.empty:
                     self.logger.warning(f"{tf_name} のリサンプリング結果が空です。")
+                    continue
+
+                # [Phase 9d 発見 #64] warmup resample 末尾の「形成中バー」を除外
+                # (M1 の同等処理と同じ理由。詳細は M1 側コメント参照)
+                resampled_df = self._filter_to_closed_buckets_warmup(
+                    resampled_df, tf_name, m05_history_pd
+                )
+
+                if resampled_df.empty:
+                    self.logger.warning(
+                        f"{tf_name} のリサンプリング結果が空 (incomplete bucket filter 後)。"
+                    )
                     continue
 
                 # [DISC-FLAG SSoT] タイムスタンプ差から不連続フラグを推定
@@ -1501,19 +1807,60 @@ class RealtimeFeatureEngine:
 
             newly_closed_timeframes["M0.5"] = [m05_timestamp]
 
-            # 3. M3確定時のみ全時間足を強制再計算・シグナルチェック
-            # M3非確定時はSTEP1・2のバッファ更新のみで完結（処理なし）
-            if "M3" not in newly_closed_timeframes:
-                return signal_list
+            # ─────────────────────────────────────────────────────────────
+            # [Phase 9d 発見 #66 Phase B] 学習側 per-TF-bar cadence への揃え
+            # (第二段階: M0.5/M1/M5/M8 を学習側と一致させる)
+            # ─────────────────────────────────────────────────────────────
+            # 旧実装 (Phase A まで):
+            #   L1703 の "if 'M3' not in newly_closed_timeframes: return" で
+            #   M3 close 以外の経路を早期 return していた。これにより M0.5/M1 の
+            #   update_and_clip は M3 cadence (3分毎=340回/17h) でしか呼ばれず、
+            #   学習側 M0.5 (2040回/17h) / M1 (1020回/17h) と大幅乖離。
+            #   M5/M8 も同様に M3 と LCM 一致時のみ recalc で過少 (68/43)。
+            #
+            # 新実装 (Phase B):
+            #   早期 return を削除し、recalc は「close した TF 全て」に対し
+            #   実行する。これで各 TF の update_and_clip 呼び出し頻度が
+            #   学習側 per-TF-bar cadence と完全一致:
+            #     M0.5: 毎 M0.5 close = 30秒毎 = 2040回/17h ← 一致
+            #     M1:   毎 M1 close   = 1分毎  = 1020回/17h ← 一致
+            #     M3:   毎 M3 close   = 3分毎  = 340回/17h  ← 一致
+            #     M5:   毎 M5 close   = 5分毎  = 204回/17h  ← 一致
+            #     M8:   毎 M8 close   = 8分毎  = 127回/17h  ← 一致
+            #     M15:  毎 M15 close  = 15分毎 = 68回/17h   ← 一致
+            #   シグナル生成は M3 close 時のみに限定 (既存設計を維持)。
+            #
+            # _recalc_one_tf 引数変更:
+            #   旧: closure 経由で m3_timestamp を参照していた (全 TF で M3 ts)
+            #   新: 各 TF の close timestamp を明示的に引数として渡す。
+            #       これにより _update_incremental_ols と
+            #       _calculate_neutralized_features が「その TF の close 時刻」を
+            #       受け取り、学習側 per-TF row の timestamp と一致する。
+            #
+            # TF の close timestamp 計算規約 (Phase B で統一):
+            #   M0.5: newly_closed_timeframes["M0.5"][-1] = m05_timestamp
+            #         (引数として渡されるのは既に close 時刻)
+            #   他 TF (M1/M3/M5/M8/M15):
+            #         newly_closed_timeframes[tf][-1] (= resample 結果の bar
+            #         開始時刻) + ALL_TIMEFRAMES[tf] 分 = close 時刻
+            # ─────────────────────────────────────────────────────────────
 
-            m3_timestamp = newly_closed_timeframes["M3"][-1] + pd.Timedelta(minutes=3)
+            def _close_ts_for(tf_name: str) -> pd.Timestamp:
+                """各 TF の close timestamp を統一的に取得"""
+                if tf_name == "M0.5":
+                    # L1699 で既に close 時刻が格納されている
+                    return newly_closed_timeframes["M0.5"][-1]
+                # 他 TF: resample 結果 (bar 開始時刻) + TF duration
+                tf_minutes = self.ALL_TIMEFRAMES[tf_name]
+                return (
+                    newly_closed_timeframes[tf_name][-1]
+                    + pd.Timedelta(minutes=tf_minutes)
+                )
 
-            # [LAG-FIX-3] M3確定時：全時間足のバッファから強制再計算 (並列実行)
-            # 6 TF を ThreadPoolExecutor で並列実行することで、6 TF × ~85ms 直列 (~547ms)
-            # を、最遅 TF 律速 (~110ms) 程度まで短縮する。各 TF の処理は独立なので
-            # thread safety 問題なし。Polars の rayon/Numba njit は GIL を解放するため
-            # CPython でも本物の並列実行が可能。
-            def _recalc_one_tf(tf_name: str):
+            # [LAG-FIX-3] 全時間足のバッファから強制再計算 (並列実行)
+            # 各 TF の処理は独立なので thread safety 問題なし。Polars の
+            # rayon/Numba njit は GIL を解放するため CPython でも本物の並列実行。
+            def _recalc_one_tf(tf_name: str, close_ts: pd.Timestamp):
                 if not self.is_buffer_filled.get(tf_name, False):
                     return None
                 try:
@@ -1521,14 +1868,31 @@ class RealtimeFeatureEngine:
                         col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
                         for col in self.OHLCV_COLS
                     }
-                    base_features = self._calculate_base_features(data, tf_name)
+                    # ─────────────────────────────────────────────────────
+                    # [Phase 9d 発見 #66 Phase D-3] QAState artifact 由来の
+                    # 状態を warmup 中に破壊しないよう skip_qa_update を判定。
+                    # ─────────────────────────────────────────────────────
+                    # warmup_only=True かつ 該当 TF の少なくとも 1 つの QAState が
+                    # artifact 由来 (= _artifact_loaded == True) なら、本 recalc
+                    # 内の update_and_clip 呼び出しで EWM 状態の追加 update を
+                    # 抑止する (clip 自体は適用される)。
+                    # これにより learning-side の 5 年分 EWM 成熟状態が warmup の
+                    # 30 日分追加 update で破壊されることを防ぎ、Layer 1 で
+                    # 数値完全一致 (1e-15) を保証する。
+                    skip_qa_update = (
+                        warmup_only and self._any_artifact_loaded(tf_name)
+                    )
+
+                    base_features = self._calculate_base_features(
+                        data, tf_name, skip_qa_update=skip_qa_update
+                    )
 
                     self._update_incremental_ols(
-                        tf_name, base_features, market_proxy_cache, m3_timestamp
+                        tf_name, base_features, market_proxy_cache, close_ts
                     )
 
                     neutralized = self._calculate_neutralized_features(
-                        base_features, tf_name, m3_timestamp, market_proxy_cache
+                        base_features, tf_name, close_ts, market_proxy_cache
                     )
                     self.latest_features_cache[tf_name] = neutralized
 
@@ -1537,13 +1901,31 @@ class RealtimeFeatureEngine:
                     self.logger.warning(f"{tf_name} 特徴量キャッシュ更新失敗: {e}")
                     return None
 
-            # 6 TF を並列実行
-            tf_names = list(self.ALL_TIMEFRAMES.keys())
-            futures = [self._tf_executor.submit(_recalc_one_tf, tf) for tf in tf_names]
-            for future in futures:
-                future.result()
+            # close した TF を全て recalc (学習側 per-TF-bar cadence と一致)
+            tf_names = [
+                tf for tf in self.ALL_TIMEFRAMES.keys()
+                if tf in newly_closed_timeframes
+            ]
+            if tf_names:
+                futures = [
+                    self._tf_executor.submit(_recalc_one_tf, tf, _close_ts_for(tf))
+                    for tf in tf_names
+                ]
+                for future in futures:
+                    future.result()
 
-            # シグナルチェックはM3のみ
+            # ─────────────────────────────────────────────────────────────
+            # シグナル生成 — M3 close 時のみ実行 (Phase B で recalc と分離)
+            # ─────────────────────────────────────────────────────────────
+            # Phase A 以前は L1703 の早期 return が recalc と signal の両方を
+            # M3 close 時のみに制限していたが、Phase B で recalc は全 TF close
+            # 時に実行されるようになり、signal だけが M3 close 限定で残る。
+            # これは設計上正しい: AI 推論 (V5_check) は M3 cadence で行う前提。
+            if "M3" not in newly_closed_timeframes:
+                return signal_list
+
+            m3_timestamp = newly_closed_timeframes["M3"][-1] + pd.Timedelta(minutes=3)
+
             # [STALE-GUARD] warmup_only=True（差分追いつき中）はシグナル生成を根本からスキップ
             if warmup_only:
                 return signal_list
@@ -1767,19 +2149,38 @@ class RealtimeFeatureEngine:
             else:
                 search_ts = search_ts.astimezone(timezone.utc)
 
-            # [プロキシ取得] 学習側2_Gのjoin_asof(strategy="backward")+fill_null(0.0)と完全一致。
-            # join_asof(strategy="backward") = 各行タイムスタンプ以前で最新のプロキシ値 = ffill
-            # fill_null(0.0) = M5バーが1件も存在しない履歴先頭のみ0.0
-            # → get_indexer(method="ffill") + idx==-1時のみ0.0 が完全等価。
-            # 「M5未確定=0.0」は誤り。M5未確定時は直前の確定M5値をffillで使うのが正しい。
-            proxy_cache_unique = market_proxy_cache[
-                ~market_proxy_cache.index.duplicated(keep="last")
-            ].sort_index()
-            idx = proxy_cache_unique.index.get_indexer([search_ts], method="ffill")[0]
-            latest_x = (
-                float(proxy_cache_unique.iloc[idx]["market_proxy"])
-                if idx != -1
-                else 0.0
+            # ─────────────────────────────────────────────────────────────
+            # [Phase 9d 発見 #65] pandas DatetimeIndex.get_indexer(method="ffill")
+            # の thread-safety 問題を回避するため numpy searchsorted に置換
+            # ─────────────────────────────────────────────────────────────
+            # 旧実装:
+            #     proxy_cache_unique = market_proxy_cache[
+            #         ~market_proxy_cache.index.duplicated(keep="last")
+            #     ].sort_index()
+            #     idx = proxy_cache_unique.index.get_indexer(
+            #         [search_ts], method="ffill"
+            #     )[0]
+            #
+            # 問題:
+            #     process_new_m05_bar の M3 close 経路で _recalc_one_tf が
+            #     6 TF 並列実行される (ThreadPoolExecutor)。6 スレッドが同じ
+            #     market_proxy_cache.index に同時アクセスすると、pandas
+            #     DatetimeIndex の lazy hashtable 初期化 (.duplicated() /
+            #     get_indexer 経由) で race condition が発生し、まれに
+            #     "Reindexing only valid with uniquely valued Index objects"
+            #     例外が投げられて、当該 TF の OLS 状態更新が skip される。
+            #     production runtime では OLS 係数の微小 drift につながり、
+            #     将来の Layer 1 v2 (post-OLS 比較) で byte-identical 比較不可。
+            #
+            # 新実装:
+            #     numpy ndarray の read-only スナップショットを取って searchsorted
+            #     で binary search する。pandas DatetimeIndex 機構を完全に迂回し、
+            #     thread-safety を numpy の documented behavior で保証する。
+            #     学習側 2_G の join_asof(strategy="backward") + fill_null(0.0)
+            #     と数値完全一致を維持。
+            # ─────────────────────────────────────────────────────────────
+            latest_x = self._ffill_lookup_market_proxy(
+                market_proxy_cache, search_ts
             )
             if not np.isfinite(latest_x):
                 latest_x = 0.0
@@ -1915,8 +2316,22 @@ class RealtimeFeatureEngine:
             self.logger.error(f"アルファ純化 ({tf_name}) に失敗: {e}", exc_info=True)
             return base_features_dict
 
+    def _any_artifact_loaded(self, tf_name: str) -> bool:
+        """
+        [Phase 9d 発見 #66 Phase D-3] 該当 TF の QAState (各モジュール) のうち
+        少なくとも 1 つが学習側 artifact から load されているか判定。
+
+        warmup loop / smoke test 等の「QAState を update すべきでない」経路で、
+        update_and_clip(skip_update=True) を渡すかどうかの判定に使う。
+        """
+        tf_qa = self.qa_states.get(tf_name, {})
+        return any(getattr(qs, "_artifact_loaded", False) for qs in tf_qa.values())
+
     def _calculate_base_features(
-        self, data: Dict[str, np.ndarray], tf_name: str
+        self,
+        data: Dict[str, np.ndarray],
+        tf_name: str,
+        skip_qa_update: bool = False,
     ) -> Dict[str, float]:
         """
         【Phase 9b 改修版: 司令塔統合 .select()】
@@ -1940,7 +2355,58 @@ class RealtimeFeatureEngine:
             プレフィックス e1a_/e1b_/.../e1f_ で qa_states[tf_name][module_id] を
             参照。e1d_sample_weight / e1e_sample_weight は QA 対象外
             (学習側 base_columns 扱いと一致、Phase 5 #36)。
+
+        [Phase 9d 発見 #66 Phase D-3] skip_qa_update 引数:
+            True の場合、qa_state.update_and_clip(skip_update=True) を渡して
+            EWM 状態の更新を抑止する。clip 自体は適用される。
+            これは learning-side QAState artifact を本番側で load した後の
+            warmup 期間中に追加 update が起きるのを防ぎ、artifact 状態を
+            純粋に維持するための仕組み (司令塔 _recalc_one_tf 経由)。
+            デフォルト False (旧挙動互換)。
         """
+        # === [§B.12.10.X cell-level deque trace] 環境変数で制御される読み取り専用 dump フック ===
+        # FORGE_DEQ_TRACE_TARGETS が空 (= default) なら早期 return、production 動作に影響ゼロ。
+        # 設定時のみ target (tf, ts) に一致した呼び出しで `data` (= OHLCV dict of np.array) を
+        # pickle dump する。monkey-patch ではない (production code 内に追加された静的フック)
+        # ので numba JIT cache 汚染リスクなし (§B.12.11.2)。
+        #
+        # 使い方:
+        #   FORGE_DEQ_TRACE_TARGETS="M0.5:2026-04-01T06:48:00,M0.5:2026-04-01T06:48:30" \
+        #     python3 run_shadow_test.py ...
+        #   → /tmp/forge_deque_dump/deque_M0_5_2026-04-01T06-48-00.pkl が 1 ファイルだけ生成される
+        _dump_targets_env = os.environ.get("FORGE_DEQ_TRACE_TARGETS", "")
+        if _dump_targets_env:
+            _ts_at_call = self.last_bar_timestamps.get(tf_name)
+            if _ts_at_call is not None:
+                _ts_iso = pd.Timestamp(_ts_at_call).strftime("%Y-%m-%dT%H:%M:%S")
+                _target_set = {
+                    tuple(tok.strip().split(":", 1))
+                    for tok in _dump_targets_env.split(",") if ":" in tok
+                }
+                if (tf_name, _ts_iso) in _target_set:
+                    _dump_dir = Path(
+                        os.environ.get("FORGE_DEQ_TRACE_DIR", "/tmp/forge_deque_dump")
+                    )
+                    _dump_dir.mkdir(parents=True, exist_ok=True)
+                    _safe_ts = _ts_iso.replace(":", "-")
+                    _safe_tf = tf_name.replace(".", "_")
+                    _dump_path = _dump_dir / f"deque_{_safe_tf}_{_safe_ts}.pkl"
+                    if not _dump_path.exists():  # 1 cell につき 1 回だけ
+                        _snapshot = {
+                            "tf": tf_name,
+                            "ts": _ts_iso,
+                            "skip_qa_update": skip_qa_update,
+                            "data": {k: np.asarray(v).copy() for k, v in data.items()},
+                            "data_lengths": {k: len(v) for k, v in data.items()},
+                        }
+                        with open(_dump_path, "wb") as _f:
+                            pickle.dump(_snapshot, _f)
+                        self.logger.info(
+                            f"[deque trace] dumped {_dump_path} "
+                            f"(skip_qa_update={skip_qa_update})"
+                        )
+        # === end deque trace hook ===
+
         # [乖離①修正] qa_stateとlookback_barsを時間足に合わせて渡す
         tf_qa = self.qa_states.get(tf_name, {})
         lb = TIMEFRAME_BARS_PER_DAY.get(tf_name, 1440)
@@ -1984,6 +2450,55 @@ class RealtimeFeatureEngine:
             **l2_a, **l2_b, **l2_c, **l2_d, **l2_e, **l2_f,
         }
 
+        # === [§B.12.12.X cell-level pieces trace] 2 番目の dump フック ===
+        # _build_polars_pieces 実行直後の各モジュールの cols_a/d/e から
+        # __temp_atr_13 配列を dump する。これにより:
+        #   - production が実際に生成した ATR 配列 (cols_a の値 = rfe_1A の出力)
+        #   - dict.update 後勝者となる cols_e の ATR 配列 (rfe_1E の出力)
+        #   - all_columns の最終 __temp_atr_13 (= polars DataFrame 内の divisor)
+        # を取得できる。trace_one_cell.py 側で「dump された data から独立計算した ATR」
+        # との bit 比較が可能になる。
+        # production 動作には影響ゼロ (環境変数 FORGE_DEQ_TRACE_TARGETS 設定時のみ動作)。
+        if _dump_targets_env:
+            _ts_at_call = self.last_bar_timestamps.get(tf_name)
+            if _ts_at_call is not None:
+                _ts_iso = pd.Timestamp(_ts_at_call).strftime("%Y-%m-%dT%H:%M:%S")
+                _target_set = {
+                    tuple(tok.strip().split(":", 1))
+                    for tok in _dump_targets_env.split(",") if ":" in tok
+                }
+                if (tf_name, _ts_iso) in _target_set:
+                    _dump_dir = Path(
+                        os.environ.get("FORGE_DEQ_TRACE_DIR", "/tmp/forge_deque_dump")
+                    )
+                    _dump_dir.mkdir(parents=True, exist_ok=True)
+                    _safe_ts = _ts_iso.replace(":", "-")
+                    _safe_tf = tf_name.replace(".", "_")
+                    _pieces_path = _dump_dir / f"pieces_{_safe_tf}_{_safe_ts}.pkl"
+                    if not _pieces_path.exists():  # 1 cell につき 1 回だけ
+                        def _maybe_arr(d, key):
+                            v = d.get(key) if isinstance(d, dict) else None
+                            return np.asarray(v).copy() if v is not None else None
+                        _pieces_snap = {
+                            "tf": tf_name,
+                            "ts": _ts_iso,
+                            # 各モジュールが出した __temp_atr_13 (= raw or +1e-10)
+                            "cols_a_temp_atr_13": _maybe_arr(cols_a, "__temp_atr_13"),
+                            "cols_d_temp_atr_13": _maybe_arr(cols_d, "__temp_atr_13"),
+                            "cols_e_temp_atr_13": _maybe_arr(cols_e, "__temp_atr_13"),
+                            # all_columns 内の最終勝者 (= polars 内で divisor に使われる値)
+                            "all_columns_temp_atr_13": _maybe_arr(all_columns, "__temp_atr_13"),
+                            # 各モジュールの close (input data の確認用、同じはず)
+                            "cols_a_close": _maybe_arr(cols_a, "close"),
+                            "cols_e_close": _maybe_arr(cols_e, "close"),
+                        }
+                        with open(_pieces_path, "wb") as _f:
+                            pickle.dump(_pieces_snap, _f)
+                        self.logger.info(
+                            f"[deque trace] pieces dumped {_pieces_path}"
+                        )
+        # === end pieces trace hook ===
+
         # ---------------------------------------------------------------
         # 3. 統合 DataFrame で単一 .select() を実行 (FFI overhead 1 回)
         # ---------------------------------------------------------------
@@ -2026,7 +2541,12 @@ class RealtimeFeatureEngine:
                 module_id = prefix[1:].upper()  # "1A", "1B", ...
                 qa_state = tf_qa.get(module_id)
                 if qa_state is not None:
-                    qa_results[k] = qa_state.update_and_clip(k, v)
+                    # [Phase 9d 発見 #66 Phase D-3] skip_qa_update を伝播。
+                    # warmup 中かつ artifact load 済の場合のみ True で
+                    # EWM 状態更新を抑止 (clip は適用される)。
+                    qa_results[k] = qa_state.update_and_clip(
+                        k, v, skip_update=skip_qa_update
+                    )
                     continue
 
             # プレフィックス不一致 / qa_state 不在 → inf/NaN フォールバックのみ

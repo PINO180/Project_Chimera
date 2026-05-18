@@ -44,3 +44,27 @@ echo "logs/" >> .gitignore
 duckdb_temp/
 .tmp/*.pkl
 *.parquet
+
+# ================== shadow_mode ==================
+# /workspace/shadow_mode/ 配下は .py 以外を ignore
+shadow_mode/*
+!shadow_mode/*.py
+# === バックアップ・アーカイブ系を ignore ===
+**/Archive/
+**/Archives/
+**/Before*/
+**/After*backup*/
+**/*_backup/
+**/*_FAIL_backup/
+**/*修正前*/
+**/*凍結*/
+**/*問題*/
+**/Polars*plan*/
+*.bak
+*.v[0-9]bak
+*.v[0-9][0-9]bak
+.tmp/
+.temp/
+tmp/
+logs/Phase_*/
+logs/Before*/

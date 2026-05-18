@@ -43,16 +43,21 @@ class ReplayBridge:
                 f"test_end_ts ({self.test_end_ts})"
             )
         self._df = self._load_m05_parquet()
+        # [Phase E §B.12.10.13] SSoT alignment:
+        #   学習側 S2 は warmup_end_ts を **test 側** に含める (`>=` / `<=`)。
+        #   旧実装は warmup 側 (`<=` / `>`) で 30 秒ズレ → e1a Cluster A 70 cells の真因。
+        #   inspect_C で gap_A=30/gap_B=0 を実機実証 (前 session, 2026-05-16)。
         self._warmup_df = self._df[
-            self._df["timestamp"] <= self.warmup_end_ts
+            self._df["timestamp"] < self.warmup_end_ts
         ].reset_index(drop=True)
         self._test_df = self._df[
-            (self._df["timestamp"] > self.warmup_end_ts)
+            (self._df["timestamp"] >= self.warmup_end_ts)
             & (self._df["timestamp"] <= self.test_end_ts)
         ].reset_index(drop=True)
         logger.info(
             f"ReplayBridge initialized: warmup={len(self._warmup_df)} bars, "
-            f"test={len(self._test_df)} bars"
+            f"test={len(self._test_df)} bars "
+            f"(SSoT-aligned: warmup_end_ts ∈ test)"
         )
 
     @staticmethod

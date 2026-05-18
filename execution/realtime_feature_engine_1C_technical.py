@@ -65,6 +65,20 @@ from core_indicators import (
     calculate_tsi_numba,
     _calculate_di_wilder,
 )
+# ─────────────────────────────────────────────────────────────
+# [Phase E (stable_rolling SSoT)] Polars rolling running 実装の
+# context 長依存性を排除するため、両側で共通の Numba 関数を import。
+# 本番側は Option C2: numpy 事前計算 + 列注入で使用 (map_batches 完全排除)。
+# rolling_var(W, ddof=1) も学習側と同じく stable_rolling_var を直接呼ぶ
+# (std**2 は IEEE 754 で 1 ULP ズレうるので使わない)。本ファイルでは
+# rolling_var の出現はないが、SSoT 揃えとして import は揃えておく。
+# ─────────────────────────────────────────────────────────────
+from stable_rolling import (
+    stable_rolling_mean,
+    stable_rolling_std,
+    stable_ewm_mean,
+)
+import math
 
 
 # ==================================================================
@@ -77,13 +91,35 @@ class QAState:
     詳細は realtime_feature_engine_1A_statistics.py の QAState を参照。
     """
 
-    def __init__(self, lookback_bars: int = 1440):
+    def __init__(
+        self,
+        lookback_bars: int = 1440,
+        artifact: Optional[Dict[str, Dict[str, float]]] = None,
+    ):
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
         self._ewm_n: Dict[str, int] = {}
 
-    def update_and_clip(self, key: str, raw_val: float) -> float:
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #66 Phase D-3] 学習側 QAState seed artifact の load
+        # ─────────────────────────────────────────────────────────────
+        # 1A と完全に同じ仕組み (詳細は realtime_feature_engine_1A_statistics.py
+        # の QAState を参照)。 artifact が渡された場合、各 feature の EWM 状態を
+        # 学習側 5 年分の成熟状態で初期化する。これにより本番側 QAState の
+        # seed 不足が解消され、Train-Serve Skew が根治される。
+        # ─────────────────────────────────────────────────────────────
+        self._artifact_loaded: bool = False
+        if artifact is not None:
+            for feat_name, state in artifact.items():
+                self._ewm_mean[feat_name] = float(state["ewm_mean"])
+                self._ewm_var[feat_name] = float(state["ewm_var"])
+                self._ewm_n[feat_name] = int(state["ewm_n"])
+            self._artifact_loaded = True
+
+    def update_and_clip(
+        self, key: str, raw_val: float, skip_update: bool = False
+    ) -> float:
         alpha = self.alpha
 
         is_pos_inf = np.isposinf(raw_val)
@@ -91,14 +127,17 @@ class QAState:
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
         if key not in self._ewm_mean:
+            # key 未初期化: artifact 不在 or artifact に存在しない feature
             if np.isnan(ewm_input):
                 return 0.0
-            self._ewm_mean[key] = ewm_input
-            self._ewm_var[key]  = 0.0
-            self._ewm_n[key]    = 1
+            if not skip_update:
+                self._ewm_mean[key] = ewm_input
+                self._ewm_var[key]  = 0.0
+                self._ewm_n[key]    = 1
+            # 初回 update は clip 範囲未確立 → そのまま返す (旧挙動)
             return ewm_input
         else:
-            if not np.isnan(ewm_input):
+            if not np.isnan(ewm_input) and not skip_update:
                 prev_mean = self._ewm_mean[key]
                 prev_var  = self._ewm_var[key]
                 new_mean = alpha * ewm_input + (1.0 - alpha) * prev_mean
@@ -307,6 +346,152 @@ class FeatureModule1C:
         if len(volume_arr) > 0:
             columns["volume"] = volume_arr
 
+        # ▼▼ [§B.12.13.7 Option C2 / Phase E] numpy 事前計算 + 列注入 ▼▼
+        # Polars map_batches を経由しない (CSE non-determinism 回避)。
+        # 命名規約:
+        #   単純: __num_<func>_<col>_<window>  (例: __num_srm_close_20)
+        #   複合: __num_<func>_<expr_id>_<window>  (例: __num_srs_atr_13_13)
+
+        # --- 単純パターン: close に対する rolling_{mean, std} ---
+        # rolling_mean(period) で出現する全 period (union):
+        #   bb_periods=[20,30,50] + dpo_periods=[20,30,50] + ma_periods=[10,20,50,100,200] + trend_periods=[20,50,100]
+        #   = {10, 20, 30, 50, 100, 200}
+        for _w in [10, 20, 30, 50, 100, 200]:
+            columns[f"__num_srm_close_{_w}"] = stable_rolling_mean(close_arr, _w)
+        # rolling_std(period, ddof=1) で出現する全 period (union):
+        #   bb_periods=[20,30,50] + trend_periods=[20,50,100] = {20, 30, 50, 100}
+        for _w in [20, 30, 50, 100]:
+            columns[f"__num_srs_close_{_w}"] = stable_rolling_std(close_arr, _w, 1)
+
+        # --- 複合パターン: atr_raw_{P}.rolling_std(P, ddof=1) ---
+        # 学習側 engine_1_C.create_atr_features L1322: atr_raw.rolling_std(period, ddof=1)
+        # period は atr_periods = [13, 21, 34, 55]、内側 atr_raw は同じ period の calculate_atr_wilder
+        for _p, _atr_arr in [(13, atr_13_raw), (21, atr_21_raw),
+                              (34, atr_34_raw), (55, atr_55_raw)]:
+            columns[f"__num_srs_atr_{_p}_{_p}"] = stable_rolling_std(
+                _atr_arr.astype(np.float64), _p, 1
+            )
+
+        # --- 複合パターン: stoch_d / stoch_slow_d ---
+        # 学習側 engine_1_C.create_oscillator_features L1386-1395:
+        #   stoch_d = stoch_k.rolling_mean(dp)
+        #   slow_d  = stoch_d.rolling_mean(sp)
+        # stoch_k 配列は既に __stoch_k_{kp}_{dp}_{sp} で計算済。それを numpy で取得して
+        # stable_rolling_mean を 2 段適用。
+        for _kp, _dp, _sp, _stoch_k_arr in [
+            (14, 3, 3, stoch_k_14_3_3),
+            (21, 5, 5, stoch_k_21_5_5),
+            (9,  3, 3, stoch_k_9_3_3),
+        ]:
+            _stoch_d_arr = stable_rolling_mean(_stoch_k_arr.astype(np.float64), _dp)
+            columns[f"__num_srm_stoch_d_{_kp}_{_dp}_{_sp}"] = _stoch_d_arr
+            columns[f"__num_srm_stoch_slow_d_{_kp}_{_dp}_{_sp}"] = (
+                stable_rolling_mean(_stoch_d_arr.astype(np.float64), _sp)
+            )
+
+        # --- 複合パターン: kst.rolling_mean(9) ---
+        # 学習側 engine_1_C.create_advanced_features L1668:
+        #   kst = (roc_10 * 1 + roc_15 * 2 + roc_20 * 3 + roc_30 * 4) / 10 * 100
+        #   kst_signal = kst.rolling_mean(9)
+        # ⚠️ 過去版では bit-identical 維持のため Polars 経路で kst_arr を計算して
+        #    いたが、_build_polars_pieces が 1 M0.5 bar あたり 6 TF × 3 (KST/Coppock/
+        #    direction_changes) = 最大 18 個の standalone Polars LazyFrame を生成
+        #    することになり、shadow_mode test phase の連続処理 (~200ms/bar) で
+        #    Polars Rayon thread pool が累積破綻して hang する問題が判明
+        #    (2-10 bar で deadlock、CPU=0 + Ctrl+C 効かず)。
+        # 対策: pure numpy で計算する。`(a+b+c+d)/10*100` の演算順序依存で
+        #    Polars 経路と 1 ULP (~1e-16) 差が出るが、shadow_mode の閾値
+        #    rtol=1e-7 / atol=1e-12 より 5-9 桁下なので影響なし。本番でも
+        #    LazyFrame 生成コスト削減 + 累積 hang リスク削減の副次効果あり。
+        # roc_X = (close - close.shift(X)) / close.shift(X) を numpy で直書き
+        # (Polars `pct_change` と等価な (c[i] - c[i-X]) / c[i-X] 形式)
+        _r10 = np.full_like(close_arr, np.nan, dtype=np.float64)
+        _r15 = np.full_like(close_arr, np.nan, dtype=np.float64)
+        _r20_kst = np.full_like(close_arr, np.nan, dtype=np.float64)
+        _r30_kst = np.full_like(close_arr, np.nan, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if len(close_arr) > 10:
+                _r10[10:] = (close_arr[10:] - close_arr[:-10]) / close_arr[:-10]
+            if len(close_arr) > 15:
+                _r15[15:] = (close_arr[15:] - close_arr[:-15]) / close_arr[:-15]
+            if len(close_arr) > 20:
+                _r20_kst[20:] = (close_arr[20:] - close_arr[:-20]) / close_arr[:-20]
+            if len(close_arr) > 30:
+                _r30_kst[30:] = (close_arr[30:] - close_arr[:-30]) / close_arr[:-30]
+        _kst_arr = ((_r10 * 1 + _r15 * 2 + _r20_kst * 3 + _r30_kst * 4) / 10 * 100).astype(np.float64)
+        columns["__num_srm_kst_9"] = stable_rolling_mean(_kst_arr, 9)
+
+        # --- 複合パターン: (roc_11 + roc_14).rolling_mean(10) ---
+        # 学習側 engine_1_C.create_advanced_features L1748:
+        #   roc_11 = (close - close.shift(11)) / close.shift(11) * 100
+        #   roc_14 = (close - close.shift(14)) / close.shift(14) * 100
+        #   coppock = (roc_11 + roc_14).rolling_mean(10)
+        # ⚠️ KST と同じく numpy 直書きに変更 (standalone Polars LazyFrame が
+        #    shadow_mode hang の原因)。`* 100` の演算順序依存で 1 ULP 差が出る
+        #    可能性はあるが shadow_mode の rtol=1e-7 で吸収される。
+        _r11_cop = np.full_like(close_arr, np.nan, dtype=np.float64)
+        _r14_cop = np.full_like(close_arr, np.nan, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if len(close_arr) > 11:
+                _r11_cop[11:] = (close_arr[11:] - close_arr[:-11]) / close_arr[:-11] * 100
+            if len(close_arr) > 14:
+                _r14_cop[14:] = (close_arr[14:] - close_arr[:-14]) / close_arr[:-14] * 100
+        _roc_sum_arr = (_r11_cop + _r14_cop).astype(np.float64)
+        columns["__num_srm_roc_sum_10"] = stable_rolling_mean(_roc_sum_arr, 10)
+
+        # --- 複合パターン: RVI ---
+        # 学習側 engine_1_C.create_advanced_features L1680-1689:
+        #   numerator   = (close - open).rolling_mean(period)
+        #   denominator = (high - low).rolling_mean(period)
+        #   rvi         = numerator / (denominator + 1e-10)
+        #   rvi_signal  = rvi.rolling_mean(4)
+        # RVI は open/high/low が必要 (rvi_available)
+        rvi_available = (len(open_arr) > 0 and len(high_arr) > 0 and len(low_arr) > 0)
+        if rvi_available:
+            _co_diff = (close_arr - open_arr).astype(np.float64)
+            _hl_diff = (high_arr - low_arr).astype(np.float64)
+            for _p in [10, 14, 20]:
+                _num_co = stable_rolling_mean(_co_diff, _p)
+                _num_hl = stable_rolling_mean(_hl_diff, _p)
+                columns[f"__num_srm_co_diff_{_p}"] = _num_co
+                columns[f"__num_srm_hl_diff_{_p}"] = _num_hl
+                _rvi_arr = _num_co / (_num_hl + 1e-10)
+                columns[f"__num_srm_rvi_4_{_p}"] = stable_rolling_mean(
+                    _rvi_arr.astype(np.float64), 4
+                )
+
+        # --- 複合パターン: direction_changes.rolling_mean(period) ---
+        # 学習側 engine_1_C.create_moving_average_features L1944-1948:
+        #   direction_changes = close.diff().sign().diff().abs()
+        #   trend_consistency = 1 - direction_changes.rolling_mean(period) / 2
+        # period は trend_periods = [20, 50, 100]
+        # ⚠️ KST/Coppock と同じく numpy 直書きに変更。np.sign の 0/NaN 挙動は
+        #    Polars `sign()` と完全一致 (NaN → NaN, 0 → 0, +x → 1, -x → -1)
+        #    なので bit-identical 維持。standalone Polars LazyFrame を排除して
+        #    shadow_mode hang を解消するための変更。
+        _diff1 = np.full_like(close_arr, np.nan, dtype=np.float64)
+        if len(close_arr) >= 2:
+            _diff1[1:] = close_arr[1:] - close_arr[:-1]
+        # np.sign は NaN を NaN のまま返す (numpy 1.x 以降の標準挙動)
+        _sign1 = np.sign(_diff1)
+        _diff_sign = np.full_like(_sign1, np.nan, dtype=np.float64)
+        if len(_sign1) >= 2:
+            _diff_sign[1:] = _sign1[1:] - _sign1[:-1]
+        _dirchg_arr = np.abs(_diff_sign).astype(np.float64)
+        for _p in [20, 50, 100]:
+            columns[f"__num_srm_dirchg_{_p}"] = stable_rolling_mean(_dirchg_arr, _p)
+        # ▲▲ [§B.12.13.7 Option C2 / Phase E] ▲▲
+
+        # ▼▼ [Phase E+ EMA] stable_ewm_mean (adjust=False) の事前計算 ▼▼
+        # Polars `ewm_mean(adjust=False)` は内部 SIMD/FMA 最適化により context
+        # 長依存性があり、ema_200 等で大きな warmup span は 3,164 cells failing
+        # を生んでいた。両側 SR (Numba 実装) で SSoT 統一して bit-identical 保証。
+        # 命名規約: __num_ema_close_<span>
+        for _span in [10, 20, 50, 100, 200]:
+            _alpha = 2.0 / (_span + 1.0)
+            columns[f"__num_ema_close_{_span}"] = stable_ewm_mean(close_arr, _alpha)
+        # ▲▲ [Phase E+ EMA] ▲▲
+
         # ===== exprs =====
         # 学習側 engine_1_C の各 create_*_features と完全一致する式
         exprs: List[pl.Expr] = []
@@ -323,8 +508,10 @@ class FeatureModule1C:
             exprs.append((atr_raw / (pl.col("close") + 1e-10) * 100)
                          .alias(f"e1c_atr_pct_{period}"))
             exprs.append((atr_raw.diff() / atr_safe).alias(f"e1c_atr_trend_{period}"))
-            exprs.append((atr_raw.rolling_std(period, ddof=1) / atr_safe)
+            # ▼▼ [Phase E] atr_raw.rolling_std(period) → __num_srs_atr_{period}_{period} 列参照
+            exprs.append((pl.col(f"__num_srs_atr_{period}_{period}") / atr_safe)
                          .alias(f"e1c_atr_volatility_{period}"))
+            # ▲▲ [Phase E] ▲▲
 
         # ---------------------------------------------------------
         # RSI系 (rsi/rsi_momentum × 4 + stochastic_rsi/rsi_divergence × 2 = 12)
@@ -368,8 +555,10 @@ class FeatureModule1C:
         # 参照: engine_1_C.create_bollinger_features (L1082-1186)
         # ---------------------------------------------------------
         for period in [20, 30, 50]:
-            sma = pl.col("close").rolling_mean(period)
-            std = pl.col("close").rolling_std(period, ddof=1)
+            # ▼▼ [Phase E] close.rolling_{mean,std}(period) → __num_srm_close/__num_srs_close 列参照
+            sma = pl.col(f"__num_srm_close_{period}")
+            std = pl.col(f"__num_srs_close_{period}")
+            # ▲▲ [Phase E] ▲▲
             for num_std in [2, 2.5, 3]:
                 upper_raw = sma + num_std * std
                 lower_raw = sma - num_std * std
@@ -416,17 +605,24 @@ class FeatureModule1C:
         for kp, dp, sp in [(14, 3, 3), (21, 5, 5), (9, 3, 3)]:
             stoch_k = pl.col(f"__stoch_k_{kp}_{dp}_{sp}")
             exprs.append(stoch_k.alias(f"e1c_stoch_k_{kp}"))
-            stoch_d = stoch_k.rolling_mean(dp)
-            exprs.append(stoch_d.alias(f"e1c_stoch_d_{kp}_{dp}"))
-            slow_d = stoch_d.rolling_mean(sp)
-            exprs.append(slow_d.alias(f"e1c_stoch_slow_d_{kp}_{dp}_{sp}"))
+            # ▼▼ [Phase E] stoch_k.rolling_mean / stoch_d.rolling_mean → __num_* 列参照
+            exprs.append(
+                pl.col(f"__num_srm_stoch_d_{kp}_{dp}_{sp}").alias(f"e1c_stoch_d_{kp}_{dp}")
+            )
+            exprs.append(
+                pl.col(f"__num_srm_stoch_slow_d_{kp}_{dp}_{sp}")
+                .alias(f"e1c_stoch_slow_d_{kp}_{dp}_{sp}")
+            )
+            # ▲▲ [Phase E] ▲▲
 
         # ---------------------------------------------------------
         # DPO (3)
         # 参照: engine_1_C.create_momentum_features (L1473-1488)
         # ---------------------------------------------------------
         for p in [20, 30, 50]:
-            sma_dpo = pl.col("close").rolling_mean(p)
+            # ▼▼ [Phase E] close.rolling_mean(p) → __num_srm_close_{p}
+            sma_dpo = pl.col(f"__num_srm_close_{p}")
+            # ▲▲ [Phase E] ▲▲
             dpo_raw = pl.col("close") - sma_dpo
             exprs.append((dpo_raw / atr_safe).alias(f"e1c_dpo_{p}"))
 
@@ -462,36 +658,57 @@ class FeatureModule1C:
         roc_30 = (pl.col("close") - pl.col("close").shift(30)) / pl.col("close").shift(30)
         kst = (roc_10 * 1 + roc_15 * 2 + roc_20 * 3 + roc_30 * 4) / 10 * 100
         exprs.append(kst.alias("e1c_kst"))
-        exprs.append(kst.rolling_mean(9).alias("e1c_kst_signal"))
+        # ▼▼ [Phase E] kst.rolling_mean(9) → __num_srm_kst_9
+        exprs.append(pl.col("__num_srm_kst_9").alias("e1c_kst_signal"))
+        # ▲▲ [Phase E] ▲▲
 
         # ---------------------------------------------------------
         # Coppock Curve (1)
         # 参照: engine_1_C.create_advanced_features (L1644-1657)
         # ---------------------------------------------------------
-        roc_11 = (pl.col("close") - pl.col("close").shift(11)) / pl.col("close").shift(11) * 100
-        roc_14 = (pl.col("close") - pl.col("close").shift(14)) / pl.col("close").shift(14) * 100
-        exprs.append((roc_11 + roc_14).rolling_mean(10).alias("e1c_coppock_curve"))
+        # ▼▼ [Phase E] (roc_11 + roc_14).rolling_mean(10) → __num_srm_roc_sum_10
+        # roc_11/roc_14 (numpy で先に計算) の sum に stable_rolling_mean(10) を適用済み
+        exprs.append(pl.col("__num_srm_roc_sum_10").alias("e1c_coppock_curve"))
+        # ▲▲ [Phase E] ▲▲
 
         # ---------------------------------------------------------
         # Schaff Trend Cycle (2)
         # 参照: engine_1_C.create_advanced_features (L1611-1640)
         #
-        # 重要: 学習側は ewm_mean(half_life=fast_period, adjust=False) と
-        # ewm_mean(span=3, adjust=False) を使用。Polars 直呼びで完全一致。
+        # ▼▼ [Phase E+ EMA] Polars ewm_mean → stable_ewm_mean (context 長非依存)
+        # 学習側 engine_1_C と完全同じ Numba 関数を呼ぶことで両側 bit-identical。
+        # 本 inline map_batches は main select 内なので standalone LazyFrame 問題
+        # (KST/Coppock で見た deadlock) は発生しない (rfe_1A 等と同じパターン)。
         # ---------------------------------------------------------
         for fast_period, slow_period_stc, cycle_period in [(23, 50, 10), (12, 26, 9)]:
-            fast_ma = pl.col("close").ewm_mean(half_life=fast_period, adjust=False)
-            slow_ma = pl.col("close").ewm_mean(half_life=slow_period_stc, adjust=False)
+            _alpha_fast = 1.0 - math.exp(-math.log(2.0) / fast_period)
+            _alpha_slow = 1.0 - math.exp(-math.log(2.0) / slow_period_stc)
+            _alpha_smooth = 2.0 / (3 + 1.0)
+            fast_ma = pl.col("close").map_batches(
+                lambda s, a=_alpha_fast: pl.Series(stable_ewm_mean(s.to_numpy().astype(np.float64), a)),
+                return_dtype=pl.Float64,
+            )
+            slow_ma = pl.col("close").map_batches(
+                lambda s, a=_alpha_slow: pl.Series(stable_ewm_mean(s.to_numpy().astype(np.float64), a)),
+                return_dtype=pl.Float64,
+            )
             macd_stc = fast_ma - slow_ma
             macd_min1 = macd_stc.rolling_min(cycle_period)
             macd_max1 = macd_stc.rolling_max(cycle_period)
             stoch_macd = ((macd_stc - macd_min1) / (macd_max1 - macd_min1 + 1e-10)) * 100
-            stoch_macd_smoothed = stoch_macd.ewm_mean(span=3, adjust=False)
+            stoch_macd_smoothed = stoch_macd.map_batches(
+                lambda s, a=_alpha_smooth: pl.Series(stable_ewm_mean(s.to_numpy().astype(np.float64), a)),
+                return_dtype=pl.Float64,
+            )
             stoch_min2 = stoch_macd_smoothed.rolling_min(cycle_period)
             stoch_max2 = stoch_macd_smoothed.rolling_max(cycle_period)
             stoch_stoch = ((stoch_macd_smoothed - stoch_min2) / (stoch_max2 - stoch_min2 + 1e-10)) * 100
-            stc = stoch_stoch.ewm_mean(span=3, adjust=False)
+            stc = stoch_stoch.map_batches(
+                lambda s, a=_alpha_smooth: pl.Series(stable_ewm_mean(s.to_numpy().astype(np.float64), a)),
+                return_dtype=pl.Float64,
+            )
             exprs.append(stc.alias(f"e1c_schaff_trend_cycle_{fast_period}_{slow_period_stc}_{cycle_period}"))
+        # ▲▲ [Phase E+ EMA] ▲▲
 
         # ---------------------------------------------------------
         # Price Oscillator (3)
@@ -507,27 +724,36 @@ class FeatureModule1C:
         # RVI (relative_vigor_index/rvi_signal × 3 = 6)
         # 参照: engine_1_C.create_advanced_features (L1597-1608)
         # 注意: open/high/low が存在しないと計算不能 → layer2 でフォールバック
+        # ▼▼ [Phase E] (close-open).rolling_mean / (high-low).rolling_mean / rvi.rolling_mean(4)
+        #              → __num_srm_co_diff / __num_srm_hl_diff / __num_srm_rvi_4 列参照
+        # rvi_available は pre-compute ブロックで設定済 (open/high/low の存在判定が同一)
         # ---------------------------------------------------------
-        rvi_available = (len(open_arr) > 0 and len(high_arr) > 0 and len(low_arr) > 0)
         if rvi_available:
             for p in [10, 14, 20]:
-                num = (pl.col("close") - pl.col("open")).rolling_mean(p)
-                den = (pl.col("high") - pl.col("low")).rolling_mean(p)
+                num = pl.col(f"__num_srm_co_diff_{p}")
+                den = pl.col(f"__num_srm_hl_diff_{p}")
                 rvi = num / (den + 1e-10)
                 exprs.append(rvi.alias(f"e1c_relative_vigor_index_{p}"))
-                exprs.append(rvi.rolling_mean(4).alias(f"e1c_rvi_signal_{p}"))
+                exprs.append(
+                    pl.col(f"__num_srm_rvi_4_{p}").alias(f"e1c_rvi_signal_{p}")
+                )
+        # ▲▲ [Phase E] ▲▲
 
         # ---------------------------------------------------------
         # 移動平均: SMA + SMA_dev + EMA + EMA_dev + WMA × 5 periods = 25
         # 参照: engine_1_C.create_moving_average_features (L1693-1752)
         # ---------------------------------------------------------
         for p in [10, 20, 50, 100, 200]:
-            sma_raw = pl.col("close").rolling_mean(p)
+            # ▼▼ [Phase E] close.rolling_mean(p) → __num_srm_close_{p}
+            sma_raw = pl.col(f"__num_srm_close_{p}")
+            # ▲▲ [Phase E] ▲▲
             exprs.append(((sma_raw - pl.col("close")) / atr_safe).alias(f"e1c_sma_{p}"))
             exprs.append(((pl.col("close") - sma_raw) / (sma_raw + 1e-10) * 100)
                          .alias(f"e1c_sma_deviation_{p}"))
 
-            ema_raw = pl.col("close").ewm_mean(span=p, adjust=False)
+            # ▼▼ [Phase E+ EMA] close.ewm_mean(span=p) → __num_ema_close_{p}
+            ema_raw = pl.col(f"__num_ema_close_{p}")
+            # ▲▲ [Phase E+ EMA] ▲▲
             exprs.append(((ema_raw - pl.col("close")) / atr_safe).alias(f"e1c_ema_{p}"))
             exprs.append(((pl.col("close") - ema_raw) / (ema_raw + 1e-10) * 100)
                          .alias(f"e1c_ema_deviation_{p}"))
@@ -554,24 +780,27 @@ class FeatureModule1C:
         # ---------------------------------------------------------
         # Trend Slope/Strength/Consistency (3 stats × 3 periods = 9)
         # 参照: engine_1_C.create_moving_average_features (L1795-1844)
+        # ▼▼ [Phase E] close.rolling_{mean,std}(p) / direction_changes.rolling_mean(p)
+        #              → __num_srm_close / __num_srs_close / __num_srm_dirchg 列参照
         # ---------------------------------------------------------
         for p in [20, 50, 100]:
-            sma_for_slope = pl.col("close").rolling_mean(p)
+            sma_for_slope = pl.col(f"__num_srm_close_{p}")
             wma_for_slope = pl.col(f"__wma_{p}")  # 既に計算済み
             true_ols_slope = 6.0 * (wma_for_slope - sma_for_slope) / (p - 1.0)
             exprs.append((true_ols_slope / atr_safe).alias(f"e1c_trend_slope_{p}"))
 
-            normalized_std = pl.col("close").rolling_std(p, ddof=1) / atr_safe
+            normalized_std = pl.col(f"__num_srs_close_{p}") / atr_safe
             exprs.append(
                 (1.0 / (normalized_std + 1e-10)).clip(upper_bound=100.0)
                 .alias(f"e1c_trend_strength_{p}")
             )
 
-            direction_changes = pl.col("close").diff().sign().diff().abs()
+            # direction_changes は numpy で pre-compute 済 (close.diff().sign().diff().abs())
             exprs.append(
-                (1 - direction_changes.rolling_mean(p) / 2)
+                (1 - pl.col(f"__num_srm_dirchg_{p}") / 2)
                 .alias(f"e1c_trend_consistency_{p}")
             )
+        # ▲▲ [Phase E] ▲▲
 
         # ===== layer2 =====
         # 1C は基本的に Polars で完結。RVI のみ open/high/low 不在時に

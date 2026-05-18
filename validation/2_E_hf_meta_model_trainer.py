@@ -362,6 +362,37 @@ def main(test_mode: bool = False) -> None:
 
     # S2_FEATURES_VALIDATED から HF 時間足のファイルを動的収集
     hf_tf_set = set(HF_TIMEFRAMES)
+
+    # ─────────────────────────────────────────────────────────────
+    # [BASE_TF 選択ロジック]
+    # ─────────────────────────────────────────────────────────────
+    # Phase 10 で HF_TIMEFRAMES から M30/H1 が除外された結果、
+    # 旧来の ASCII sort 任せだと base が M0.5 (340 万行) になり
+    # OOM する問題があった。また、M3 base は entry 間隔が短すぎて
+    # ラベルウィンドウ (60 分固定) が 95% 重複し、M0.5 微細特徴量が
+    # 冗長として gain=0 で過剰除外される。
+    #
+    # H1 base (60 分間隔の entry) はラベルウィンドウが重複ゼロで、
+    # かつ本チャンの sparse entry ラベリングと最も整合する。
+    # よってデフォルトは H1 base に固定する。
+    #
+    # 環境変数 BASE_TF を指定すれば任意の TF に上書き可能 (検証用)。
+    # 例: BASE_TF=M3 python validation/2_E_*.py
+    # ─────────────────────────────────────────────────────────────
+    base_tf_env = os.environ.get("BASE_TF", "").strip()
+    if base_tf_env:
+        base_tf_override = base_tf_env
+        using_default_h1 = False
+        logger.info(f"  [BASE_TF] 環境変数で '{base_tf_override}' に上書き")
+    else:
+        base_tf_override = "H1"
+        using_default_h1 = True
+        logger.info(f"  [BASE_TF] デフォルト 'H1' を使用 "
+                    f"(本チャンラベリングの sparse entry と整合)")
+
+    # 指定 TF が HF_TIMEFRAMES に含まれていなくても base に使えるよう動的追加
+    hf_tf_set.add(base_tf_override)
+
     hf_parquet_paths: List[Path] = []
     for tf in hf_tf_set:
         if tf == "tick":
@@ -374,15 +405,23 @@ def main(test_mode: bool = False) -> None:
             f"S2_FEATURES_VALIDATED に HF parquet ファイルが見つかりません: "
             f"{S2_FEATURES_VALIDATED}"
         )
-    # stem のアルファベット順でソート: M0.5 < M1 < M3 … の順になり
-    # 最も粒度の細かい（行数の多い）M1 系ファイルがベースになりやすくなる
+    # stem のアルファベット順でソート
     hf_parquet_paths = sorted(hf_parquet_paths, key=lambda p: p.stem)
     logger.info(f"  発見した HF parquet ファイル数: {len(hf_parquet_paths)}")
 
     # 最初のファイルをベースに LazyFrame を構築
-    # timeframe カラムを特徴量リストの先頭に追加（順序データとして学習）
-    base_path = hf_parquet_paths[0]
-    base_tf = base_path.stem.split("_")[-1]  # 例: "M1"
+    # base_tf_override (デフォルト H1 or 環境変数) に該当する parquet を強制的に base に
+    candidates = [
+        p for p in hf_parquet_paths
+        if p.stem.split("_")[-1] == base_tf_override
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"BASE_TF={base_tf_override} の parquet が見つかりません。"
+            f"engine_1_X を TF={base_tf_override} で再実行してください。"
+        )
+    base_path = candidates[0]
+    base_tf = base_tf_override
 
     logger.info(f"  ベースファイル: {base_path} (tf={base_tf})")
 
@@ -767,12 +806,23 @@ def main(test_mode: bool = False) -> None:
     # 出力ディレクトリ作成
     S3_SURVIVED_HF_FEATURES.parent.mkdir(parents=True, exist_ok=True)
 
-    # 【Phase 5 比較実験】sample_weight 除外モードでは別ファイル名で保存
-    # 通常版と diff 比較できるようにするため
+    # 【Phase 5 比較実験 + BASE_TF override】
+    # サフィックスを段階的に組み立て:
+    #   - EXCLUDE_SAMPLE_WEIGHT: 通常版と diff 比較するため _no_sw を付与
+    #   - BASE_TF env 指定 (デフォルト H1 以外): _base_{TF} を付与
+    # デフォルト H1 (環境変数なし) は suffix なしで保存し、後段が
+    # survived_hf_features.txt を参照するそのままの形を維持する。
+    suffix_parts = []
     if EXCLUDE_SAMPLE_WEIGHT:
+        suffix_parts.append("no_sw")
+    if not using_default_h1:
+        # 環境変数で明示的に override された場合のみ suffix 付与
+        suffix_parts.append(f"base_{base_tf_override}")
+    if suffix_parts:
+        suffix = "_" + "_".join(suffix_parts)
         survived_path = (
             S3_SURVIVED_HF_FEATURES.parent
-            / f"{S3_SURVIVED_HF_FEATURES.stem}_no_sw{S3_SURVIVED_HF_FEATURES.suffix}"
+            / f"{S3_SURVIVED_HF_FEATURES.stem}{suffix}{S3_SURVIVED_HF_FEATURES.suffix}"
         )
     else:
         survived_path = S3_SURVIVED_HF_FEATURES
@@ -786,6 +836,10 @@ def main(test_mode: bool = False) -> None:
         logger.info(
             f"  (通常版と比較: diff {S3_SURVIVED_HF_FEATURES} {survived_path})"
         )
+    if using_default_h1:
+        logger.info(f"  (base_tf=H1 デフォルト、本チャンラベリングと整合)")
+    else:
+        logger.info(f"  (base_tf={base_tf_override} 環境変数 override)")
     logger.info("\n2_E_hf_meta_model_trainer: 処理完了")
 
 

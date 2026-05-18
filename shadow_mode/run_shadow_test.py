@@ -17,7 +17,13 @@
     --rtol         : 相対許容誤差 (default 1e-7)
     --atol         : 絶対許容誤差 (default 1e-12)
     --m05-path     : M0.5 parquet (default: blueprint.S1_MULTITIMEFRAME/timeframe=M0.5)
-    --s2-path      : S2 reference (default: blueprint.S2_FEATURES_VALIDATED)
+    --s2-path      : S2 reference (default: blueprint.S2_FEATURES = engine 生 Float64 raw 出力)
+                     学習用に Float32 cast + KS filter された S2_FEATURES_VALIDATED ではなく、
+                     engine_1_A〜F が直接吐いた raw 出力を SSoT として比較する。これにより:
+                       - Float32 ダウンキャストによる ULP オーダーの無用ノイズが排除
+                       - 2_A_ks_stability_filter.py の再実行依存性が解消 (engine を再生成すれば即反映)
+                       - production runtime (Float64) との dtype 整合が取れる
+                     §B.12.11 で「validated が古い state を反映 → 152 cells 偽陽性」が判明した結果の構造修正。
     --feature-list : feature_list.txt (default: blueprint.S3_FEATURES_FOR_TRAINING_V5)
     --timeframes   : 比較対象 TF (default: M0.5,M1,M3,M5,M8,M15)
     --cache-dir    : ウォームアップ snapshot キャッシュ先 (default: ./.warmup_cache/)
@@ -72,8 +78,24 @@ from shadow_mode.replay_bridge import ReplayBridge  # noqa: E402
 from shadow_mode.feature_capturer import ShadowEngine  # noqa: E402
 from shadow_mode.reference_builder import ReferenceBuilder  # noqa: E402
 from shadow_mode.diff_aggregator import DiffAggregator  # noqa: E402
+
+# [§B.12.13 Step 1c cache_key bug fix] cache_key 計算で使う、production 計算
+# 経路に関与する SSoT モジュール。両者を直接 import することで:
+#   - __file__ 経由で実 path 解決ができ、sha256 計算可能
+#   - 依存を明示的に表現(run_shadow_test.py が SSoT を意識していることを示す)
+import stable_rolling as _ssot_stable_rolling  # noqa: E402, F401
+import core_indicators as _ssot_core_indicators  # noqa: E402, F401
+# [Plan §B.12.14.10] _pct_change SSoT 集約で新規追加された numpy ヘルパー。
+# rfe_1A/1B/1D/1E/1F の 5 file が共通 import している。本ファイルを編集
+# したら cache_key が変わり Layer 1 が自動再走行される設計。
+# import numpy_helpers as _ssot_numpy_helpers  # [revert] temporarily disabled
 from shadow_mode.diff_report import DiffReport  # noqa: E402
 from shadow_mode.stress_injector import StressInjector  # noqa: E402
+from shadow_mode.qa_state_loader import (  # noqa: E402
+    load_qa_state_artifacts,
+    artifact_pickle_paths,
+    summarize_artifacts,
+)
 
 logger = logging.getLogger("shadow_mode.runner")
 
@@ -173,30 +195,80 @@ def update_market_proxy(
 # ミスや例外なら通常のフルウォームアップを実行 (機能は壊さない)。
 
 
+def _file_sha16(path: Path) -> str:
+    """ファイル内容の sha256 先頭 16 字を返す。
+
+    [Phase E §B.12.10.13] cache_key の identity 判定を mtime ベースから
+    内容ベース (sha256) に変更するためのヘルパー。これにより:
+      - artifact pipeline が pkl を touch (中身同一・mtime 更新) しても
+        cache が誤って invalidate されない
+      - 逆に中身が 1 byte でも変わったら確実に invalidate される
+    qa_state_*.pkl (最大 ~150KB) でも sha256 計算は ms オーダー。
+    """
+    if not path.exists():
+        return "missing"
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except OSError:
+        return "ioerror"
+
+
 def _compute_warmup_cache_key(
     warmup_end_ts: pd.Timestamp,
     feature_list_path: Path,
     engine_code_path: Path,
+    replay_bridge_path: Path,
+    qa_state_artifact_dir: Optional[Path] = None,
 ) -> str:
-    """ウォームアップキャッシュのキーを計算する。"""
+    """ウォームアップキャッシュのキーを計算する。
+
+    [Phase E §B.12.10.13] mtime ベース → ファイル内容 sha256 ベースに変更。
+    cache 識別子の安定性が大幅向上 (touch では invalidate されず、中身変化
+    では確実に invalidate される)。
+
+    Args:
+        warmup_end_ts: warmup と test の境界 (test 期間最初の bar)
+        feature_list_path: feature_list.txt (内容変更検出)
+        engine_code_path: realtime_feature_engine.py (本番側 production code)
+        replay_bridge_path: replay_bridge.py (warmup/test の interval semantic)
+        qa_state_artifact_dir: cutoff_YYYYMMDD dir override (Layer 1 検証用)
+    """
     parts: List[str] = []
     parts.append(f"end:{warmup_end_ts.isoformat()}")
+    parts.append(f"flist:{_file_sha16(feature_list_path)}")
+    parts.append(f"engine:{_file_sha16(engine_code_path)}")
+    parts.append(f"bridge:{_file_sha16(replay_bridge_path)}")
 
-    if feature_list_path.exists():
-        try:
-            parts.append(f"flist:{feature_list_path.stat().st_mtime:.3f}")
-        except OSError:
-            parts.append(f"flist:nostat")
-    else:
-        parts.append(f"flist:missing")
+    # [§B.12.13 Step 1c cache_key bug fix] 各 engine の specialty ファイル
+    # (rfe_1A_statistics.py 等) の sha も含める。本体 rfe.py だけだと
+    # 各 engine 単体の修正が cache invalidate されない (Phase 1 patch の盲点)。
+    _exec_dir = engine_code_path.parent
+    for spec_file in sorted(_exec_dir.glob("realtime_feature_engine_1[A-F]_*.py")):
+        parts.append(f"engine_{spec_file.stem}:{_file_sha16(spec_file)}")
 
-    if engine_code_path.exists():
-        try:
-            parts.append(f"engine:{engine_code_path.stat().st_mtime:.3f}")
-        except OSError:
-            parts.append(f"engine:nostat")
-    else:
-        parts.append(f"engine:missing")
+    # [§B.12.13 Step 1c cache_key bug fix] stable_rolling / core_indicators は
+    # rfe_1A_statistics.py 等が import して deque/QAState 計算に直接関与する
+    # SSoT モジュール。これらが変更されても specialty engine ファイルが無修正
+    # なら cache_key が変わらない silent stale バグを防ぐため、両者の sha も
+    # 含める。これで「sha256 ベース cache_key 完成版」となる (§B.12.11 禁則の
+    # 完成形)。
+    parts.append(
+        f"stable_rolling:{_file_sha16(Path(_ssot_stable_rolling.__file__))}"
+    )
+    parts.append(
+        f"core_indicators:{_file_sha16(Path(_ssot_core_indicators.__file__))}"
+    )
+    # [Plan §B.12.14.10] _pct_change SSoT 集約で追加した numpy_helpers.py。
+    # rfe_1A/1B/1D/1E/1F が共通 import しているため、本ファイルが変更されても
+    # specialty engine 無修正だと cache_key が変わらない silent stale を防ぐ。
+    # [revert] temporarily disabled
+    # parts.append(
+    #     f"numpy_helpers:{_file_sha16(Path(_ssot_numpy_helpers.__file__))}"
+    # )
 
     # blueprint NEUTRALIZATION_CONFIG (発見 #63 関連)
     try:
@@ -207,6 +279,14 @@ def _compute_warmup_cache_key(
         parts.append(f"ols:{ols_str}")
     except Exception:
         parts.append("ols:default")
+
+    # [Phase 9d 発見 #66 Phase D-3] QAState seed artifact pickles の内容 sha。
+    # qa_state_artifact_dir override 時はその dir 自体もキーに含める
+    # (本番ライブ用と Layer 1 用 cutoff dir で別キャッシュ)。
+    if qa_state_artifact_dir is not None:
+        parts.append(f"qa_dir:{str(qa_state_artifact_dir)}")
+    for pkl_path in artifact_pickle_paths(base_dir=qa_state_artifact_dir):
+        parts.append(f"qa_{pkl_path.stem}:{_file_sha16(pkl_path)}")
 
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -320,7 +400,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--s2-path", type=Path, default=None,
-        help="S2 reference root (default: S2_FEATURES_VALIDATED)"
+        help="S2 reference root (default: S2_FEATURES = engine 生 Float64 raw 出力; "
+             "学習用 Float32 cast + KS filtered な S2_FEATURES_VALIDATED ではない、§B.12.11)"
     )
     p.add_argument(
         "--feature-list", type=Path, default=None,
@@ -338,6 +419,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-cache", action="store_true",
         help="Skip warmup cache (force full warmup, do not save)"
+    )
+    p.add_argument(
+        "--qa-state-artifact-dir", type=Path, default=None,
+        help="[Phase D-3 修正方針 R] QAState artifact pickle のルート dir を "
+             "オーバーライドする (Layer 1 検証用に学習側 --cut-off-date 指定で "
+             "生成した cutoff_YYYYMMDD/ subdir を指定する)。"
+             "default: blueprint.S3_QA_STATES_DIR (本番ライブ用 dir)"
     )
     p.add_argument(
         "--log-level", default="INFO",
@@ -372,7 +460,15 @@ def resolve_paths(args: argparse.Namespace) -> dict:
         m05_path = Path(config.S1_MULTITIMEFRAME) / "timeframe=M0.5"
     s2_path = args.s2_path
     if s2_path is None:
-        s2_path = Path(config.S2_FEATURES_VALIDATED)
+        # [§B.12.11.X SSoT alignment] S2_FEATURES_VALIDATED は 2_A 経由で
+        # Float32 cast + KS filter を経た学習用 subset。Layer 1 検証は
+        # production runtime と engine の数値再現性を見るのが目的なので、
+        # ref は engine が直接吐いた raw output (= S2_FEATURES, Float64) を
+        # 使う。これにより:
+        #   - Float32 cast の無用ノイズが排除される
+        #   - engine 再生成後、2_A の再実行を待たずに即反映される
+        #   - production (Float64) との dtype 整合が取れる
+        s2_path = Path(config.S2_FEATURES)
     feature_list = args.feature_list
     if feature_list is None:
         feature_list = Path(config.S3_FEATURES_FOR_TRAINING_V5)
@@ -444,14 +540,38 @@ def main() -> int:
     # ─── Step 2: Initialize ShadowEngine + warmup (with cache) ─────────
     logger.info("[Step 2/6] Initializing ShadowEngine + warmup")
     t0 = time.time()
-    engine = ShadowEngine(feature_list_path=str(paths["feature_list"]))
+
+    # [Phase 9d 発見 #66 Phase D-3] QAState seed artifact を S3_QA_STATES_DIR
+    # から load し、本番側 main.py L640-694 と同じ初期化状態で ShadowEngine
+    # を構築する。これにより Layer 1 Shadow Mode の検証結果が本番ライブと
+    # 完全一致する (artifact 経由で QAState の EWM 状態が 5 年成熟済となるため)。
+    # artifact 不在 / 一部欠落のときは qa_state_loader 側で ERROR ログ出力済、
+    # 欠落分のみ旧挙動 fallback、全欠落で None 返却。
+    #
+    # [Phase D-3 修正方針 R] --qa-state-artifact-dir で artifact dir override 可能。
+    # Layer 1 検証時は 学習側 --cut-off-date 指定で生成した cutoff_YYYYMMDD/
+    # subdir を指定することで、本番側 clip 範囲 を ref の進行型 EWM と整合させる。
+    qa_artifact_dir = args.qa_state_artifact_dir  # None ならデフォルト dir
+    if qa_artifact_dir is not None:
+        logger.info(f"  [Phase D-3] artifact dir override: {qa_artifact_dir}")
+    qa_artifacts = load_qa_state_artifacts(base_dir=qa_artifact_dir)
+    logger.info(
+        f"  QAState artifact 状態: {summarize_artifacts(qa_artifacts)}"
+    )
+    engine = ShadowEngine(
+        feature_list_path=str(paths["feature_list"]),
+        qa_state_artifacts=qa_artifacts,
+    )
 
     # Cache key
     engine_code_path = _WORKSPACE / "execution" / "realtime_feature_engine.py"
+    replay_bridge_path = Path(__file__).parent / "replay_bridge.py"
     cache_key = _compute_warmup_cache_key(
         warmup_end_ts=warmup_end,
         feature_list_path=paths["feature_list"],
         engine_code_path=engine_code_path,
+        replay_bridge_path=replay_bridge_path,
+        qa_state_artifact_dir=qa_artifact_dir,
     )
     cache_file = paths["cache_dir"] / f"warmup_{cache_key}.pkl"
 
@@ -492,6 +612,7 @@ def main() -> int:
                 "warmup_end_ts": warmup_end.isoformat(),
                 "feature_list": str(paths["feature_list"]),
                 "engine_code_path": str(engine_code_path),
+                "replay_bridge_path": str(replay_bridge_path),
                 "ols_windows": dict(
                     config.NEUTRALIZATION_CONFIG.get("HF", {}).get(
                         "window_per_tf", {}
@@ -525,9 +646,16 @@ def main() -> int:
         #  but DEDUP inside update prevents redundant entries)
         market_proxy = update_market_proxy(market_proxy, engine)
 
-        # Process bar with warmup_only=True (no signal generation needed
-        # for shadow mode; we only care about feature values)
-        engine.process_new_m05_bar(bar, market_proxy, warmup_only=True)
+        # [Phase 9d 発見 #66 Phase D-3 真因修正]
+        # 以前は warmup_only=True で呼んでいたが、本番 _recalc_one_tf の
+        # L1854 で skip_qa_update=(warmup_only and self._any_artifact_loaded(tf))
+        # と判定されるため、artifact load 済 (= Phase D-3 後の全 HF TF) では
+        # test 期間中も QAState update が完全にスキップされ、_ewm_mean/_ewm_var
+        # が artifact 状態のまま固定された。これが Layer 1 fail rate 4.85% →
+        # 4.46% (worst.csv で prod 固定値繰り返しが残存) の真因。
+        # 本番ライブ運用と完全に同じ経路を辿るため warmup_only=False で呼ぶ。
+        # signal generation も走るが shadow_mode の比較対象外なので無害。
+        engine.process_new_m05_bar(bar, market_proxy, warmup_only=False)
 
         n_processed += 1
         if n_processed % progress_step == 0:

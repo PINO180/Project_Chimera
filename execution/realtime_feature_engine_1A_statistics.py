@@ -60,6 +60,27 @@ from core_indicators import (
     basic_stabilization_numba,
     robust_stabilization_numba,
 )
+# ─────────────────────────────────────────────────────────────
+# [Phase E (stable_rolling SSoT)] Polars rolling running 実装の
+# context 長依存性を排除するため、両側で共通の Numba 関数を import。
+# /workspace/core/stable_rolling.py に SSoT 配置。
+# ─────────────────────────────────────────────────────────────
+from stable_rolling import (
+    stable_rolling_mean,
+    stable_rolling_var,
+    stable_rolling_std,
+    stable_rolling_skew,
+    stable_kurtosis_engine_formula,
+    stable_moment_k_engine_formula,
+)
+
+# ─────────────────────────────────────────────────────────────
+# [Plan §B.12.14.10] _pct_change SSoT 集約 — local 重複定義を撤廃。
+# canonical 実装は core/numpy_helpers.py の pct_change_polars_compat。
+# rfe_1A/1B/1D/1E/1F の 5 file で共通 import に統一する。
+# ─────────────────────────────────────────────────────────────
+from numpy_helpers import pct_change_polars_compat as _pct_change
+
 
 import numba as nb
 
@@ -88,20 +109,6 @@ def _trim_mean(arr: np.ndarray, proportiontocut: float) -> float:
     if len(trimmed) == 0:
         return np.nan
     return float(np.mean(trimmed))
-
-
-def _pct_change(arr: np.ndarray) -> np.ndarray:
-    """Polars .pct_change() と完全一致: (x[i] - x[i-1]) / x[i-1]
-    prev == 0 のとき inf (Polars 準拠)、先頭は nan。
-    Group 5 (統計検定) の Numba UDF への入力として使用。
-    """
-    n = len(arr)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return out
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out[1:] = (arr[1:] - arr[:-1]) / arr[:-1]
-    return out
 
 
 # ==================================================================
@@ -153,14 +160,56 @@ class QAState:
             features = FeatureModule1A.calculate_features(data_window, 1440, qa_state)
     """
 
-    def __init__(self, lookback_bars: int = 1440):
+    def __init__(
+        self,
+        lookback_bars: int = 1440,
+        artifact: Optional[Dict[str, Dict[str, float]]] = None,
+    ):
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
         self._ewm_n: Dict[str, int] = {}
 
-    def update_and_clip(self, key: str, raw_val: float) -> float:
-        """1特徴量の raw_val に対して QA処理を適用し、処理済みスカラーを返す。"""
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #66 Phase D-3] 学習側 QAState seed artifact の load
+        # ─────────────────────────────────────────────────────────────
+        # artifact が渡された場合、各 feature の EWM 状態を学習側 5 年分の
+        # 成熟状態で初期化する。これにより本番側 QAState の seed 不足が解消
+        # され、Train-Serve Skew が根治される。
+        #
+        # artifact の形式:
+        #   {feature_name: {"ewm_mean": float, "ewm_var": float, "ewm_n": int}}
+        # キーは production の update_and_clip(key=...) と完全一致する feature
+        # 名 (例: "e1a_statistical_kurtosis_20")。
+        #
+        # _artifact_loaded フラグ:
+        #   warmup loop で update_and_clip(skip_update=True) を指示するため、
+        #   司令塔 (process_new_m05_bar / _replace_buffer_from_dataframe) が
+        #   このフラグを参照する。warmup 期間中の追加 update を抑止すれば、
+        #   artifact の状態がそのまま維持され、学習側との数値完全一致が保証
+        #   される (1e-15 精度)。
+        # ─────────────────────────────────────────────────────────────
+        self._artifact_loaded: bool = False
+        if artifact is not None:
+            for feat_name, state in artifact.items():
+                # 防御的型変換 (pickle 経由で float64 / int64 のはずだが念のため)
+                self._ewm_mean[feat_name] = float(state["ewm_mean"])
+                self._ewm_var[feat_name] = float(state["ewm_var"])
+                self._ewm_n[feat_name] = int(state["ewm_n"])
+            self._artifact_loaded = True
+
+    def update_and_clip(
+        self, key: str, raw_val: float, skip_update: bool = False
+    ) -> float:
+        """1特徴量の raw_val に対して QA処理を適用し、処理済みスカラーを返す。
+
+        Args:
+            key: feature 名 (例: "e1a_statistical_kurtosis_20")
+            raw_val: pre-clip の生値
+            skip_update: True の場合、EWM 状態を更新せずに clip のみ適用。
+                Phase D-3 で artifact 由来の状態を warmup loop で破壊しないため
+                に司令塔から渡される。デフォルト False (旧挙動互換)。
+        """
         alpha = self.alpha
 
         # 学習側 col.replace([inf,-inf], None) 相当
@@ -168,23 +217,28 @@ class QAState:
         is_neg_inf = np.isneginf(raw_val)
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
-        # EWM 状態更新
+        # EWM 状態更新 (skip_update=True なら state を変更しない)
         if key not in self._ewm_mean:
+            # key 未初期化: artifact が無いケース or artifact に存在しない feature
             if np.isnan(ewm_input):
                 return 0.0
-            self._ewm_mean[key] = ewm_input
-            self._ewm_var[key]  = 0.0
-            self._ewm_n[key]    = 1
+            if not skip_update:
+                self._ewm_mean[key] = ewm_input
+                self._ewm_var[key] = 0.0
+                self._ewm_n[key] = 1
+            # 初回 update は clip 範囲未確立 → そのまま返す (旧挙動)
             return ewm_input
         else:
-            if not np.isnan(ewm_input):
+            if not np.isnan(ewm_input) and not skip_update:
                 prev_mean = self._ewm_mean[key]
-                prev_var  = self._ewm_var[key]
+                prev_var = self._ewm_var[key]
                 new_mean = alpha * ewm_input + (1.0 - alpha) * prev_mean
-                new_var  = (1.0 - alpha) * (prev_var + alpha * (ewm_input - prev_mean) ** 2)
+                new_var = (1.0 - alpha) * (
+                    prev_var + alpha * (ewm_input - prev_mean) ** 2
+                )
                 self._ewm_mean[key] = new_mean
-                self._ewm_var[key]  = new_var
-                self._ewm_n[key]    = self._ewm_n.get(key, 0) + 1
+                self._ewm_var[key] = new_var
+                self._ewm_n[key] = self._ewm_n.get(key, 0) + 1
 
         # ±5σ クリップ (bias=False 補正適用)
         ewm_mean = self._ewm_mean[key]
@@ -221,6 +275,30 @@ class QAState:
 # ==================================================================
 # メイン計算クラス
 # ==================================================================
+
+
+# ════════════════════════════════════════════════════════════════
+# [Phase E (stable_rolling SSoT)] Polars expression helpers
+# ────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# [§B.12.13 Option C2] helper 関数 (_srm_expr 等) 削除済み
+#
+# 旧実装では Polars map_batches 経由で Numba 関数を呼んでいたが、
+# 6 engine 統合 select で Polars Rust の最適化 plan が
+# non-deterministic になる原因が判明 (§B.12.13)。
+#
+# 修正方針 (Option C2):
+#   - Numba 関数を numpy で直呼びして DataFrame 列として注入
+#   - Polars expression は単純な列演算 (pl.col のみ) に変更
+#   - これで Polars CSE / Slice Pushdown / Rayon 等の
+#     最適化 plan の非決定性に依存しない構造になる
+#
+# 数値結果は map_batches 経由と bit-identical (§B.12.12.7 実機実証済)。
+# SSoT は Layer 2 (stable_rolling.py / core_indicators.py の Numba 関数) で維持。
+# 学習側 engine_1_A は Polars map_batches 経由のまま (性能維持、3.4M bars 一括処理)。
+# Layer 1 で経路非対称となるが、Polars version up が本番に直撃しない防御力強化。
+# ════════════════════════════════════════════════════════════════
+
 
 class FeatureModule1A:
 
@@ -281,57 +359,80 @@ class FeatureModule1A:
         if len(volume_arr) > 0:
             columns["volume"] = volume_arr
 
+        # ▼▼ [§B.12.13 Option C2] numpy 事前計算 + 列注入 ▼▼
+        # Polars map_batches 経由の Numba 直呼びを排除し、numpy で先に
+        # 計算してから DataFrame 列として注入する。
+        # 命名規約: __num_<func>_<col>_<window>  (例: __num_srm_close_10)
+        #            __num_smom<moment>_<col>_<window>
+        # 6 engine 統合 select 内では pl.col() 参照のみとなり、
+        # Polars Rust の最適化 plan の非決定性に依存しない。
+
+        # Group 1 + Group 6 共通: stable_rolling_{mean, std} の全 window
+        for _w in [5, 10, 20, 50, 100]:
+            columns[f"__num_srm_close_{_w}"] = stable_rolling_mean(close_arr, _w)
+            columns[f"__num_srs_close_{_w}"] = stable_rolling_std(close_arr, _w, 1)
+
+        # Group 1: stable_rolling_var (window 10, 20, 50)
+        for _w in [10, 20, 50]:
+            columns[f"__num_srv_close_{_w}"] = stable_rolling_var(close_arr, _w, 1)
+
+        # Group 2: skewness, kurtosis, moments (window 20, 50)
+        for _w in [20, 50]:
+            columns[f"__num_sskew_close_{_w}"] = stable_rolling_skew(close_arr, _w)
+            columns[f"__num_skurt_close_{_w}"] = stable_kurtosis_engine_formula(close_arr, _w)
+            for _m in [5, 6, 7, 8]:
+                columns[f"__num_smom{_m}_close_{_w}"] = stable_moment_k_engine_formula(close_arr, _w, _m)
+
+        # Group 6: volume 系 (volume があるときのみ)
+        if len(volume_arr) > 0:
+            for _w in [5, 10, 20, 50, 100]:
+                columns[f"__num_srm_volume_{_w}"] = stable_rolling_mean(volume_arr, _w)
+            columns["__num_srm_volume_lookback"] = stable_rolling_mean(volume_arr, lookback_bars)
+        # ▲▲ [§B.12.13 Option C2] ▲▲
+
         # ===== exprs (Group 1, 2, 3 (median/q25/q75/iqr), 6) =====
         exprs = []
 
-        # Group 1: 統計的モーメント
+        # ▼▼ [Phase E (stable_rolling SSoT)] Polars rolling_* の context 長依存を排除 ▼▼
+        # Group 1: 統計的モーメント (stable Numba 実装 — Option C2 で numpy 事前計算)
         for window in [10, 20, 50]:
             exprs.append(
-                ((pl.col("close") - pl.col("close").rolling_mean(window))
+                ((pl.col("close") - pl.col(f"__num_srm_close_{window}"))
                  / pl.col("__temp_atr_13"))
                 .alias(f"e1a_statistical_mean_{window}")
             )
             exprs.append(
-                (pl.col("close").rolling_var(window, ddof=1)
+                (pl.col(f"__num_srv_close_{window}")
                  / pl.col("__temp_atr_13").pow(2))
                 .alias(f"e1a_statistical_variance_{window}")
             )
             exprs.append(
-                (pl.col("close").rolling_std(window, ddof=1)
+                (pl.col(f"__num_srs_close_{window}")
                  / pl.col("__temp_atr_13"))
                 .alias(f"e1a_statistical_std_{window}")
             )
             exprs.append(
-                (pl.col("close").rolling_std(window, ddof=1)
-                 / (pl.col("close").rolling_mean(window) + 1e-10))
+                (pl.col(f"__num_srs_close_{window}")
+                 / (pl.col(f"__num_srm_close_{window}") + 1e-10))
                 .alias(f"e1a_statistical_cv_{window}")
             )
 
-        # Group 2: 歪度・尖度・高次モーメント
+        # Group 2: 歪度・尖度・高次モーメント (stable Numba 実装 — Option C2 で numpy 事前計算)
         for window in [20, 50]:
             exprs.append(
-                pl.col("close").rolling_skew(window_size=window)
+                pl.col(f"__num_sskew_close_{window}")
                 .alias(f"e1a_statistical_skewness_{window}")
             )
-            var_ddof0 = pl.col("close").rolling_var(window, ddof=1) * ((window - 1.0) / window)
-            std_ddof0_pow4 = var_ddof0.pow(2)
             exprs.append(
-                ((pl.col("close") - pl.col("close").rolling_mean(window))
-                 .pow(4)
-                 .rolling_mean(window)
-                 / (std_ddof0_pow4 + 1e-10)
-                 - 3)
+                pl.col(f"__num_skurt_close_{window}")
                 .alias(f"e1a_statistical_kurtosis_{window}")
             )
-            mean_col = pl.col("close").rolling_mean(window)
-            std_ddof0 = (var_ddof0 + 1e-10).sqrt()
             for moment in [5, 6, 7, 8]:
                 exprs.append(
-                    (((pl.col("close") - mean_col) / std_ddof0)
-                     .pow(moment)
-                     .rolling_mean(window))
+                    pl.col(f"__num_smom{moment}_close_{window}")
                     .alias(f"e1a_statistical_moment_{moment}_{window}")
                 )
+        # ▲▲ [Phase E (stable_rolling SSoT)] ▲▲
 
         # Group 3 (Polars部分): median/q25/q75/iqr
         for window in [10, 20, 50]:
@@ -355,24 +456,26 @@ class FeatureModule1A:
                 .alias(f"e1a_robust_iqr_{window}")
             )
 
-        # Group 6: 高速ローリング統計
+        # ▼▼ [Phase E (stable_rolling SSoT)] Group 6 fast_rolling active path ▼▼
+        # (Option C2: numpy 事前計算 + pl.col 参照)
         for window in [5, 10, 20, 50, 100]:
             exprs.append(
-                ((pl.col("close") - pl.col("close").rolling_mean(window))
+                ((pl.col("close") - pl.col(f"__num_srm_close_{window}"))
                  / pl.col("__temp_atr_13"))
                 .alias(f"e1a_fast_rolling_mean_{window}")
             )
             exprs.append(
-                (pl.col("close").rolling_std(window, ddof=1)
+                (pl.col(f"__num_srs_close_{window}")
                  / pl.col("__temp_atr_13"))
                 .alias(f"e1a_fast_rolling_std_{window}")
             )
             if len(volume_arr) > 0:
                 exprs.append(
-                    (pl.col("volume").rolling_mean(window)
-                     / (pl.col("volume").rolling_mean(lookback_bars) + 1e-10))
+                    (pl.col(f"__num_srm_volume_{window}")
+                     / (pl.col("__num_srm_volume_lookback") + 1e-10))
                     .alias(f"e1a_fast_volume_mean_{window}")
                 )
+        # ▲▲ [Phase E (stable_rolling SSoT)] ▲▲
 
         # ===== layer2 (Numba UDF 直接呼び + 後処理) =====
         layer2: Dict[str, float] = {}

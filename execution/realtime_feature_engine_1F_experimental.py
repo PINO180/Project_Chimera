@@ -72,6 +72,16 @@ from core_indicators import (
     rolling_energy_expenditure_udf,
 )
 
+# ─────────────────────────────────────────────────────────────
+# [Plan §B.12.14.10] _pct_change SSoT 集約 — local 重複定義を撤廃。
+# canonical 実装は core/numpy_helpers.py の pct_change_polars_compat。
+# rfe_1A/1B/1D/1E/1F の 5 file で共通 import に統一する。
+# 旧実装は @nb.njit JIT 版だったが、純 numpy vectorized でも本番運用上
+# 十分高速 (3500 行で ~9.5μs/call、1 時間あたり 0.0007 秒の差で実害ゼロ)、
+# JIT cache 不要で cache_key 設計が単純化する。
+# ─────────────────────────────────────────────────────────────
+from numpy_helpers import pct_change_polars_compat as _pct_change
+
 import numpy as np
 import polars as pl
 import numba as nb
@@ -81,33 +91,6 @@ from typing import Dict, Optional, Tuple, List
 # ==================================================================
 # ヘルパー関数
 # ==================================================================
-
-@nb.njit(fastmath=False, cache=True)
-def _pct_change(arr: np.ndarray) -> np.ndarray:
-    """Polars pct_change() と完全一致: (x[i] - x[i-1]) / x[i-1]
-    prev == 0 のとき: x[i] > 0 → +inf, x[i] < 0 → -inf, x[i] == 0 → NaN
-    先頭は nan。
-
-    rolling_energy_expenditure_udf の入力に使用 (学習側 Polars
-    pct_change と semantics 一致)。
-    """
-    n = len(arr)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return out
-    for i in range(1, n):
-        prev = arr[i - 1]
-        if prev != 0.0:
-            out[i] = (arr[i] - prev) / prev
-        else:
-            cur = arr[i]
-            if cur > 0.0:
-                out[i] = np.inf
-            elif cur < 0.0:
-                out[i] = -np.inf
-            else:
-                out[i] = np.nan
-    return out
 
 
 # ==================================================================
@@ -120,13 +103,35 @@ class QAState:
     詳細は realtime_feature_engine_1A_statistics.py の QAState を参照。
     """
 
-    def __init__(self, lookback_bars: int = 1440):
+    def __init__(
+        self,
+        lookback_bars: int = 1440,
+        artifact: Optional[Dict[str, Dict[str, float]]] = None,
+    ):
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
         self._ewm_n: Dict[str, int] = {}
 
-    def update_and_clip(self, key: str, raw_val: float) -> float:
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #66 Phase D-3] 学習側 QAState seed artifact の load
+        # ─────────────────────────────────────────────────────────────
+        # 1A と完全に同じ仕組み (詳細は realtime_feature_engine_1A_statistics.py
+        # の QAState を参照)。 artifact が渡された場合、各 feature の EWM 状態を
+        # 学習側 5 年分の成熟状態で初期化する。これにより本番側 QAState の
+        # seed 不足が解消され、Train-Serve Skew が根治される。
+        # ─────────────────────────────────────────────────────────────
+        self._artifact_loaded: bool = False
+        if artifact is not None:
+            for feat_name, state in artifact.items():
+                self._ewm_mean[feat_name] = float(state["ewm_mean"])
+                self._ewm_var[feat_name] = float(state["ewm_var"])
+                self._ewm_n[feat_name] = int(state["ewm_n"])
+            self._artifact_loaded = True
+
+    def update_and_clip(
+        self, key: str, raw_val: float, skip_update: bool = False
+    ) -> float:
         alpha = self.alpha
 
         is_pos_inf = np.isposinf(raw_val)
@@ -134,14 +139,17 @@ class QAState:
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
         if key not in self._ewm_mean:
+            # key 未初期化: artifact 不在 or artifact に存在しない feature
             if np.isnan(ewm_input):
                 return 0.0
-            self._ewm_mean[key] = ewm_input
-            self._ewm_var[key]  = 0.0
-            self._ewm_n[key]    = 1
+            if not skip_update:
+                self._ewm_mean[key] = ewm_input
+                self._ewm_var[key]  = 0.0
+                self._ewm_n[key]    = 1
+            # 初回 update は clip 範囲未確立 → そのまま返す (旧挙動)
             return ewm_input
         else:
-            if not np.isnan(ewm_input):
+            if not np.isnan(ewm_input) and not skip_update:
                 prev_mean = self._ewm_mean[key]
                 prev_var  = self._ewm_var[key]
                 new_mean = alpha * ewm_input + (1.0 - alpha) * prev_mean

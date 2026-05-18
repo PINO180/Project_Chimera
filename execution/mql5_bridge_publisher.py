@@ -348,6 +348,38 @@ class MQL5BridgePublisherV3:
             # タイムスタンプ変換 (MQL5 time は Unix Timestamp)
             df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
+            # ════════════════════════════════════════════════════════════
+            # [DTYPE-ALIGN 段1] Train-Serve Skew 排除 — 学習側 s1_1_A の
+            # cast(pl.Float32) と等価な量子化を本番側でも適用する。
+            #
+            # 学習側経路:
+            #   CSV string → Polars Float64 parse
+            #     → s1_1_A: cast(pl.Float32) で値の解像度を Float32 に落とす
+            #     → s1_1_B: Float32 のまま resample → S1_MULTITIMEFRAME (Float32)
+            #     → s1_1_C: GOLDEN_SCHEMA astype("float64") で dtype だけ昇格
+            #       (値は Float32 量子化済のまま)
+            #     → engine 入口: .astype(np.float64) で Float64 計算
+            #
+            # 本番側経路 (本パッチ適用前):
+            #   MT5 broker double → ZMQ <f8> → pandas Float64 (値も dtype も Float64)
+            #   → 学習側より高い解像度の値がそのまま rfe に流れ込んでいた
+            #
+            # 本パッチ適用後:
+            #   ↓ astype(np.float32).astype(np.float64) で Float32 量子化を通過させる
+            #   → 値は Float32 解像度(学習側 S1 と等価)、dtype は Float64
+            #     (学習側 s1_1_C 出力と完全一致)
+            #
+            # 注意:
+            # - `.astype(np.float32).astype(np.float64)` の順序が重要
+            #   (Float32 のみで止めると下流の Float64 計算で dtype 不整合)
+            # - Phase E shadow_mode が「学習側 S1 (Float32) 入力で学習エンジンと
+            #   本番 rfe が bit-identical」を証明済 — 本パッチでその証明条件を
+            #   ライブ環境にそのまま継承する
+            # ════════════════════════════════════════════════════════════
+            for _col in ("open", "high", "low", "close"):
+                if _col in df.columns:
+                    df[_col] = df[_col].astype(np.float32).astype(np.float64)
+
             # [75分ギャップ修正] EA側の①CopyTicksRange+②g_m05_bars合成で時刻逆転が起こりうる。
             # CopyTicksRange由来の末尾(例:13:37:00)の後ろにg_m05_barsの先頭(例:12:00:00)が
             # 単純appendされるため、Python側がソートせずiloc[-1]を参照すると
@@ -529,6 +561,17 @@ class MQL5BridgePublisherV3:
                         bar["time"], tz=timezone.utc
                     )
                     bar["spread"] = spread
+                    # ════════════════════════════════════════════════════
+                    # [DTYPE-ALIGN 段1] Train-Serve Skew 排除 — 学習側
+                    # s1_1_A の cast(pl.Float32) と等価な量子化を OHLC に適用。
+                    # request_historical_data 側と同一の処理 (詳細は同関数の
+                    # コメント参照)。volume は学習側で Int64 維持なので除外。
+                    # ════════════════════════════════════════════════════
+                    for _ohlc_key in ("open", "high", "low", "close"):
+                        if _ohlc_key in bar and bar[_ohlc_key] is not None:
+                            bar[_ohlc_key] = float(
+                                np.float64(np.float32(bar[_ohlc_key]))
+                            )
                     # [SPIKE-GUARD] 受信バーのバリデーション
                     if self._validate_bar(bar):
                         result.append(bar)

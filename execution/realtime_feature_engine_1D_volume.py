@@ -39,9 +39,26 @@
 #           → 割り算時に Polars 式で `(pl.col("__temp_atr_13") + 1e-10)` を使う
 #   結果: 学習側と完全同値の計算式
 #
-# 【SSoT 階層】(Phase 9 から不変)
-#   Layer 1 (rolling 統計): Polars Rust エンジン
-#   Layer 2 (Numba UDF):    core_indicators (SSoT)
+# 【Phase E (stable_rolling SSoT) 適用】
+#   Polars 組込 rolling_{mean,std} は内部 running 累積実装で context 長依存性
+#   がある (学習側 3.4M bars と本番側 ~2980 bars deque で結果が乖離)。本ファイル
+#   では全 rolling_{mean,std} 呼出しを Option C2 で置換:
+#     - numpy で stable_rolling_{mean,std} を事前計算 → `__num_*` 列に注入
+#     - expression 内では `pl.col("__num_...")` で参照のみ
+#     - map_batches は stable_rolling 経由のものを完全排除 (CSE non-determinism 回避)
+#   rolling_{max,min,quantile,map} は context 長非依存のため変更なし。
+#
+#   ⚠ verify 時のリスク注記:
+#     D-pair 適用で rfe_1D の expression 構造が変化 (rolling 6 個が
+#     `pl.col(__num_*)` 参照に置換、列 6 個が新規追加)。Cluster A の機序
+#     (= expression 集合の構造変化が Polars plan / CSE 経路を切替) の
+#     観点では、他 engine (e1a/e1b/e1c/e1e/e1f) の結果が変動する可能性は
+#     ゼロではない。shadow_mode 検証時に e1d 以外の cells も diff チェック
+#     することを推奨。
+#
+# 【SSoT 階層】(§B.12.13.9 で再定義)
+#   Layer 1 (経路): 学習側 = Polars map_batches、本番側 = numpy 直呼び + 列注入
+#   Layer 2 (真の SSoT): stable_rolling.py (Numba 関数) + core_indicators.py
 #
 # 【保持される過去の修正】
 #   ・QAState (apply_quality_assurance_to_group の等価実装、bias=False 補正)
@@ -75,6 +92,25 @@ from core_indicators import (
     candlestick_patterns_udf,
     force_index_udf,
 )
+# ─────────────────────────────────────────────────────────────
+# [Phase E (stable_rolling SSoT)] Polars rolling running 実装の
+# context 長依存性を排除するため、両側で共通の Numba 関数を import。
+# 本番側は Option C2: numpy 事前計算 + 列注入で使用 (map_batches 完全排除)。
+# ─────────────────────────────────────────────────────────────
+from stable_rolling import (
+    stable_rolling_mean,
+    stable_rolling_std,
+)
+
+# ─────────────────────────────────────────────────────────────
+# [Plan §B.12.14.10] _pct_change SSoT 集約 — local 重複定義を撤廃。
+# canonical 実装は core/numpy_helpers.py の pct_change_polars_compat。
+# rfe_1A/1B/1D/1E/1F の 5 file で共通 import に統一する。
+# 旧実装は @nb.njit JIT 版だったが、純 numpy vectorized でも本番運用上
+# 十分高速 (3500 行で ~9.5μs/call、1 時間あたり 0.0007 秒の差で実害ゼロ)、
+# JIT cache 不要で cache_key 設計が単純化する。
+# ─────────────────────────────────────────────────────────────
+from numpy_helpers import pct_change_polars_compat as _pct_change
 # --------------------------------------------------------
 
 import numpy as np
@@ -87,33 +123,6 @@ from typing import Dict, Optional, Tuple, List
 # ヘルパー関数
 # ==================================================================
 
-@nb.njit(fastmath=False, cache=True)
-def _pct_change(arr: np.ndarray) -> np.ndarray:
-    """Polars pct_change() と完全一致: (x[i] - x[i-1]) / x[i-1]
-    prev == 0 のとき: x[i] > 0 → +inf, x[i] < 0 → -inf, x[i] == 0 → NaN
-    先頭は nan。
-
-    Layer 2 (Numba UDF) のうち hv_standard_udf / hv_robust_udf 等の入力に使用。
-    Polars rolling_map 経由で同じ pct_change を渡す学習側と数値完全一致。
-    """
-    n = len(arr)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return out
-    for i in range(1, n):
-        prev = arr[i - 1]
-        if prev != 0.0:
-            out[i] = (arr[i] - prev) / prev
-        else:
-            cur = arr[i]
-            if cur > 0.0:
-                out[i] = np.inf
-            elif cur < 0.0:
-                out[i] = -np.inf
-            else:
-                out[i] = np.nan  # 0 / 0
-    return out
-
 
 # ==================================================================
 # QAState — 学習側 apply_quality_assurance_to_group の等価実装
@@ -125,13 +134,35 @@ class QAState:
     詳細は realtime_feature_engine_1A_statistics.py の QAState を参照。
     """
 
-    def __init__(self, lookback_bars: int = 1440):
+    def __init__(
+        self,
+        lookback_bars: int = 1440,
+        artifact: Optional[Dict[str, Dict[str, float]]] = None,
+    ):
         self.alpha: float = 1.0 - np.exp(-np.log(2.0) / max(lookback_bars, 1))
         self._ewm_mean: Dict[str, float] = {}
         self._ewm_var: Dict[str, float] = {}
         self._ewm_n: Dict[str, int] = {}
 
-    def update_and_clip(self, key: str, raw_val: float) -> float:
+        # ─────────────────────────────────────────────────────────────
+        # [Phase 9d 発見 #66 Phase D-3] 学習側 QAState seed artifact の load
+        # ─────────────────────────────────────────────────────────────
+        # 1A と完全に同じ仕組み (詳細は realtime_feature_engine_1A_statistics.py
+        # の QAState を参照)。 artifact が渡された場合、各 feature の EWM 状態を
+        # 学習側 5 年分の成熟状態で初期化する。これにより本番側 QAState の
+        # seed 不足が解消され、Train-Serve Skew が根治される。
+        # ─────────────────────────────────────────────────────────────
+        self._artifact_loaded: bool = False
+        if artifact is not None:
+            for feat_name, state in artifact.items():
+                self._ewm_mean[feat_name] = float(state["ewm_mean"])
+                self._ewm_var[feat_name] = float(state["ewm_var"])
+                self._ewm_n[feat_name] = int(state["ewm_n"])
+            self._artifact_loaded = True
+
+    def update_and_clip(
+        self, key: str, raw_val: float, skip_update: bool = False
+    ) -> float:
         alpha = self.alpha
 
         is_pos_inf = np.isposinf(raw_val)
@@ -139,14 +170,17 @@ class QAState:
         ewm_input = np.nan if not np.isfinite(raw_val) else raw_val
 
         if key not in self._ewm_mean:
+            # key 未初期化: artifact 不在 or artifact に存在しない feature
             if np.isnan(ewm_input):
                 return 0.0
-            self._ewm_mean[key] = ewm_input
-            self._ewm_var[key]  = 0.0
-            self._ewm_n[key]    = 1
+            if not skip_update:
+                self._ewm_mean[key] = ewm_input
+                self._ewm_var[key]  = 0.0
+                self._ewm_n[key]    = 1
+            # 初回 update は clip 範囲未確立 → そのまま返す (旧挙動)
             return ewm_input
         else:
-            if not np.isnan(ewm_input):
+            if not np.isnan(ewm_input) and not skip_update:
                 prev_mean = self._ewm_mean[key]
                 prev_var  = self._ewm_var[key]
                 new_mean = alpha * ewm_input + (1.0 - alpha) * prev_mean
@@ -247,6 +281,52 @@ class FeatureModule1D:
             "__temp_atr_13": atr13_arr,
         }
 
+        # ▼▼ [§B.12.13.7 Option C2 / Phase E] numpy 事前計算 + 列注入 ▼▼
+        # Polars map_batches を経由しない (CSE non-determinism 回避)。
+        # 命名規約:
+        #   単純: __num_<func>_<col>_<window>  (例: __num_srm_volume_20)
+        #   複合: __num_<func>_<expr_id>_<window>  (例: __num_srs_pct_close_252)
+
+        # --- 単純パターン: volume.rolling_mean ---
+        # 用途:
+        #   - volume.rolling_mean(lookback_bars) → vol_ma1440 (Relative Volume base)
+        #   - volume.rolling_mean(20) → volume_ma20_rel と volume_ratio で共用
+        columns["__num_srm_volume_lookback"] = stable_rolling_mean(volume_arr, lookback_bars)
+        columns["__num_srm_volume_20"] = stable_rolling_mean(volume_arr, 20)
+
+        # --- 複合パターン: pct_change(close) を numpy で先に計算 ---
+        # pct_change: 先頭 1 NaN、stable_rolling_std は window 内 NaN で出力 NaN
+        # → Polars `pct_change().rolling_std(W, ddof=1)` と NaN 位置・値が完全一致
+        # (実機で B 側にて検証済)
+        # 注意: 計算式は `(c[i] - c[i-1]) / c[i-1]` 形式を使う。
+        #   `c[i] / c[i-1] - 1.0` は数学的等価だが IEEE 754 で 1 ULP 差が出るため不可。
+        #   Polars `pct_change()` の内部実装に合わせる。
+        pct_close = np.empty(len(close_arr), dtype=np.float64)
+        pct_close[0] = np.nan
+        if len(close_arr) > 1:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pct_close[1:] = (close_arr[1:] - close_arr[:-1]) / close_arr[:-1]
+
+        # hv_annual_252: pct_change.rolling_std(252, ddof=1)
+        # → __num_srs_pct_close_252
+        columns["__num_srs_pct_close_252"] = stable_rolling_std(pct_close, 252, 1)
+
+        # hv_regime_50 内の hv_50: pct_change.rolling_std(50, ddof=1)
+        # → __num_srs_pct_close_50
+        columns["__num_srs_pct_close_50"] = stable_rolling_std(pct_close, 50, 1)
+
+        # --- 複合パターン: (pct_change(close) * volume).rolling_mean(10) ---
+        # 用途: volume_price_trend_norm の分子
+        # pv = pct_close * volume_arr (先頭 1 NaN を継承)
+        # stable_rolling_mean(pv, 10) → 先頭 10 NaN (window 内 NaN 含むため)
+        # ※ 命名: __num_srm_pv_10 (pv = pct_close × volume)
+        #   注意: B 側の __num_srm_vpt_10 は別物 (B 側は pct_close × rel_volume)。
+        #   D 側では「pct_change * volume」を rolling した結果に vol_ma1440 で割るため、
+        #   分子と分母を分離している。
+        _pv = (pct_close * volume_arr).astype(np.float64)
+        columns["__num_srm_pv_10"] = stable_rolling_mean(_pv, 10)
+        # ▲▲ [§B.12.13.7 Option C2 / Phase E] ▲▲
+
         # ===== exprs =====
         exprs: List[pl.Expr] = []
 
@@ -256,14 +336,18 @@ class FeatureModule1D:
         # =====================================================================
 
         # hv_annual_252: 学習側 rolling_std(252, ddof=1) * sqrt(252) と完全一致
+        # ▼▼ [Phase E] pct_change.rolling_std(252) → __num_srs_pct_close_252 列参照
         exprs.append(
-            (pl.col("close").pct_change().rolling_std(252, ddof=1) * np.sqrt(252))
+            (pl.col("__num_srs_pct_close_252") * np.sqrt(252))
             .alias("e1d_hv_annual_252")
         )
+        # ▲▲ [Phase E] ▲▲
 
         # hv_regime_50: 学習側 Polars ネイティブのローリング分位数判定と完全一致
         # 参照: engine_1_D L1265-1273
-        hv_50 = pl.col("close").pct_change().rolling_std(50, ddof=1)
+        # ▼▼ [Phase E] pct_change.rolling_std(50) → __num_srs_pct_close_50 列参照
+        hv_50 = pl.col("__num_srs_pct_close_50")
+        # ▲▲ [Phase E] ▲▲
         q80_roll = hv_50.rolling_quantile(0.8, window_size=1440)
         q60_roll = hv_50.rolling_quantile(0.6, window_size=1440)
         exprs.append(
@@ -307,7 +391,9 @@ class FeatureModule1D:
 
         # vol_ma1440 (with +1e-10 baked in - 学習側と完全一致):
         # 学習側: vol_ma1440 = pl.col("volume").rolling_mean(lookback_bars) + 1e-10
-        vol_ma1440 = pl.col("volume").rolling_mean(lookback_bars) + 1e-10
+        # ▼▼ [Phase E] volume.rolling_mean(lookback_bars) → __num_srm_volume_lookback 列参照
+        vol_ma1440 = pl.col("__num_srm_volume_lookback") + 1e-10
+        # ▲▲ [Phase E] ▲▲
 
         # CMF / MFI / VWAP距離: window=[13, 21, 34]
         # 参照: engine_1_D L1328-1378
@@ -399,27 +485,28 @@ class FeatureModule1D:
 
         # Volume MA20 relative: 学習側 rolling_mean(20) / vol_ma1440
         # 参照: engine_1_D L1420-1424
+        # ▼▼ [Phase E] volume.rolling_mean(20) → __num_srm_volume_20 列参照
         exprs.append(
-            (pl.col("volume").rolling_mean(20) / vol_ma1440)
+            (pl.col("__num_srm_volume_20") / vol_ma1440)
             .alias("e1d_volume_ma20_rel")
         )
 
         # Volume ratio: 学習側 volume / rolling_mean(20)  ← +1e-10 なし (inf 伝播)
         # 参照: engine_1_D L1425-1428
         exprs.append(
-            (pl.col("volume") / pl.col("volume").rolling_mean(20))
+            (pl.col("volume") / pl.col("__num_srm_volume_20"))
             .alias("e1d_volume_ratio")
         )
 
         # Volume Price Trend normalized:
         #   学習側: (pct_change * volume).rolling_mean(10) / vol_ma1440
         # 参照: engine_1_D L1430-1435
+        # ▼▼ [Phase E] (pct_change*volume).rolling_mean(10) → __num_srm_pv_10 列参照
         exprs.append(
-            (
-                (pl.col("close").pct_change() * pl.col("volume")).rolling_mean(10)
-                / vol_ma1440
-            ).alias("e1d_volume_price_trend_norm")
+            (pl.col("__num_srm_pv_10") / vol_ma1440)
+            .alias("e1d_volume_price_trend_norm")
         )
+        # ▲▲ [Phase E] ▲▲
 
         # =====================================================================
         # Breakout / Range Group
