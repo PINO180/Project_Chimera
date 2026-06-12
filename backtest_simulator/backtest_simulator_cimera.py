@@ -7,7 +7,7 @@ from pathlib import Path
 import logging
 import argparse
 from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 import json
 import datetime as dt
 # import zoneinfo
@@ -72,6 +72,10 @@ class BacktestConfig:
     initial_capital: float = 1000.0
     simulation_data_path: Path = S6_WEIGHTED_DATASET
 
+    # 期間フィルタ (YYYY-MM-DD, UTC, inclusive)。None なら全期間
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
     # V5: Long/Short独立のOOF予測パス
     oof_long_path: Path = S7_M2_OOF_PREDICTIONS_LONG
     oof_short_path: Path = S7_M2_OOF_PREDICTIONS_SHORT
@@ -98,7 +102,7 @@ class BacktestConfig:
     min_capital_threshold: float = 1.0
     min_lot_size: float = 0.01
     min_atr_threshold: float = (
-        0.9  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
+        0.8  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
     )
     # [baseline_ATR床フィルター] 前日24h ATR平均の絶対下限 (0.0 = フィルターなし)
     # baseline_ATR = atr_value / atr_ratio (= 直近480本のATR平均 = 前日の平均ボラ水準)
@@ -583,6 +587,27 @@ class BacktestSimulator:
                     pl.col("m2_proba_short").fill_null(0.0),
                 ]
             )
+
+        # ─── 期間フィルタ (BacktestConfig.start_date / end_date) ───
+        # 注: price_lf_long / price_lf_short には適用しない (TD ルックアップで
+        #     期間末の翌日の close が必要なため、base_lf 全体を保持しておく)
+        if self.config.start_date is not None:
+            start_dt = dt.datetime.fromisoformat(self.config.start_date).replace(
+                tzinfo=dt.timezone.utc
+            )
+            lf = lf.filter(pl.col("timestamp") >= start_dt)
+            logging.info(f"期間フィルタ適用 (start): {self.config.start_date} 以降")
+        if self.config.end_date is not None:
+            # end_date を inclusive にするため、その日の 23:59:59.999999 まで
+            end_dt = (
+                dt.datetime.fromisoformat(self.config.end_date).replace(
+                    tzinfo=dt.timezone.utc
+                )
+                + dt.timedelta(days=1)
+                - dt.timedelta(microseconds=1)
+            )
+            lf = lf.filter(pl.col("timestamp") <= end_dt)
+            logging.info(f"期間フィルタ適用 (end):   {self.config.end_date} 以前")
 
         logging.info("Discovering partitions...")
         partitions_df = (
@@ -2806,9 +2831,35 @@ if __name__ == "__main__":
         help=f"Path to Short OOF predictions.",
     )
 
+    # ─── 期間フィルタと初期資本 ───
+    parser.add_argument(
+        "--initial-capital",
+        type=float,
+        default=default_config.initial_capital,
+        dest="initial_capital",
+        help=f"Initial capital. Default: {default_config.initial_capital}",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        dest="start_date",
+        help="Start date filter (YYYY-MM-DD, UTC, inclusive). Default: None (no filter)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        dest="end_date",
+        help="End date filter (YYYY-MM-DD, UTC, inclusive). Default: None (no filter)",
+    )
+
     args = parser.parse_args()
 
     config = BacktestConfig(
+        initial_capital=args.initial_capital,
+        start_date=args.start_date,
+        end_date=args.end_date,
         auto_lot_base_capital=args.auto_lot_base_capital,
         auto_lot_size_per_base=args.auto_lot_size_per_base,
         use_fixed_risk=default_config.use_fixed_risk,
@@ -2937,4 +2988,49 @@ if __name__ == "__main__":
         return data
 
     preloaded_data = load_or_generate_cache()
+
+    # ─── キャッシュ load 後の期間フィルタ ───
+    # キャッシュには全期間データが入っているため、--start-date / --end-date が
+    # 指定された場合は preloaded_dict と partitions_to_process を切り出す
+    if config.start_date is not None or config.end_date is not None:
+        preloaded_dict, partitions_to_process = preloaded_data
+        start_d = (
+            dt.date.fromisoformat(config.start_date) if config.start_date else None
+        )
+        end_d = dt.date.fromisoformat(config.end_date) if config.end_date else None
+
+        # filter preloaded_dict (Dict[date, DataFrame])
+        filtered_dict = {
+            d: df
+            for d, df in preloaded_dict.items()
+            if (start_d is None or d >= start_d) and (end_d is None or d <= end_d)
+        }
+
+        # filter partitions_to_process (pl.DataFrame with "date" col)
+        filter_expr = pl.lit(True)
+        if start_d is not None:
+            filter_expr = filter_expr & (pl.col("date") >= start_d)
+        if end_d is not None:
+            filter_expr = filter_expr & (pl.col("date") <= end_d)
+        filtered_partitions = partitions_to_process.filter(filter_expr)
+
+        logging.info(
+            f"[期間フィルタ post-cache] preloaded_dict: "
+            f"{len(preloaded_dict)} → {len(filtered_dict)} dates"
+        )
+        logging.info(
+            f"[期間フィルタ post-cache] partitions: "
+            f"{len(partitions_to_process)} → {len(filtered_partitions)} dates"
+        )
+
+        if len(filtered_dict) == 0:
+            raise ValueError(
+                f"期間フィルタ後に対象データが 0 件です。"
+                f"start_date={config.start_date} end_date={config.end_date} を"
+                f"確認してください。キャッシュ内データの範囲: "
+                f"{min(preloaded_dict.keys())} 〜 {max(preloaded_dict.keys())}"
+            )
+
+        preloaded_data = (filtered_dict, filtered_partitions)
+
     simulator.run(preloaded_data=preloaded_data)

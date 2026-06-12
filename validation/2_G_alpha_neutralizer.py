@@ -130,6 +130,7 @@ def find_proxy_file(proxy_tf: str) -> Optional[Path]:
 
 def build_proxy_lazyframe(proxy_tf: str) -> Optional[pl.LazyFrame]:
     """
+    旧式記述
     プロキシ時間足の close リターン系列を LazyFrame として返す。
 
     close は S1_PROCESSED から取得する。
@@ -138,6 +139,16 @@ def build_proxy_lazyframe(proxy_tf: str) -> Optional[pl.LazyFrame]:
 
     close リターン = close / close.shift(1) - 1（1バー前比）
     shift(正の数) で過去参照のみ（未来情報リーク排除: ルール1）
+
+    新記述-新式-
+    close リターン = close.shift(1) / close.shift(2) - 1
+    (= timestamp T で T-10min → T-5min の確定済 return のみ参照)
+
+    [Phase 11.19] 旧式 (close / close.shift(1) - 1) は S1 M5 が
+    label="left" 規約で close が「未来 bar の close」 を指すため、
+    join_asof backward での同 timestamp 結合により look-ahead bias が成立。
+    新式で proxy_M5[T] を完全に過去確定済 return に限定し、 production の
+    _ffill_lookup_market_proxy と整合させた。
     """
     price_dir = blueprint.S1_PROCESSED / f"timeframe={proxy_tf}"
     if not price_dir.exists():
@@ -153,8 +164,15 @@ def build_proxy_lazyframe(proxy_tf: str) -> Optional[pl.LazyFrame]:
         )  # S1はns、S2はus — 統一
         .sort("timestamp")
         .with_columns(
-            # 過去1バーに対するリターン（shift(1) = 1バー前 = 過去方向のみ: ルール1）
-            (pl.col("close") / pl.col("close").shift(1) - 1).alias(col_name)
+            # [Phase 11.19 修正] proxy を 1 bar 過去 shift して look-ahead bias 除去。
+            # 旧: (close / close.shift(1) - 1) は S1 M5 timestamp が label="left" で
+            # close が「未来の bar の close (= T+4:30 頃の M0.5 close)」 のため、
+            # proxy_M5[T] = (T+5min 先の close) / (T 時点の close) - 1 となり
+            # join_asof backward (<=) で同 timestamp の proxy を取得すると未来情報リーク。
+            # 新: (close.shift(1) / close.shift(2) - 1) = T-2 → T-1 の return
+            # これにより proxy_M5[T] = 過去確定済の M5 return のみ参照し、 production の
+            # _ffill_lookup_market_proxy (= 過去 proxy のみ取得可能) と整合する。
+            (pl.col("close").shift(1) / pl.col("close").shift(2) - 1).alias(col_name)
         )
         .select(["timestamp", col_name])
     )

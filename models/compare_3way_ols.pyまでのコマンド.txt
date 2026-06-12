@@ -1,0 +1,45 @@
+compare_3way_ols.pyまでのコマンド
+
+① dump付き dry-run（本番側 C と OLS state を生成）
+
+main.py を --dry-run --ols-dump で起動。
+発注skip、OLS state は実機通り更新、シグナル発火時に state+deque を pickle dump。
+
+cd /workspace && python3 /workspace/models/main.py --dry-run --ols-dump
+
+これが /workspace/logs/triggered_features_log.csv（C の元）と
+ /workspace/logs/ols_state_dumps/ を生成します。
+
+② 学習側パイプライン（Step 1-16、A・B の素材を生成）
+
+cd /workspace && bash /workspace/run_ols_diagnosis_pipeline.sh
+
+2_G以降だけ回し直すなら bash /workspace/run_ols_diagnosis_pipeline.sh 11 16。
+engine 1A-1F は対話入力が要るので、全実行する場合はプロンプトに応答が必要です。
+
+③ snapshot 生成（A=純化前 + B=純化後 を1ファイルに）
+
+窓を 6/3 16:39 〜 6/4 05:33 に合わせます。
+日付をまたぐので --start 2026-06-03 --end 2026-06-04、時刻を --start-time/--end-time で指定。
+出力名は窓に合わせて命名します。
+
+cd /workspace && python3 /workspace/models/snapshot_training_inference_with_pre_ols.py \
+  --start 2026-06-03 --end 2026-06-04 \
+  --start-time 16:39:00 --end-time 05:33:00 \
+  --out /workspace/data/diagnostics/training_snapshot_with_pre_ols_20260603_pm.parquet \
+  --m2-proba 0.70 --m2-delta 0.30 --min-atr 0.80
+
+④ compare_3way_ols.py（A/B/C 突合 + dump）
+
+③の出力を --training に、①の triggered log を --production に。窓は snapshot と揃えます。
+
+cd /workspace && python3 /workspace/models/compare_3way_ols.py \
+  --training /workspace/data/diagnostics/training_snapshot_with_pre_ols_20260603_pm.parquet \
+  --production /workspace/logs/triggered_features_log.csv \
+  --start "2026-06-03 16:39:00" --end "2026-06-04 05:33:00" \
+  --out-dir /workspace/data/diagnostics/compare_3way_ols_v4_wide \
+  --dump-raw "e1d_force_index_norm_neutralized_M0.5"
+
+実行順は ② パイプライン → ③ snapshot → ④ compare が学習側の依存。
+①の dry-run は本番側（C）なので②と並行でも前後でもOKですが
+④の前には①③両方が終わっている必要があります。

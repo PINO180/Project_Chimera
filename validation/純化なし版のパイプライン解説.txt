@@ -1,0 +1,51 @@
+本番の学習パイプライン（Step 1-22）ですね。純化除去の観点で、各ステップを「現状維持／修正／廃止（スキップ）」に分類します。まず前提として、純化に直接関わる Step 13（2_G）と Step 14（create_proxy_labels）の依存を、このパイプラインの文脈で正確に確認します。Confirm 2_G input/output and whether 2_F precedes or follows it in the data flowConfirm 2_G input/output and whether 2_F precedes or follows it in the data flowデータフローが完全に確定しました。重要な事実：
+
+2_G（Step 13）: S2_FEATURES_VALIDATED → S5_NEUTRALIZED_ALPHA_SET（純化の本体）
+2_F（Step 12）: 特徴量**リスト（.txt）**を作るだけ（S3_FINAL_FEATURE_TEAM + survived_hf → S3_FEATURES_FOR_ALPHA_DECAY）。データ純化とは無関係、リスト結合のみ。
+create_proxy_labels（Step 14）: input = S5_NEUTRALIZED_ALPHA_SET ← ここが純化済データを食う唯一の下流。価格はS1から直接取得（S2不使用）。
+
+つまり純化除去の本質は「Step 13（2_G）を飛ばし、Step 14 の input を S5 → S2_FEATURES_VALIDATED に繋ぎ替える」。これだけ。各ステップを順に判定します。
+
+run_phase_d3_pipeline.sh — 純化除去での各ステップ判定
+Step 1-6: engine 1A-1F（特徴量生成）
+現状維持。 純化と無関係。S2_FEATURES（純化前の生特徴量）を作る本体。ただし再実行不要 — 既に生成済みのS2があるなら、ここは飛ばして後段から回せる。純化版でも撤去版でも同じS2を使う。
+Step 7-9: 2_A / 2_B / 2_C（KS安定性・統計フィルタ・LF信号）
+現状維持。 特徴量の選別・フィルタで、純化とは独立。撤去版でも同じ選別結果を使う。再実行不要（生成済みリストを流用可）。
+Step 10: 2_D
+現状維持（実体なしSKIP）。 スクリプトが存在しなければ元々SKIPされる。触らない。
+Step 11: 2_E（HFメタモデルtrainer → survived_hf_features.txt）
+現状維持。 特徴量リスト（survived_hf）を作るだけ。純化と無関係。再実行不要。
+Step 12: 2_F（feature_aggregator）
+現状維持（軽微確認のみ）。 LF + HF の特徴量リスト結合で、データ純化はしない。L64 の neutralized 除外コメントは「sample_weight が純化に伝搬するのを防ぐ」話だが、純化を撤去すればその伝搬自体が起きないので、除外ロジックが残っていても無害（何も除外しないだけ）。触らなくていい。
+Step 13: 2_G（alpha_neutralizer）★純化の本体
+廃止＝スキップ。 これが純化そのもの。bash run_phase_d3_pipeline.sh で Step 13 を範囲から外して回す（後述）。スクリプト自体は削除せず温存（純化版に戻せるよう）。
+Step 14: create_proxy_labels ★唯一の修正対象
+修正。 input_dir = S5_NEUTRALIZED_ALPHA_SET（L94）を S2_FEATURES_VALIDATED に変更。これが純化除去で実際にコードを直す唯一のファイル。あわせてL310の features_*_neutralized* 探索パターンと、列名regex（L331 の _neutralized 前提）を非neutralized列名に調整。価格はS1から取るので（L95）そこは不変。スコア4の難所はここだけ。
+Step 15: aggregate_daily_to_monthly
+現状維持。 S6の月次集約。純化と無関係、データ追従のみ。
+Step 16-17: sample_uniqueness_weighting（calculate / join）
+現状維持。 López de Prado のサンプル重み。純化と無関係。データ追従。
+Step 18: update_feature_list_v5 ★追従修正
+実質修正（自動追従）。 モデルが要求する特徴量名リストを再生成。純化を抜くと列名から _neutralized が消えるので、このステップを必ず再実行して新しい列名リストを作る。コード変更は不要（S6を読んで再生成するだけ）だが、再実行は必須。
+Step 19: split_features_first_orthogonal（M1/M2直交分割）
+現状維持（再実行必須）。 列名追従。コード変更不要、再実行のみ。
+Step 20-22: model_training Ax2 / Bx2 / Cx2（M1 CV → メタラベル → M2較正）
+現状維持（再学習＝これが本番）。 コード変更不要。S6を読んで学習するだけ。ここが2日かかる再学習の本体。 純化除去の成否（BT/AUC・train-serve一致度）はこの出力で判定する。
+
+結論：回し方
+コード修正は Step 14（create_proxy_labels の input を S5→S2）の1ファイルのみ。 他は全て現状維持。
+回す範囲: Step 1-13 は再実行不要（S2まで生成済みのはず）。なので——
+純化版パイプラインは Step 13 を含むが、撤去版では Step 13 を飛ばして Step 14 から回すのが基本。ただしこの .sh は範囲指定が連続区間（FROM〜TO）なので「13だけ飛ばす」ができない。2つの選択肢：
+選択肢A（推奨・最小）: Step 14 を修正した上で、
+bashbash run_phase_d3_pipeline.sh 14 22
+Step 1-13 は生成済み成果物（S2・各種.txtリスト）をそのまま使い、Step 14（修正済・S2入力）から再学習まで一気に回す。Step 13（2_G）は範囲外なので自動スキップ＝純化が走らない。これが「途中から回せばいい」のあなたの読み通り。S5は古い純化版が残っていても、Step 14がS2を読むので参照されない。
+選択肢B（クリーン）: パイプライン .sh をコピーして撤去版（Step 13 の行を削除した版）を作り、1-22通しで回す。再現性重視ならこちら。ただしStep 1-13の再計算で時間を食うので、生成済みなら選択肢Aが速い。
+最小手順まとめ:
+
+create_proxy_labels（Step 14）の input_dir を S2_FEATURES_VALIDATED に修正 + 列名regex調整
+bash run_phase_d3_pipeline.sh 14 22 で14から回す
+Step 14（ラベリング~16h）→ 18（リスト再生成）→ 20-22（再学習~残り）
+出力モデルで BT/AUC + train-serve一致度を純化版と比較
+
+ひとつ注意。Step 14 のラベリングが~16時間（コメント記載）かかります。これは純化の有無と無関係に元々重い。なので「2日」の大半はStep 14のラベリング + Step 20-22の再学習です。
+確認です。唯一の修正対象である create_proxy_labels の input_dir 繋ぎ替え、実際にコードを精読して「S2のどの列をどう読むか・S5前提の列名処理（neutralized regex）が S2 の生列名で破綻しないか」を詰めておきますか？ ここだけが躓きうる箇所なので、回す前に確認しておく価値があります。

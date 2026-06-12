@@ -483,6 +483,14 @@ class RealtimeFeatureEngine:
             self.proxy_feature_buffers[tf_name]["market_proxy"] = deque(
                 maxlen=tf_ols_window
             )
+            # [計測基盤] OLS deque 各要素に対応するバー時刻 (close_ts) を記録する並行 deque。
+            #   x_deque/y_deque と同一タイミングで append され length が常に一致する。
+            #   OLS 計算には一切関与しない (更新ループは latest_proxy_features で回るため、
+            #   buffer キーを総舐めする箇所は存在しない)。exact-timestamp での
+            #   train-serve 突合を可能にし、positional 推測アライメントを廃するための土台。
+            self.proxy_feature_buffers[tf_name]["__bar_ts__"] = deque(
+                maxlen=tf_ols_window
+            )
 
             self.ols_state[tf_name] = {}
             # 各エントリは _update_incremental_ols で特徴量登場時に動的初期化される
@@ -810,44 +818,21 @@ class RealtimeFeatureEngine:
 
     def run_smoke_test(self) -> None:
         """
-        【診断 L2: 実行時健全性検証】(public 化版、Phase 9b 案 V)
+        【診断 L2: 実行時健全性検証】起動時 1 バーでの過去バグ再発検知。
 
-        全バッファ充填完了後 / スナップショット復帰完了後の **両経路** で
-        起動シーケンスから明示的に呼び出される。
-        以下の異常を検出する:
-            (a) NaN になった特徴量 (Polars 計算で None を返す特徴量)
-            (b) 過去のバグで死蔵したことがある特定の高 gain 特徴量が 0 になる
-            (c) 0 値特徴量の具体名を一覧表示 (新たな死蔵バグの早期発見、Phase 9b 案 C 強化)
-            (d) カテゴリ C 死蔵候補が 0 のとき最終バー OHLC を verbose 出力 (Phase 9b 案 W)
+        Layer 1 Shadow Mode が rtol=1e-7 で完全検証済 (発見 #69 §D 参照) の
+        ため、偽陽性の多い INFO/WARNING ログは廃止。以下の ERROR のみ出力:
+            - M0.5 で HIGH_GAIN_M05_FEATURES のうち 3+ 件が同時 0
+            - 全 TF で 0 値比率 > 30% (EXPECTED_ZERO_FEATURES 除外後)
 
-        診断 L1 (静的検証) でカバーできない以下の事態を補完する:
-            - スナップショット復元失敗で deque が空のまま起動
-            - 学習側パラメータ変更を本番側に反映し忘れ
-            - volume が全 0 の TF など、入力データの異常で NaN が出るケース
-            - PER_TF_FEATURE_MAX 自体に見落としがあり L1 が通っても実は死蔵 (案 D で発見)
+        正常時は無音 (= ログに何も出ない = OK)。
 
-        Phase 9b 案 ZAW (本セッション最終強化):
-            案 Z: WIDE_WINDOW_FEATURES の WARNING を削除 (e1d_hv_regime_50 は
-                  低レジューム判定で 60% が 0 になる正常動作。WARNING は誤検出)
-            案 A: EXPECTED_ZERO_FEATURES (gain=0 で AI 未使用、定義通り 0 が正常な
-                  4 件) を 0 値リストから除外。表示の S/N 比向上
-            案 W: SUSPICIOUS_ZERO_FEATURES (合成データでは 0 にならないが実機で
-                  0 死蔵の高 gain 特徴量) が 0 のとき、最終バー OHLCV と計算
-                  中間値を verbose 出力。実機データ特有の何かが原因と判明済み
-                  だが、デプロイ後ログから具体原因を特定するため
-
-        Phase 9b 案 V (起動経路 SSoT 化):
-            旧: `fill_all_buffers()` の最後で `self._run_initial_smoke_test()` を
-                呼んでいたため、フルウォームアップ起動時のみ smoke test が実行
-                されていた → スナップショット爆速復帰時には呼ばれず、案 W の
-                verbose ログを得られないという致命的な穴があった
-            新: メソッドを public 化 (`run_smoke_test`) し、`fill_all_buffers`
-                内の呼び出しを削除。`main.py` 起動シーケンスの両経路 (フル
-                ウォームアップ / スナップショット復帰) の合流地点で 1 回だけ
-                呼び出す形に統一 → 起動経路によらず必ず実行される
+        起動経路 SSoT 化 (Phase 9b 案 V):
+            メソッドを public 化し、main.py 起動シーケンスの両経路 (フル
+            ウォームアップ / スナップショット復帰) の合流地点で 1 回呼ぶ。
         """
-        # 過去にバグで死蔵していた特徴量 (今後同様のバグの再発を即時検出)
-        # gain ランキング: e1d_obv_rel_M0.5 = M1L 7,463 / M1S 9,123
+        # 過去にバグで死蔵していた特徴量 (e1d_obv_rel_M0.5 = gain 7,463 等)。
+        # 再発検知のため 3+ 件同時 0 を ERROR 判定する。
         HIGH_GAIN_M05_FEATURES = [
             "e1d_obv_rel",
             "e1d_force_index_norm",
@@ -856,18 +841,7 @@ class RealtimeFeatureEngine:
             "e1d_volume_price_trend_norm",
         ]
 
-        # ─────────────────────────────────────────────────────────────────
-        # Phase 9b 案 A: 「定義通り 0 が正常な特徴量」を 0 値リストから除外
-        # ─────────────────────────────────────────────────────────────────
-        # これらは gain=0 (AI 未使用) かつ計算ロジック上 0 が正常な動作:
-        #   - e1d_hv_regime_50: 60% が低レジューム判定 (rolling_quantile q60 以下)
-        #     で 0 になる定義。学習データでも 60% が 0 で、AI は使っていない
-        #   - e1f_biomechanical_efficiency_10: rolling UDF が `< 20 本でスキップ
-        #     (np.nan 維持)」する設計。window_size=10 では永遠に該当しない構造的死蔵
-        #   - e1f_linguistic_complexity_15: 同上 (window_size=15 < 20)
-        #   - e1f_rhythm_pattern_12: 同上 (window_size=12 < 20)
-        # gain=0 で AI が使っていないため、これらの 0 は「死蔵バグ」ではなく
-        # 「設計通り使わない値」。診断 L2 の S/N 比を向上させるため除外する
+        # 定義上 0 が正常な特徴量 (gain=0、AI 未使用)。zero_pct 集計から除外。
         EXPECTED_ZERO_FEATURES = {
             "e1d_hv_regime_50",
             "e1f_biomechanical_efficiency_10",
@@ -875,55 +849,20 @@ class RealtimeFeatureEngine:
             "e1f_rhythm_pattern_12",
         }
 
-        # ─────────────────────────────────────────────────────────────────
-        # Phase 9b 案 W: カテゴリ C 死蔵候補の verbose デバッグ
-        # ─────────────────────────────────────────────────────────────────
-        # 合成データ (sandbox) では 0 にならないが実機で常時 0 になる高 gain 特徴量:
-        #   - e1d_lower_wick_ratio (M3 で gain 18,166! / M0.5/M1/M3 で 0)
-        #   - e1b_rolling_max_10 (M0.5 で gain 3,789! / M0.5 で 0)
-        #   - e1a_robust_q75_10 (M5/M8 で 0)
-        #   - e1a_robust_q75_20 (M5 で 0)
-        #   - e1a_runs_test_statistic_30 (M5/M15 で 0)
-        # これらが 0 のとき、最終バー OHLCV と計算中間値を出力して
-        # 実機データの何が原因かを特定する (例: high == low、open == close 等)
-        # 注: e1a_fast_basic/robust_stabilization はカテゴリ B (式の設計上ほぼ
-        #     常時 0、外れ値時のみ非ゼロ) で死蔵バグではないため除外
-        SUSPICIOUS_ZERO_FEATURES = {
-            "e1d_lower_wick_ratio",
-            "e1b_rolling_max_10",
-            "e1a_robust_q75_10",
-            "e1a_robust_q75_20",
-            "e1a_runs_test_statistic_30",
-        }
-
-        self.logger.info("--- 初期 smoke test (診断 L2) ---")
         for tf_name in self.lookbacks_by_tf.keys():
             if not self.is_buffer_filled.get(tf_name, False):
-                self.logger.warning(f"  ⚠️ {tf_name:<5} バッファ未充填、smoke test スキップ")
                 continue
             try:
                 data = {
                     col: np.array(self.data_buffers[tf_name][col], dtype=np.float64)
                     for col in self.OHLCV_COLS
                 }
-                # [Phase 9d 発見 #66 Phase D-3] smoke test は QAState を update
-                # すべきでない。artifact load 済の場合は状態を維持し、未 load の
-                # 場合も smoke test で余計な update を入れない (warmup loop で
-                # 既に成熟済の状態を保持)。
+                # [Phase 9d 発見 #66 Phase D-3] smoke test は QAState を update しない
                 features = self._calculate_base_features(
                     data, tf_name, skip_qa_update=True
                 )
 
-                # (a) 全特徴量の 0 値集計 (Phase 9b 案 A: EXPECTED_ZERO_FEATURES 除外)
-                zero_features = sorted([
-                    k for k, v in features.items()
-                    if v == 0.0 and k not in EXPECTED_ZERO_FEATURES
-                ])
-                zero_count = len(zero_features)
-                total_count = len(features) - len(EXPECTED_ZERO_FEATURES)
-                zero_pct = (zero_count / total_count * 100) if total_count > 0 else 0.0
-
-                # (b) M0.5 限定: 過去のバグで死蔵していた特徴量が 0 でないかチェック
+                # ERROR 1: M0.5 で過去バグ被害者 (高 gain 特徴量) の 3+ 件同時 0
                 if tf_name == "M0.5":
                     zero_critical = [
                         feat for feat in HIGH_GAIN_M05_FEATURES
@@ -931,99 +870,22 @@ class RealtimeFeatureEngine:
                     ]
                     if len(zero_critical) >= 3:
                         self.logger.error(
-                            f"  ❌ {tf_name:<5} 死蔵バグ再発の可能性: 高 gain 特徴量 "
-                            f"{len(zero_critical)} 件が同時 0 → {zero_critical}。"
-                            f" バッファ容量や入力データを確認してください。"
-                        )
-                    elif zero_critical:
-                        self.logger.warning(
-                            f"  ⚠️ {tf_name:<5} 一部の高 gain 特徴量が 0: {zero_critical}"
-                        )
-                    else:
-                        self.logger.info(
-                            f"  ✓ {tf_name:<5} 高 gain 特徴量 {len(HIGH_GAIN_M05_FEATURES)} 件 "
-                            f"全て非ゼロ (死蔵バグなし)"
+                            f"❌ {tf_name} 死蔵バグ再発の可能性: {zero_critical}"
                         )
 
-                # (c) 全 TF 共通: 特徴量の 0 比率を診断 + 0 値特徴量名のリスト出力
-                # ※ EXPECTED_ZERO_FEATURES 除外後の集計 (案 A)
-                # ※ WIDE_WINDOW_FEATURES の WARNING は削除 (案 Z)
-                if zero_pct > 30.0:
+                # ERROR 2: 全 TF で 0 比率 > 30% (EXPECTED_ZERO_FEATURES 除外後)
+                zero_count = sum(
+                    1 for k, v in features.items()
+                    if v == 0.0 and k not in EXPECTED_ZERO_FEATURES
+                )
+                total_count = len(features) - len(EXPECTED_ZERO_FEATURES)
+                if total_count > 0 and zero_count / total_count > 0.30:
                     self.logger.error(
-                        f"  ❌ {tf_name:<5} 特徴量 0 比率が異常に高い: "
-                        f"{zero_count}/{total_count} ({zero_pct:.1f}%)。"
-                        f" 入力データやバッファ状態を確認してください。"
+                        f"❌ {tf_name} 特徴量 0 比率異常: "
+                        f"{zero_count}/{total_count} ({zero_count/total_count*100:.1f}%)"
                     )
-                elif zero_pct > 10.0:
-                    self.logger.warning(
-                        f"  ⚠️ {tf_name:<5} 特徴量 0 比率がやや高い: "
-                        f"{zero_count}/{total_count} ({zero_pct:.1f}%)"
-                    )
-                else:
-                    self.logger.info(
-                        f"  ✓ {tf_name:<5} 特徴量計算正常: "
-                        f"{total_count} 件中 0 値 {zero_count} 件 ({zero_pct:.1f}%) "
-                        f"[正常 0 の {len(EXPECTED_ZERO_FEATURES)} 件は除外済み]"
-                    )
-
-                # 0 値特徴量の具体名を出力 (案 C 強化、新たな死蔵バグの早期発見)
-                # 1 件以上あれば必ず出力。20 件超なら上位 20 件のみ表示してログを過剰に長くしない。
-                if zero_features:
-                    if len(zero_features) <= 20:
-                        self.logger.info(
-                            f"     ↳ 0 値特徴量 ({zero_count}件): {zero_features}"
-                        )
-                    else:
-                        self.logger.info(
-                            f"     ↳ 0 値特徴量 ({zero_count}件、上位20件表示): "
-                            f"{zero_features[:20]} ..."
-                        )
-
-                # (d) Phase 9b 案 W: カテゴリ C 死蔵候補の verbose デバッグ
-                # 合成データでは 0 にならないのに実機で 0 になる高 gain 特徴量が
-                # 0 になっている場合、最終バー OHLCV と計算中間値を出力して
-                # 実機データ特有の原因 (例: open==low、high==low) を特定する
-                suspicious_zero = [
-                    feat for feat in SUSPICIOUS_ZERO_FEATURES
-                    if features.get(feat) == 0.0
-                ]
-                if suspicious_zero:
-                    last_o = data["open"][-1]
-                    last_h = data["high"][-1]
-                    last_l = data["low"][-1]
-                    last_c = data["close"][-1]
-                    last_v = data["volume"][-1]
-                    hl_range = last_h - last_l
-                    min_oc = min(last_o, last_c)
-                    self.logger.info(
-                        f"     ↳ ⚠ 高 gain 死蔵候補 ({len(suspicious_zero)}件): "
-                        f"{suspicious_zero}"
-                    )
-                    self.logger.info(
-                        f"     ↳ 最終バー: O={last_o:.4f} H={last_h:.4f} "
-                        f"L={last_l:.4f} C={last_c:.4f} V={last_v:.2f}"
-                    )
-                    self.logger.info(
-                        f"     ↳ 計算中間値: high-low={hl_range:.6f}, "
-                        f"min(O,C)={min_oc:.4f}, min(O,C)-low={min_oc - last_l:.6f}, "
-                        f"high-close={last_h - last_c:.6f}, "
-                        f"close-low={last_c - last_l:.6f}"
-                    )
-                    # 直近 10 本の OHLC 範囲統計も出力 (rolling_max_10 等の挙動把握用)
-                    if len(data["close"]) >= 10:
-                        last10_close = data["close"][-10:]
-                        last10_high = data["high"][-10:]
-                        last10_low = data["low"][-10:]
-                        self.logger.info(
-                            f"     ↳ 直近10本: close[max={last10_close.max():.4f}, "
-                            f"min={last10_close.min():.4f}], "
-                            f"high_max={last10_high.max():.4f}, "
-                            f"low_min={last10_low.min():.4f}"
-                        )
             except Exception as e:
-                self.logger.warning(f"  ⚠️ {tf_name:<5} smoke test 失敗: {e}")
-
-        self.logger.info("--- smoke test 完了 ---")
+                self.logger.error(f"❌ {tf_name} smoke test 例外: {e}")
 
     def get_max_lookback_for_all_timeframes(self) -> Dict[str, int]:
         return self.lookbacks_by_tf
@@ -1762,7 +1624,28 @@ class RealtimeFeatureEngine:
 
             # 1. M0.5バッファに新しいバーを追加
             # m05_dataframe はリサンプリング起点として使用
-            self.m05_dataframe.append(m05_bar)
+            # [DEDUP-M05DF 単調増加ガード / 支流(保険)] 末尾1本比較 (旧 == 実装) では
+            # warmup/live 境界の「バッチ再投入」(実機で 527 本オーバーラップ確認、
+            # 重複 1259 行・ユニーク重複時刻 577・出現位置間隔の主要値 527) を防げなかった。
+            # 直前 1 本としか比較しないため、527 本前の重複を擦り抜けて同一時刻 2 値が残り、
+            # M5 リサンプル close が分裂 → proxy(X) partial 混入 → OLS cov 崩壊を招いた。
+            # 新バー時刻が既存最新時刻「以下」なら過去/同一の再投入として拒否する
+            # (time series 単調増加原則)。実機の重複は全て既処理範囲の再投入で
+            # 新規時刻を含まないため <= は正当な新規バーを取りこぼさない。
+            # 復帰系 (clear→extend / load_state) は append を通らずこのガードの影響を
+            # 受けず、復帰後の live バーのみ昇順で通過する。
+            # 本流の根治は main.py の live ループ (g_last_processed_bar_time 前進) 側で、
+            # 本ガードは万一の二重投入再発に対する多層防御 (保険)。
+            if (
+                len(self.m05_dataframe) > 0
+                and m05_timestamp <= self.m05_dataframe[-1]["timestamp"]
+            ):
+                self.logger.debug(
+                    f"[DEDUP-M05DF] 非単調(<=last)の再投入をスキップ: "
+                    f"ts={m05_timestamp} last={self.m05_dataframe[-1]['timestamp']}"
+                )
+            else:
+                self.m05_dataframe.append(m05_bar)
             m05_bar_df = pd.DataFrame([m05_bar]).set_index("timestamp")
             self._append_bar_to_buffer("M0.5", m05_bar_df, market_proxy_cache)
 
@@ -2188,7 +2071,8 @@ class RealtimeFeatureEngine:
             # バッファ・状態の初期化
             if tf_name not in self.proxy_feature_buffers:
                 self.proxy_feature_buffers[tf_name] = {
-                    "market_proxy": deque(maxlen=OLS_WINDOW)
+                    "market_proxy": deque(maxlen=OLS_WINDOW),
+                    "__bar_ts__": deque(maxlen=OLS_WINDOW),  # [計測基盤] バー時刻並行記録
                 }
             if tf_name not in self.ols_state:
                 self.ols_state[tf_name] = {}
@@ -2242,6 +2126,12 @@ class RealtimeFeatureEngine:
 
             # x_dequeはループ後に1回だけ更新
             x_deque.append(latest_x)
+            # [計測基盤] このバーの時刻 (tz正規化済 close_ts = search_ts) を並行記録。
+            #   x_deque.append と同一地点なので length が常に一致する。
+            #   旧 state 復元で欠けている場合は setdefault で生成 (以後 append で同期)。
+            self.proxy_feature_buffers[tf_name].setdefault(
+                "__bar_ts__", deque(maxlen=OLS_WINDOW)
+            ).append(search_ts)
 
         except Exception as e:
             feat_name_safe = locals().get("feat_name", "<unknown>")
@@ -2303,7 +2193,23 @@ class RealtimeFeatureEngine:
                 alpha = mean_y - beta * mean_x
 
                 y_latest = float(latest_y) if np.isfinite(latest_y) else 0.0
-                val = y_latest - (beta * x_latest + alpha)
+                # ─────────────────────────────────────────────────────────────
+                # [純化撤去 / unpurified §11.34.14] proxy OLS 回帰 (Y − (β·X + α))
+                # を撤去し、生 Y をそのまま採用する恒等化 (β=0, α=0 と等価)。
+                # 学習側の恒等コピー 2_G_alpha_neutralizer_unpurified.py L327:
+                #     pl.col(base_name).cast(pl.Float64).fill_null(0.0)
+                # と中身を一致させる。上の y_latest が
+                #   float(latest_y) if np.isfinite(latest_y) else 0.0
+                # = Float64 化 + 非有限(=欠損相当)→0.0 を担い、学習側
+                # cast(Float64).fill_null(0.0) と整合する (engine QA で NaN/inf は
+                # 構造的に消滅済のため「非有限→0」と「fill_null(0)」は等価)。
+                # beta / x_latest / alpha は上で計算されるが、ここで一切参照しない
+                # ため出力に影響しない (proxy 非依存 = proxy 経由の train-serve skew
+                # 発生源が構造的に消滅)。proxy_feature_buffers / ols_state の充填は
+                # warmup 経路でそのまま走るが死んだ計算であり無害。proxy 機構の
+                # 物理削除 (クリーンアップ) は動作確認後の別段階で行う。
+                # ─────────────────────────────────────────────────────────────
+                val = y_latest
 
                 if np.isfinite(val):
                     neutralized_features[base_name] = val
@@ -2777,6 +2683,17 @@ class RealtimeFeatureEngine:
             self.proxy_feature_buffers = state_data.get(
                 "proxy_feature_buffers", self.proxy_feature_buffers
             )
+            # [計測基盤] 旧 state には __bar_ts__ が無い (または長さ不一致)。
+            #   market_proxy (= x_deque) と長さを揃えて None パディングし、 位置対応を
+            #   壊さない。 以後の _update_incremental_ols append で実時刻が入る。
+            for _tf, _bufs in self.proxy_feature_buffers.items():
+                _mp = _bufs.get("market_proxy")
+                if _mp is not None:
+                    _bt = _bufs.get("__bar_ts__")
+                    if _bt is None or len(_bt) != len(_mp):
+                        _bufs["__bar_ts__"] = deque(
+                            [None] * len(_mp), maxlen=_mp.maxlen
+                        )
             self.ols_state = state_data.get("ols_state", self.ols_state)
             self.qa_states = state_data.get("qa_states", self.qa_states)  # [乖離①修正]
 

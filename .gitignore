@@ -10,6 +10,8 @@ data/
 # VS Codeのワークスペース設定を無視します
 .vscode/
 
+# log関係
+logs/
 
 # ================== Python / Jupyter ==================
 # Pythonのキャッシュファイル

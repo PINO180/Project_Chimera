@@ -1,0 +1,32 @@
+使い方とその先の流れ
+前提
+S6_WEIGHTED_DATASET / year=2026/month=5/day=20/data.parquet および day=21/data.parquet が既に存在していること。
+これは:
+
+5/19〜5/21 を s1_0_X_filter で抽出
+s1_1_A → s1_1_B → s1_1_C → engine_1_A〜1_F → 2_G_alpha_neutralizer → create_proxy_labels → aggregate_daily_to_monthly → sample_uniqueness_weighting_calculate/join まで通したもの
+
+を意味します。「5/19-5/21 だけのフル学習側パイプライン」を回す必要があります。
+実行
+bash# 1. 推論
+cd /workspace
+python infer_period.py \
+    --start 2026-05-20 --end 2026-05-21 \
+    --out-dir /workspace/data/XAUUSD/stratum_7_models/infer_1day_20260520
+
+# 2. BT で同期間再現
+python backtest_simulator_cimera.py \
+    --oof-long-path  /workspace/.../infer_1day_20260520/m2_oof_predictions_long.parquet \
+    --oof-short-path /workspace/.../infer_1day_20260520/m2_oof_predictions_short.parquet \
+    --start-date 2026-05-20 --end-date 2026-05-21 \
+    (その他 BT パラメータ)
+検証ポイント
+A. M2 raw proba の本番ライブとの突き合わせ (これが最も重要)
+本番ログの:
+14:18:01,676 - 🧠 [Raw Proba] M1(L: 0.9901, S: 0.1057) -> M2(L: 0.9982, S: 0.0000)
+14:21:01,810 - 🧠 [Raw Proba] M1(L: 0.9916, S: 0.1218) -> M2(L: 0.9994, S: 0.0000)
+...
+を、infer_period.py 出力の timestamp=2026-05-20 05:18:00 UTC, timeframe=M3 の M1/M2 確率 (Long/Short) と比較。
+結果解釈一致 (誤差 < 1e-4)推論レベル乖離なし。乖離は特徴量計算より下流 (= リスク管理・約定処理) または BT 内のシミュレーション仕様不一致特徴量レベルで既に乖離。engine_1_A〜1_F / 純化経路 / Tick 入力 のどこかに本番固有の差分がある (= Shadow Test の盲点ど真ん中)
+B. BT 結果 (PF/勝率/TO 比率) の本番との突き合わせ
+A で一致した場合、BT を回して同 1 日の trade レコードと本番 MT5 レポートを比較。この時 BT と本番が違うなら、確実にリスク管理・約定処理側の問題。逆に BT と本番が一致するなら、Universal Brain の予測自体が「今日の相場で勝てない」だけ という結論になる (= プログラムは正常、市場が悪い)。

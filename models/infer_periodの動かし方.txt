@@ -1,0 +1,19 @@
+infer_period.py の入力は S6_WEIGHTED_DATASET の日次パーティションが存在していないと動かない。
+
+1broker → CSV エクスポートMT5 から XAUUSDm_*.csv5 分
+2s1_1_A_ingest.pyCSV → S1_RAW_TICK_PARQUET5-10 分
+3s1_1_B_build_ohlcv.py→ S1_MULTITIMEFRAME5 分
+4s1_1_C_enrich.py→ S1_PROCESSED5 分
+5engine_1_A.py 〜 engine_1_F.py→ S2_FEATURES20-30 分
+62_G_alpha_neutralizer.py→ S5_NEUTRALIZED_ALPHA_SET10-20 分
+7create_proxy_labels_polars_patch_regime_Universal_Brain_V5.py→ S6_LABELED_DATASET10 分
+8aggregate_daily_to_monthly.py→ S6_LABELED_DATASET_MONTHLY5 分
+9sample_uniqueness_weighting_calculate.py→ S3_CONCURRENCY_RESULTS5 分
+10sample_uniqueness_weighting_join.py→ S6_WEIGHTED_DATASET5 分
+11infer_period.py 実行→ infer_出力5 分
+
+bashpython infer_period.py \
+    --start 2026-05-25 --end 2026-05-25 \
+    --out-dir /workspace/data/XAUUSD/stratum_7_models/infer_20260525
+
+合計 約 1.5〜2 時間。学習データを汚さないために別ディレクトリで実行するなら、blueprint.py の SYMBOL を分けるなどの工夫が要る。

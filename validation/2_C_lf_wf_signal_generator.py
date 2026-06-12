@@ -16,6 +16,7 @@ LF環境スコア生成器（旧: 02_M1_walk_forward_validator.py の後継）
 """
 
 import sys
+import re  # [LOOKAHEAD-FIX] TF 判定用
 import warnings
 import argparse
 import logging
@@ -79,6 +80,64 @@ LGP_PARAMS = {
 # ─────────────────────────────────────────────
 # ユーティリティ
 # ─────────────────────────────────────────────
+
+# =============================================================================
+# [LOOKAHEAD-FIX §11.34.16] 高 TF 特徴量の「閉じたバー」再ラベル (2_C 版)
+# -----------------------------------------------------------------------------
+# 問題: 本スクリプトは全 TF (M0.5〜MN) の S2 ファイルを native グリッド
+#   (label=left = ラベル L のバー [L, L+tf)) のまま M1 価格に exact join していた。
+#   L273 の「全特徴量は M1 粒度」というコメントは事実と異なる (実測: 14TF 混在)。
+#   行 T の行動地平は M1 close (= T+60s) なので、tf > 60s の特徴量は境界行で
+#   形成中バー (D1 なら最大丸 1 日分の未来) を含み、LF ターゲット
+#   (close.shift で数時間先) の答えを内包する lookahead だった。
+#   create_proxy_labels の同ラベル結合リーク (§11.34.16) と同型。
+# 対処: tf > ACTION_HORIZON_SEC_2C (=60s、M1 地平) の TF を index シフト
+#   (各バーの値を「次のバーのラベル」に割当) で閉じたバー基準に再ラベルする。
+#   index シフトはギャップ (週末) 越しでも「ラベル L = L 時点で閉じている
+#   最新バー」を保証し、可変長 TF (MN) でも破綻しない。
+# =============================================================================
+ACTION_HORIZON_SEC_2C = 60  # 行動地平 = M1 close (本スクリプトのベース粒度)
+
+_TF_SECONDS_RE_M = re.compile(r"M(\d+(?:\.\d+)?)$")
+_TF_SECONDS_RE_H = re.compile(r"H(\d+(?:\.\d+)?)$")
+_TF_SECONDS_RE_W = re.compile(r"W(\d+)$")
+
+
+def _tf_to_seconds_2c(timeframe: str) -> "int | None":
+    """シフト要否判定用の TF 秒数 ('MN' は判定用下限値)。未知は None。"""
+    m = _TF_SECONDS_RE_M.fullmatch(timeframe)
+    if m:
+        return int(float(m.group(1)) * 60)
+    m = _TF_SECONDS_RE_H.fullmatch(timeframe)
+    if m:
+        return int(float(m.group(1)) * 3600)
+    m = _TF_SECONDS_RE_W.fullmatch(timeframe)
+    if m:
+        return int(m.group(1)) * 604800
+    if timeframe == "MN":
+        return 28 * 86400
+    return None
+
+
+def _shift_high_tf_to_closed_bar_2c(part: pl.LazyFrame, timeframe: str) -> pl.LazyFrame:
+    """tf > 60s の TF を閉じたバー基準に index シフト再ラベルする (詳細は上記)。"""
+    tf_sec = _tf_to_seconds_2c(timeframe)
+    if tf_sec is None:
+        logger.info(
+            f"  [LOOKAHEAD-FIX] 未知の TF '{timeframe}' — シフト判定不能のため通過 (要確認)"
+        )
+        return part
+    if tf_sec <= ACTION_HORIZON_SEC_2C:
+        return part  # M0.5/M1: 既に因果的
+    logger.info(
+        f"  [LOOKAHEAD-FIX] TF={timeframe} を閉じたバー基準に再ラベル (index シフト)"
+    )
+    return (
+        part.sort("timestamp")
+        .with_columns(pl.col("timestamp").shift(-1).alias("timestamp"))
+        .filter(pl.col("timestamp").is_not_null())
+    )
+
 
 def classify_features_by_group(feature_names: list[str]) -> dict[str, list[str]]:
     """
@@ -375,6 +434,8 @@ def main(test_mode: bool) -> None:
             .rename(rename_map)
             .with_columns([pl.col(c).cast(pl.Float32) for c in suffixed_cols])  # ルール8
         )
+        # [LOOKAHEAD-FIX §11.34.16] tf > 60s を閉じたバー基準に再ラベル
+        part = _shift_high_tf_to_closed_bar_2c(part, tf)
         lf_parts.append(part)
         loaded_suffixed_cols.update(suffixed_cols)
 

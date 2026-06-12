@@ -1,0 +1,49 @@
+"python /workspace/backtest_simulator/backtest_simulator_cimera.py \
+    --initial-capital 200 \
+    --start-date 2026-05-03 --end-date 2026-06-06 \
+    --oof-long /workspace/data/XAUUSD/stratum_7_models/infer_20260503_20260606/m2_oof_predictions_long.parquet \
+    --oof-short /workspace/data/XAUUSD/stratum_7_models/infer_20260503_20260606/m2_oof_predictions_short.parquet
+
+python /workspace/models/infer_period.py \
+    --start 2026-05-03 --end 2026-06-06 \
+    --out-dir /workspace/data/XAUUSD/stratum_7_models/infer_20260503_20260606
+
+
+① dump付き dry-run（本番側 C と OLS state を生成）
+main.py を --dry-run --ols-dump で起動。
+発注skip、OLS state は実機通り更新、シグナル発火時に state+deque を pickle dump。
+
+
+cd /workspace && python3 /workspace/main.py --dry-run --ols-dump
+
+② 学習側パイプライン（Step 1-16、A・B の素材を生成）
+
+
+cd /workspace && bash run_ols_diagnosis_pipeline_unpurified.sh
+
+
+③ snapshot 生成（A=純化前 + B=純化後 を1ファイルに）
+
+cd /workspace && python3 /workspace/models/snapshot_training_inference_with_pre_ols.py \
+  --start 2026-06-05 --end 2026-06-05 \
+  --start-time 11:54:00 --end-time 20:24:00 \
+  --out /workspace/data/diagnostics/training_snapshot_with_pre_ols_20260605_pm.parquet \
+  --m2-proba 0.70 --m2-delta 0.30 --min-atr 0.80
+
+④ compare_3way_unpurified.py(特徴量レベル検証)
+cd /workspace && python3 /workspace/models/compare_3way_unpurified.py \
+  --training /workspace/data/diagnostics/training_snapshot_with_pre_ols_20260605_pm.parquet \
+  --production /workspace/logs/triggered_features_log.csv \
+  --start "2026-06-05 11:54:00" --end "2026-06-05 20:24:00" \
+  --out-dir /workspace/data/diagnostics/compare_3way_unpurified_v1 \
+  --dump-raw "e1d_force_index_norm_neutralized_M0.5"
+
+引数は純化版compare_3way_ols.pyと完全に同じ。
+BC_corr 0.86→0.95+、BC_rel 0.37→0.05以下になればPASS。
+
+⑤ compare_prediction_live_vs_infer.py(予測レベル検証)
+cd /workspace && python3 /workspace/models/compare_prediction_live_vs_infer.py \
+  --live /workspace/logs/m1_m2_predictions_log.csv \
+  --infer-dir <infer_periodの出力dir> \
+  --start "2026-06-05 11:54:00" --end "2026-06-05 20:24:00" \
+  --out-dir /workspace/data/diagnostics/prediction_compare_v1
