@@ -139,19 +139,9 @@ def _numba_find_hits_dual(
     ticks_ts: np.ndarray,
     ticks_high: np.ndarray,
     ticks_low: np.ndarray,
-    entry_offset_us: np.int64,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Numba JIT compiled function to find barrier hits for BOTH Long and Short simultaneously.
-
-    [LOOKAHEAD-FIX §11.34.16] entry_offset_us:
-      t0 はトリガー行のラベル L (バー開始時刻)。エントリーはバーの close
-      (= L + ACTION_HORIZON_SEC、価格もその時点の close) で行われるため、
-      バリア走査はエントリー時刻 (t0 + entry_offset_us) より後の tick から
-      開始しなければならない。旧実装は t0 直後から走査しており、
-      エントリー前 3 分間の tick (エントリー時点ではまだ取引が存在しない) が
-      PT/SL 判定に混入していた → PT1.0 側に楽観バイアス。
-      BT (エントリー後のバーのみで判定) / 本番 (発注後の価格のみ) と整合させる。
     """
     n_bets = len(bets_t0)
     n_ticks = len(ticks_ts)
@@ -179,10 +169,9 @@ def _numba_find_hits_dual(
 
         # --- 修正前 ---
         # start_idx = np.searchsorted(ticks_ts, t0, side="left")
-        # start_idx = np.searchsorted(ticks_ts, t0, side="right")  # 旧: ラベル直後から走査
 
-        # --- [LOOKAHEAD-FIX §11.34.16] エントリー時刻 (t0 + offset) より後から走査 ---
-        start_idx = np.searchsorted(ticks_ts, t0 + entry_offset_us, side="right")
+        # --- 修正後 ---
+        start_idx = np.searchsorted(ticks_ts, t0, side="right")
 
         # ヒットしたタイムスタンプを記録する変数
         pt_l_found = np.int64(0)
@@ -381,11 +370,6 @@ class ProxyLabelingEngine:
                 if lf is not None:
                     lf_renamed = self._rename_features(lf, timeframe_suffix)
                     if lf_renamed is not None:
-                        # [JOINASOF-FIX §11.34.16-O2] 旧 index シフトは撤去。
-                        # 高TF/低TF の足選択は後段の close_ts ベース join_asof で
-                        # 統一的に行う (index シフトは 1 対多=ffill を表現できず
-                        # M5/M8/M15 を実質スパースにしていた)。ここでは縦持ち
-                        # (timeframe 列付与) のまま渡す。
                         all_lazy_frames_hive.append(
                             lf_renamed.with_columns(
                                 pl.lit(timeframe).alias("timeframe")
@@ -419,7 +403,6 @@ class ProxyLabelingEngine:
                 if lf is not None:
                     lf_renamed = self._rename_features(lf, timeframe_suffix)
                     if lf_renamed is not None:
-                        # [JOINASOF-FIX §11.34.16-O2] 旧 index シフトは撤去 (上記 hive 側と同旨)
                         all_lazy_frames_file.append(
                             lf_renamed.with_columns(
                                 pl.lit(timeframe).alias("timeframe")
@@ -445,153 +428,6 @@ class ProxyLabelingEngine:
             logging.warning(f"No S5 non-tick data found for {TARGET_TIMEFRAMES}.")
 
         return unified_hive_lf, unified_file_lf
-
-    # =========================================================================
-    # [LOOKAHEAD-FIX §11.34.16] 高 TF 特徴量の「閉じたバー」再ラベル
-    # -------------------------------------------------------------------------
-    # 問題: 全 TF を label=left のまま diagonal concat → group_by(timestamp) で
-    #   同ラベル融合すると、行 L (行動時刻 = L + ACTION_HORIZON_SEC) に
-    #   「ラベル L のバー [L, L+tf)」の特徴量が乗る。tf > ACTION_HORIZON_SEC の
-    #   TF (M5/M8/M15) ではバーのクローズ (L+tf) が行動時刻より未来になり、
-    #   学習特徴量に最大 tf-180 秒の未来情報が混入していた (M5:+2分/M8:+5分/M15:+12分)。
-    #   実証: S6 境界行の M15 wick 値 = 形成中バー [L, L+15分) の値と 17/17 bit 一致
-    #   (2026-06-11 検証、レポート §11.34.16)。
-    # 対処: tf > ACTION_HORIZON_SEC の TF のみ timestamp を +tf シフトし、
-    #   ラベル L に「L で閉じたバー [L-tf, L)」を割り当てる。
-    #   → 行動時刻 L+180 で完全に閉じた情報のみになる (因果的)。
-    #   → 本番は最新の閉じたバーを常に持つため、初めて学習を 100% 再現可能になる
-    #     (main.py HF-NB-GATE の minute_idx を T-180 基準に直す修正とセット)。
-    # 注意:
-    #   - M0.5/M1/M3 (tf <= 180s) はシフト禁止。これらはデータ到達点が行動時刻
-    #     以下で既に因果的であり、シフトすると 1 本古い情報になり本番とズレる。
-    #   - シフト後もグリッドは不変 (M15 ラベルは 900 の倍数のまま) なので、
-    #     値が乗る行 (境界行) は変わらず、値の中身だけが閉じたバーになる。
-    #   - 価格系 (entry/barrier 用 close/high/low) は S1_PROCESSED から別経路で
-    #     取得しており (_load_all_price_data → price_window)、本シフトの影響なし。
-    # =========================================================================
-    ACTION_HORIZON_SEC = 180  # トリガー行の行動猶予 = TARGET_TIMEFRAMES の TF 秒数
-    #   (TARGET_TIMEFRAMES を M3 以外に変える場合はここも合わせて変更すること)
-
-    @staticmethod
-    def _tf_to_seconds(timeframe: str) -> Optional[int]:
-        """'M0.5'→30, 'M15'→900, 'H1'→3600, 'W1'→604800, 'MN'→約28日。未知形式は None。
-        ※ [JOINASOF-FIX §11.34.16-O2] close_ts = ラベル + tf_sec の計算に使用。
-           M0.5〜M15 は厳密値が必要 (MN は判定用近似だが LF はモデル不使用)。"""
-        m = re.fullmatch(r"M(\d+(?:\.\d+)?)", timeframe)
-        if m:
-            return int(float(m.group(1)) * 60)
-        m = re.fullmatch(r"H(\d+(?:\.\d+)?)", timeframe)
-        if m:
-            return int(float(m.group(1)) * 3600)
-        m = re.fullmatch(r"W(\d+)", timeframe)
-        if m:
-            return int(m.group(1)) * 604800
-        m = re.fullmatch(r"D(\d+)", timeframe)
-        if m:
-            return int(m.group(1)) * 86400  # D系: 念のため対応 (LF は通常 S5 不在)
-        if timeframe == "MN":
-            return 28 * 86400  # 月足: 可変長だが判定用の下限値で十分
-        return None
-
-    def _join_tf_to_triggers_asof(
-        self,
-        trigger_df: pl.DataFrame,
-        tf_feat_df: pl.DataFrame,
-        timeframe: str,
-        feat_cols: List[str],
-    ) -> pl.DataFrame:
-        """[案 2 §11.34.16-Q] TF 足をトリガー行に割付。高 TF はスパース、低 TF は held。
-
-        Q 節の BT 結果 (高 TF held=Y はスパース=X よりリスク構造劣位・AUC 同一) を受け、
-        TF タイプで割付方式を分岐する:
-          - 高 TF (tf > ACTION_HORIZON, M5/M8/M15): index シフト + exact join =
-            「境界だけ実値・他 0」 のスパース表現 (本番 HF-NB-GATE と一致)。X を維持。
-          - 低 TF (tf < ACTION_HORIZON, M0.5/M1): join_asof(backward, close_ts<=T) =
-            「T で閉じた最新足」 を割付。本番 rfe L214 と一字一句一致し、足選択ズレ
-            (M0.5=5 本/M1=2 本) を解消。低 TF は毎トリガーで値が変わるため held の
-            連続エントリー慣性は生じない。
-          - トリガー TF (tf == ACTION_HORIZON, M3): ラベル exact 一致 ([L,L+180) の
-            close=L+180=T、本番と同一)。
-
-        低 TF の join_asof は本番一致:
-          - 各 TF 足のクローズ時刻 close_ts = ラベル + tf_sec
-          - トリガーのエントリー時刻 T = ラベル(L_m3) + ACTION_HORIZON_SEC
-          - join_asof(left=T, right=close_ts, backward) = 「close_ts <= T の最新足」
-        単体検証済み (verified_joinasof_logic.py): M1 全行で期待ラベル一致、lookahead 違反 0。
-
-        Args:
-            trigger_df: [timestamp] (= M3 ラベル L_m3、本関数内でソート)
-            tf_feat_df: [timestamp(=足ラベル)] + feat_cols (本関数内でソート)
-            timeframe:  当該 TF 名
-            feat_cols:  結合する特徴量列 (TF サフィックス付き、例 e1d_xxx_M15)
-        Returns:
-            trigger_df の各行に feat_cols を割付した DataFrame (高 TF=スパース/低 TF=held)。
-        """
-        tf_sec = self._tf_to_seconds(timeframe)
-        if tf_sec is None:
-            logging.warning(
-                f"  [JOINASOF-FIX] 未知の TF '{timeframe}' — 割付スキップ (要確認)"
-            )
-            return trigger_df
-
-        if tf_sec == self.ACTION_HORIZON_SEC:
-            # トリガー TF (M3): ラベル exact 一致
-            return trigger_df.join(
-                tf_feat_df.select(["timestamp"] + feat_cols), on="timestamp", how="left"
-            )
-
-        if tf_sec > self.ACTION_HORIZON_SEC:
-            # ════════════════════════════════════════════════════
-            # [案 2 §11.34.16-Q] 高 TF (M5/M8/M15) は X (スパース) を維持。
-            # Q 節 BT で held(Y) より X(スパース) がリスク構造優位 (MaxDD 4.80<6.79%、
-            # 連敗 2<3) かつ AUC 同一と判明したため、高 TF は旧 index シフト方式に戻す。
-            # ────────────────────────────────────────────────────
-            # index シフト (shift(-1)) で「ラベル L の行 = L 時点で閉じた最新バー」 に
-            # した上で、トリガー (M3 グリッド) に exact join。M3 グリッド (180s) と
-            # 高 TF グリッド (300/480/900s) の交点だけ実値が乗り、非交点は null
-            # (後段 fill_null(0) で 0)。これが本番 HF-NB-GATE (非境界 0 化) と一致する
-            # スパース表現。held(join_asof backward) と違い「境界だけ実値」 になる。
-            # ※ 本番側は main.py の HF-NB-GATE 復活とセット (学習スパース=本番スパース)。
-            # ════════════════════════════════════════════════════
-            shifted = (
-                tf_feat_df.sort("timestamp")
-                .with_columns(pl.col("timestamp").shift(-1).alias("timestamp"))
-                .filter(pl.col("timestamp").is_not_null())
-                .select(["timestamp"] + feat_cols)
-            )
-            return trigger_df.join(shifted, on="timestamp", how="left")
-
-        # 低 TF (M0.5/M1, tf < 180): close_ts <= T の最新足を join_asof(backward)。
-        # 本番 (rfe latest_features_cache: close_ts<=確定時刻の最新足) と足選択一致。
-        # 低 TF は毎トリガーで値が変わる (M3 以下で必ず新足が確定) ため、held による
-        # 連続エントリー慣性 (高 TF の Y で問題化) は生じず、純粋に足選択の正解化のみ。
-        tf2 = (
-            tf_feat_df.with_columns(
-                (pl.col("timestamp") + pl.duration(seconds=tf_sec)).alias("close_ts")
-            )
-            .sort("close_ts")
-            .select(["close_ts"] + feat_cols)
-        )
-        trig2 = trigger_df.with_columns(
-            (pl.col("timestamp") + pl.duration(seconds=self.ACTION_HORIZON_SEC)).alias(
-                "_T"
-            )
-        ).sort("_T")
-        joined = trig2.join_asof(
-            tf2, left_on="_T", right_on="close_ts", strategy="backward"
-        )
-        # [lookahead 監査] join_asof が引いた close_ts は必ず <= _T のはず (backward の定義)。
-        # 念のため明示検査 (2_G の同時刻=未来バー混入の再発防止)。
-        if "close_ts" in joined.columns:
-            viol = joined.filter(
-                pl.col("close_ts").is_not_null() & (pl.col("close_ts") > pl.col("_T"))
-            ).height
-            if viol > 0:
-                raise RuntimeError(
-                    f"[JOINASOF-FIX] LOOKAHEAD VIOLATION: TF={timeframe} で "
-                    f"{viol} 行が close_ts > T。結合キー/方向を確認せよ。"
-                )
-        return joined.select(["timestamp"] + feat_cols).sort("timestamp")
 
     def _rename_features(
         self, lf: pl.LazyFrame, timeframe_suffix: str
@@ -870,67 +706,6 @@ class ProxyLabelingEngine:
                 )
 
                 # =====================================================
-                # [JOINASOF-FIX §11.34.16-O2] 月次の縦持ち TF フレームを準備。
-                # join_asof 割付は日初トリガーが前日夜の高TF足を引く必要があるため、
-                # TF 特徴量は月次チャンク全体を使う (トリガー行は日次)。
-                # ※ unified_*_lf は全期間 LazyFrame のため、月初の held 窓〜月末に
-                #   絞ってから collect する (全期間フルマテリアライズの OOM/低速を回避)。
-                #   月初トリガーが前月末の足を引くのに必要な遡り = 最大 held 窓。
-                #   モデル使用 TF は M15 (900s) までだが、年末年始等の連休が月境界に
-                #   重なる極端ケースまで安全に潰すため 4 日遡る (コストはほぼゼロ)。
-                # =====================================================
-                _held_lookback = dt.timedelta(days=4)
-                _win_start = month_start - _held_lookback
-                _monthly_hive_df = (
-                    unified_hive_lf.filter(
-                        pl.col("timestamp").is_between(_win_start, month_end)
-                    ).collect()
-                    if "timestamp" in unified_hive_lf.collect_schema().names()
-                    else pl.DataFrame()
-                )
-                _monthly_file_df = (
-                    unified_file_lf.filter(
-                        pl.col("timestamp").is_between(_win_start, month_end)
-                    ).collect()
-                    if "timestamp" in unified_file_lf.collect_schema().names()
-                    else pl.DataFrame()
-                )
-                _monthly_bets_df = pl.concat(
-                    [_monthly_hive_df, _monthly_file_df], how="diagonal"
-                )
-                # TF 別の特徴量フレームを事前に分離 (timeframe 列で振り分け、月次・ソート済)。
-                # 各 TF: [timestamp(=足ラベル)] + その TF の特徴量列 (他 TF 由来の全 null 列は drop)。
-                # ※ [複製バグ修正 §11.34.16-O2] S5 は 6 エンジン×6TF=36 ファイルを縦積みのため、
-                #   同一 TF 内に同一 timestamp が複数エンジン分 (最大 6 行) 存在する。
-                #   各行は自エンジンの列だけ実値・他 null。これを group_by(timestamp).first()
-                #   で 1 行に集約しないと、後段の join_asof が 1 トリガーを 6 倍 (6TF で 36 倍)
-                #   に複製する。従来の group_by("timestamp").agg(first()) が担っていた
-                #   「エンジン横断の集約」 をここで TF 別に復元する (TF 融合は join_asof が担当)。
-                _monthly_tf_frames: Dict[str, pl.DataFrame] = {}
-                if not _monthly_bets_df.is_empty():
-                    for _tf_name in _monthly_bets_df["timeframe"].unique().to_list():
-                        _sub = (
-                            _monthly_bets_df.filter(pl.col("timeframe") == _tf_name)
-                            .drop("timeframe")
-                            .sort("timestamp")
-                        )
-                        # 全 null 列 (他 TF 由来) を除外して当該 TF の実特徴量列のみ残す
-                        _nonnull_cols = [
-                            c
-                            for c in _sub.columns
-                            if c == "timestamp" or _sub[c].null_count() < _sub.height
-                        ]
-                        _sub = _sub.select(_nonnull_cols)
-                        # [複製バグ修正] 同一 timestamp の複数エンジン行を 1 行に集約
-                        # (各列の non-null 先頭値を拾う)。これで timestamp が一意になり、
-                        # join_asof が 1 トリガー = 1 行を保つ。
-                        _monthly_tf_frames[_tf_name] = (
-                            _sub.group_by("timestamp")
-                            .agg(pl.all().drop_nulls().first())
-                            .sort("timestamp")
-                        )
-
-                # =====================================================
                 # 内側ループ：日次処理（既存ロジックをそのまま維持）
                 # =====================================================
                 for row in days_in_month.iter_rows(named=True):
@@ -978,26 +753,19 @@ class ProxyLabelingEngine:
                         .unique()
                     )
 
-                    # 2-3. [JOINASOF-FIX §11.34.16-O2] 各 TF を close_ts ベース join_asof で
-                    # トリガー行に割付 (group_by 同一timestamp融合を置換)。
-                    # 本番 (rfe latest_features_cache: close_ts<=確定時刻の最新足を ffill)
-                    # と一字一句一致。トリガー行 = 当日の M3 ラベル、TF 特徴量 = 月次フレーム。
-                    _trigger_rows = (
-                        valid_targets_df.select("timestamp").unique().sort("timestamp")
+                    # 2. 全時間足の特徴量をtimestampごとに1行に集約
+                    # （forward_fillは未来情報リークのリスクがあるため削除、group_by+aggの重複排除は維持）
+                    master_features_df = (
+                        raw_bets_df.drop("timeframe")
+                        .group_by("timestamp")
+                        .agg(pl.all().drop_nulls().first())
+                        .sort("timestamp")
                     )
-                    daily_bets_df = valid_targets_df.sort(["timeframe", "timestamp"])
-                    for _tf_name, _tf_frame in _monthly_tf_frames.items():
-                        _feat_cols = [c for c in _tf_frame.columns if c != "timestamp"]
-                        if not _feat_cols:
-                            continue
-                        _assigned = self._join_tf_to_triggers_asof(
-                            _trigger_rows, _tf_frame, _tf_name, _feat_cols
-                        )
-                        # トリガー行 (timestamp) に当該 TF 特徴量を結合 (全ターゲット行へ)
-                        daily_bets_df = daily_bets_df.join(
-                            _assigned, on="timestamp", how="left"
-                        )
-                    daily_bets_df = daily_bets_df.sort(["timeframe", "timestamp"])
+
+                    # 3. 集約済み特徴量を各ターゲット時間足行に結合
+                    daily_bets_df = valid_targets_df.join(
+                        master_features_df, on="timestamp", how="left"
+                    ).sort(["timeframe", "timestamp"])
 
                     if daily_bets_df.is_empty():
                         continue
@@ -1104,19 +872,11 @@ class ProxyLabelingEngine:
             td_long_minutes = self._get_duration_in_minutes(RULE_LONG["td"])
             td_short_minutes = self._get_duration_in_minutes(RULE_SHORT["td"])
 
-            # [LOOKAHEAD-FIX §11.34.16] TD の基点をラベル(timestamp=L)から
-            # エントリー時刻 (L + ACTION_HORIZON_SEC) に変更。
-            # 旧実装は L+TD で打ち切っており、TD30分 が実質「エントリー後27分」
-            # になっていた (BT/本番はエントリー後 TD 分で判定するため不整合)。
-            t1_max_long_expr = (
-                pl.col("timestamp")
-                + pl.duration(seconds=self.ACTION_HORIZON_SEC)
-                + pl.duration(minutes=td_long_minutes)
+            t1_max_long_expr = pl.col("timestamp") + pl.duration(
+                minutes=td_long_minutes
             )
-            t1_max_short_expr = (
-                pl.col("timestamp")
-                + pl.duration(seconds=self.ACTION_HORIZON_SEC)
-                + pl.duration(minutes=td_short_minutes)
+            t1_max_short_expr = pl.col("timestamp") + pl.duration(
+                minutes=td_short_minutes
             )
 
             atr_col_name = f"e1c_atr_{ATR_PERIOD}_{timeframe}"
@@ -1227,7 +987,6 @@ class ProxyLabelingEngine:
                 ticks_ts_np,
                 ticks_high_np,
                 ticks_low_np,
-                np.int64(self.ACTION_HORIZON_SEC * 1_000_000),  # [LOOKAHEAD-FIX] エントリーオフセット(us)
             )
 
             # 計算済みトリガー行の DataFrame 作成

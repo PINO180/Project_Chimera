@@ -159,10 +159,8 @@ def _run_gap_fill(
 
     logger.info(f"[GAP-FILL] ギャップ {diff_minutes} 分を M0.5 で穴埋めします...")
 
-    # [GAP-FIX 要修正①] gap-fill も有界リトライで包む (層2 の一過性 None で未充填続行に
-    # ならないよう自己回復させる)。長期 GAP-FILL の転送脆弱性対策。
-    diff_df = _request_historical_with_retry(
-        bridge,
+    diff_df = bridge.request_historical_data(
+        symbol=STRATEGY_SYMBOL,
         timeframe_name="M0.5",
         lookback_bars=diff_minutes * 2 + 60,
     )
@@ -260,142 +258,6 @@ def _run_gap_fill(
     return _new_last_ts
 
 
-def _request_historical_with_retry(
-    bridge: "MQL5BridgePublisherV3",
-    timeframe_name: str,
-    lookback_bars: int,
-    max_retries: int = 3,
-) -> Optional[pd.DataFrame]:
-    """[GAP-FIX §11.34.16-T 要修正①] bridge.request_historical_data を有界リトライで包む。
-
-    層2 (bridge 側 received==total 照合) は転送が不完全なら None を返す。これにより
-    13 万本の長期 GAP-FILL で 1 チャンクでも欠けると None → 呼び出し側が起動中止する
-    回帰が生じる (転送量が大きいほどヒカップ確率が上がるため長期 GAP-FILL で顕著)。
-    一過性の不完全転送は再取得すれば回復するので、ここで有界リトライして自己回復させる。
-    本物のデータ欠損 (週末/休場) は何度取っても None なので、リトライ尽きたら None を返す
-    (呼び出し側の従来挙動 = warmup なら中止 / gap-fill なら未充填続行 に委ねる)。
-    """
-    for _attempt in range(1, max_retries + 1):
-        try:
-            # [HEARTBEAT-FIX §11.34.16-U] バルク取得中は EA が巨大 CopyTicksRange で
-            # ブロックし heartbeat PONG を返せない。warmup_guard で囲み、この間の
-            # heartbeat timeout を「EA 再起動」と誤検知させない (gap-fill 連発を防ぐ)。
-            with bridge.warmup_guard():
-                _df = bridge.request_historical_data(
-                    symbol=STRATEGY_SYMBOL,
-                    timeframe_name=timeframe_name,
-                    lookback_bars=lookback_bars,
-                )
-        except Exception as _e:
-            logger.warning(
-                f"[GAP-FIX] バルク取得 {timeframe_name} 試行{_attempt}/{max_retries} 例外: {_e}"
-            )
-            _df = None
-        if _df is not None and len(_df) > 0:
-            if _attempt > 1:
-                logger.info(
-                    f"[GAP-FIX] バルク取得 {timeframe_name} は試行{_attempt}で成功 "
-                    f"({len(_df)} 行)。一過性の不完全転送を自己回復。"
-                )
-            return _df
-        logger.warning(
-            f"[GAP-FIX] バルク取得 {timeframe_name} 試行{_attempt}/{max_retries} "
-            f"が None/空 (層2 の完全性照合 NG か転送失敗)。リトライ。"
-        )
-    logger.error(
-        f"[GAP-FIX] バルク取得 {timeframe_name} が {max_retries} 回とも失敗。"
-        f"呼び出し側の None ハンドリングに委ねる。"
-    )
-    return None
-
-
-def _refetch_m05_range(
-    bridge: "MQL5BridgePublisherV3",
-    gap_start_ut: int,
-    gap_end_ut: int,
-    max_retries: int = 3,
-) -> List[Dict[str, Any]]:
-    """[GAP-FIX §11.34.16-T 層3] 欠損 M0.5 区間 [gap_start, gap_end] を MT5 から
-    pinpoint 再取得し、時系列順の bar dict リストを返す。
-
-    本物の取りこぼし (EA 境界落ち等) は MT5 履歴に実在する (S1 に volume>0 で存在)
-    ので再取得は必ず成功する。一過性 ZMQ ブリップは有界リトライ (max_retries) で
-    吸収する。取得不能 = 正規市場ギャップ (週末/休場) で、その場合は S1 にも足が
-    無く埋める対象でないため空リストを返す (呼び出し側はそのまま流す)。
-
-    Args:
-        gap_start_ut / gap_end_ut: 欠損区間の端 (unixtime 秒、両端含む)
-    Returns:
-        [gap_start, gap_end] の M0.5 bar dict リスト (時系列順、V=0 除外済み)。
-        取得できなければ空リスト。
-    """
-    _span_sec = max(0, gap_end_ut - gap_start_ut)
-    _need_bars = int(_span_sec / 30) + 1  # 30 秒足
-    # 端の取りこぼしに備え少し広めに取得 (前後 +60 本)、後で区間で絞る
-    _lookback = _need_bars + 120
-    for _attempt in range(1, max_retries + 1):
-        _fetch_ok = False
-        try:
-            _df = bridge.request_historical_data(
-                symbol=STRATEGY_SYMBOL,
-                timeframe_name="M0.5",
-                lookback_bars=_lookback,
-            )
-        except Exception as _e:
-            logger.warning(f"[GAP-FIX] 再取得 試行{_attempt}/{max_retries} 例外: {_e}")
-            _df = None
-        if _df is not None and not _df.empty:
-            _fetch_ok = True  # 取得自体は成功 (中身が区間外でも transfer は成立)
-            _d = _df.copy()
-            _d["timestamp"] = pd.to_datetime(_d["timestamp"], utc=True)
-            # V=0 除外 (学習側 filter(tick_count>0) と整合)
-            if "volume" in _d.columns:
-                _d = _d[_d["volume"] > 0]
-            # 欠損区間だけに絞る
-            _s = datetime.fromtimestamp(gap_start_ut, timezone.utc)
-            _e2 = datetime.fromtimestamp(gap_end_ut, timezone.utc)
-            _d = _d[(_d["timestamp"] >= _s) & (_d["timestamp"] <= _e2)].sort_values(
-                "timestamp"
-            )
-            if not _d.empty:
-                _bars = []
-                for _ts, _row in _d.set_index("timestamp").iterrows():
-                    _bars.append(
-                        {
-                            "timestamp": _ts,
-                            "open": float(_row["open"]),
-                            "high": float(_row["high"]),
-                            "low": float(_row["low"]),
-                            "close": float(_row["close"]),
-                            "volume": float(_row["volume"]),
-                        }
-                    )
-                logger.info(
-                    f"[GAP-FIX] 欠損区間 {_s}〜{_e2} を再取得: {len(_bars)} 本 "
-                    f"(試行{_attempt}/{max_retries})。"
-                )
-                return _bars
-        # [GAP-FIX 空即打ち切り] 取得自体が成功している (transfer OK) のに区間に該当
-        # バーが無い = MT5 にそのバーが存在しない = 正規市場ギャップ。再試行しても結果は
-        # 同じなので即打ち切る (再開が綺麗な日のクローズ tail 空振り 3 回を 1 回に削減)。
-        # 取得自体が失敗 (None/例外) の場合のみ ZMQ ブリップの可能性があるのでリトライ継続。
-        if _fetch_ok:
-            logger.info(
-                f"[GAP-FIX] 区間 [{gap_start_ut},{gap_end_ut}] に該当バーなし "
-                f"(取得は成功・MT5 に不在=正規ギャップ)。即スキップ。"
-            )
-            return []
-        logger.warning(
-            f"[GAP-FIX] 再取得 試行{_attempt}/{max_retries}: 取得失敗 (None/例外)。リトライ。"
-        )
-    # 有界リトライ尽きた = 取得自体が繰り返し失敗 (ZMQ 不調等)
-    logger.warning(
-        f"[GAP-FIX] 欠損区間 [{gap_start_ut},{gap_end_ut}] は {max_retries} 回とも取得失敗。"
-        f"穴埋めをスキップ。"
-    )
-    return []
-
-
 def initialize_data_buffer(
     engine: RealtimeFeatureEngine,
     bridge: MQL5BridgePublisherV3,  # [V11.0] V3を使用
@@ -443,10 +305,8 @@ def initialize_data_buffer(
     )
 
     # ✨ [V12.0] ZMQ リクエスト (PULLによるストリーミング受信)
-    # [GAP-FIX 要修正①] 有界リトライで包み、層2 の完全性照合 NG による一過性 None で
-    # 起動中止しないようにする (長期 GAP-FILL の転送脆弱性に対する自己回復)。
-    df_rates_m05 = _request_historical_with_retry(
-        bridge,
+    df_rates_m05 = bridge.request_historical_data(
+        symbol=STRATEGY_SYMBOL,
         timeframe_name=tf_name,
         lookback_bars=lookback,
     )
@@ -1008,22 +868,6 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     >= _BUFFER_CHECK_INTERVAL_SEC
                 ):
                     last_buffer_check_time = current_time_sec
-                    # [GAP-FIX §11.34.16-T 層3] rfe 単一入口が検知した M0.5 欠損を吸い上げる。
-                    # 通常は上流の「流す前の連続性保証」(L1100 付近) で穴は発生しないが、
-                    # それを抜けて検知された場合はここで記録 (監視用)。バッファには既に
-                    # 穴が入っているため、次回 BUFFER-INTEGRITY gap-fill / スナップショット
-                    # 復帰時の連続性保証で埋め直される (deque 末尾 append では過去穴を
-                    # その場で直せないため、ログで可視化し再発を監視する)。
-                    try:
-                        _rfe_gaps = feature_engine.pop_detected_m05_gaps()
-                        if _rfe_gaps:
-                            logger.warning(
-                                f"⚠️ [GAP-FIX] rfe が M0.5 欠損 {len(_rfe_gaps)} 区間を検知 "
-                                f"(上流の連続性保証をすり抜け): {_rfe_gaps[:3]}。"
-                                f"次回 gap-fill/復帰で埋め直し対象。"
-                            )
-                    except Exception:
-                        pass
                     _m3_silence_sec = current_time_sec - last_m3_received_time
                     if (
                         _m3_silence_sec > 360  # M3 間隔(180s) × 2
@@ -1252,80 +1096,6 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                 # フィルタ後に全件が既処理 (= 新規 M3 close 無し) なら次ループへ
                 if len(new_m05_bars) == 0:
                     continue
-
-                # ════════════════════════════════════════════════════════
-                # [GAP-FIX §11.34.16-T 層3 / 案A] 流す前の連続性保証。
-                # ────────────────────────────────────────────────────────
-                # process_new_m05_bar の単調増加ガード (deque 末尾 append) は
-                # 「過去の穴」を後から埋められない (順序が壊れる)。よって埋めるなら
-                # バッファに入る前に連続列へ整える必要がある。ここで「現在の
-                # m05_dataframe 末尾」と「これから流す new_m05_bars 先頭」の間に
-                # 30s 超の穴があれば、欠損区間を MT5 から pinpoint 再取得して
-                # new_m05_bars の前に差し込み、単調順を保ったまま流す。
-                # これにより層1(EA)・層2(bridge) を抜けた取りこぼしも、バッファに
-                # 入る前に埋まる (rfe 側の検知は最終 backstop として残す)。
-                # 本物の落ちは MT5 に実在し再取得成功。正規ギャップは空が返り素通り。
-                # ════════════════════════════════════════════════════════
-                try:
-                    _buf_last_ut = None
-                    if len(feature_engine.m05_dataframe) > 0:
-                        _blt = feature_engine.m05_dataframe[-1]["timestamp"]
-                        if getattr(_blt, "tzinfo", None) is None:
-                            _blt = _blt.replace(tzinfo=timezone.utc)
-                        _buf_last_ut = int(_blt.timestamp())
-                    _head_ut = _bar_unixtime(new_m05_bars[0])
-                    if (
-                        _buf_last_ut is not None
-                        and _head_ut is not None
-                        and (_head_ut - _buf_last_ut) > 30
-                    ):
-                        _gap_s = _buf_last_ut + 30
-                        _gap_e = _head_ut - 30
-                        _n_missing = int((_head_ut - _buf_last_ut) / 30) - 1
-                        # [GAP-FIX §11.34.16-U 再開 tail 回収] 穴の扱いを 2 分岐。
-                        # ─────────────────────────────────────────────────
-                        # 小さい穴 (≤20 本): 市場オープン中の取りこぼし → 全区間を再取得。
-                        # 大きい穴 (>20 本): 市場クローズ (週末/日次メンテ) を含む。クローズ
-                        #   部 (古い側) は MT5 にも足が無く再取得しても空 = 埋め不要。だが
-                        #   クローズ「明け」の再開直後の数本 (新しい側) は MT5 に実在し、S1
-                        #   は毎日それを揃えて学習しているのに本番は EA 再起動/M3 境界復帰で
-                        #   取りこぼす (日次の train-serve 非対称、実機 22:00 再開の 5 本)。
-                        #   そこで大ギャップでも「再開 tail = _gap_e から遡って cap 本」だけ
-                        #   を再取得して前方差し込みする。要求は cap 本に有界なので週末スト
-                        #   ームは起きず、クローズ部 (古い側) は要求範囲外で空振りもしない。
-                        #   連続性保証はストリーム前に走るのでバッファ末尾はまだクローズ前
-                        #   (例 20:57:30) = 単調順を壊さず差し込める。取引非依存窓 (ATR 低)
-                        #   だが学習と揃え、最長窓スペクトル (M3 spectral_512=25.6h>24h で
-                        #   毎日再開を含む) の日次恒常残差を消す。
-                        _GAP_REFETCH_MAX_BARS = 20  # オープン中の取りこぼし上限
-                        _REOPEN_TAIL_BARS = 20      # 再開直後に回収する tail 本数 (有界)
-                        if _n_missing > _GAP_REFETCH_MAX_BARS:
-                            # 大ギャップ: 再開 tail のみ回収 (クローズ部はスキップ)
-                            _tail_s = _gap_e - (_REOPEN_TAIL_BARS - 1) * 30
-                            if _tail_s < _gap_s:
-                                _tail_s = _gap_s
-                            logger.warning(
-                                f"⚠️ [GAP-FIX] live 大ギャップ {_n_missing} 本 (市場クローズ含む)。"
-                                f"クローズ部はスキップ、再開 tail ({_REOPEN_TAIL_BARS} 本以内) のみ回収。"
-                            )
-                            _fill_bars = _refetch_m05_range(bridge, _tail_s, _gap_e)
-                            if _fill_bars:
-                                new_m05_bars = _fill_bars + new_m05_bars
-                                logger.info(
-                                    f"[GAP-FIX] 再開 tail {len(_fill_bars)} 本を回収・差し込み "
-                                    f"(日次 train-serve 非対称を解消)。"
-                                )
-                        else:
-                            logger.warning(
-                                f"⚠️ [GAP-FIX] live 連続性違反: バッファ末尾と新バー間に "
-                                f"{_n_missing} 本欠落。pinpoint 再取得して先に流す。"
-                            )
-                            _fill_bars = _refetch_m05_range(bridge, _gap_s, _gap_e)
-                            if _fill_bars:
-                                # 再取得分を new_m05_bars の前に差し込む (単調順を保つ)
-                                new_m05_bars = _fill_bars + new_m05_bars
-                except Exception as _gap_e:
-                    logger.warning(f"[GAP-FIX] live 連続性保証で例外 (続行): {_gap_e}")
 
                 # 先頭〜末尾の 1 本前を warmup_only=True で順次消費
                 # (バッファ・OLS のみ更新、シグナル生成はスキップ)

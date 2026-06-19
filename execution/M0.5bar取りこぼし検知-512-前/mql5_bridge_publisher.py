@@ -14,7 +14,6 @@ import zmq
 import json
 import time
 import threading
-import contextlib
 import numpy as np  # [V11.0] ゼロ・デシリアライズ用
 from pathlib import Path
 from datetime import datetime, timezone
@@ -149,14 +148,6 @@ class MQL5BridgePublisherV3:
         # [STALE-GUARD] EA側のg_python_readyがfalseになったことをHeartbeatスレッドが検知し、
         # メインスレッドにnotify_python_ready()の再送を要求するためのスレッドセーフなフラグ
         self.needs_notify = threading.Event()
-        # [HEARTBEAT-FIX §11.34.16-U] ウォームアップ/大量履歴取得中フラグ。
-        # フルウォームアップ (本番初回 13 万本等) の巨大 CopyTicksRange は EA の単一
-        # スレッドを長時間ブロックし、その間 EA の OnTimer が回らず heartbeat PONG を
-        # 返せない → _heartbeat_loop が timeout → needs_notify セット → ウォームアップ
-        # 完了後にメインループが「EA 再起動」と誤検知し不要な gap-fill を撃つ。これを
-        # 防ぐため、warmup/大量取得の前後でこのフラグを立て、フラグ中の heartbeat
-        # timeout では needs_notify をセットしない (EA は生きていてブロック中なだけ)。
-        self._in_warmup = threading.Event()
         # [STALE-GUARD] Python側の準備完了状態。
         # HeartbeatにPING:READY/PING:NOT_READYとして乗せてEAに毎回通知する。
         # EA再起動・瞬断後も次のHeartbeat(最大10秒)で自動的に状態が同期される。
@@ -346,28 +337,6 @@ class MQL5BridgePublisherV3:
                 return None
 
             full_array = np.concatenate(all_chunks)
-
-            # ════════════════════════════════════════════════════════════
-            # [COMPLETENESS-CHECK §11.34.16-T] 受信完全性の強制照合。
-            # ─────────────────────────────────────────────────────────
-            # 旧実装は ACK で TOTAL_BARS=N を受け取りながら、return 前に
-            # received_bars == total_bars を一度も照合していなかった。その結果、
-            # 黙ってデータを失う 3 経路 — poll 10s タイムアウト break / サイズ 60
-            # 非倍数チャンクの continue skip / デコード例外 break — を通っても、
-            # all_chunks が空でなければ「短いまま」素通りしていた。これが長期
-            # GAP-FILL (13 万本超) で転送量に比例して取りこぼし露出を増やす経路。
-            # ここで厳密照合し、不足なら None を返して呼び出し側に再取得させる
-            # (既存の「all_chunks 空 → None」 と同じ再送促し規約)。
-            # ※ total_bars<=0 (AComfort 異常) の場合は照合をスキップ (従来挙動)。
-            # ════════════════════════════════════════════════════════════
-            if total_bars > 0 and received_bars != total_bars:
-                logger.error(
-                    f"[COMPLETENESS-CHECK] 受信バー数不一致: received={received_bars} "
-                    f"!= total={total_bars} (chunks={chunk_count}/{total_chunks})。"
-                    f"転送が不完全 (タイムアウト/チャンク欠落/デコード失敗)。"
-                    f"None を返し再取得を促す。"
-                )
-                return None
 
             # DataFrame変換
             df = pd.DataFrame(full_array)
@@ -618,28 +587,6 @@ class MQL5BridgePublisherV3:
             logger.error(f"M3通知受信エラー: {e}")
             return None
 
-    def begin_warmup(self) -> None:
-        """[HEARTBEAT-FIX §11.34.16-U] ウォームアップ/大量履歴取得の開始を記録。
-        この間の heartbeat timeout は EA のブロックとみなし再起動扱いしない。"""
-        self._in_warmup.set()
-        logger.debug("[HEARTBEAT-FIX] ウォームアップ中フラグ ON (heartbeat timeout を再起動扱いしない)")
-
-    def end_warmup(self) -> None:
-        """[HEARTBEAT-FIX §11.34.16-U] ウォームアップ/大量履歴取得の終了を記録。"""
-        self._in_warmup.clear()
-        logger.debug("[HEARTBEAT-FIX] ウォームアップ中フラグ OFF")
-
-    @contextlib.contextmanager
-    def warmup_guard(self):
-        """[HEARTBEAT-FIX §11.34.16-U] with 文で囲った区間をウォームアップ扱いにする。
-        区間中の heartbeat timeout では needs_notify をセットしない。例外時も確実に解除。
-        使用例: with bridge.warmup_guard(): df = bridge.request_historical_data(...)"""
-        self.begin_warmup()
-        try:
-            yield
-        finally:
-            self.end_warmup()
-
     def notify_python_ready(self) -> bool:
         """
         [STALE-GUARD] Python側の準備完了をEAに通知し、M3通知の送信を解禁させる。
@@ -774,21 +721,10 @@ class MQL5BridgePublisherV3:
                                 self.last_heartbeat_received = datetime.now()
                                 self.heartbeats_received += 1
                         else:
-                            # タイムアウト = EA再起動中・切断中・またはウォームアップ中ブロック
-                            # [HEARTBEAT-FIX §11.34.16-U] ウォームアップ/大量取得中は EA が
-                            # 巨大 CopyTicksRange でブロックしているだけで再起動ではない。
-                            # この間は needs_notify をセットせず (再起動誤検知→gap-fill 連発を
-                            # 防ぐ)、ソケットだけ再作成して次の PING に備える。EA がブロックを
-                            # 抜ければ PONG が戻り自然に復帰する。
-                            if self._in_warmup.is_set():
-                                logger.debug(
-                                    "Heartbeat timeout (ウォームアップ中: EA ブロックとみなし "
-                                    "再起動扱いしない)"
-                                )
-                            else:
-                                logger.warning("Heartbeat timeout")
-                                # [STALE-GUARD] EA再起動の可能性 → 復帰後にnotify_python_ready()再送が必要
-                                self.needs_notify.set()
+                            # タイムアウト = EA再起動中または切断中
+                            logger.warning("Heartbeat timeout")
+                            # [STALE-GUARD] EA再起動の可能性 → 復帰後にnotify_python_ready()再送が必要
+                            self.needs_notify.set()
                             # ソケット再作成後即PINGを送るためsleepをスキップ
                             self.heartbeat_socket.close(linger=0)
                             self.heartbeat_socket = self.context.socket(zmq.REQ)

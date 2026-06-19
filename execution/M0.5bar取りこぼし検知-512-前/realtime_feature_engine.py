@@ -460,17 +460,6 @@ class RealtimeFeatureEngine:
         max_m05_bars_needed = max_lookback_val * 2880 + 1000
         self.m05_dataframe: deque[Dict[str, Any]] = deque(maxlen=max_m05_bars_needed)
 
-        # [GAP-DETECT §11.34.16-T 層3] M0.5 バーの連続性監視 (多重防御の最終 backstop)。
-        # 層1 (EA 最終バケット flush) と層2 (bridge 完全性照合) で取りこぼしは源で塞ぐが、
-        # それらを抜けた残りを process_new_m05_bar の単一入口で検知する。末尾との時刻差が
-        # 30s (M0.5 の 1 足) を超えたら欠損と判定し、区間 (start, end) を記録。main が
-        # pop_detected_m05_gaps() で受け取り、MT5 (S1 と同源) から pinpoint 再取得して
-        # 単調順で流し直す (deque 末尾 append 不変条件を保持)。本物の落ちなら足は必ず
-        # MT5 に在るので再取得は成功する。rfe は検知のみ (再取得は bridge を持つ main の責務)。
-        self._detected_m05_gaps: List[tuple] = []
-        self._M05_FREQ_SEC: int = 30  # M0.5 = 30 秒足
-        self._GAP_DETECT_MAX_BARS: int = 20  # [要修正②] これ超の欠落は正規市場ギャップ扱い
-
         # 5. 純化(OLS)用 状態保持バッファ
         self.proxy_feature_buffers: Dict[str, Dict[str, deque]] = {}
         self.ols_state: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -1226,18 +1215,6 @@ class RealtimeFeatureEngine:
             f" OLS学習サンプル数: ~{ols_n} / {OLS_WINDOW}"
         )
 
-    def pop_detected_m05_gaps(self) -> List[tuple]:
-        """[GAP-DETECT §11.34.16-T 層3] 検知済み M0.5 欠損区間を返し内部をクリアする。
-
-        main のリアルタイムループが毎サイクル呼び、返った各 (start_ts, end_ts) を
-        bridge.request_historical_data で pinpoint 再取得 → process_new_m05_bar へ
-        再投入する。再投入もこの単一入口を通るため、再取得中に別の欠落があれば再び
-        検知される (入口が 1 点なので漏れない)。pop 方式でループ間の二重処理を防ぐ。
-        """
-        gaps = list(self._detected_m05_gaps)
-        self._detected_m05_gaps.clear()
-        return gaps
-
     def fill_all_buffers(
         self,
         history_data_map: Dict[str, pd.DataFrame],
@@ -1668,35 +1645,6 @@ class RealtimeFeatureEngine:
                     f"ts={m05_timestamp} last={self.m05_dataframe[-1]['timestamp']}"
                 )
             else:
-                # [GAP-DETECT §11.34.16-T 層3] append 直前に末尾との連続性を検査。
-                # M0.5 は 30 秒刻み。末尾→新バーの差が 30s を超えたら間のバーが欠落。
-                # (層1=EA flush・層2=bridge 完全性照合 を抜けた取りこぼしの最終 backstop。
-                #  実機で 02:38:30 を 1 本取りこぼし spectral_512 が窓ズレした事象に対応)
-                # warmup (fill_all_buffers の clear→extend) はこの append を通らないため
-                # 誤検知しない。live/gap-fill の昇順バーのみ通過する。
-                if len(self.m05_dataframe) > 0:
-                    _last_ts = self.m05_dataframe[-1]["timestamp"]
-                    _delta_sec = (m05_timestamp - _last_ts).total_seconds()
-                    if _delta_sec > self._M05_FREQ_SEC:
-                        _gap_start = _last_ts + pd.Timedelta(seconds=self._M05_FREQ_SEC)
-                        _gap_end = m05_timestamp - pd.Timedelta(seconds=self._M05_FREQ_SEC)
-                        _n_missing = int(_delta_sec / self._M05_FREQ_SEC) - 1
-                        # [GAP-FIX 要修正②] 穴サイズ上限。週末/休場の正規ギャップ
-                        # (数千本) は S1 にも足が無く埋め不要なので記録しない。本物の
-                        # 落ち (層1・2 後はせいぜい 1〜2 本) だけ main に再取得させる。
-                        if _n_missing <= self._GAP_DETECT_MAX_BARS:
-                            self._detected_m05_gaps.append((_gap_start, _gap_end))
-                            self.logger.warning(
-                                f"[GAP-DETECT] M0.5 連続性違反: {_n_missing} 本欠落 "
-                                f"({_gap_start} 〜 {_gap_end})。末尾={_last_ts} 新バー={m05_timestamp}。"
-                                f"main に pinpoint 再取得を要求。"
-                            )
-                        else:
-                            self.logger.info(
-                                f"[GAP-DETECT] {_n_missing} 本の大欠落は上限"
-                                f"({self._GAP_DETECT_MAX_BARS})超 = 正規市場ギャップ"
-                                f"(週末/休場)とみなし記録せず。"
-                            )
                 self.m05_dataframe.append(m05_bar)
             m05_bar_df = pd.DataFrame([m05_bar]).set_index("timestamp")
             self._append_bar_to_buffer("M0.5", m05_bar_df, market_proxy_cache)

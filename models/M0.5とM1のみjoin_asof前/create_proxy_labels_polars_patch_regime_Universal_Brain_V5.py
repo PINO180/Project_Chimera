@@ -500,24 +500,18 @@ class ProxyLabelingEngine:
         timeframe: str,
         feat_cols: List[str],
     ) -> pl.DataFrame:
-        """[案 2 §11.34.16-Q] TF 足をトリガー行に割付。高 TF はスパース、低 TF は held。
+        """[JOINASOF-FIX §11.34.16-O2] TF 足をトリガー行に close_ts ベース join_asof で割付。
 
-        Q 節の BT 結果 (高 TF held=Y はスパース=X よりリスク構造劣位・AUC 同一) を受け、
-        TF タイプで割付方式を分岐する:
-          - 高 TF (tf > ACTION_HORIZON, M5/M8/M15): index シフト + exact join =
-            「境界だけ実値・他 0」 のスパース表現 (本番 HF-NB-GATE と一致)。X を維持。
-          - 低 TF (tf < ACTION_HORIZON, M0.5/M1): join_asof(backward, close_ts<=T) =
-            「T で閉じた最新足」 を割付。本番 rfe L214 と一字一句一致し、足選択ズレ
-            (M0.5=5 本/M1=2 本) を解消。低 TF は毎トリガーで値が変わるため held の
-            連続エントリー慣性は生じない。
-          - トリガー TF (tf == ACTION_HORIZON, M3): ラベル exact 一致 ([L,L+180) の
-            close=L+180=T、本番と同一)。
-
-        低 TF の join_asof は本番一致:
+        本番 (rfe `_filter_to_closed_buckets`: 足のクローズ時刻 <= 確定時刻 の最新足を
+        latest_features_cache が ffill 保持) と一字一句一致させる:
           - 各 TF 足のクローズ時刻 close_ts = ラベル + tf_sec
           - トリガーのエントリー時刻 T = ラベル(L_m3) + ACTION_HORIZON_SEC
-          - join_asof(left=T, right=close_ts, backward) = 「close_ts <= T の最新足」
-        単体検証済み (verified_joinasof_logic.py): M1 全行で期待ラベル一致、lookahead 違反 0。
+          - join_asof(left=T, right=close_ts, backward) = 「close_ts <= T の最新足」を ffill
+        トリガー TF (M3, tf==ACTION_HORIZON_SEC) は足[L,L+180) の close=L+180=T なので
+        ラベル exact 一致で正しい (join_asof でも同結果だが exact の方が安全)。
+
+        単体検証済み (verified_joinasof_logic.py): M1 全行で期待ラベル一致、M15 の ffill
+        (1 対多) 成立、lookahead 違反 0。
 
         Args:
             trigger_df: [timestamp] (= M3 ラベル L_m3、本関数内でソート)
@@ -525,7 +519,8 @@ class ProxyLabelingEngine:
             timeframe:  当該 TF 名
             feat_cols:  結合する特徴量列 (TF サフィックス付き、例 e1d_xxx_M15)
         Returns:
-            trigger_df の各行に feat_cols を割付した DataFrame (高 TF=スパース/低 TF=held)。
+            trigger_df の各行に feat_cols を ffill 割付した DataFrame。
+            lookahead 監査のため _src_close_ts 列も一時付与し、関数末尾で違反を assert。
         """
         tf_sec = self._tf_to_seconds(timeframe)
         if tf_sec is None:
@@ -540,31 +535,7 @@ class ProxyLabelingEngine:
                 tf_feat_df.select(["timestamp"] + feat_cols), on="timestamp", how="left"
             )
 
-        if tf_sec > self.ACTION_HORIZON_SEC:
-            # ════════════════════════════════════════════════════
-            # [案 2 §11.34.16-Q] 高 TF (M5/M8/M15) は X (スパース) を維持。
-            # Q 節 BT で held(Y) より X(スパース) がリスク構造優位 (MaxDD 4.80<6.79%、
-            # 連敗 2<3) かつ AUC 同一と判明したため、高 TF は旧 index シフト方式に戻す。
-            # ────────────────────────────────────────────────────
-            # index シフト (shift(-1)) で「ラベル L の行 = L 時点で閉じた最新バー」 に
-            # した上で、トリガー (M3 グリッド) に exact join。M3 グリッド (180s) と
-            # 高 TF グリッド (300/480/900s) の交点だけ実値が乗り、非交点は null
-            # (後段 fill_null(0) で 0)。これが本番 HF-NB-GATE (非境界 0 化) と一致する
-            # スパース表現。held(join_asof backward) と違い「境界だけ実値」 になる。
-            # ※ 本番側は main.py の HF-NB-GATE 復活とセット (学習スパース=本番スパース)。
-            # ════════════════════════════════════════════════════
-            shifted = (
-                tf_feat_df.sort("timestamp")
-                .with_columns(pl.col("timestamp").shift(-1).alias("timestamp"))
-                .filter(pl.col("timestamp").is_not_null())
-                .select(["timestamp"] + feat_cols)
-            )
-            return trigger_df.join(shifted, on="timestamp", how="left")
-
-        # 低 TF (M0.5/M1, tf < 180): close_ts <= T の最新足を join_asof(backward)。
-        # 本番 (rfe latest_features_cache: close_ts<=確定時刻の最新足) と足選択一致。
-        # 低 TF は毎トリガーで値が変わる (M3 以下で必ず新足が確定) ため、held による
-        # 連続エントリー慣性 (高 TF の Y で問題化) は生じず、純粋に足選択の正解化のみ。
+        # 非トリガー TF: close_ts <= T の最新足を join_asof(backward)
         tf2 = (
             tf_feat_df.with_columns(
                 (pl.col("timestamp") + pl.duration(seconds=tf_sec)).alias("close_ts")

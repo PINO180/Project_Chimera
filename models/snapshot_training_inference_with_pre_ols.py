@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re  # [LOOKAHEAD-FIX §11.34.16] TF 判定用
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +92,42 @@ S2_META_COLS = {
 }
 
 
+# [LOOKAHEAD-FIX §11.34.16 注記]
+# snapshot は A 列 (本番特徴量計算経路の検証基準) を S2 から切り出す。S2 は
+# label=left (ラベル L のバー [L, L+tf)) のため、高 TF (tf>180s) をそのまま使うと
+# A 列に形成中バー値が入り、閉じバー化された B/C (cpl/main 修正後) と食い違う。
+# cpl と同じ index シフト (各バーの値を次ラベルへ = 「ラベル L = L 時点で閉じた
+# 最新バー」) を S2 読込時にも適用し、A/B/C を同じ時刻意味論に揃える。
+ACTION_HORIZON_SEC_SNAP = 180  # M3 トリガの行動猶予
+
+
+def _tf_to_seconds_snap(timeframe: str):
+    m = re.fullmatch(r"M(\d+(?:\.\d+)?)", timeframe)
+    if m:
+        return int(float(m.group(1)) * 60)
+    m = re.fullmatch(r"H(\d+(?:\.\d+)?)", timeframe)
+    if m:
+        return int(float(m.group(1)) * 3600)
+    m = re.fullmatch(r"W(\d+)", timeframe)
+    if m:
+        return int(m.group(1)) * 604800
+    if timeframe == "MN":
+        return 28 * 86400
+    return None
+
+
+def _shift_high_tf_snap(df: "pl.DataFrame", timeframe: str) -> "pl.DataFrame":
+    """tf > 180s の TF を閉じたバー基準に index シフト (cpl と同方式)。"""
+    tf_sec = _tf_to_seconds_snap(timeframe)
+    if tf_sec is None or tf_sec <= ACTION_HORIZON_SEC_SNAP:
+        return df  # M0.5/M1/M3 はそのまま
+    return (
+        df.sort("timestamp")
+        .with_columns(pl.col("timestamp").shift(-1).alias("timestamp"))
+        .filter(pl.col("timestamp").is_not_null())
+    )
+
+
 def load_s2_pre_ols(
     start: datetime,
     end: datetime,
@@ -137,6 +174,10 @@ def load_s2_pre_ols(
             if len(df) == 0:
                 pieces_missing.append(f"{path.name} (期間外)")
                 continue
+
+            # [LOOKAHEAD-FIX §11.34.16] 高TF (tf>180s) を閉じたバー基準に再ラベル
+            # (cpl/main と同じ時刻意味論に A 列を揃える)
+            df = _shift_high_tf_snap(df, tf)
 
             # 特徴量列のみ抽出 → TF サフィックス付与で rename
             feat_cols = [c for c in df.columns if c not in S2_META_COLS]
