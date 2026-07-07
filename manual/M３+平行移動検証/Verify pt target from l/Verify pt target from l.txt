@@ -1,0 +1,11 @@
+python verify_pt_target_from_L.py \
+    --feature-data /workspace/data/XAUUSD/stratum_1_base/master_processed \
+    --tick-dir /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned \
+    --out-dir /workspace/data/diagnostics/pt_target \
+    --window-min 30 --max-bets 0
+
+「普通の順行（d<1）の行」を読むだけで (B) の答えも得られる。わざわざ即PTを母集団から外すと、後で「やっぱり高dも見たい」となったとき測り直しになる。一度で両方見える (A) が無駄がない。
+§30 の検証器を、こう組み替えます。
+項目§30（前回）今回（PT適正値版）母集団全M3グリッド同じ（全M3グリッド・脳CSV不使用）起点L+180L（price(L)＝波動起点。L基準PTにどこまで届くか）窓L+180から30分Lから30分（TD）主出力最大順行の分布各PT水準への到達率（L基準で何%届くか）PT水準—1.0 / 1.5 / 2.0 / 2.5 / 3.0 / 4.0 / 5.0 ATR層別d帯別d帯別（普通=低d ／ 即PT=高d を一望）＋ATR帯別
+そしてPT適正値の判定材料として、各PT水準で 到達率 × pt（取れる幅の期待値の天井）を出します。pt を上げると1回の取り分は増えるが到達率は下がる——その積がどこで最大かが、相場側から見たPTの天井です。
+留保は §30.6 のまま生きます。これは「相場が L から pt まで届く頻度」＝脳が完璧に撃った場合の上限で、実際の脳での到達率はこれ以下。最終的な pt は PT≈2脳を作って脳込みで確定、という流れは変わりません。今回は「相場としてPTをどこまで伸ばせる余地があるか」の天井を測る、という位置づけです。

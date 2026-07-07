@@ -37,7 +37,7 @@ from typing import Dict
 
 OUTPUT_DIR = Path("/workspace/data/diagnostics/feature_snapshots")
 WIDE_CSV_PATH = Path("/workspace/data/diagnostics/feature_snapshots_wide.csv")
-logger = logging.getLogger("ProjectCimera.FeatureSnapshot")
+logger = logging.getLogger("♾️Chimera♾️.SNAP")
 
 # 横持ち CSV のメタ列 (feature_dict の特徴量列より前に置く固定列)
 _WIDE_META_COLS = [
@@ -87,10 +87,10 @@ def _append_wide_row(
         missing = sorted(current_feat - existing_feat)  # 既存ヘッダーに無い新 key
         dropped = sorted(existing_feat - current_feat)  # 今回 dict に無い旧 key
         logger.warning(
-            "📸 [WideSnapshot] feature key 集合がヘッダーと不一致。 "
-            f"新規key={len(missing)} 件, 欠落key={len(dropped)} 件。 "
-            "既存ヘッダー順を維持して記録します (新規 key は記録されません)。 "
-            f"例 新規={missing[:3]}, 欠落={dropped[:3]}"
+            "📸 [WideSnapshot] feature key set differs from header. "
+            f"new={len(missing)}, dropped={len(dropped)}. "
+            "Keeping existing header order (new keys are not recorded). "
+            f"e.g. new={missing[:3]}, dropped={dropped[:3]}"
         )
 
     # 記録に使う列順: 既存ヘッダーがあればそれに従う (凍結維持)、 無ければ expected
@@ -171,7 +171,7 @@ def save_feature_snapshot(
                 writer.writerow([name, val])
 
         logger.info(
-            f"📸 [Snapshot] 縦持ち保存: {fname} ({len(feature_dict)}件)"
+            f"🏭 [Snapshot] saved (long): {fname} ({len(feature_dict)} features)"
         )
 
         # 古いファイルを削除（max_snapshots超過分）
@@ -179,10 +179,10 @@ def save_feature_snapshot(
         if len(existing) > max_snapshots:
             for old_file in existing[: len(existing) - max_snapshots]:
                 old_file.unlink()
-                logger.debug(f"古いスナップショット削除: {old_file.name}")
+                logger.debug(f"old snapshot deleted: {old_file.name}")
 
     except Exception as e:
-        logger.error(f"縦持ちスナップショット保存失敗: {e}", exc_info=True)
+        logger.error(f"long-format snapshot save failed: {e}", exc_info=True)
 
     # ============================================================
     # (2) 横持ち (新規) — compare_3way_ols.py 用の単一 wide CSV
@@ -199,4 +199,4 @@ def save_feature_snapshot(
             atr_ratio=atr_ratio,
         )
     except Exception as e:
-        logger.error(f"横持ちスナップショット保存失敗: {e}", exc_info=True)
+        logger.error(f"wide-format snapshot save failed: {e}", exc_info=True)

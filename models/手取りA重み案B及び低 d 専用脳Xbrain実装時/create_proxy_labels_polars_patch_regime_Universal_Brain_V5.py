@@ -72,15 +72,15 @@ SPREAD = 0.50
 
 # ロング用ルール
 RULE_LONG = {
-    "pt_mult": 1.0,   # pt_multiplier_long
-    "sl_mult": 5.0,   # sl_multiplier_long
+    "pt_mult": 1.5,   # pt_multiplier_long  [手取り重み検証] PT=1.5（到達率×ptの天井・厚利プール最大）
+    "sl_mult": 0.3,   # sl_multiplier_long  [手取り重み検証] SL=0.3（建値級・速い素直な順行を正例化）
     "td": "30m",      # td_minutes_long: 30
 }
 
 # ショート用ルール
 RULE_SHORT = {
-    "pt_mult": 1.0,   # pt_multiplier_short
-    "sl_mult": 5.0,   # sl_multiplier_short
+    "pt_mult": 1.5,   # pt_multiplier_short  [手取り重み検証] PT=1.5（到達率×ptの天井・厚利プール最大）
+    "sl_mult": 0.3,   # sl_multiplier_short  [手取り重み検証] SL=0.3（建値級・速い素直な順行を正例化）
     "td": "30m",      # td_minutes_short: 30
 }
 # --- ▲▲▲ 改造ここまで ▲▲▲ ---
@@ -830,11 +830,6 @@ class ProxyLabelingEngine:
 
                 # ★ その月のtickデータだけをメモリに載せる
                 # hive_partitioning=Trueで述語プッシュダウンを確実に有効化
-                # 用途: (a) バリア hit 判定の tick 走査 (high/low、価格 = mid)、
-                #       (b) バリア基準 close のアンカー = エントリー時刻 L+180 の mid
-                #           (ENTRY-ANCHOR FIX §11.34.16-O3、_calculate_labels_for_batch 内で
-                #            timestamp+ACTION_HORIZON_SEC を backward asof)。
-                # mid_price を close/high/low に展開 (tick は単一点なので OHLC 同値)。
                 logging.debug(f"Loading tick chunk for {y}-{m:02d}...")
                 try:
                     base_price_chunk_df = (
@@ -1141,82 +1136,12 @@ class ProxyLabelingEngine:
                 c for c in group_df.columns if c not in ["timestamp", "close"]
             ]
 
-            # ===================================================================
-            # [ENTRY-ANCHOR FIX §11.34.16-O3] バリア基準価格 = エントリー時刻の価格
-            # ===================================================================
-            # 旧実装は close/high/low/ATR を一括で timestamp=L (トリガー = M3 バー始値
-            # 時刻) に join_asof(backward) し、バリア基準 close に「L 時点 (バー始値) の
-            # tick mid」を採用していた。しかし本番のエントリーは
-            #   T = L + ACTION_HORIZON_SEC (= L+180、M3 バーのクローズ時刻)
-            # で行われ、エントリー価格 = realtime_feature_engine の
-            #   current_price = data["close"][-1] = M3 バー [L, L+180) の close。
-            # よって旧実装の基準 close は実エントリーより 1 バー (約 3 分) 手前で、
-            # かつシグナルは「価格が動いている」ときに出るため必ずトレード方向に
-            # 有利側へズレていた。走査は L+180 から始まる (entry_offset) ため、
-            # [L, L+180) で既に起きた順行分が「タダ乗り」して PT に早期到達し、
-            # ラベルが楽観化 → BT と本番の乖離 (本番 TO 過多) の震源になっていた。
-            # 実測 (本番 ReportHistory vs BT detailed_trade_log、同一足 93 件) で
-            # 本番 TO×BT-PT 24 件・基準価格が方向有利側に中央 +$6.1・24/24 方向一致を
-            # 確認、コード (本ブロック + tick mid ソース) でも裏取り済み。
-            #
-            # 修正方針:
-            #   - バリア基準 close = エントリー時刻 L+180 の価格に合わせる
-            #     (price_window の tick mid を L+180 で backward asof = L+180 以前で
-            #      最新の tick = M3 バー [L, L+180) の close = 本番エントリー価格)。
-            #   - ATR / ATR_ratio は従来通り トリガー時刻 L で結合 (バー [L, L+180) の
-            #     値で、本番ゲート整合済み)。変更しない。
-            #   - 走査用 ticks_high/low (price_window 由来) と走査開始
-            #     t0+ACTION_HORIZON_SEC、縦バリア t1_max = L+180+TD は既に正しく不変。
-            #   - SPREAD 項は §2 で確定済みの意図的な保守化のため不変。
-            _entry_offset = pl.duration(seconds=self.ACTION_HORIZON_SEC)
-
-            # (1) ATR / ATR_ratio は トリガー時刻 L で結合 (バーの値、本番整合済み)
-            bets_with_atr_df = group_df.join_asof(
+            bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
-                    ["timestamp", atr_col_name, atr_ratio_col_name]
+                    ["timestamp", "close", "high", "low", atr_col_name, atr_ratio_col_name]
                 ),
                 on="timestamp",
             ).filter(pl.col(atr_col_name).is_not_null())
-
-            if bets_with_atr_df.is_empty():
-                continue
-
-            # 旧 close 列が混入していれば除去 (アンカーで付け直すため)
-            if "close" in bets_with_atr_df.columns:
-                bets_with_atr_df = bets_with_atr_df.drop("close")
-
-            # (2) バリア基準 close は エントリー時刻 L+180 の価格を別途 asof 結合
-            #     (本番 current_price = data["close"][-1] = M3 バー [L,L+180) close と一致)
-            _anchor_price_df = price_window_df.select(
-                pl.col("timestamp").alias("_anchor_ts"),
-                pl.col("close"),
-            ).sort("_anchor_ts")
-
-            bets_with_price_df = (
-                bets_with_atr_df.with_columns(
-                    (pl.col("timestamp") + _entry_offset).alias("_entry_ts")
-                )
-                .sort("_entry_ts")
-                .join_asof(
-                    _anchor_price_df,
-                    left_on="_entry_ts",
-                    right_on="_anchor_ts",
-                    strategy="backward",
-                )
-                .sort("timestamp")
-            )
-            # 一時列を除去 (バージョン差で右キーが残る場合に備え存在時のみ drop)
-            _tmp_cols = [
-                c for c in ["_entry_ts", "_anchor_ts"]
-                if c in bets_with_price_df.columns
-            ]
-            if _tmp_cols:
-                bets_with_price_df = bets_with_price_df.drop(_tmp_cols)
-
-            # エントリー時刻の価格が取得できなかった行 (窓端等) は除外
-            bets_with_price_df = bets_with_price_df.filter(
-                pl.col("close").is_not_null()
-            )
 
             if bets_with_price_df.is_empty():
                 continue
@@ -1305,6 +1230,28 @@ class ProxyLabelingEngine:
                 np.int64(self.ACTION_HORIZON_SEC * 1_000_000),  # [LOOKAHEAD-FIX] エントリーオフセット(us)
             )
 
+            # [TAKEHOME §36] L+180 約定価格と手取り(pt−d, ATR単位)を算出。
+            #   バリアは price(L)=close 基準（平行移動・旧脳のまま）、約定は L+180。
+            #   手取り_long = (PT価格 − 約定価格)/ATR、手取り_short = (約定価格 − PT価格)/ATR。
+            #   ※ X(特徴量)・ラベル・バリア・duration は一切変更しない。np_realized 2列を追加するのみ。
+            _entry_off_us = np.int64(self.ACTION_HORIZON_SEC * 1_000_000)
+            _entry_idx = (
+                np.searchsorted(ticks_ts_np, bets_t0_np + _entry_off_us, side="right") - 1
+            )
+            _entry_idx = np.clip(_entry_idx, 0, len(ticks_low_np) - 1)
+            bets_entry_px_np = ticks_low_np[_entry_idx]  # L+180 の mid ≈ バー close
+            bets_atr_np = bets_df["atr_value"].to_numpy()
+            _safe_atr = np.where(bets_atr_np > 0.0, bets_atr_np, np.nan)
+            # [TAKEHOME SPREAD除去] バリア価格 pt_long/pt_short には判定を厳しくするための
+            # SPREAD が乗っている（pt_long=close+ATR*pt_mult+SPREAD 等）。だが手取りは
+            # 「エントリーからPTまで実際に取れる幅 = pt_mult - d」であり、SPREADコストを
+            # モノサシに含めるべきでない（含めると np = pt_mult - d + SPREAD/ATR となり
+            # ATR依存で 0.2〜0.6 上振れ→C0較正がずれ濃淡が鈍り低ATRに重みチルト）。
+            # よってバリアの SPREAD を相殺し、純粋な pt_mult - d を測る。
+            # ※ バリア判定(勝ち負け)側の SPREAD は無変更＝損益計算は従来通り厳しいまま。
+            np_realized_long_np = (bets_pt_l_np - SPREAD - bets_entry_px_np) / _safe_atr
+            np_realized_short_np = (bets_entry_px_np - (bets_pt_s_np + SPREAD)) / _safe_atr
+
             # 計算済みトリガー行の DataFrame 作成
             calculated_df = (
                 bets_df.with_columns(
@@ -1312,6 +1259,8 @@ class ProxyLabelingEngine:
                     pl.Series("sl_l_time", out_sl_l),
                     pl.Series("pt_s_time", out_pt_s),
                     pl.Series("sl_s_time", out_sl_s),
+                    pl.Series("np_realized_long", np_realized_long_np),
+                    pl.Series("np_realized_short", np_realized_short_np),
                 )
                 .with_columns(
                     # ロング用ラベルと「正確な決済時刻(マイクロ秒)」の特定
@@ -1381,6 +1330,8 @@ class ProxyLabelingEngine:
                         "label_short",
                         "duration_long",
                         "duration_short",
+                        "np_realized_long",
+                        "np_realized_short",
                     ]
                 )
             )

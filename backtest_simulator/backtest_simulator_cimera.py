@@ -144,10 +144,10 @@ class BacktestConfig:
     # ==========================================
     # V5 新規追加: 取引ロジックの固定パラメータ
     # ==========================================
-    sl_multiplier_long: float = 5.0
-    pt_multiplier_long: float = 1.0
-    sl_multiplier_short: float = 5.0
-    pt_multiplier_short: float = 1.0
+    sl_multiplier_long: float = 0.3
+    pt_multiplier_long: float = 1.5
+    sl_multiplier_short: float = 0.3
+    pt_multiplier_short: float = 1.5
 
     td_minutes_long: float = 30.0
     td_minutes_short: float = 30.0

@@ -1,0 +1,14 @@
+このスクリプトの設計思想を一言で。脳CSVを「相場を語る物差し」としては使わず、「脳が何をどこで撃ったかの事実集計」だけに使う——この切り分けを docstring 冒頭に明記してあります。相場の性質は全グリッド系（保存組）の担当、という原則をコードに焼き込みました。
+出す事実は4ブロック。(A) 基本（勝率・PnL・PF・方向・TD・spread）、(B) M2確信度の帯別分布と勝率、(C) ATR値帯・atr_ratio帯の分布と勝率、(D) d_realized 分布＝6.3倍濃縮の再現。(A)(B)(C) は CSV だけで完結、(D) だけ tick が要ります（price(L+180) を引くため。price(L) は CSV の close_price 列＝BTのS6 close をそのまま使うので厳密）。
+(D) は濃縮倍率を自動計算します。脳CSVの d≥1率 ÷ 全グリッドの d≥1率(12.1%、コード内定数 GRID_D_GE1_RATE)で「6.3倍」が再生産されます。将来 pt=2脳で全グリッド率が変わったら定数を更新するだけ。
+使い方は2通り。CSVだけなら:
+python analyze_brain_csv_stats.py --log "/workspace/data/XAUUSD/stratum_7_models/backtest_simulator_results/M2_20260629_200219_Th0.7_D0.3_R2 1と0.3/detailed_trade_log_v5_M2.csv" --log-tz jst
+6.3倍濃縮も出すなら --tick-dir を足す。
+これで削除組の76.8%系の数字を、正しい物差しの形で再生産できます。
+
+
+python analyze_brain_csv_stats.py --log "/workspace/data/XAUUSD/stratum_7_models/backtest_simulator_results/M2_20260618_105217_Th0.7_D0.3_R2 X+2TF/detailed_trade_log_v5_M2.csv" --log-tz jst
+
+python analyze_brain_csv_stats.py --log "/workspace/data/XAUUSD/stratum_7_models/backtest_simulator_results/M2_20260701_001446_Th0.7_D0.3_R2 1.5と0.3/detailed_trade_log_v5_M2.csv" --log-tz jst
+
+python analyze_brain_csv_stats.py --log "/workspace/data/XAUUSD/stratum_7_models/backtest_simulator_results/M2_20260629_200219_Th0.7_D0.3_R2 1と0.3/detailed_trade_log_v5_M2.csv" --log-tz jst

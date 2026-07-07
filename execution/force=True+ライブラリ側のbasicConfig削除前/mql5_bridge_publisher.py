@@ -24,9 +24,10 @@ from enum import Enum
 import logging
 import pandas as pd
 
-# [LOG-FIX §11.34.16-U] モジュールレベルの basicConfig を削除 (ログ構成は main の責務)。
-# これが main の basicConfig (FileHandler 付き) を no-op 化し forge_system.log を空にしていた。
-logger = logging.getLogger("♾️Chimera♾️.BRDG")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 class MessageType(Enum):
@@ -100,7 +101,7 @@ def parse_response(response_bytes: bytes) -> Any:
             return json.loads(clean_json)
         return response_str
     except Exception as e:
-        logger.warning(f"response parse warning: {e}")
+        logger.warning(f"レスポンスパース警告: {e}")
         return None
 
 
@@ -170,13 +171,13 @@ class MQL5BridgePublisherV3:
         self.last_heartbeat_sent: Optional[datetime] = None
         self.last_heartbeat_received: Optional[datetime] = None
 
-        logger.info("MQL5BridgePublisherV3 (V11.0) initialized.")
+        logger.info("MQL5BridgePublisherV3 (V11.0) を初期化しました。")
 
     # ========== 接続管理 ==========
 
     def connect(self) -> bool:
         try:
-            logger.info("Initializing ZeroMQ (V11.0)...")
+            logger.info("ZeroMQ通信 (V11.0) を初期化中...")
             self.context = zmq.Context()
 
             # 1. 制御チャネル (REQ)
@@ -207,7 +208,7 @@ class MQL5BridgePublisherV3:
             return True
 
         except Exception as e:
-            logger.error(f"✗ ZeroMQ startup failed: {e}")
+            logger.error(f"✗ ZeroMQ通信の起動に失敗: {e}")
             self.is_connected = False
             return False
 
@@ -227,7 +228,7 @@ class MQL5BridgePublisherV3:
         if self.context:
             self.context.term()
         self.is_connected = False
-        logger.info("ZeroMQ disconnected.")
+        logger.info("ZeroMQ通信を切断しました。")
 
     # ========== V11.0 履歴データ取得 (ゼロ・シリアライズ) ==========
 
@@ -241,7 +242,7 @@ class MQL5BridgePublisherV3:
         3. Completion: EoSシグナル待機と確認
         """
         if not self.is_connected:
-            logger.error("Not connected.")
+            logger.error("接続されていません。")
             return None
 
         # 1. ハンドシェイク: 履歴リクエスト送信 (制御チャネル)
@@ -257,14 +258,14 @@ class MQL5BridgePublisherV3:
             poller.register(self.control_socket, zmq.POLLIN)
 
             if not poller.poll(self.config.request_timeout):
-                logger.error("History request timed out (no ACK)")
+                logger.error("履歴リクエストがタイムアウトしました (ACK未受信)")
                 self._recreate_control_socket()
                 return None
 
             ack_response = self.control_socket.recv_string()
 
             if not ack_response.startswith("ACK:"):
-                logger.error(f"MQL5 response is not ACK: {ack_response}")
+                logger.error(f"MQL5からの応答がACKではありません: {ack_response}")
                 return None
 
             # メタデータのパース
@@ -279,7 +280,7 @@ class MQL5BridgePublisherV3:
             total_chunks = int(meta.get("TOTAL_CHUNKS", 0))
 
             logger.info(
-                f"Transfer start: {total_bars} bars, {total_chunks} chunks (via PULL)"
+                f"転送開始: {total_bars} bars, {total_chunks} chunks (via PULL)"
             )
 
             # 2. データストリーミング受信 (データチャネル)
@@ -290,7 +291,7 @@ class MQL5BridgePublisherV3:
             # 受信ループ
             while True:
                 if self.data_socket.poll(10000) == 0:
-                    logger.warning("Data receive timeout (stream interrupted)")
+                    logger.warning("データ受信タイムアウト (ストリーム中断)")
                     break
 
                 message = self.data_socket.recv()
@@ -298,17 +299,17 @@ class MQL5BridgePublisherV3:
 
                 # デバッグ: バイト数を出力 (最初の数回のみ)
                 if chunk_count < 3:
-                    logger.info(f"DEBUG: received message size: {msg_len} bytes")
+                    logger.info(f"DEBUG: 受信メッセージサイズ: {msg_len} bytes")
 
                 if message == b"END_OF_STREAM":
                     logger.info(
-                        f"EoS received. chunks: {chunk_count}/{total_chunks}"
+                        f"転送完了シグナル (EoS) を受信。受信済みチャンク: {chunk_count}/{total_chunks}"
                     )
                     break
 
                 try:
                     if msg_len == 0:
-                        logger.warning("Received empty (size-0) message.")
+                        logger.warning("サイズ0の空メッセージを受信しました。")
                         continue
 
                     if msg_len % 60 != 0:
@@ -331,16 +332,16 @@ class MQL5BridgePublisherV3:
 
                     if chunk_count % 10 == 0 or chunk_count == total_chunks:
                         logger.info(
-                            f"receiving... {chunk_count}/{total_chunks} chunks ({received_bars} bars)"
+                            f"受信中... {chunk_count}/{total_chunks} chunks ({received_bars} bars)"
                         )
 
                 except Exception as e:
-                    logger.error(f"chunk decode error: {e}")
+                    logger.error(f"チャンクデコードエラー: {e}")
                     break
 
             # 3. データ結合とDataFrame化
             if not all_chunks:
-                logger.error("No data received (all_chunks is empty).")
+                logger.error("データを受信できませんでした (all_chunks is empty)。")
                 # 完了通知を送らずに終了（再送を促すため）
                 return None
 
@@ -421,7 +422,7 @@ class MQL5BridgePublisherV3:
                 .reset_index(drop=True)
             )
 
-            logger.info(f"✓ All data received: {len(df)} rows (expected {total_bars})")
+            logger.info(f"✓ 全データ受信完了: {len(df)} 行 (期待値: {total_bars})")
 
             # 4. 完了確認通知 (制御チャネル)
             self.control_socket.send_string("CONFIRM_HISTORY:OK")
@@ -429,12 +430,12 @@ class MQL5BridgePublisherV3:
             if self.control_socket.poll(5000):
                 self.control_socket.recv_string()
             else:
-                logger.warning("Did not receive completion ACK")
+                logger.warning("完了確認のACKを受信できませんでした")
 
             return df
 
         except Exception as e:
-            logger.error(f"history fetch error: {e}", exc_info=True)
+            logger.error(f"履歴データ取得エラー: {e}", exc_info=True)
             self._recreate_control_socket()
             return None
 
@@ -614,19 +615,19 @@ class MQL5BridgePublisherV3:
                 return result if result else None
             return None
         except Exception as e:
-            logger.error(f"M3 notify receive error: {e}")
+            logger.error(f"M3通知受信エラー: {e}")
             return None
 
     def begin_warmup(self) -> None:
         """[HEARTBEAT-FIX §11.34.16-U] ウォームアップ/大量履歴取得の開始を記録。
         この間の heartbeat timeout は EA のブロックとみなし再起動扱いしない。"""
         self._in_warmup.set()
-        logger.debug("[HEARTBEAT-FIX] warmup flag ON (heartbeat timeout not treated as restart)")
+        logger.debug("[HEARTBEAT-FIX] ウォームアップ中フラグ ON (heartbeat timeout を再起動扱いしない)")
 
     def end_warmup(self) -> None:
         """[HEARTBEAT-FIX §11.34.16-U] ウォームアップ/大量履歴取得の終了を記録。"""
         self._in_warmup.clear()
-        logger.debug("[HEARTBEAT-FIX] warmup flag OFF")
+        logger.debug("[HEARTBEAT-FIX] ウォームアップ中フラグ OFF")
 
     @contextlib.contextmanager
     def warmup_guard(self):
@@ -648,7 +649,7 @@ class MQL5BridgePublisherV3:
         EA再起動・瞬断後も自動的に状態が同期される。
         """
         self.needs_notify.clear()
-        logger.info("[STALE-GUARD] needs_notify cleared; PING:READY will be sent to the EA on the next heartbeat.")
+        logger.info("[STALE-GUARD] needs_notifyをクリア。次のHeartbeatでPING:READYをEAに送信します。")
         return True
 
     def request_broker_state(self) -> Optional[Dict[str, Any]]:
@@ -679,15 +680,15 @@ class MQL5BridgePublisherV3:
                     )
                     return state
                 else:
-                    logger.warning(f"broker state format invalid: {state}")
+                    logger.warning(f"ブローカー状態の形式が不正です: {state}")
                     return None
             else:
-                logger.warning("broker state request timed out")
+                logger.warning("ブローカー状態リクエストがタイムアウトしました")
                 self._recreate_control_socket()
                 return None
 
         except Exception as e:
-            logger.error(f"broker state request failed: {e}")
+            logger.error(f"ブローカー状態リクエスト失敗: {e}")
             self._recreate_control_socket()
             return None
 
@@ -710,12 +711,12 @@ class MQL5BridgePublisherV3:
                     return history
                 return None
             else:
-                logger.warning("history request timed out")
+                logger.warning("履歴リクエストがタイムアウトしました")
                 self._recreate_control_socket()
                 return None
 
         except Exception as e:
-            logger.error(f"history request failed: {e}")
+            logger.error(f"履歴リクエスト失敗: {e}")
             self._recreate_control_socket()
             return None
 
@@ -726,7 +727,7 @@ class MQL5BridgePublisherV3:
         self.control_socket.close(linger=0)
         self.control_socket = self.context.socket(zmq.REQ)
         self.control_socket.connect(self.config.control_endpoint)
-        logger.warning("control socket recreated.")
+        logger.warning("制御ソケットを再作成しました。")
 
     def _start_heartbeat_thread(self):
         self.heartbeat_running = True
@@ -781,8 +782,8 @@ class MQL5BridgePublisherV3:
                             # 抜ければ PONG が戻り自然に復帰する。
                             if self._in_warmup.is_set():
                                 logger.debug(
-                                    "Heartbeat timeout (during warmup: treating EA as blocked, "
-                                    "not as a restart)"
+                                    "Heartbeat timeout (ウォームアップ中: EA ブロックとみなし "
+                                    "再起動扱いしない)"
                                 )
                             else:
                                 logger.warning("Heartbeat timeout")
@@ -824,7 +825,7 @@ class MQL5BridgePublisherV3:
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
         except Exception as e:
-            logger.warning(f"log file write failed: {e}")
+            logger.warning(f"ログファイル書き込み失敗: {e}")
 
     def get_statistics(self) -> Dict[str, Any]:
         """統計情報取得"""
@@ -852,7 +853,7 @@ class FileBasedBridge:
     def __init__(self, file_path: str = str(config.BRIDGE_FALLBACK_FILE)):
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(f"file-based bridge initialized: {self.file_path}")
+        logger.info(f"ファイルベースBridgeを初期化: {self.file_path}")
 
     def write_command(self, trade_command: Dict[str, Any]) -> bool:
         """
@@ -871,9 +872,9 @@ class FileBasedBridge:
             with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump(trade_command, f, indent=2, ensure_ascii=False)
 
-            logger.info(f"✓ file-based comms: command written")
+            logger.info(f"✓ ファイルベース通信: コマンドを書き込みました")
             return True
 
         except Exception as e:
-            logger.error(f"✗ file-based comms failed: {e}")
+            logger.error(f"✗ ファイルベース通信失敗: {e}")
             return False

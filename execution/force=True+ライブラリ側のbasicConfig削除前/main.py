@@ -51,66 +51,15 @@ from execution.extreme_risk_engine import (
 from execution.realtime_feature_engine import RealtimeFeatureEngine
 
 # --- ログ設定 ---
-_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-
-# Log level -> emoji (shown in place of INFO/WARNING/ERROR).
-_LEVEL_EMOJI = {
-    "DEBUG": "🔧",
-    "INFO": "🧬",
-    "WARNING": "⚠️",
-    "ERROR": "🛑",
-    "CRITICAL": "🛑",
-}
-
-
-class AlignedFormatter(logging.Formatter):
-    """(1) Replaces the level name with an emoji (INFO=🧬, WARNING=⚠️, ERROR=🛑).
-    (2) Indents the continuation lines of a multi-line message so they line up with
-    the message column (to the right of the '... - 🧬 - ' prefix) instead of the
-    left edge under the timestamp. The indent is measured from the actual formatted
-    prefix, so it holds for any logger-name length. Single-line records, and records
-    carrying a traceback, are left untouched."""
-
-    def format(self, record):
-        orig_level = record.levelname
-        record.levelname = _LEVEL_EMOJI.get(orig_level, orig_level)
-        try:
-            msg = record.getMessage()
-            if "\n" not in msg or record.exc_info or record.stack_info:
-                return super().format(record)
-            head, *tail = msg.split("\n")
-            saved_msg, saved_args = record.msg, record.args
-            record.msg, record.args = head, None
-            formatted_head = super().format(record)
-            record.msg, record.args = saved_msg, saved_args
-            indent = " " * (len(formatted_head) - len(head))
-            return formatted_head + "".join(f"\n{indent}{line}" for line in tail)
-        finally:
-            record.levelname = orig_level
-
-
 logging.basicConfig(
     level=logging.INFO,
-    format=_LOG_FORMAT,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(config.LOGS_FORGE_SYSTEM, encoding="utf-8"),
     ],
-    # [LOG-FIX §11.34.16-U] force=True で既存の root handler を除去してこの構成を必ず適用。
-    # main は L38〜 で execution.* を先に import するが、state_manager / mql5_bridge_publisher
-    # がモジュールレベルで logging.basicConfig (StreamHandler のみ) を呼び root に handler を
-    # 付けるため、それより後の本 basicConfig は従来 no-op になり FileHandler が root に付かず、
-    # forge_system.log が 0 KB のままだった (コンソールには出るがファイルに残らない)。
-    # main はエントリポイント=ログ構成の権威なので、force=True で確実に File+Stream を適用する。
-    force=True,
 )
-# Apply the aligned formatter to every root handler (Stream + File) so multi-line
-# logs (Order / BARRIER etc.) indent their continuation lines under the message
-# column on both the console and forge_system.log.
-for _h in logging.getLogger().handlers:
-    _h.setFormatter(AlignedFormatter(_LOG_FORMAT))
-logger = logging.getLogger("♾️Chimera♾️.MAIN")
+logger = logging.getLogger("ProjectForge.Main")
 
 # ==================================================================
 # 🚨 B案戦略のためのグローバル変数とパラメータ 🚨
@@ -150,7 +99,7 @@ g_market_proxy: Optional[pd.DataFrame] = (
     None  # M5リターン (アルファ純化用) [Pandasに事前変換済み]
 )
 # ==================================================================
-# 🚨 Project Chimera (V5) 戦略パラメータ 🚨
+# 🚨 Project Cimera (V5) 戦略パラメータ 🚨
 # ==================================================================
 risk_engine = ExtremeRiskEngineV5(config_path=str(config.CONFIG_RISK))
 # 【未使用グローバル変数・参照禁止】
@@ -175,14 +124,14 @@ def load_static_data() -> bool:
     """
     global g_market_proxy
 
-    logger.info("   setting up initial data structures...")
+    logger.info("--- 0. 初期データ構造のセットアップ ---")
 
     # 空のDataFrameで初期化 (型とインデックスを定義)
     g_market_proxy = pd.DataFrame(
         columns=["market_proxy"], index=pd.DatetimeIndex([], tz="UTC", name="timestamp")
     )
 
-    logger.info("✓ Proxy DataFrame ready (real data generated dynamically from ZMQ)")
+    logger.info("✓ プロキシ用DataFrameの初期化完了 (実データはZMQから動的生成します)")
     return True
 
 
@@ -208,7 +157,7 @@ def _run_gap_fill(
     if diff_minutes <= 0:
         return last_processed_bar_time
 
-    logger.info(f"[GAP-FILL] filling {diff_minutes} min gap with M0.5...")
+    logger.info(f"[GAP-FILL] ギャップ {diff_minutes} 分を M0.5 で穴埋めします...")
 
     # [GAP-FIX 要修正①] gap-fill も有界リトライで包む (層2 の一過性 None で未充填続行に
     # ならないよう自己回復させる)。長期 GAP-FILL の転送脆弱性対策。
@@ -230,7 +179,7 @@ def _run_gap_fill(
     ]
 
     if new_m05_bars.empty:
-        logger.info("[GAP-FILL] no bars to fill (already current).")
+        logger.info("[GAP-FILL] 穴埋め対象バーなし（既に最新）。")
         return last_processed_bar_time
 
     # [V=0 GUARD] 学習側 s1_1_B_build_ohlcv.py の filter(tick_count > 0) と
@@ -250,7 +199,7 @@ def _run_gap_fill(
             )
 
     if new_m05_bars.empty:
-        logger.info("[GAP-FILL] no bars to fill after excluding V=0 ghosts.")
+        logger.info("[GAP-FILL] V=0 ghost 除外後、穴埋め対象バーなし。")
         return last_processed_bar_time
 
     # [DISC-FLAG SSoT] disc 計算は feature_engine._compute_disc_flag に
@@ -307,7 +256,7 @@ def _run_gap_fill(
         feature_engine.process_new_m05_bar(_bar_dict, market_proxy, warmup_only=True)
         _new_last_ts = int(_ts.timestamp())
 
-    logger.info(f"✓ [GAP-FILL] filled {len(new_m05_bars)} M0.5 bars.")
+    logger.info(f"✓ [GAP-FILL] {len(new_m05_bars)} 本 (M0.5) の穴埋め完了。")
     return _new_last_ts
 
 
@@ -393,7 +342,7 @@ def _refetch_m05_range(
                 lookback_bars=_lookback,
             )
         except Exception as _e:
-            logger.warning(f"[GAP-FIX] refetch attempt {_attempt}/{max_retries} exception: {_e}")
+            logger.warning(f"[GAP-FIX] 再取得 試行{_attempt}/{max_retries} 例外: {_e}")
             _df = None
         if _df is not None and not _df.empty:
             _fetch_ok = True  # 取得自体は成功 (中身が区間外でも transfer は成立)
@@ -460,7 +409,7 @@ def initialize_data_buffer(
     M1データの量を動的に計算してリクエストする。
     """
     logger.info(
-        "Fetching all-timeframe history via ZMQ (V12.0: M0.5 origin / zero-serialization)..."
+        "ZMQ経由で全時間足の履歴データを取得中 (V12.0: M0.5 起点 / Zero-Serialization)..."
     )
 
     history_data_map = {}
@@ -490,7 +439,7 @@ def initialize_data_buffer(
     lookback = max(800000, max_m05_bars_needed + 10000)
 
     logger.info(
-        f"  -> fetching {lookback} {tf_name} history bars (engine needs {max_m05_bars_needed} M0.5 bars)..."
+        f"  -> {tf_name} の履歴データを {lookback} 本取得中 (Engine要求: {max_m05_bars_needed} M0.5 bars)..."
     )
 
     # ✨ [V12.0] ZMQ リクエスト (PULLによるストリーミング受信)
@@ -519,7 +468,7 @@ def initialize_data_buffer(
 
     # ▼▼▼ M0.5履歴データから市場プロキシ(M5)を動的生成 ▼▼▼
     global g_market_proxy
-    logger.info("  -> generating initial market proxy (M5) from fetched M0.5 history...")
+    logger.info("  -> 取得したM0.5履歴データから初期の市場プロキシ(M5)を動的生成中...")
     try:
         temp_df = df_rates_m05[["timestamp", "close"]].copy()
         temp_df.set_index("timestamp", inplace=True)
@@ -564,7 +513,7 @@ def initialize_data_buffer(
         else:
             g_market_proxy = proxy_df.tz_convert("UTC")
 
-        logger.info(f"  ✓ market proxy generated ({len(g_market_proxy)} rows)")
+        logger.info(f"  ✓ 動的市場プロキシ生成完了 ({len(g_market_proxy)}行)")
     except Exception as e:
         logger.warning(
             f"  ⚠ 動的市場プロキシ生成に失敗しました（空のプロキシで続行）: {e}"
@@ -587,7 +536,7 @@ def initialize_data_buffer(
             f"M0.5バー最終処理時刻: {datetime.fromtimestamp(g_last_processed_bar_time, timezone.utc)}"
         )
     else:
-        logger.warning("M0.5 data empty -> setting last-processed time to now.")
+        logger.warning("M0.5データが空のため、最終処理時刻を現在時刻に設定します。")
         g_last_processed_bar_time = int(time.time())
 
     return True
@@ -604,12 +553,12 @@ def main(dry_run: bool = False, ols_dump: bool = False):
     global g_market_proxy
 
     logger.info("=" * 60)
-    logger.info("🐉 ProjectChimera integrated system (ZMQ hybrid) starting...")
+    logger.info("🚀 Project Forge 統合実行システム V11.0 (ZMQハイブリッド版) 起動...")
     logger.info("=" * 60)
     if dry_run:
-        logger.info("🔬 [DRY-RUN] orders SKIPPED (OLS state still updated as in live)")
+        logger.info("🔬 [DRY-RUN] 発注は SKIP されます (OLS state は実機通り更新)")
     if ols_dump:
-        logger.info("🔬 [OLS DUMP] OLS state pickle-dumped on signal fire")
+        logger.info("🔬 [OLS DUMP] シグナル発火時に OLS state を pickle dump します")
 
     # ▼▼▼ 追加: 推論値ログ用CSVのセットアップ ▼▼▼
     predictions_csv_path = config.LOGS_DIR / "m1_m2_predictions_log.csv"
@@ -643,29 +592,29 @@ def main(dry_run: bool = False, ols_dump: bool = False):
     try:
         # --- 0. 静的データ (プロキシ) のロード ---
         logger.info("")  # ★空白行を追加
-        logger.info("🧙‍♂️  0. Load static data (proxy)  🧙‍♂️")
+        logger.info("--- 0. 静的データ (プロキシ) のロード ---")
         if not load_static_data():
             raise RuntimeError("静的データのロードに失敗しました。")
-        logger.info("✓ Static data (M5 proxy) cached.")
+        logger.info("✓ 静的データ（M5プロキシ）をキャッシュしました。")
 
         # --- 1. 状態管理 (StateManager) の初期化 ---
         logger.info("")  # ★空白行を追加
-        logger.info("💫  1. State manager init  💫")
+        logger.info("--- 1. 状態管理 (StateManager) の初期化 ---")
         state_manager = StateManager(
             checkpoint_dir=str(config.STATE_CHECKPOINT_DIR),
             event_log_path=str(config.STATE_EVENT_LOG),
         )
         initial_state = state_manager.load_checkpoint()
         if initial_state:
-            logger.info(f"✓ State restored (equity: {initial_state.current_equity:.2f})")
+            logger.info(f"✓ 状態を復元 (Equity: {initial_state.current_equity:.2f})")
         else:
             logger.warning(
-                "No checkpoint found; initializing from broker state."
+                "チェックポイントが見つかりません。ブローカー状態から初期化します。"
             )
 
         # --- 2. 通信 (MQL5BridgeV3) の初期化 ---
         logger.info("")  # ★空白行を追加
-        logger.info("✈️  2. Bridge (MQL5BridgeV3) init  ✈️")
+        logger.info("--- 2. 通信 (MQL5BridgeV3 - V11.0) の初期化 ---")
         # [V11.0] 3系統のエンドポイントを設定
         bridge_config = BridgeConfig(
             control_endpoint=config.ZMQ["control_endpoint"],
@@ -675,31 +624,31 @@ def main(dry_run: bool = False, ols_dump: bool = False):
         bridge = MQL5BridgePublisherV3(bridge_config)
         if not bridge.connect():
             raise RuntimeError(
-                "MQL5 bridge connection failed. Check the EA (V11.0) is running."
+                "MQL5ブリッジへの接続に失敗しました。EA(V11.0)が起動しているか確認してください。"
             )
-        logger.info("✓ MQL5 bridge connected (Control/Data/Heartbeat).")
+        logger.info("✓ MQL5ブリッジ接続完了 (Control/Data/Heartbeat)。")
 
         # --- 3. ブローカー状態との整合性検証 ---
         logger.info("")  # ★空白行を追加
-        logger.info("🤖  3. Broker-state reconciliation  🤖")
+        logger.info("--- 3. ブローカー状態との整合性検証 ---")
         broker_state = bridge.request_broker_state()
         if broker_state:
             state_manager.reconcile_with_broker(broker_state)
-            logger.info("✓ State reconciled.")
+            logger.info("✓ 状態の整合性を確保しました。")
         else:
             logger.warning(
-                "Failed to fetch broker state (may be skipped at startup in V11.0)."
+                "ブローカー状態の取得に失敗しました (V11.0では起動時スキップの場合あり)。"
             )
 
         # --- 4. リスクエンジン (ExtremeRiskEngineV5) の初期化 ---
         logger.info("")  # ★空白行を追加
-        logger.info("🧠  4. Risk engine (ExtremeRiskEngineV5) init  🧠")
+        logger.info("--- 4. リスクエンジン (ExtremeRiskEngineV5) の初期化 ---")
         risk_engine = ExtremeRiskEngineV5(config_path=str(config.CONFIG_RISK))
-        logger.info("✓ Risk engine initialized (base + calibrator loaded).")
+        logger.info("✓ リスクエンジンを初期化しました（Base+Calibratorロード完了）。")
 
         # --- 5. AIモデル (Two-Brain) と特徴量リストのロード ---
         logger.info("")  # ★空白行を追加
-        logger.info("🏄  5. AI models & feature lists (V5)  🏄")
+        logger.info("--- 5. AIモデルと専用特徴量リストのロード (V5仕様) ---")
         try:
             # 1. LightGBM Booster (M1/M2)
             models = {
@@ -797,7 +746,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                 fl.append("m1_pred_proba")
 
             logger.info(
-                "✓ Two-Brain models, calibrators and feature lists loaded."
+                "✓ Two-Brainモデル、較正器、および専用特徴量リストのロード完了。"
             )
         except Exception as e:
             raise RuntimeError(f"モデルまたは特徴量リストのロードに失敗しました: {e}")
@@ -805,7 +754,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
         # --- 6. リアルタイム特徴量エンジン (マルチバッファ) の初期化 ---
         logger.info("")
         logger.info(
-            "🏭  6. Real-time feature engine init (zero-serialization)  🏭"
+            "--- 6. リアルタイム特徴量エンジンの初期化 (ゼロ・シリアライズ) ---"
         )
 
         # [FIX] orthogonal 4ファイルのユニーク和集合を特徴量名簿として渡す。
@@ -835,7 +784,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
         _tmp_feature_list.write("\n".join(_union))
         _tmp_feature_list.close()
         logger.info(
-            f"[FIX] feature roster replaced with orthogonal 4-file union ({len(_union)} items)."
+            f"[FIX] 特徴量名簿を orthogonal 4ファイル和集合 ({len(_union)}件) に差し替えました。"
             f" -> {_tmp_feature_list.name}"
         )
 
@@ -904,7 +853,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
             try:
                 # 1. とりあえずロードを試みる
                 if feature_engine.load_state(str(state_file)):
-                    logger.info("⚡ Fast restore from snapshot succeeded!")
+                    logger.info("⚡ スナップショットからの爆速復帰に成功しました！")
                     if len(feature_engine.m05_dataframe) > 0:
                         global g_last_processed_bar_time
                         g_last_processed_bar_time = int(
@@ -922,7 +871,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         # 穴埋め完了後に最新状態をスナップショット保存
                         feature_engine.save_state(str(state_file))
                         logger.info(
-                            "💾 Post-catchup state snapshotted."
+                            "💾 追いつき後の最新状態をスナップショットに保存しました。"
                         )
 
                     is_warmed_up = True
@@ -935,7 +884,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                 try:
                     state_file.unlink(missing_ok=True)  # 物理的にファイルを削除
                 except Exception as del_e:
-                    logger.error(f"Failed to delete file: {del_e}")
+                    logger.error(f"ファイルの削除に失敗しました: {del_e}")
                 is_warmed_up = (
                     False  # Falseにして下のフルウォームアップ処理へ合流させる
                 )
@@ -975,13 +924,13 @@ def main(dry_run: bool = False, ols_dump: bool = False):
         # EA側のg_python_readyが自動的にtrueになる。
         # EA再起動・瞬断後も次のHeartbeatで自動同期されるため一発コマンドへの依存がない。
         logger.info(
-            "[STALE-GUARD] Python-ready flag set; EA M3 notifications enabled on next heartbeat."
+            "[STALE-GUARD] Python準備完了フラグをセット。次のHeartbeatでEAのM3通知が解禁されます。"
         )
         bridge.notify_python_ready()
 
         # --- 7. リアルタイム取引ループ開始 (M3イベント駆動ループ) ---
         logger.info("=" * 60)
-        logger.info(f"🚀  Real-time trading loop started  🚀")
+        logger.info(f"🚀 リアルタイム取引ループ開始 ")
         logger.info("=" * 60)
 
         # ▼追加: ホットリロード用のタイムスタンプ監視
@@ -1012,7 +961,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
         #   BUFFER-INTEGRITY gap-fill（市場閉鎖・月曜再開等）: 1回
         _skip_signals_count = 1
         logger.info(
-            f"[COOLDOWN] startup stabilization: skipping {_skip_signals_count} M3 close(s)"
+            f"[COOLDOWN] 起動後安定化クールダウン設定: {_skip_signals_count} M3確定スキップ"
         )
 
         while True:
@@ -1045,7 +994,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     # [COOLDOWN] EA再起動後はOLS欠落が大きいため2M3確定スキップ
                     _skip_signals_count = max(_skip_signals_count, 2)
                     logger.info(
-                        f"[COOLDOWN] EA restart detected: skipping {_skip_signals_count} M3 close(s)"
+                        f"[COOLDOWN] EA再起動検知: {_skip_signals_count} M3確定スキップに設定"
                     )
 
                 # [BUFFER-INTEGRITY] メインループ整合性チェック & 自動 gap-fill
@@ -1095,7 +1044,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         # [COOLDOWN] 市場閉鎖・月曜再開等の復帰後は1M3確定スキップ
                         _skip_signals_count = max(_skip_signals_count, 1)
                         logger.info(
-                            f"[COOLDOWN] buffer-integrity recovery: skipping {_skip_signals_count} M3 close(s)"
+                            f"[COOLDOWN] BUFFER-INTEGRITY復帰: {_skip_signals_count} M3確定スキップに設定"
                         )
 
                 # 15分間隔でスナップショットを強制保存
@@ -1106,7 +1055,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         )
                         feature_engine.save_state(str(state_file))
                         logger.info(
-                            "💾 [Periodic save] feature-engine state snapshotted."
+                            "💾 [定期保存] 特徴量エンジンの状態をスナップショットに保存しました。"
                         )
                     last_snapshot_time = current_time_sec
 
@@ -1212,7 +1161,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                                 if active_trade:
                                     reason = closed_pos.get("close_reason", "UNKNOWN")
                                     logger.warning(
-                                        f"🔔 Broker-side close detected (silent close): ticket={ticket}, reason={reason}"
+                                        f"🔔 ブローカー側での決済を検知 (サイレントクローズ捕捉): Ticket={ticket}, Reason={reason}"
                                     )
                                     event_data = {
                                         "ticket": ticket,
@@ -1376,7 +1325,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                                 # 再取得分を new_m05_bars の前に差し込む (単調順を保つ)
                                 new_m05_bars = _fill_bars + new_m05_bars
                 except Exception as _gap_e:
-                    logger.warning(f"[GAP-FIX] live-continuity guard exception (continuing): {_gap_e}")
+                    logger.warning(f"[GAP-FIX] live 連続性保証で例外 (続行): {_gap_e}")
 
                 # 先頭〜末尾の 1 本前を warmup_only=True で順次消費
                 # (バッファ・OLS のみ更新、シグナル生成はスキップ)
@@ -1496,8 +1445,8 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                 if _skip_signals_count > 0 and _m3_ts_after != _m3_ts_before:
                     _skip_signals_count -= 1
                     logger.info(
-                        f"[COOLDOWN] stabilization active -> signal skipped"
-                        f" ({_skip_signals_count} M3 close(s) left)"
+                        f"[COOLDOWN] 安定化クールダウン中のためシグナルをスキップ"
+                        f"（残り {_skip_signals_count} M3確定待ち）"
                     )
                     continue  # バッファ・OLS更新は完了済み、シグナル処理のみスキップ
 
@@ -1506,9 +1455,9 @@ def main(dry_run: bool = False, ols_dump: bool = False):
 
                 # シグナル処理ループ
                 for signal in signal_list:
-                    logger.info("────────────── 🐉 ──────────────")
+                    logger.info("-" * 30)
                     logger.info(
-                        f"🐉 {signal.timeframe} signal @ {signal.market_info['current_price']:.3f}"
+                        f"🔍 {signal.timeframe} R4 シグナル検知 @ {signal.market_info['current_price']:.3f}"
                     )
 
                     # ▼▼▼ 追加: 現在の保有ポジション数の集計と表示 ▼▼▼
@@ -1523,7 +1472,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         if t.direction == "SELL"
                     )
                     logger.info(
-                        f"💫 Positions: Long {current_longs} / Short {current_shorts} (total {current_longs + current_shorts})"
+                        f"📊 現在の保有ポジション: Long {current_longs} / Short {current_shorts} (Total {current_longs + current_shorts})"
                     )
                     # ▲▲▲ ここまで追加 ▲▲▲
 
@@ -1714,20 +1663,20 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         if p_l > p_s and p_l > current_m2_thresh:
                             should_trade_long = True
                             logger.info(
-                                f"🎯 [Delta: PASS] delta {delta:.4f} >= {current_m2_delta} and Long({p_l:.4f}) > {current_m2_thresh}"
+                                f"🎯 [Delta Filter: PASS] Delta {delta:.4f} >= {current_m2_delta} 尚且つ Long({p_l:.4f}) > {current_m2_thresh}"
                             )
                         elif p_s > p_l and p_s > current_m2_thresh:
                             should_trade_short = True
                             logger.info(
-                                f"🎯 [Delta: PASS] delta {delta:.4f} >= {current_m2_delta} and Short({p_s:.4f}) > {current_m2_thresh}"
+                                f"🎯 [Delta Filter: PASS] Delta {delta:.4f} >= {current_m2_delta} 尚且つ Short({p_s:.4f}) > {current_m2_thresh}"
                             )
                         else:
                             logger.info(
-                                f"🚧 [Delta: SKIP] low confidence (winning proba <= {current_m2_thresh})"
+                                f"🚧 [Delta Filter: SKIP] 確信度不足 (勝つ方の確率が閾値 {current_m2_thresh} 以下)"
                             )
                     else:
                         logger.info(
-                            f"🚧 [Delta: SKIP] delta too small ({delta:.4f} < {current_m2_delta})"
+                            f"🚧 [Delta Filter: SKIP] 差分不足 (Delta {delta:.4f} < 閾値 {current_m2_delta})"
                         )
                     # ▲▲▲ ここまで修正 ▲▲▲
 
@@ -1759,7 +1708,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                                 ]
                             )
                     except Exception as e:
-                        logger.warning(f"Failed to write CSV: {e}")
+                        logger.warning(f"CSVへの書き込みに失敗しました: {e}")
                     # ▲▲▲ ここまで追加 ▲▲▲
 
                     if should_trade_long or should_trade_short:
@@ -1848,8 +1797,8 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                             )
                             n_missing = n_required - n_computed
                             logger.info(
-                                f"🌚 Entry features -> CSV: "
-                                f"requested {n_required} / computed {n_computed} / missing {n_missing} "
+                                f"💾 エントリー時の全特徴量を CSV に記録: "
+                                f"要求 {n_required} / 計算済 {n_computed} / 未計算 {n_missing} "
                                 f"({dump_csv_path.name})"
                             )
                             if n_missing > 0:
@@ -1918,7 +1867,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                                     )
                             # ▲▲▲ [OLS state dump フック] ▲▲▲
                         except Exception as e:
-                            logger.warning(f"Failed to save feature CSV: {e}")
+                            logger.warning(f"特徴量CSVの保存に失敗: {e}")
                     # ▲▲▲ ここまで追加 ▲▲▲
 
                     # # --- 1. 同時発注禁止 & 両建て防止 (prevent_simultaneous_orders) ---
@@ -1941,15 +1890,13 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     # ステップC: クールダウン中かどうかの最終確認
                     if should_trade_long and state_manager.is_cooldown_active("BUY"):
                         logger.warning(
-                            "🔒 [Risk gate: cooldown] BUY is in cooldown "
-                            "(consecutive-SL lockout) -> entry dropped"
+                            "🔒 【防衛線2】BUY方向は現在Cooldown中（連続SLロックアウト）。エントリーを破棄します。"
                         )
                         should_trade_long = False
 
                     if should_trade_short and state_manager.is_cooldown_active("SELL"):
                         logger.warning(
-                            "🔒 [Risk gate: cooldown] SELL is in cooldown "
-                            "(consecutive-SL lockout) -> entry dropped"
+                            "🔒 【防衛線2】SELL方向は現在Cooldown中（連続SLロックアウト）。エントリーを破棄します。"
                         )
                         should_trade_short = False
 
@@ -1958,19 +1905,17 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     current_dd = state_manager.current_state.current_drawdown
                     if current_dd >= current_max_dd:
                         logger.warning(
-                            f"🛑 [Risk gate: drawdown] max drawdown exceeded "
-                            f"({current_dd:.1%} >= {current_max_dd:.1%}) -> all entries halted"
+                            f"🛑 【防衛線3】最大ドローダウン超過 ({current_dd:.1%} >= {current_max_dd:.1%})。全エントリーを停止します。"
                         )
                         should_trade_long = False
                         should_trade_short = False
 
-                    # --- 4. Max open positions ---
+                    # --- 4. 最大ポジション数チェック (防衛線4) ---
                     current_max_pos = risk_engine.config.get("max_positions", 100)
                     current_pos_count = len(state_manager.current_state.trades)
                     if current_pos_count >= current_max_pos:
                         logger.warning(
-                            f"🛑 [Risk gate: max positions] limit reached "
-                            f"({current_pos_count}/{current_max_pos}) -> new entries halted"
+                            f"🛑 【防衛線4】最大ポジション数到達 ({current_pos_count}/{current_max_pos})。新規エントリーを停止します。"
                         )
                         should_trade_long = False
                         should_trade_short = False
@@ -1988,7 +1933,7 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     else:
                         continue  # どちらもFalseなら見送り (次のループへ)
                     logger.info(
-                        f"🚀 Risk gates cleared -> starting {direction} entry"
+                        f"🟢 防衛線クリア。{direction}方向のエントリー手続きを開始します。"
                     )
 
                     # --- リスクエンジンへの委譲 (V5 Pure Math Mode) ---
@@ -2030,7 +1975,6 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         tp_multiplier=current_tp_mult,  # 修正反映
                         current_spread_pips=current_spread,
                         atr_ratio=current_atr_ratio,  # ★追加: ATR Ratio をリスクエンジンに渡す
-                        price_at_L=signal.market_info.get("price_at_L", 0.0),  # [L-ANCHOR] PT を L 起点に
                     )
 
                     # [DEBUG-BARRIER] 発注直前の診断ログ — バリア幅異常の原因特定用
@@ -2038,17 +1982,20 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     # HOLDコマンドの場合はこれらキーが無いためフォールバックを用意。
                     _entry_price = signal.market_info["current_price"]
                     _sl_dollar = float(command.get("sl_width", 0.0))
-                    _sl_dollar_from_L = float(command.get("sl_width_from_L", 0.0))
                     _tp_dollar = float(command.get("tp_width", 0.0))
-                    _tp_dollar_full = float(command.get("tp_width_full", 0.0))
                     _buf_len = signal.market_info.get("atr_buffer_len", -1)
                     _last_tr = signal.market_info.get("last_tr", -1.0)
                     if command["action"] != "HOLD":
                         logger.info(
-                            f"📐 BARRIER | {direction} @ {_entry_price:.3f}\n"
-                            f" | ATR={current_atr:.4f} last_TR={_last_tr:.4f} buf={_buf_len}\n"
-                            f" | SL ${_sl_dollar:.3f}/L${_sl_dollar_from_L:.3f} (x{current_sl_mult})"
-                            f" | TP ${_tp_dollar:.3f}/full${_tp_dollar_full:.3f} (x{current_tp_mult})"
+                            f"[DEBUG-BARRIER] direction={direction}"
+                            f" | entry={_entry_price:.3f}"
+                            f" | ATR={current_atr:.4f}"
+                            f" | last_TR={_last_tr:.4f}"
+                            f" | buf_len={_buf_len}"
+                            f" | SL幅=${_sl_dollar:.3f}"
+                            f" | TP幅=${_tp_dollar:.3f}"
+                            f" | SL_mult={current_sl_mult}"
+                            f" | TP_mult={current_tp_mult}"
                         )
 
                     # [BARRIER-GUARD] 最低ドル幅フィルター
@@ -2061,14 +2008,13 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         _sl_dollar < _min_barrier or _tp_dollar < _min_barrier
                     ):
                         logger.warning(
-                            f"⚠️ [Barrier guard] width below floor (${_min_barrier}) "
-                            f"-> converted to HOLD  "
-                            f"(SL ${_sl_dollar:.3f} / TP ${_tp_dollar:.3f})"
+                            f"⚠️ [BARRIER-GUARD] バリア幅が最低閾値(${_min_barrier})未満のためHOLDに変換。"
+                            f" SL幅=${_sl_dollar:.3f} / TP幅=${_tp_dollar:.3f}"
                         )
                         command["action"] = "HOLD"
                         command["reason"] = (
-                            f"Barrier guard: SL ${_sl_dollar:.3f} TP ${_tp_dollar:.3f}"
-                            f" < min ${_min_barrier}"
+                            f"BARRIER-GUARD: SL=${_sl_dollar:.3f} TP=${_tp_dollar:.3f}"
+                            f" < min=${_min_barrier}"
                         )
 
                     # V5エンジンは独立したため、ここでイベントログを記録する
@@ -2082,53 +2028,53 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     if command["action"] != "HOLD":
                         if dry_run:
                             logger.info(
-                                f"🔬 [DRY-RUN] order skipped: {command['action']} "
-                                f"{command['lots']} lots  "
-                                f"(SL {command.get('stop_loss')} / "
-                                f"TP {command.get('take_profit')})"
+                                f"🔬 [DRY-RUN] 発注 skip: {command['action']} "
+                                f"{command['lots']} lots "
+                                f"(SL:{command.get('stop_loss')}, "
+                                f"TP:{command.get('take_profit')})"
                             )
                         else:
                             logger.info(
-                                f"-> Sending order: {command['action']} {command['lots']} lots  "
-                                f"(SL {command.get('stop_loss')} / TP {command.get('take_profit')})"
-                                f"  [spread {current_spread:.1f} pips]"
+                                f"-> 発注コマンドを送信: {command['action']} {command['lots']} lots"
+                                f" (SL:{command.get('stop_loss')}, TP:{command.get('take_profit')})"
+                                f" [Spread: {current_spread:.1f}pips]"
                             )
                             success = bridge.send_trade_command(command)
                             if success:
-                                logger.info("✓ Command sent (ACK received)")
-                                logger.info("⏳ Waiting for position to register (5s)...")
+                                logger.info("✓ コマンド送信成功 (ACK受信)")
+                                logger.info("⏳ ポジション反映待ち (5秒待機)...")
                                 time.sleep(5.0)
 
                                 broker_state_after = bridge.request_broker_state()
                                 if broker_state_after:
                                     state_manager.reconcile_with_broker(broker_state_after)
                             else:
-                                logger.error("✗ Command send failed (NACK or timeout)")
+                                logger.error("✗ コマンド送信失敗 (NACKまたはタイムアウト)")
                     else:
                         logger.info(
-                            f"🧙‍♂️ HOLD (risk engine): {command['reason']}"
+                            f"-> HOLD (リスクエンジン判断): {command['reason']}"
                         )
 
             except Exception as loop_error:
-                logger.error(f"Trade loop error: {loop_error}", exc_info=True)
+                logger.error(f"取引ループでエラーが発生: {loop_error}", exc_info=True)
                 time.sleep(10)
 
     except KeyboardInterrupt:
         logger.info("\n" + "=" * 60)
-        logger.info("... shutdown signal (Ctrl+C) received ...")
+        logger.info("... システム終了シグナル (Ctrl+C) を受信 ...")
         logger.info("=" * 60)
     except Exception as e:
         logger.critical(f"起動シーケンスで致命的なエラーが発生: {e}", exc_info=True)
 
     finally:
         # --- 8. グレースフルシャットダウン ---
-        logger.info("🛑  7. Shutting down  🛑")
+        logger.info("--- 8. シャットダウン処理中 ---")
         if bridge:
             bridge.disconnect()
-            logger.info("MQL5 bridge disconnected.")
+            logger.info("MQL5ブリッジを切断しました。")
         if state_manager and state_manager.current_state:
             state_manager.save_checkpoint(state_manager.current_state)
-            logger.info("Final state saved to checkpoint.")
+            logger.info("最終状態をチェックポイントに保存しました。")
 
         # ▼▼▼ 追加: 終了時に特徴量エンジンのスナップショットを必ず保存する ▼▼▼
         if feature_engine:
@@ -2136,15 +2082,15 @@ def main(dry_run: bool = False, ols_dump: bool = False):
             feature_engine.save_state(str(state_file))
         # ▲▲▲ ここまで追加 ▲▲▲
 
-        logger.info("MetaTrader5 connection shut down.")
+        logger.info("MetaTrader5との接続をシャットダウンしました。")
         logger.info("=" * 60)
-        logger.info("👋 ProjectChimera shut down cleanly")
+        logger.info("👋 Project Forge 正常終了")
         logger.info("=" * 60)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="ProjectChimera V5")
+    parser = argparse.ArgumentParser(description="Project Forge V5")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="発注を skip (OLS state は実機通り更新、 検証用)",

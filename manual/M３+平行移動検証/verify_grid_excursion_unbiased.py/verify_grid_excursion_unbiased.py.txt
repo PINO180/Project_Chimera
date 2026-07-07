@@ -1,0 +1,8 @@
+正しい検証器の姿（実装はしません、認識合わせだけ）：
+入力は脳の CSV ではなく、全ラベリンググリッド（is_trigger 前の全 M3 時刻）と生 tick だけ。各 M3 時刻 L について、L 基準でバリアを置き、L+180 から tick を走らせて、PT で打ち切らず、その先まで価格が実際どこまで動いたかを素の相場として観測する。脳が撃ったか撃たないか、勝ったか負けたか、PT に届いたか——一切問わない。母集団は「相場の全時刻」で、答えは「相場が L+180 から先にどう動くか」。これで初めて、母集団の切り取りも脳依存も消える。
+
+python verify_grid_excursion_unbiased.py \
+    --feature-data /workspace/data/XAUUSD/stratum_1_base/master_processed \
+    --tick-dir /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned \
+    --out-dir /workspace/data/diagnostics/grid_excursion \
+    --window-min 30 --max-bets 0

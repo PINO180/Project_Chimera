@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 # ▲▲▲ ここまで追加 ▲▲▲
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import json
 import re
@@ -88,7 +88,7 @@ class Signal:
 
 class RealtimeFeatureEngine:
     """
-    【Project Cimera V5: オーケストレーター】
+    【Project Chimera V5: オーケストレーター】
     15時間足の独立したNumpyバッファを保持し、M0.5バーを起点とした
     全時間足の同期・リサンプリング・OLS純化・ベクトル生成を司る司令塔。
     特徴量計算そのものは外部のNumbaモジュール(1A〜1F)へ委譲する。
@@ -384,7 +384,7 @@ class RealtimeFeatureEngine:
                 main.py 起動時に S3_QA_STATES_DIR/qa_state_e1{a..f}.pkl を load
                 して渡す。None の場合は旧挙動 (warmup loop で seed) で fallback。
         """
-        self.logger = logging.getLogger("ProjectCimera.FeatureEngine")
+        self.logger = logging.getLogger("♾️Chimera♾️.FEAT")
 
         # [Phase 9d 発見 #66 Phase D-3] artifact を instance var に保持。
         # 後段 (qa_states 初期化箇所) で _extract_artifact が参照する。
@@ -404,10 +404,10 @@ class RealtimeFeatureEngine:
         try:
             self.feature_list = self._load_feature_list(feature_list_path)
             self.logger.info(
-                f"特徴量名簿 ({len(self.feature_list)}個) をロードしました。"
+                f"Feature roster loaded ({len(self.feature_list)} items)."
             )
         except Exception as e:
-            self.logger.critical(f"特徴量名簿 {feature_list_path} のロードに失敗: {e}")
+            self.logger.critical(f"Feature roster load failed ({feature_list_path}): {e}")
             raise
 
         # 2. 名簿から各時間足の最大ルックバック期間を特定
@@ -438,7 +438,7 @@ class RealtimeFeatureEngine:
                 )
             else:
                 self.logger.info(
-                    f"  -> {tf_name:<3} バッファ初期化 (Lookback: {self.lookbacks_by_tf[tf_name]})"
+                    f"  -> {tf_name:<5} buffer init (lookback: {self.lookbacks_by_tf[tf_name]})"
                 )
 
             lookback = self.lookbacks_by_tf[tf_name]
@@ -506,7 +506,7 @@ class RealtimeFeatureEngine:
             self.ols_state[tf_name] = {}
             # 各エントリは _update_incremental_ols で特徴量登場時に動的初期化される
 
-        self.logger.info(f"M0.5 Dequeバッファを初期化 (maxlen: {max_m05_bars_needed})")
+        self.logger.info(f"M0.5 deque buffer init (maxlen: {max_m05_bars_needed})")
 
         # [診断 L1] バッファ容量と特徴量計算要求の整合性を検証
         # 学習側 timeframe_bars_per_day と本番側 lookbacks_by_tf のズレを起動時に検出する
@@ -567,7 +567,7 @@ class RealtimeFeatureEngine:
                     lookback_bars=lb, artifact=_extract_artifact("e1f")
                 ),
             }
-        self.logger.info("✓ 全時間足のQAStateを初期化しました。")
+        self.logger.info("✓ QAState initialized for all timeframes.")
 
         # Phase D-3 artifact load 状況のサマリーをログ出力
         if getattr(self, "_qa_state_artifacts", None):
@@ -611,7 +611,7 @@ class RealtimeFeatureEngine:
 
     def _warmup_jit(self):
         """各モジュールの完全カプセル化メソッドを呼び出し、JITコンパイルを済ませる"""
-        self.logger.info("外部モジュールのJITウォームアップを開始します...")
+        self.logger.info("Starting JIT warmup of external modules...")
         try:
             # OHLCVのダミーデータ（辞書）を作成
             dummy_arr = np.cumsum(np.random.randn(300)).astype(np.float64) + 1000.0
@@ -631,9 +631,9 @@ class RealtimeFeatureEngine:
             _ = FeatureModule1E.calculate_features(dummy_data)
             _ = FeatureModule1F.calculate_features(dummy_data)
 
-            self.logger.info("✓ JITウォームアップ完了。")
+            self.logger.info("✓ JIT warmup done.")
         except Exception as e:
-            self.logger.warning(f"JITウォームアップ中に警告: {e}")
+            self.logger.warning(f"JIT warmup warning: {e}")
 
     def _parse_feature_list_and_get_lookbacks(
         self, feature_list: List[str]
@@ -752,8 +752,8 @@ class RealtimeFeatureEngine:
             final_lookbacks[tf_name_parsed] = req_size + 100  # 安全マージン
             tf_ols_window = self._get_ols_window(tf_name_parsed)
             self.logger.info(
-                f"  -> {tf_name_parsed:<5} 最大ルックバック: {final_lookbacks[tf_name_parsed]} "
-                f"(特徴量計算用、純化窓 {tf_ols_window} は別バッファ)"
+                f"  -> {tf_name_parsed:<5} max lookback: {final_lookbacks[tf_name_parsed]} "
+                f"(features; purify window {tf_ols_window} separate)"
             )
 
         # PER_TF_FEATURE_MAX に未登録の TF があれば末尾に追加 (ソート済み、ログ出力)
@@ -762,8 +762,8 @@ class RealtimeFeatureEngine:
             final_lookbacks[tf_name_parsed] = req_size + 100
             tf_ols_window = self._get_ols_window(tf_name_parsed)
             self.logger.info(
-                f"  -> {tf_name_parsed:<5} 最大ルックバック: {final_lookbacks[tf_name_parsed]} "
-                f"(特徴量計算用、純化窓 {tf_ols_window} は別バッファ、未登録TF)"
+                f"  -> {tf_name_parsed:<5} max lookback: {final_lookbacks[tf_name_parsed]} "
+                f"(features; purify window {tf_ols_window} は別バッファ、未登録TF)"
             )
 
         return final_lookbacks
@@ -803,7 +803,7 @@ class RealtimeFeatureEngine:
             "M15":  1440,
         }
 
-        self.logger.info("--- バッファ容量検証 (診断 L1) ---")
+        self.logger.info("--- Buffer capacity check (diag L1) ---")
         all_ok = True
         for tf_name, required in PER_TF_FEATURE_MAX.items():
             if tf_name not in self.lookbacks_by_tf:
@@ -818,10 +818,10 @@ class RealtimeFeatureEngine:
                 all_ok = False
             else:
                 self.logger.info(
-                    f"  ✓ {tf_name:<5} バッファ容量 OK: maxlen={actual} >= 必要={required}"
+                    f"  ✓  {tf_name:<5} buffer capacity OK: maxlen={actual} >= need={required}"
                 )
         if all_ok:
-            self.logger.info("✓ 全 TF のバッファ容量が学習側要求を満たしています。")
+            self.logger.info("✓ All TF buffer capacities meet training requirements.")
         else:
             self.logger.error(
                 "❌ バッファ容量不足の TF があります。学習側との特徴量分布が乖離します。"
@@ -2016,11 +2016,48 @@ class RealtimeFeatureEngine:
                     float(barrier_atr) if np.isfinite(barrier_atr) else atr_value
                 )
 
+                # [L-ANCHOR §41.8] price(L) を market_info へ追加。
+                #   ラベリングの L アンカー = 「timestamp <= L の最後の tick mid」
+                #   (create_proxy_labels: tick mid を L で join_asof(backward))。
+                #   学習側 M0.5 バーは group_key = ts//30s の floor バケットで
+                #   bar(T) = [T, T+30s) の集計、close = last mid (s1_1_B L200-201)。
+                #   よって「L で閉じた M0.5 バー = bar(L-30s) の close」が
+                #   「timestamp < L の最後の tick mid」に一致 (境界 tick=L ちょうどの
+                #   1 点のみ join_asof と異なるが ms 精度で実務上無視できる)。
+                #   本番 EA の M0.5 も CopyTicksRange の同一バケット・同一 mid 定義
+                #   ([TICK-AGG-FIX A-2]) なので bit 一致。
+                #   timestamp 引数 = M3 close = L+180 → L = timestamp - 180s。
+                #   探索は m05_dataframe (deque of dict, timestamp 昇順) を末尾から。
+                price_at_L = 0.0
+                try:
+                    _L_ts = timestamp - timedelta(seconds=180)
+                    _target_m05_ts = _L_ts - timedelta(seconds=30)
+                    for _b in reversed(self.m05_dataframe):
+                        _bts = _b["timestamp"]
+                        if _bts == _target_m05_ts:
+                            price_at_L = float(_b["close"])
+                            break
+                        if _bts < _target_m05_ts:
+                            # 30s 欠落 (流動性ギャップ等) → それ以前で最後に閉じた
+                            # M0.5 close = 「timestamp < L の最後の mid」に一致するので採用
+                            price_at_L = float(_b["close"])
+                            break
+                except Exception as _e:
+                    self.logger.warning(f"[L-ANCHOR] price_at_L 取得失敗: {_e}")
+                if price_at_L <= 0.0:
+                    # フォールバック: 取得不能時は current_price (=約定基準 PT に退化)。
+                    # risk engine 側は price_at_L<=0 を「L 起点 PT 不可」として扱う。
+                    self.logger.warning(
+                        "[L-ANCHOR] price_at_L が取得できません。current_price に"
+                        "フォールバックします (PT は約定基準に退化)。"
+                    )
+
                 market_info = {
                     "atr_value": barrier_atr_value,  # SL/TP計算用（堅牢版）
                     "atr_value_raw": atr_value,       # 参考値（学習側と同一のWilder EWM）
                     "atr_ratio": atr_ratio,
                     "current_price": current_price,
+                    "price_at_L": price_at_L,  # [L-ANCHOR] L 時点価格 (0.0=取得不能)
                     "sl_multiplier_long": self.risk_config.get(
                         "sl_multiplier_long", 5.0
                     ),
@@ -2040,14 +2077,14 @@ class RealtimeFeatureEngine:
                 }
 
                 self.logger.info(
-                    f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
+                    f"🏄  V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
                     f"PASSED (ATR Ratio: {atr_ratio:.3f} >= {atr_threshold:.3f})"
                 )
                 return {"is_V5": True, "market_info": market_info}
             else:
                 # ▼▼▼ 追加: ATR不足で見送った時のログ ▼▼▼
                 self.logger.info(
-                    f"  -> V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
+                    f"🏄  V5 Signal Check ({tf_name} @ {timestamp.strftime('%H:%M')}): "
                     f"FAILED ⛔ (ATR Ratio: {atr_ratio:.3f} < {atr_threshold:.3f})"
                 )
                 # ▲▲▲ ここまで追加 ▲▲▲
@@ -2700,7 +2737,7 @@ class RealtimeFeatureEngine:
             os.replace(temp_filepath, filepath)
 
             self.logger.info(
-                f"✓ 特徴量エンジンの状態をスナップショット保存しました (Atomic): {filepath}"
+                f"✓ Feature-engine state snapshotted (atomic): {filepath}"
             )
             return True
 
@@ -2750,7 +2787,7 @@ class RealtimeFeatureEngine:
             self.qa_states = state_data.get("qa_states", self.qa_states)  # [乖離①修正]
 
             self.logger.info(
-                f"✓ 特徴量エンジンの状態をスナップショットから復元しました: {filepath}"
+                f"✓ Feature-engine state restored from snapshot: {filepath}"
             )
             return True
         except Exception as e:

@@ -36,8 +36,13 @@ if str(project_root) not in sys.path:
 
 # --- Blueprint Imports ---
 from blueprint import (
-    S5_NEUTRALIZED_ALPHA_SET, S2_FEATURES_VALIDATED, S6_LABELED_DATASET,
-    S1_RAW_TICK_PARTITIONED, S1_PROCESSED, BARRIER_ATR_PERIOD, ATR_BASELINE_DAYS
+    S5_NEUTRALIZED_ALPHA_SET,
+    S2_FEATURES_VALIDATED,
+    S6_LABELED_DATASET,
+    S1_RAW_TICK_PARTITIONED,
+    S1_PROCESSED,
+    BARRIER_ATR_PERIOD,
+    ATR_BASELINE_DAYS,
 )
 
 # --- Logging Setup ---
@@ -62,9 +67,20 @@ ATR_RATIO_THRESHOLD = 0.8  # ATR Ratio閾値（絶対値ではなく相対比率
 
 # timeframeごとの1日あたりバー数（ATR Ratio計算のbaseline_period算出に使用）
 timeframe_bars_per_day = {
-    "M0.5": 2880, "M1": 1440, "M3": 480, "M5": 288,
-    "M8": 180, "M15": 96, "M30": 48, "H1": 24,
-    "H4": 6, "H6": 4, "H12": 2, "D1": 1, "W1": 1, "MN": 1
+    "M0.5": 2880,
+    "M1": 1440,
+    "M3": 480,
+    "M5": 288,
+    "M8": 180,
+    "M15": 96,
+    "M30": 48,
+    "H1": 24,
+    "H4": 6,
+    "H6": 4,
+    "H12": 2,
+    "D1": 1,
+    "W1": 1,
+    "MN": 1,
 }
 
 # ★スプレッドコストを定義（spread_pips=50.0 → XAUUSD: 1pip=0.01ドル → 50pips=0.50ドル）
@@ -72,16 +88,16 @@ SPREAD = 0.50
 
 # ロング用ルール
 RULE_LONG = {
-    "pt_mult": 1.0,   # pt_multiplier_long
-    "sl_mult": 5.0,   # sl_multiplier_long
-    "td": "30m",      # td_minutes_long: 30
+    "pt_mult": 2.0,  # pt_multiplier_long
+    "sl_mult": 0.3,  # sl_multiplier_long
+    "td": "30m",  # td_minutes_long: 30
 }
 
 # ショート用ルール
 RULE_SHORT = {
-    "pt_mult": 1.0,   # pt_multiplier_short
-    "sl_mult": 5.0,   # sl_multiplier_short
-    "td": "30m",      # td_minutes_short: 30
+    "pt_mult": 2.0,  # pt_multiplier_short
+    "sl_mult": 0.3,  # sl_multiplier_short
+    "td": "30m",  # td_minutes_short: 30
 }
 # --- ▲▲▲ 改造ここまで ▲▲▲ ---
 
@@ -92,7 +108,9 @@ class ProxyLabelConfig:
     """Config for creating a context-adaptive, dual-labeled subset for proxy model training."""
 
     input_dir: Path = S5_NEUTRALIZED_ALPHA_SET
-    price_data_source_dir: Path = S1_PROCESSED  # tick/ATRはS1から直接取得（S2_FEATURES_VALIDATEDは不使用）
+    price_data_source_dir: Path = (
+        S1_PROCESSED  # tick/ATRはS1から直接取得（S2_FEATURES_VALIDATEDは不使用）
+    )
     output_dir: Path = S6_LABELED_DATASET
 
     filter_mode: str = "year"  # 'year', 'month', 'all'
@@ -618,7 +636,9 @@ class ProxyLabelingEngine:
         tick_dir = S1_RAW_TICK_PARTITIONED
         if not tick_dir.exists():
             raise FileNotFoundError(f"Master tick directory not found: {tick_dir}")
-        logging.info(f"  -> Confirmed tick source: '{tick_dir}' (will be loaded per-month chunk).")
+        logging.info(
+            f"  -> Confirmed tick source: '{tick_dir}' (will be loaded per-month chunk)."
+        )
 
         # --- S1_PROCESSEDのOHLCVからWilder平滑化でATR絶対値を自前計算 ---
         # e1c_atr_13はATR/ATR_13の相対値（≈1.0）のため使用不可
@@ -627,7 +647,9 @@ class ProxyLabelingEngine:
         for tf in TARGET_TIMEFRAMES:
             price_dir_tf = S1_PROCESSED / f"timeframe={tf}"
             if not price_dir_tf.exists():
-                logging.warning(f"  -> S1_PROCESSED/timeframe={tf} が見つかりません。スキップします。")
+                logging.warning(
+                    f"  -> S1_PROCESSED/timeframe={tf} が見つかりません。スキップします。"
+                )
                 continue
             target_atr_name = f"e1c_atr_{ATR_PERIOD}_{tf}"
             atr_ratio_name = f"atr_ratio_{tf}"
@@ -642,27 +664,36 @@ class ProxyLabelingEngine:
                 .select(["timestamp", "high", "low", "close", "disc"])
                 .with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
                 .sort("timestamp")
-                .with_columns([
-                    # disc=True の足は H-L のみ、それ以外は通常の True Range
-                    pl.when(pl.col("disc"))
-                    .then(pl.col("high") - pl.col("low"))
-                    .otherwise(
-                        pl.max_horizontal(
-                            pl.col("high") - pl.col("low"),
-                            (pl.col("high") - pl.col("close").shift(1)).abs(),
-                            (pl.col("low") - pl.col("close").shift(1)).abs(),
+                .with_columns(
+                    [
+                        # disc=True の足は H-L のみ、それ以外は通常の True Range
+                        pl.when(pl.col("disc"))
+                        .then(pl.col("high") - pl.col("low"))
+                        .otherwise(
+                            pl.max_horizontal(
+                                pl.col("high") - pl.col("low"),
+                                (pl.col("high") - pl.col("close").shift(1)).abs(),
+                                (pl.col("low") - pl.col("close").shift(1)).abs(),
+                            )
                         )
-                    )
-                    .ewm_mean(alpha=1 / ATR_PERIOD, adjust=False)
-                    .alias(target_atr_name)
-                ])
+                        .ewm_mean(alpha=1 / ATR_PERIOD, adjust=False)
+                        .alias(target_atr_name)
+                    ]
+                )
                 # ATR Ratioも全期間データで計算（日次ループ内での計算より精度・速度ともに優れる）
-                .with_columns([
-                    (
-                        pl.col(target_atr_name) /
-                        (pl.col(target_atr_name).rolling_mean(window_size=baseline_period, min_samples=1) + 1e-10)
-                    ).alias(atr_ratio_name)
-                ])
+                .with_columns(
+                    [
+                        (
+                            pl.col(target_atr_name)
+                            / (
+                                pl.col(target_atr_name).rolling_mean(
+                                    window_size=baseline_period, min_samples=1
+                                )
+                                + 1e-10
+                            )
+                        ).alias(atr_ratio_name)
+                    ]
+                )
                 .select(["timestamp", target_atr_name, atr_ratio_name])
             )
             all_atr_lfs.append(atr_lf)
@@ -774,7 +805,9 @@ class ProxyLabelingEngine:
             )
             max_lookahead_delta = dt.timedelta(minutes=max_lookahead_minutes)
             # 月末に加算するルックアヘッドマージン（TD分 + 安全バッファ3日）
-            lookahead_margin = dt.timedelta(minutes=max_lookahead_minutes) + dt.timedelta(days=3)
+            lookahead_margin = dt.timedelta(
+                minutes=max_lookahead_minutes
+            ) + dt.timedelta(days=3)
 
             # ATRは全期間・全時間足で1回だけ事前ロード（軽量なのでOK）
             logging.info(f"   -> Pre-loading {len(atr_lfs)} ATR files into memory...")
@@ -830,11 +863,6 @@ class ProxyLabelingEngine:
 
                 # ★ その月のtickデータだけをメモリに載せる
                 # hive_partitioning=Trueで述語プッシュダウンを確実に有効化
-                # 用途: (a) バリア hit 判定の tick 走査 (high/low、価格 = mid)、
-                #       (b) バリア基準 close のアンカー = エントリー時刻 L+180 の mid
-                #           (ENTRY-ANCHOR FIX §11.34.16-O3、_calculate_labels_for_batch 内で
-                #            timestamp+ACTION_HORIZON_SEC を backward asof)。
-                # mid_price を close/high/low に展開 (tick は単一点なので OHLC 同値)。
                 logging.debug(f"Loading tick chunk for {y}-{m:02d}...")
                 try:
                     base_price_chunk_df = (
@@ -857,11 +885,15 @@ class ProxyLabelingEngine:
                         .sort("timestamp")
                     )
                 except Exception as e:
-                    logging.warning(f"Failed to load tick chunk for {y}-{m:02d}: {e}. Skipping month.")
+                    logging.warning(
+                        f"Failed to load tick chunk for {y}-{m:02d}: {e}. Skipping month."
+                    )
                     continue
 
                 if base_price_chunk_df.is_empty():
-                    logging.warning(f"No tick data found for {y}-{m:02d}. Skipping month.")
+                    logging.warning(
+                        f"No tick data found for {y}-{m:02d}. Skipping month."
+                    )
                     continue
 
                 logging.debug(
@@ -870,8 +902,7 @@ class ProxyLabelingEngine:
 
                 # その月に含まれる日のリストを取得
                 days_in_month = partitions_df.filter(
-                    (pl.col("date").dt.year() == y) &
-                    (pl.col("date").dt.month() == m)
+                    (pl.col("date").dt.year() == y) & (pl.col("date").dt.month() == m)
                 )
 
                 # =====================================================
@@ -1015,12 +1046,9 @@ class ProxyLabelingEngine:
                     max_ts_req = min_ts_req + max_lookahead_delta + dt.timedelta(days=2)
 
                     # ★ base_price_chunk_df（月チャンク）から窓を切り出す
-                    price_window_df = (
-                        base_price_chunk_df.filter(
-                            pl.col("timestamp").is_between(min_ts_req, max_ts_req)
-                        )
-                        .sort("timestamp")
-                    )
+                    price_window_df = base_price_chunk_df.filter(
+                        pl.col("timestamp").is_between(min_ts_req, max_ts_req)
+                    ).sort("timestamp")
 
                     if price_window_df.is_empty():
                         continue
@@ -1141,82 +1169,19 @@ class ProxyLabelingEngine:
                 c for c in group_df.columns if c not in ["timestamp", "close"]
             ]
 
-            # ===================================================================
-            # [ENTRY-ANCHOR FIX §11.34.16-O3] バリア基準価格 = エントリー時刻の価格
-            # ===================================================================
-            # 旧実装は close/high/low/ATR を一括で timestamp=L (トリガー = M3 バー始値
-            # 時刻) に join_asof(backward) し、バリア基準 close に「L 時点 (バー始値) の
-            # tick mid」を採用していた。しかし本番のエントリーは
-            #   T = L + ACTION_HORIZON_SEC (= L+180、M3 バーのクローズ時刻)
-            # で行われ、エントリー価格 = realtime_feature_engine の
-            #   current_price = data["close"][-1] = M3 バー [L, L+180) の close。
-            # よって旧実装の基準 close は実エントリーより 1 バー (約 3 分) 手前で、
-            # かつシグナルは「価格が動いている」ときに出るため必ずトレード方向に
-            # 有利側へズレていた。走査は L+180 から始まる (entry_offset) ため、
-            # [L, L+180) で既に起きた順行分が「タダ乗り」して PT に早期到達し、
-            # ラベルが楽観化 → BT と本番の乖離 (本番 TO 過多) の震源になっていた。
-            # 実測 (本番 ReportHistory vs BT detailed_trade_log、同一足 93 件) で
-            # 本番 TO×BT-PT 24 件・基準価格が方向有利側に中央 +$6.1・24/24 方向一致を
-            # 確認、コード (本ブロック + tick mid ソース) でも裏取り済み。
-            #
-            # 修正方針:
-            #   - バリア基準 close = エントリー時刻 L+180 の価格に合わせる
-            #     (price_window の tick mid を L+180 で backward asof = L+180 以前で
-            #      最新の tick = M3 バー [L, L+180) の close = 本番エントリー価格)。
-            #   - ATR / ATR_ratio は従来通り トリガー時刻 L で結合 (バー [L, L+180) の
-            #     値で、本番ゲート整合済み)。変更しない。
-            #   - 走査用 ticks_high/low (price_window 由来) と走査開始
-            #     t0+ACTION_HORIZON_SEC、縦バリア t1_max = L+180+TD は既に正しく不変。
-            #   - SPREAD 項は §2 で確定済みの意図的な保守化のため不変。
-            _entry_offset = pl.duration(seconds=self.ACTION_HORIZON_SEC)
-
-            # (1) ATR / ATR_ratio は トリガー時刻 L で結合 (バーの値、本番整合済み)
-            bets_with_atr_df = group_df.join_asof(
+            bets_with_price_df = group_df.join_asof(
                 price_window_df.select(
-                    ["timestamp", atr_col_name, atr_ratio_col_name]
+                    [
+                        "timestamp",
+                        "close",
+                        "high",
+                        "low",
+                        atr_col_name,
+                        atr_ratio_col_name,
+                    ]
                 ),
                 on="timestamp",
             ).filter(pl.col(atr_col_name).is_not_null())
-
-            if bets_with_atr_df.is_empty():
-                continue
-
-            # 旧 close 列が混入していれば除去 (アンカーで付け直すため)
-            if "close" in bets_with_atr_df.columns:
-                bets_with_atr_df = bets_with_atr_df.drop("close")
-
-            # (2) バリア基準 close は エントリー時刻 L+180 の価格を別途 asof 結合
-            #     (本番 current_price = data["close"][-1] = M3 バー [L,L+180) close と一致)
-            _anchor_price_df = price_window_df.select(
-                pl.col("timestamp").alias("_anchor_ts"),
-                pl.col("close"),
-            ).sort("_anchor_ts")
-
-            bets_with_price_df = (
-                bets_with_atr_df.with_columns(
-                    (pl.col("timestamp") + _entry_offset).alias("_entry_ts")
-                )
-                .sort("_entry_ts")
-                .join_asof(
-                    _anchor_price_df,
-                    left_on="_entry_ts",
-                    right_on="_anchor_ts",
-                    strategy="backward",
-                )
-                .sort("timestamp")
-            )
-            # 一時列を除去 (バージョン差で右キーが残る場合に備え存在時のみ drop)
-            _tmp_cols = [
-                c for c in ["_entry_ts", "_anchor_ts"]
-                if c in bets_with_price_df.columns
-            ]
-            if _tmp_cols:
-                bets_with_price_df = bets_with_price_df.drop(_tmp_cols)
-
-            # エントリー時刻の価格が取得できなかった行 (窓端等) は除外
-            bets_with_price_df = bets_with_price_df.filter(
-                pl.col("close").is_not_null()
-            )
 
             if bets_with_price_df.is_empty():
                 continue
@@ -1269,7 +1234,9 @@ class ProxyLabelingEngine:
                 ).alias("sl_short"),
                 t1_max_short_expr.alias("t1_max_short"),
                 pl.col("atr_value"),
-                pl.col("atr_ratio"),  # ★ S6出力に含める（バックテストシミュレーターが再計算不要になる）
+                pl.col(
+                    "atr_ratio"
+                ),  # ★ S6出力に含める（バックテストシミュレーターが再計算不要になる）
                 pl.col("close"),
                 pl.col(original_cols),
             )
@@ -1302,7 +1269,9 @@ class ProxyLabelingEngine:
                 ticks_ts_np,
                 ticks_high_np,
                 ticks_low_np,
-                np.int64(self.ACTION_HORIZON_SEC * 1_000_000),  # [LOOKAHEAD-FIX] エントリーオフセット(us)
+                np.int64(
+                    self.ACTION_HORIZON_SEC * 1_000_000
+                ),  # [LOOKAHEAD-FIX] エントリーオフセット(us)
             )
 
             # 計算済みトリガー行の DataFrame 作成
@@ -1497,18 +1466,18 @@ class ProxyLabelingEngine:
             s_win = df.filter(pl.col("label_short") == 1).height
 
             # --- Duration統計: 勝ち/負け別に分解 ---
-            df_l_win  = df.filter(pl.col("label_long") == 1)["duration_long"]
+            df_l_win = df.filter(pl.col("label_long") == 1)["duration_long"]
             df_l_loss = df.filter(pl.col("label_long") == 0)["duration_long"]
-            df_s_win  = df.filter(pl.col("label_short") == 1)["duration_short"]
+            df_s_win = df.filter(pl.col("label_short") == 1)["duration_short"]
             df_s_loss = df.filter(pl.col("label_short") == 0)["duration_short"]
 
-            avg_dur_l_win  = df_l_win.mean()  or 0.0
-            med_dur_l_win  = df_l_win.median() or 0.0
-            avg_dur_l_loss = df_l_loss.mean()  or 0.0
+            avg_dur_l_win = df_l_win.mean() or 0.0
+            med_dur_l_win = df_l_win.median() or 0.0
+            avg_dur_l_loss = df_l_loss.mean() or 0.0
             med_dur_l_loss = df_l_loss.median() or 0.0
-            avg_dur_s_win  = df_s_win.mean()  or 0.0
-            med_dur_s_win  = df_s_win.median() or 0.0
-            avg_dur_s_loss = df_s_loss.mean()  or 0.0
+            avg_dur_s_win = df_s_win.mean() or 0.0
+            med_dur_s_win = df_s_win.median() or 0.0
+            avg_dur_s_loss = df_s_loss.mean() or 0.0
             med_dur_s_loss = df_s_loss.median() or 0.0
 
             daily_activity = (

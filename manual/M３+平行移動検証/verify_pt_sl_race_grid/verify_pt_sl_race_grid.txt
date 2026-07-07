@@ -1,0 +1,10 @@
+python verify_pt_sl_race_grid.py \
+    --feature-data /workspace/data/XAUUSD/stratum_1_base/master_processed \
+    --tick-dir /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned \
+    --out-dir /workspace/data/diagnostics/pt_sl_race \
+    --window-min 30 --max-bets 0
+
+レース版の設計を確認しておきます。PT は L基準で 1.0/1.5/2.0/3.0、SL は L+180起点の建値で 0.1〜0.5、各組み合わせで「PT に先に届けば勝ち／SL に先に届けば負け／時間切れ」。即PT（d≥pt）はその pt 水準で弾いて母集団から除外（本番でエントリー前にPT価格を行き過ぎるため）。WIN 時の手取りは平行移動の実態どおり pt − d_realized（あなたの「9.21−6.45=2.76」の一般化）で計算し、EV 格子に反映します。
+出力は勝率格子・EV格子・即PT弾き率の内訳。これで「PT と SL をどこに置くと、相場側で実取り幅期待値が最大か」が一望できます。
+
+この格子の読み方で最重要の注意を一つ。この勝率（pt=2.0でWIN18%、LOSS80%）は、脳を外した全グリッドの数字です。脳の方向選択力がゼロ——つまり「ランダムな方向に張った場合」に等しい。だから勝率が低いのは当たり前で、ここを実際のBT（1.5:0.3でWIN79%）と混同してはいけません。これは「相場の地の勝ちやすさ＝脳が乗る前の床」です。

@@ -22,7 +22,7 @@
 #   全実行 (Step 1-22):
 #     bash run_phase_d3_pipeline.sh
 #   範囲指定 (例: Step 11-22):
-#     bash run_phase_d3_pipeline.sh 11 22
+#     bash run_phase_d3_pipeline.sh 14 22
 #   単一 step (例: Step 14 だけ):
 #     bash run_phase_d3_pipeline.sh 14 14
 #

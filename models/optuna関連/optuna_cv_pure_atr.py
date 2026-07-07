@@ -102,20 +102,25 @@ ATR_THRESHOLDS = [
 PT_MULTS = [
     # 0.5,
     1.0,
-    2.0,
-    2.5,
-    3.0,
+    # 2.0,
+    # 2.5,
+    # 3.0,
     # 5.0,
     # 8.0,
     # 10.0,
 ]
 SL_MULTS = [
-    # 0.5,
-    # 1.0,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.8,
+    1.0,
     # 2.5,
-    4.0,
-    5.0,
-    6.0,
+    # 4.0,
+    # 5.0,
+    # 6.0,
     # 8.0,
     # 10.0,
 ]
@@ -140,6 +145,12 @@ N_TRIALS = 200
 MIN_TOTAL_BETS_PER_FOLD = 100
 
 SEARCH_TIMEFRAMES = TIMEFRAMES  # + ["mixed"]
+
+# [ENTRY-OFFSET] TF→秒数（エントリー猶予 ACTION_HORIZON = TF 秒数、旧ラベリング整合）
+TF_SECONDS = {
+    "M0.5": 30, "M1": 60, "M3": 180, "M5": 300, "M8": 480, "M15": 900,
+    "M30": 1800, "H1": 3600, "H4": 14400, "H6": 21600, "H12": 43200, "D1": 86400,
+}
 
 # 修正④：timeframe_bars_per_day（ATR Ratio計算用・全スクリプト共通定数）
 timeframe_bars_per_day = {
@@ -172,6 +183,7 @@ def _numba_find_hits_fast(
     ticks_ts,
     ticks_high,
     ticks_low,
+    entry_offset_us,
 ):
     """
     厳密版: TO時は t1_max 直後の tick 価格（mid_price）で決済。
@@ -184,6 +196,7 @@ def _numba_find_hits_fast(
     out_exit_time = np.zeros(n_bets, dtype=np.int64)
     out_exit_price = np.zeros(n_bets, dtype=np.float64)
     out_reason = np.zeros(n_bets, dtype=np.int8)
+    out_entry_price = np.zeros(n_bets, dtype=np.float64)
 
     for i in prange(n_bets):
         t0 = bets_t0[i]
@@ -191,7 +204,16 @@ def _numba_find_hits_fast(
         pt = bets_pt_barrier[i]
         sl = bets_sl_barrier[i]
 
-        start_idx = np.searchsorted(ticks_ts, t0, side="right")
+        # [ENTRY-OFFSET] 走査開始 = エントリー時刻 L + entry_offset_us (=L+180)。
+        # エントリー前の区間 [L, L+180) の tick は判定に含めない
+        # （旧旧の①ルックアヘッド除去、旧ラベリング start_idx=t0+ACTION_HORIZON と整合）。
+        start_idx = np.searchsorted(ticks_ts, t0 + entry_offset_us, side="right")
+        # 約定価格 = L+180 時点の価格（= M3 バー close ≈ 走査開始直前の tick mid）。
+        # バリア(pt/sl)は price(L) 基準(bets_close)のまま＝平行移動。約定はこの L+180 価格。
+        if start_idx > 0:
+            out_entry_price[i] = ticks_low[start_idx - 1]
+        elif n_ticks > 0:
+            out_entry_price[i] = ticks_low[0]
 
         exit_time = np.int64(0)
         exit_price = np.float64(0.0)
@@ -224,7 +246,7 @@ def _numba_find_hits_fast(
         out_exit_price[i] = exit_price
         out_reason[i] = reason
 
-    return out_exit_time, out_exit_price, out_reason
+    return out_exit_time, out_exit_price, out_reason, out_entry_price
 
 
 # ====================================================================
@@ -523,17 +545,30 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                 bets_close = np.ascontiguousarray(raw_close[valid_indices])
                 bets_atr = np.ascontiguousarray(raw_atr[valid_indices])
 
-                bets_t1_max = bets_t0 + td_us
+                # [ENTRY-OFFSET] 縦バリア = エントリー(L+180)から td 分
+                # （旧ラベリング t1_max = timestamp + ACTION_HORIZON_SEC + TD と整合）。
+                entry_offset_us = np.int64(TF_SECONDS[tf_choice] * 1_000_000)
+                bets_t1_max = bets_t0 + entry_offset_us + td_us
+
+                # [ENTRY-PRICE] 各ベットの L+180 約定価格 = 走査開始直前の tick mid（事前計算）。
+                # SL バリアを建値(L+180)基準に置くため、バリア計算前にここで求める。
+                _entry_idx = (
+                    np.searchsorted(ticks_ts, bets_t0 + entry_offset_us, side="right") - 1
+                )
+                _entry_idx = np.clip(_entry_idx, 0, len(ticks_ts) - 1)
+                bets_entry_price = np.ascontiguousarray(ticks_low[_entry_idx])
 
                 # ★スプレッドの壁をバリアに組み込む
+                # PT: price(L) 基準(bets_close)＝平行移動（①順行分を先取りして近い）
                 bets_pt = np.ascontiguousarray(
                     bets_close + bets_atr * pt_mult + spread_cost
                 )
+                # SL: L+180 建値(bets_entry_price)基準＝①順行分を守る（建値付近に置ける）
                 bets_sl = np.ascontiguousarray(
-                    bets_close - bets_atr * sl_mult + spread_cost
+                    bets_entry_price - bets_atr * sl_mult + spread_cost
                 )
 
-                out_exit_time, out_exit_price, out_reason = _numba_find_hits_fast(
+                out_exit_time, out_exit_price, out_reason, out_entry_price = _numba_find_hits_fast(
                     bets_t0,
                     bets_t1_max,
                     bets_pt,
@@ -541,13 +576,15 @@ def create_objective(cv_folds, data_loader, target_tf, spread_cost):
                     ticks_ts,
                     ticks_high,
                     ticks_low,
+                    entry_offset_us,
                 )
 
-                # exit_price==0はtickが見つからなかったケース→エントリー価格で代替（-spread_costのみ）
+                # [ENTRY-ANCHOR] 約定価格 = L+180 の実価格(bets_entry_price、上で事前計算)。
+                # PT は price(L) 基準、SL は L+180 建値基準。損益は L+180 約定から測る。
                 safe_exit_price = np.where(
-                    out_exit_price == 0.0, bets_close, out_exit_price
+                    out_exit_price == 0.0, bets_entry_price, out_exit_price
                 )
-                net_pnl = safe_exit_price - bets_close - spread_cost
+                net_pnl = safe_exit_price - bets_entry_price - spread_cost
 
                 # 1. レポート用件数集計（バリア到達理由ベース）
                 is_pt = out_reason == np.int8(1)

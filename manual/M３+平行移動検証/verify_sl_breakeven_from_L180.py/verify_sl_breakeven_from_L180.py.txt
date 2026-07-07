@@ -1,0 +1,7 @@
+何を測るか：全 M3 グリッド（脳CSV不使用）で、L+180 起点でエントリーし、そこから建値SL（起点−sl·ATR）に各 SL幅（0.1/0.2/0.3/0.4/0.5）でどれだけ刈られるか。PT は §31 で天井が見えたので、ここでは「SL がどれだけ無駄に刈るか」を測るため、SL 単独で「建値割り率＝逆行が建値に届く頻度」と「割った深さ」「割るまでの時間」を SL幅別・d帯別に出します。これは §29 を全グリッド母集団でやり直す版です（§29 は脳CSV母集団だった）。
+
+python verify_sl_breakeven_from_L180.py \
+    --feature-data /workspace/data/XAUUSD/stratum_1_base/master_processed \
+    --tick-dir /workspace/data/XAUUSD/stratum_1_base/master_tick_partitioned \
+    --out-dir /workspace/data/diagnostics/sl_breakeven \
+    --window-min 30 --max-bets 0

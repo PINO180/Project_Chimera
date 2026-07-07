@@ -22,11 +22,10 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
 
-# [LOG-FIX §11.34.16-U] モジュールレベルの basicConfig を削除。
-# ライブラリが import 時に root logger を設定するのは不適切で、これが main の
-# basicConfig (FileHandler 付き) を no-op 化し forge_system.log を 0 KB にしていた。
-# ログ構成はエントリポイント (main.py) の責務とし、ここは getLogger のみ。
-logger = logging.getLogger("♾️Chimera♾️.STAT")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 class EventType(Enum):
@@ -300,7 +299,7 @@ class StateManager:
             return True
 
         except Exception as e:
-            logger.error(f"✗ Checkpoint save failed: {e}")
+            logger.error(f"✗ チェックポイント保存失敗: {e}")
             return False
 
     def load_checkpoint(self, format: str = "json") -> Optional[SystemState]:
@@ -317,7 +316,7 @@ class StateManager:
             latest_link = self.checkpoint_dir / f"latest_checkpoint.{format}"
 
             if not latest_link.exists():
-                logger.warning("No checkpoint found.")
+                logger.warning("チェックポイントが見つかりません。")
                 return None
 
             checkpoint_path = Path(latest_link.read_text())
@@ -341,17 +340,17 @@ class StateManager:
                 raise ValueError(f"未対応の形式: {format}")
 
             self.current_state = state
-            logger.info(f"✓ Checkpoint loaded: {checkpoint_path.name}")
+            logger.info(f"✓ チェックポイント読み込み成功: {checkpoint_path.name}")
             logger.info(
-                f"  equity: {state.current_equity:.2f}, "
+                f"  エクイティ: {state.current_equity:.2f}, "
                 f"DD: {state.current_drawdown:.2%}, "
-                f"positions: {len(state.trades)}"
+                f"ポジション数: {len(state.trades)}"
             )
 
             return state
 
         except Exception as e:
-            logger.error(f"✗ Checkpoint load failed: {e}")
+            logger.error(f"✗ チェックポイント読み込み失敗: {e}")
             return None
 
     def _cleanup_old_checkpoints(self, keep_count: int = 10) -> None:
@@ -828,7 +827,7 @@ class StateManager:
             # 状態を保存
             self.save_checkpoint(self.current_state)
 
-            logger.debug("✓ State reconciled.")  # infoをdebugに
+            logger.debug("✓ 状態の整合性を確保しました。")  # infoをdebugに
             return True
 
         except Exception as e:
@@ -849,7 +848,7 @@ class StateManager:
             初期化成功の場合True
         """
         try:
-            logger.info("Initializing system state from broker...")
+            logger.info("ブローカー状態からシステム状態を初期化中...")
 
             # 口座情報の取得
             equity = broker_state.get("equity", 0.0)
@@ -900,7 +899,7 @@ class StateManager:
                     except Exception as e:
                         logger.warning(f"    ポジション解析エラー: {e}")
             else:
-                logger.info("  No active positions.")
+                logger.info("  アクティブなポジションがありません。")
 
             self.current_state = SystemState(
                 timestamp=datetime.now(timezone.utc),
@@ -915,7 +914,7 @@ class StateManager:
             # チェックポイント保存
             self.save_checkpoint(self.current_state)
 
-            logger.info("✓ Initialized from broker state.")
+            logger.info("✓ ブローカー状態から初期化完了")
             return True
 
         except Exception as e:
