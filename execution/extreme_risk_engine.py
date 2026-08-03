@@ -203,29 +203,22 @@ class ExtremeRiskEngineV5:
         direction: int,
         sl_multiplier: float,
         tp_multiplier: float,
-        price_at_L: float = 0.0,
     ) -> Dict[str, float]:
-        """[L-ANCHOR §41.8] PT=L起点・SL=約定基準 のハイブリッド計算。
+        """Pure SL/TP calculation using ATR as the absolute ruler.
 
-        平行移動理論 (§14/§41):
-          - PT はラベリングと同じ L 起点 (price_at_L ± atr*tp_mult) に固定。
-            L→L+180 の順行分 (先取り) はそのまま PT までの残距離の短縮になる。
-          - SL は約定価格 (entry=L+180) 基準で常に atr*sl_mult 幅。
-            SL はエネルギー枯渇の検出器であり、約定から sl_mult 逆行 =
-            順行エネルギー消滅とみなして薄い損で降りる (脳の学習対象ではない
-            ため train-serve skew にはならない: ユーザー確定方針)。
-          - price_at_L<=0 (取得不能) 時は PT も約定基準にフォールバック。
+        Both PT and SL are anchored at the fill price (entry = L+180):
+          - PT = entry +/- atr * tp_multiplier
+          - SL = entry -/+ atr * sl_multiplier
         """
-        pt_anchor = price_at_L if price_at_L > 0.0 else entry_price
         if direction == 1:
             sl = entry_price - (atr * sl_multiplier)
-            tp = pt_anchor + (atr * tp_multiplier)
+            tp = entry_price + (atr * tp_multiplier)
         elif direction == -1:
             sl = entry_price + (atr * sl_multiplier)
-            tp = pt_anchor - (atr * tp_multiplier)
+            tp = entry_price - (atr * tp_multiplier)
         else:
             raise ValueError(
-                f"無効な取引方向です: {direction} (1 または -1 を指定してください)"
+                f"Invalid trade direction: {direction} (specify 1 or -1)"
             )
 
         return {"stop_loss": round(sl, 3), "take_profit": round(tp, 3)}
@@ -244,7 +237,6 @@ class ExtremeRiskEngineV5:
         lot_per_base: Optional[float] = None,
         current_spread_pips: Optional[float] = None,
         atr_ratio: Optional[float] = None,  # ★追加: realtime_feature_engineから渡されるATR Ratio
-        price_at_L: float = 0.0,  # [L-ANCHOR] L 時点価格 (0.0=取得不能→約定基準に退化)
     ) -> Dict[str, Any]:
         """外部(司令塔)から受け取った確率とパラメータに基づき、最終的な執行コマンドを生成する"""
 
@@ -294,29 +286,6 @@ class ExtremeRiskEngineV5:
 
         direction = 1 if action == "BUY" else -1
 
-        # [PHANTOM-GATE §41.8] 幻エントリー弾き:
-        #   約定時点 (L+180) で価格が既に L 起点 PT に到達済みなら発注しない。
-        #   ラベリング上は label=1 (即決着 TD<=3 相当) だが、PT 指値は価格通過後で
-        #   約定し得ない「取れない幻」。BT の楽観分を本番入口で物理的に落とす。
-        #   price_at_L<=0 (取得不能) 時は判定不能のためゲートはスキップ (フォールバック)。
-        if price_at_L > 0.0:
-            _pt_L = (
-                price_at_L + (atr * float(tp_mult))
-                if direction == 1
-                else price_at_L - (atr * float(tp_mult))
-            )
-            _already_reached = (
-                current_price >= _pt_L if direction == 1 else current_price <= _pt_L
-            )
-            if _already_reached:
-                return self._generate_hold_command(
-                    f"[PHANTOM-GATE] L-anchored PT already reached at fill "
-                    f"(price_at_L={price_at_L:.3f}, PT={_pt_L:.3f}, cur={current_price:.3f}) "
-                    f"-> phantom entry, skipped",
-                    p_long,
-                    p_short,
-                )
-
         lots = self.calculate_auto_lot(
             equity=equity,
             current_price=current_price,
@@ -333,48 +302,15 @@ class ExtremeRiskEngineV5:
             direction=direction,
             sl_multiplier=sl_mult,  # 修正反映
             tp_multiplier=tp_mult,  # 修正反映
-            price_at_L=price_at_L,  # [L-ANCHOR] PT を L 起点に
         )
 
         # [SL/TP-FIX] MQL5側でOrderSend直前のAsk/Bid基準にSL/TPを再計算するため、
         # ドル幅(sl_width/tp_width)・ATR・乗数をコマンドに追加する。
         # Python送信時とMT5約定時の価格差(スリッページ)があっても、
-        # ポジションから見たSL/TP幅は常に意図通りとなる。
+        # ポジションから見たSL/TP幅は常に意図通り(atr*sl_mult / atr*tp_mult)となる。
         # MQL5側ではキー不在時に0.0が返るため、フォールバックでstop_loss/take_profitの絶対価格を使用する。
-        #
-        # [L-ANCHOR §41.8] tp_width の定義変更:
-        #   旧: atr * tp_mult (約定基準 PT の幅)
-        #   新: |L起点PT - current_price| (約定価格から見た L 起点 PT までの残距離)。
-        #   L→L+180 の順行分だけ tp_width は atr*tp_mult より縮む (先取り)。
-        #   EA は Ask/Bid ± width で引き直すため、この width を渡せば PT 位置は
-        #   L 起点のままスリッページ補正だけが効く。
-        #   sl_width は従来通り atr*sl_mult (SL は約定基準幅なので不変)。
         sl_width = float(atr) * float(sl_mult)
-        _pt_abs = sl_tp["take_profit"]
-        tp_width = abs(_pt_abs - float(current_price))
-
-        # [L-ANCHOR] Full PT band measured from L (== atr * tp_mult).
-        #   tp_width above is the *remaining* distance (entry -> L-anchored PT),
-        #   which shrinks by the L -> L+180 pre-entry travel. tp_width_full is the
-        #   *original* PT band from L, so logs can show both (remaining vs full)
-        #   and the gap between them = distance already travelled before entry.
-        tp_width_full = float(atr) * float(tp_mult)
-
-        # [L-ANCHOR] Reference SL distance if the SL were anchored at L (like the TP),
-        #   measured from the fill. The actual SL is entry-anchored
-        #   (sl_width == atr*sl_mult); this figure just shows where an L-anchored SL
-        #   would sit relative to entry, so logs can read symmetrically with the TP
-        #   remaining/full pair. Falls back to the entry-anchored width when price_at_L
-        #   is unavailable.
-        if float(price_at_L) > 0.0:
-            _sl_at_L = (
-                float(price_at_L) - (float(atr) * float(sl_mult))
-                if direction == 1
-                else float(price_at_L) + (float(atr) * float(sl_mult))
-            )
-            sl_width_from_L = abs(_sl_at_L - float(current_price))
-        else:
-            sl_width_from_L = sl_width
+        tp_width = float(atr) * float(tp_mult)
 
         trade_command = {
             "action": action,
@@ -384,9 +320,7 @@ class ExtremeRiskEngineV5:
             "take_profit": sl_tp["take_profit"],
             # [SL/TP-FIX] MQL5側でAsk/Bid基準のSL/TP再計算に使用
             "sl_width": sl_width,
-            "sl_width_from_L": sl_width_from_L,  # SL distance if anchored at L (reference)
-            "tp_width": tp_width,           # remaining PT distance (entry -> L-anchored PT)
-            "tp_width_full": tp_width_full,  # full PT band from L (atr * tp_mult)
+            "tp_width": tp_width,
             "atr": float(atr),
             "sl_multiplier": float(sl_mult),
             "tp_multiplier": float(tp_mult),
@@ -398,8 +332,8 @@ class ExtremeRiskEngineV5:
 
         logger.info(
             f"✓ Order | {action} {lots} @ {current_price:.3f}\n"
-            f" | SL {sl_tp['stop_loss']:.3f} (${sl_width:.3f} / L ${sl_width_from_L:.3f})"
-            f" | TP {sl_tp['take_profit']:.3f} (rem ${tp_width:.3f} / full ${tp_width_full:.3f})"
+            f" | SL {sl_tp['stop_loss']:.3f} (${sl_width:.3f})"
+            f" | TP {sl_tp['take_profit']:.3f} (${tp_width:.3f})"
         )
         return trade_command
 

@@ -3,6 +3,9 @@
 # これが最も重要な設定です
 data/
 
+# ================== 探索系？ ==================
+diagnostics/
+
 # --------ALL REUNION/
 # --------ALL REUNION2/
 # --------ALL REUNION3/

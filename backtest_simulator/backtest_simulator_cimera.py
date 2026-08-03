@@ -58,6 +58,586 @@ logging.basicConfig(
 # XAUUSDの契約サイズ
 CONTRACT_SIZE = Decimal("100")  # 1 lot = 100 oz
 
+
+# ##########################################################################
+# ##########################################################################
+# ##
+# ##   ★★★  設 定 は こ こ だ け 編 集 す れ ば O K  ★★★
+# ##
+# ##   CLI 引数は覚える必要はありません。ここの値がそのまま既定値になります。
+# ##   （CLI で明示した場合だけ、その項目がここより優先されます）
+# ##
+# ##   実行:  python3 backtest_simulator_cimera.py
+# ##
+# ##########################################################################
+# ##########################################################################
+
+USER_PARAMS: Dict[str, Any] = {
+    # ======================================================================
+    # 【1】バリア幾何 — ★ラベリング側と必ず一致させること★
+    # ----------------------------------------------------------------------
+    #   create_proxy_labels の RULE_LONG / RULE_SHORT と同じ値にする。
+    #   起動時に自動突合し、pt/sl が違えば警告（strict_geometry=True で停止）。
+    #
+    #   ★★ TD を絞りたいときは「ここ」だけ変える ★★
+    #      下の方にある _LABEL_GEOMETRY_FALLBACK は絶対に触らないこと。
+    #      あちらは「ラベリング側が何だったか」の控えであり、
+    #      一緒に書き換えると突合ガードが機能しなくなる。
+    #
+    #   TD について:
+    #     ・ラベルの TD 以下  → OK。「その時間で強制決済したら」の再現ができる
+    #     ・ラベルの TD より上 → 不可。ラベルがその先を走査していないので
+    #                            結果が物理的に存在しない（起動時に停止）
+    # ======================================================================
+    "pt_multiplier_long": 1.0,  # PT = entry + ATR × これ  (Long)
+    "sl_multiplier_long": 5.0,  # SL = entry − ATR × これ  (Long)
+    "pt_multiplier_short": 1.0,  # PT = entry − ATR × これ  (Short)
+    "sl_multiplier_short": 5.0,  # SL = entry + ATR × これ  (Short)
+    "td_minutes_long": 1200.0,  # 強制決済までの分（エントリー起点）
+    "td_minutes_short": 1200.0,  # 同上。ラベル TD 以下にすること
+    # --- ★ 時間決済モード（バリアを使わない） ---
+    #   False にすると PT/SL を一切使わず、【必ず TD 分後に成行決済】する。
+    #
+    #   なぜ要るか:
+    #     測定 (§13.5〜13.6) が測ったのは「t 分後の変位」であって
+    #     バリア到達ではない。効果 0.25 ATR に対し ±1.4 ATR のバリアは 5.6 倍広く、
+    #     実測では 94% がバリア決着 = ノイズによるコイン投げになっていた
+    #     (PT 47.4% / SL 46.9% / TO 5.6%)。
+    #     変位を丸ごと取るには時間で畳む必要がある。
+    #
+    #   使い方: use_barriers=False かつ td_minutes=15 で
+    #           「エントリー → 15分後に成行決済」を再現する。
+    #   注意  : 損切りが無いので 1 トレードの最大損失は無制限。
+    #           エッジの有無を測るためのモードで、そのまま運用する形ではない。
+    "use_barriers": False,
+    # ======================================================================
+    # 【2】発注ゲート — ここを振るのが本番のスイープ
+    # ----------------------------------------------------------------------
+    #   対称バリア (pt=sl) では p_short ≈ 1 − p_long になるため、
+    #   delta ≈ |2·p_long − 1|。つまり m2_proba_threshold=0.55 は
+    #   自動的に delta >= 0.10 を課す。delta をそれ未満にしても効かない。
+    #   → 対称幾何では m2_proba_threshold を単独で振ること。
+    # ======================================================================
+    "m2_proba_threshold": 0.70,  # M2 確率の下限
+    "m2_delta_threshold": 0.30,  # |p_long − p_short| の下限
+    # ======================================================================
+    # 【3】ボラティリティ・フィルター（0.0 = 無効）
+    # ----------------------------------------------------------------------
+    #   min_atr_threshold  : atr_ratio（相対）の下限。ラベル側のゲートは
+    #                        撤廃済み(0.0)なので、ここも 0.0 が既定。
+    #   max_atr_threshold  : atr_ratio の上限（0.0 = 無効）。
+    #                        min と組み合わせて「この帯だけ撃つ」ができる。
+    #                        例) 0.0〜0.8 の帯だけ → min 0.0 / max 0.8
+    #                            0.5〜0.8 の帯だけ → min 0.5 / max 0.8
+    #                        判定は  min <= atr_ratio < max （上限は含まない）
+    #   min/max_baseline_atr: baseline_ATR = atr_value / atr_ratio の下限/上限(USD)。
+    #                        スプレッドは USD 固定なので、ATR が小さいほど
+    #                        バリアに対する相対コストが跳ね上がる。
+    #   min_baseline_ratio : 昨日ボラ / 過去N日ボラ。価格水準に依存しない。
+    #   min_sar_threshold  : 現在ATR / 過去D日の同時刻ATR平均（季節性調整）。
+    #
+    #   atr_ratio_bands    : レポートの ATR Ratio Band Analysis の区切り。
+    #                        ここを変えると集計表の帯が変わる（発注には無関係）。
+    # ======================================================================
+    "min_atr_threshold": 0.0,
+    "max_atr_threshold": 0.0,  # 0.0 = 上限なし
+    # --- ★ atr_value（そのバーの ATR・USD）の下限/上限 ---
+    #   バリア幅 = 1.4 × atr_value、スプレッドは USD 固定なので
+    #       コスト比 = spread_pips × value_per_pip / (barrier_mult × atr_value × 100)
+    #   例) spread_pips=36 / value_per_pip=1.0 / pt=sl=1.4 のとき
+    #       ATR 0.5 → コストがバリア幅の 51%（損益分岐勝率 75.7%）
+    #       ATR 1.0 → 25.7%（62.9%）
+    #       ATR 2.0 → 12.8%（56.4%）
+    #       ATR 5.0 →  5.1%（52.6%）
+    #   §13.6 の ER ルール損益分岐 ATR 0.96 USD は spread 0.24 前提。
+    #   spread 0.36 なら 1.44 USD が下限の目安。
+    "min_atr_value": 0.0,  # 0.0 = 下限なし（USD）
+    "max_atr_value": 0.0,  # 0.0 = 上限なし（USD）
+    "min_baseline_atr": 0.0,  # 例: 1.5 / 2.0 / 2.6 / 3.0 を振る
+    "max_baseline_atr": 0.0,  # 0.0 = 上限なし
+    "min_baseline_ratio": 0.0,
+    "baseline_ratio_lookback_days": 7,
+    "min_sar_threshold": 0.0,
+    "sar_lookback_days": 10,
+    "atr_ratio_bands": [0.5, 0.8, 1.0, 1.2, 1.5],  # 区切り値のリスト
+    # ======================================================================
+    # 【4】資金管理
+    # ======================================================================
+    "initial_capital": 1_000_000.0,
+    # --- ★ 固定ロットモード（エッジ測定用） ---
+    #   True にすると常に fixed_lot_size で発注し、複利・資産減少の影響を消す。
+    #   破産で期間が途中で切れないので「1トレードあたりの期待値」を
+    #   全期間で観測できる。資金管理の評価には使えない（そのための機能ではない）。
+    "use_fixed_lot": True,
+    "fixed_lot_size": 0.01,
+    "use_fixed_risk": False,  # True: 1トレードのリスクを資産の一定%に固定
+    "fixed_risk_percent": 0.02,  # 0.02 = 2%。use_fixed_risk=True のとき有効
+    "auto_lot_base_capital": 1000.0,  # use_fixed_risk=False のときだけ使用
+    "auto_lot_size_per_base": 0.1,  # 同上
+    "base_leverage": 2000.0,
+    "min_lot_size": 0.01,
+    "min_capital_threshold": 1.0,
+    "max_positions": 100,
+    # ======================================================================
+    # 【5】コスト
+    # ======================================================================
+    "spread_pips": 16.0,  # 36 pips = 0.36 USD 相当
+    "value_per_pip": 1.0,
+    # ======================================================================
+    # 【6】サーキットブレーカー
+    # ======================================================================
+    "prevent_simultaneous_orders": True,  # True: delta で勝った片方だけ発注
+    "max_consecutive_sl": 2,
+    "cooldown_minutes_after_sl": 30,
+    "margin_call_percent": 0.0,
+    "stop_out_percent": 0.0,
+    # ======================================================================
+    # 【7】期間・実行制御
+    # ======================================================================
+    "start_date": None,  # "2021-07-12" のように文字列 or None（全期間）
+    "end_date": None,  # "2024-08-02" のように文字列 or None（全期間）
+    "test_limit_partitions": 0,  # 0 = 全パーティション。動作確認は 20 等
+    # ======================================================================
+    # 【9】シグナル源 — 脳を使うか、ルールだけで撃つか
+    # ----------------------------------------------------------------------
+    #   "model" : M2 OOF の確率でゲート（従来どおり。m2_proba/m2_delta が効く）
+    #   "rule"  : ★脳を一切使わない。効率比(ER)と符号つき1バー変位 d だけで撃つ
+    #
+    #   【rule の中身 — Residual_Drift_Harvester_Theory §13.5〜13.6】
+    #     ER(K) = |close[t] − close[t−K]| / Σ|close[i] − close[i−1]|
+    #       1に近い = 一直線に走った / 0に近い = 行って戻った
+    #     d = (close − open) / ATR   符号つき1バー変位（エントリー時刻に確定）
+    #
+    #     ER が高い（直近60分すでに走りきった）バーの直後に そこそこ大きい
+    #     1本が出ると、その後【逆行】する。行き過ぎの解消。
+    #     モデル非依存・6年すべて同符号。
+    #
+    #   【下の既定値は測定で確定した座標そのもの】
+    #     窓20本(60分) ER>=0.396 × |d| 0.6-0.9 × t=15分
+    #       → −0.2508 ATR (t=−4.28)  5/5 年 同符号  χ² p=0.4487
+    #       → 損益分岐 ATR 0.96 USD（現水準 4〜6 USD）
+    #     ※ TD は【1】の td_minutes_long/short を 15 に合わせて使うこと
+    #
+    #   rule モードでも OOF ファイルは読みます（label_long/short と行集合の
+    #   供給元。prediction は使いません）。m2_proba / m2_delta は無効になります。
+    # ======================================================================
+    "signal_source": "rule",  # "model" or "rule"
+    "rule_er_column": "eff_ratio_20_M3",  # 効率比の列名（窓20本=60分）
+    "rule_er_min": 0.396,  # ER の下限
+    "rule_er_max": 0.0,  # ER の上限（0.0 = 上限なし）
+    "rule_d_column": "d_atr_M3",  # 符号つき1バー変位の列名
+    "rule_d_abs_min": 0.6,  # |d| の下限
+    "rule_d_abs_max": 0.9,  # |d| の上限
+    "rule_direction": "reverse",  # "reverse" = −sign(d) / "follow" = +sign(d)
+    # ======================================================================
+    # 【8】幾何チェックの厳格さ
+    # ----------------------------------------------------------------------
+    #   True  : ラベルと pt/sl が食い違ったら起動時に停止（推奨）
+    #   False : 警告だけ出して続行（レポートには GEOMISMATCH が付く）
+    #   ※ TD をラベルより長くした場合は、この設定に関わらず必ず停止します
+    # ======================================================================
+    "strict_geometry": True,
+}
+
+
+# ==========================================================================
+# [GEOMETRY-SYNC] 学習側ラベル幾何との突合
+# --------------------------------------------------------------------------
+# 事故の記録:
+#   ラベルを対称 1.4 / TD60 で作り直した後、BT を CLI 引数付きで起動したところ、
+#   --pt-long 等を省略したために argparse の default が旧 dataclass 既定値
+#   (pt=1.0 / sl=5.0 / td=30) を拾い、旧幾何のまま評価したレポートが出力された。
+#   レポートは正常終了して見えるため、幾何が違うことに気づく手掛かりが
+#   「Strategy: L(PT1.0/SL5.0)」の 1 行しかなかった。
+#
+# 対策:
+#   BT 起動時に create_proxy_labels のソースを *テキストとして* 読み、
+#   RULE_LONG / RULE_SHORT / ATR_RATIO_THRESHOLD / ACTION_HORIZON_SEC を
+#   抽出して実効 config と突合する。import しないのは副作用 (numba JIT 登録・
+#   blueprint 経由の重い依存) を持ち込まないため。
+# ==========================================================================
+
+# ──────────────────────────────────────────────────────────────────────────
+# ▼▼▼ ここから下は編集不要 ▼▼▼
+# ──────────────────────────────────────────────────────────────────────────
+#
+#  ╔════════════════════════════════════════════════════════════════════╗
+#  ║  ★ 編集禁止 ★  _LABEL_GEOMETRY_FALLBACK                            ║
+#  ║                                                                    ║
+#  ║  これは「ラベリング側が何だったか」の控えであり、BT の動作値では    ║
+#  ║  ありません。TD や pt/sl を変えたいときは USER_PARAMS【1】を編集。 ║
+#  ║                                                                    ║
+#  ║  通常は create_proxy_labels のソースを直接読むので、この定数は      ║
+#  ║  一切参照されません。使われるのは「ラベリングのソースが見つから    ║
+#  ║  なかった環境」だけで、その場合は起動時に WARNING が出ます。        ║
+#  ║                                                                    ║
+#  ║  ここを USER_PARAMS と一緒に書き換えると、突合ガードが「ラベルも   ║
+#  ║  その値だった」と誤認し、本来止めるべき TD 延長を素通りさせます。   ║
+#  ║  = 自分で嘘をつく物差しになるので、絶対に触らないこと。             ║
+#  ╚════════════════════════════════════════════════════════════════════╝
+#
+# 値の出典: Residual_Drift_Harvester_Theory §13.11「確定した再設計」
+_LABEL_GEOMETRY_FALLBACK: Dict[str, float] = {
+    "pt_mult_long": 1.4,
+    "sl_mult_long": 1.4,
+    "pt_mult_short": 1.4,
+    "sl_mult_short": 1.4,
+    "td_minutes_long": 60.0,
+    "td_minutes_short": 60.0,
+    "atr_ratio_threshold": 0.0,
+    "action_horizon_sec": 180.0,
+}
+
+LABELING_SCRIPT_NAME = "create_proxy_labels_polars_patch_regime_Universal_Brain_V5.py"
+
+# ==========================================================================
+# [TD-RESIM] ラベル側の TD と行動地平 — TD 短縮リシミュレーションの土台
+# --------------------------------------------------------------------------
+# S6 の duration_long/short は「t0 = L からの経過分」であり、エントリー時刻は
+# L + ACTION_HORIZON_SEC (= L+3分)。したがって
+#     エントリー起点の経過分 = duration − ACTION_HORIZON_MIN
+#     タイムアウト行の duration = ACTION_HORIZON_MIN + TD_label   (= 63.0)
+# BT の td_minutes_* は「エントリー起点の分」として扱う。
+#
+# TD をラベルより短くした再シミュレーションは duration から厳密に再現できる:
+#     経過 <  新TD → ラベル通りの PT/SL
+#     経過 >= 新TD → その時点で強制決済 (close_future)
+# 逆に TD をラベルより長くすることは、ラベルが走査していない時間帯の結果を
+# 要求するため原理的に不可能。
+# ==========================================================================
+LABEL_TD_MINUTES: float = 60.0  # __main__ で実ラベルから上書き
+ACTION_HORIZON_MIN: float = 3.0  # __main__ で実ラベルから上書き
+
+# 起動時のラベル幾何突合の結果 (レポート JSON へ埋め込む)
+GEOMETRY_CHECK_RESULT: Dict[str, Any] = {"status": "not_checked"}
+
+
+def _required_extra_cols(cfg: "BacktestConfig") -> List[str]:
+    """signal_source に応じて S6 から追加で必要になる列。"""
+    if str(cfg.signal_source).lower() == "rule":
+        return [c for c in (cfg.rule_er_column, cfg.rule_d_column) if c]
+    return []
+
+
+def _s6_actual_columns(cfg: "BacktestConfig") -> Optional[List[str]]:
+    """S6 の実スキーマを1ファイルだけ読んで返す (推測しないための確認)。"""
+    try:
+        base = Path(str(cfg.simulation_data_path))
+        files = sorted(base.rglob("*.parquet"))
+        if not files:
+            return None
+        return list(pl.read_parquet_schema(files[-1]).keys())
+    except Exception:
+        return None
+
+
+def validate_preload_columns(data, cfg: "BacktestConfig", cache_path: Path) -> bool:
+    """プリロード済みデータに必要列が揃っているか検証する。
+
+    [CACHE-GUARD] backtest_preload_cache.pkl は base_cols を変更しても
+    自動では作り直されない。古いキャッシュを掴んだまま走ると、
+    シミュレーション途中の KeyError で初めて気づくことになる。
+    ここで起動直後に検出し、原因を「キャッシュが古い」/「S6 に列が無い」の
+    どちらかまで切り分ける。
+
+    Returns:
+        True  : そのまま続行してよい
+        False : キャッシュを削除して再生成すべき (呼び出し側で実施)
+    """
+    req = _required_extra_cols(cfg)
+    if not req:
+        return True
+
+    preloaded_dict, _ = data
+    cols: Optional[set] = None
+    for _v in preloaded_dict.values():
+        if _v is not None and len(_v) > 0:
+            cols = set(_v.columns)
+            break
+    if cols is None:
+        return True
+
+    missing = [c for c in req if c not in cols]
+    if not missing:
+        logging.info(f"[CACHE-GUARD] 必要列は揃っています: {req}")
+        return True
+
+    # --- 原因の切り分け: S6 の実スキーマを直接見る ---
+    s6_cols = _s6_actual_columns(cfg)
+    logging.warning("=" * 68)
+    logging.warning(f"[CACHE-GUARD] プリロードデータに必要列がありません: {missing}")
+
+    if s6_cols is None:
+        logging.warning("  S6 のスキーマを読めませんでした。パスを確認してください:")
+        logging.warning(f"    {cfg.simulation_data_path}")
+        logging.warning("=" * 68)
+        raise SystemExit("[CACHE-GUARD] S6 スキーマ確認不可のため中止しました。")
+
+    s6_missing = [c for c in req if c not in s6_cols]
+
+    if not s6_missing:
+        # S6 にはある → キャッシュが古いだけ。作り直せば直る。
+        logging.warning("  → S6 には存在します。キャッシュが古いだけです。")
+        logging.warning(f"     {cache_path}")
+        logging.warning("  → 自動で削除して再生成します。")
+        logging.warning("=" * 68)
+        return False
+
+    # S6 にも無い → ラベリングがその列を出力していない
+    import difflib as _dl
+
+    logging.warning("  → S6 にも存在しません。ラベリングがこの列を出力していません。")
+    for c in s6_missing:
+        near = _dl.get_close_matches(c, s6_cols, n=5, cutoff=0.4)
+        prefix = c.split("_")[0]
+        pat = [x for x in s6_cols if x.startswith(prefix)]
+        logging.warning(f"    '{c}' の候補: 類似={near} / 同接頭辞={pat}")
+    logging.warning("")
+    logging.warning("  S6 の全列 (実測):")
+    for c in sorted(s6_cols):
+        logging.warning(f"    - {c}")
+    logging.warning("=" * 68)
+    raise SystemExit(
+        "[CACHE-GUARD] S6 に必要列がないため中止しました。"
+        " USER_PARAMS【9】の rule_er_column / rule_d_column を"
+        " 上の実列名に合わせるか、ラベリングを再実行してください。"
+    )
+
+
+def _build_band_defs(edges) -> List[Any]:
+    """区切り値のリストから [(帯名, 判定関数), ...] を作る。
+
+    例: [0.5, 0.8, 1.0] → "< 0.5" / "0.5-0.8" / "0.8-1.0" / ">= 1.0"
+    判定は下限を含み上限を含まない (lo <= x < hi)。
+    ルール6: lambda はデフォルト引数で束縛し late binding を避ける。
+    """
+    e = sorted(float(x) for x in (edges or []))
+    if not e:
+        return [("all", lambda x: True)]
+    defs: List[Any] = [(f"< {e[0]:g}", lambda x, hi=e[0]: x < hi)]
+    for a, b in zip(e[:-1], e[1:]):
+        defs.append((f"{a:g}-{b:g}", lambda x, lo=a, hi=b: lo <= x < hi))
+    defs.append((f">= {e[-1]:g}", lambda x, lo=e[-1]: x >= lo))
+    return defs
+
+
+def _find_labeling_script() -> Optional[Path]:
+    """create_proxy_labels のソースを探索する。
+
+    探索順:
+      1. /workspace/models  ← 実配置 (確認済み、2026-07)
+      2. /workspace/scripts, /workspace
+      3. 本スクリプトの隣 / 親の models/
+      4. 上記が全部外れたら /workspace 配下を再帰検索 (ファイル名パターン)
+    4 を入れてあるのは、パスを当て推量しないため。移動しても見つかる。
+    """
+    candidates: List[Path] = []
+    for d in ("/workspace/models", "/workspace/scripts", "/workspace"):
+        candidates.append(Path(d) / LABELING_SCRIPT_NAME)
+    here = Path(__file__).resolve().parent
+    candidates.append(here / LABELING_SCRIPT_NAME)
+    candidates.append(here.parent / "models" / LABELING_SCRIPT_NAME)
+    for p in candidates:
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+
+    # --- 再帰フォールバック: 名前で探す ---
+    for root in (Path("/workspace"), here.parent):
+        try:
+            if not root.is_dir():
+                continue
+            hits = sorted(root.rglob("create_proxy_labels_*.py"))
+            if hits:
+                logging.info(
+                    f"[GEOMETRY-SYNC] 既定パスに無かったため再帰検索で発見: {hits[0]}"
+                )
+                return hits[0]
+        except OSError:
+            continue
+    return None
+
+
+def _parse_labeling_geometry(src_path: Path) -> Optional[Dict[str, float]]:
+    """ラベリングスクリプトから幾何定数を正規表現で抽出する (import しない)。
+
+    抽出対象:
+        RULE_LONG  = {"pt_mult": X, "sl_mult": Y, "td": "Nm"}
+        RULE_SHORT = {...}
+        ATR_RATIO_THRESHOLD = Z
+        ACTION_HORIZON_SEC  = W   (クラス属性なのでインデント許容)
+    どれか 1 つでも読めなければ None を返す (部分一致で誤判定しないため)。
+    """
+    import re as _re
+
+    try:
+        src = src_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+    def _rule(name: str) -> Optional[Dict[str, float]]:
+        m = _re.search(name + r"\s*=\s*\{(.*?)\}", src, _re.DOTALL)
+        if not m:
+            return None
+        body = m.group(1)
+        pt = _re.search(r'["\']pt_mult["\']\s*:\s*([0-9.]+)', body)
+        sl = _re.search(r'["\']sl_mult["\']\s*:\s*([0-9.]+)', body)
+        td = _re.search(r'["\']td["\']\s*:\s*["\']\s*([0-9.]+)\s*m["\']', body)
+        if not (pt and sl and td):
+            return None
+        return {
+            "pt": float(pt.group(1)),
+            "sl": float(sl.group(1)),
+            "td": float(td.group(1)),
+        }
+
+    rl = _rule("RULE_LONG")
+    rs = _rule("RULE_SHORT")
+    m_atr = _re.search(r"^ATR_RATIO_THRESHOLD\s*=\s*([0-9.]+)", src, _re.MULTILINE)
+    m_ah = _re.search(r"^\s*ACTION_HORIZON_SEC\s*=\s*([0-9]+)", src, _re.MULTILINE)
+    if rl is None or rs is None or m_atr is None:
+        return None
+
+    return {
+        "pt_mult_long": rl["pt"],
+        "sl_mult_long": rl["sl"],
+        "td_minutes_long": rl["td"],
+        "pt_mult_short": rs["pt"],
+        "sl_mult_short": rs["sl"],
+        "td_minutes_short": rs["td"],
+        "atr_ratio_threshold": float(m_atr.group(1)),
+        "action_horizon_sec": float(m_ah.group(1)) if m_ah else 180.0,
+    }
+
+
+def verify_geometry_against_labeling(
+    config: "BacktestConfig", strict: bool = False
+) -> Dict[str, Any]:
+    """実効 BT 幾何とラベリング側幾何を突合し、結果 dict を返す。"""
+    effective = {
+        "pt_mult_long": float(config.pt_multiplier_long),
+        "sl_mult_long": float(config.sl_multiplier_long),
+        "pt_mult_short": float(config.pt_multiplier_short),
+        "sl_mult_short": float(config.sl_multiplier_short),
+        "td_minutes_long": float(config.td_minutes_long),
+        "td_minutes_short": float(config.td_minutes_short),
+        "atr_ratio_threshold": float(config.min_atr_threshold),
+    }
+
+    src_path = _find_labeling_script()
+    parsed = _parse_labeling_geometry(src_path) if src_path else None
+
+    if parsed is None:
+        reference = dict(_LABEL_GEOMETRY_FALLBACK)
+        origin = "_LABEL_GEOMETRY_FALLBACK (静的定数)"
+        logging.warning("=" * 68)
+        logging.warning(
+            "[GEOMETRY-SYNC] ⚠ ラベリングのソースが見つかりませんでした: "
+            f"{LABELING_SCRIPT_NAME}"
+        )
+        logging.warning(
+            "  → 静的定数 _LABEL_GEOMETRY_FALLBACK と突合します。"
+            " この定数が古いと突合そのものが無意味になります。"
+        )
+        logging.warning(
+            "  → 探索先: /workspace/models, /workspace/scripts, /workspace,"
+            " および本スクリプトの隣・親/models"
+        )
+        logging.warning("=" * 68)
+    else:
+        reference = parsed
+        origin = str(src_path)
+
+    # pt/sl : ラベルの定義そのもの。ずれたら PnL に意味が無い → critical
+    # td    : ラベルより短いのは正当な再シミュレーション、長いのは不可能 → 条件付き
+    # atrゲート: ラベル後の選抜フィルタ。スイープは正当 → informational
+    # use_barriers=False のときは PT/SL を一切使わないので、幾何不一致は無害。
+    CRITICAL_KEYS = (
+        ()
+        if not getattr(config, "use_barriers", True)
+        else ("pt_mult_long", "sl_mult_long", "pt_mult_short", "sl_mult_short")
+    )
+    TD_KEYS = ("td_minutes_long", "td_minutes_short")
+
+    diffs: List[str] = []
+    notes: List[str] = []
+    for key, ref_val in reference.items():
+        if key == "action_horizon_sec":
+            continue
+        eff_val = effective.get(key)
+        if eff_val is None:
+            continue
+        if abs(eff_val - float(ref_val)) > 1e-9:
+            msg = f"{key}: BT={eff_val} vs LABEL={ref_val}"
+            if key in CRITICAL_KEYS:
+                diffs.append(msg)
+            elif key in TD_KEYS:
+                if eff_val > float(ref_val) + 1e-9:
+                    diffs.append(
+                        msg + "  ← TD をラベルより長くすることはできません "
+                        "(ラベルが走査していない時間帯の結果は存在しない)"
+                    )
+                else:
+                    notes.append(
+                        msg + f"  ← TD 短縮リシミュレーション "
+                        f"(経過 >= {eff_val}分 の PT/SL は強制決済に再分類)"
+                    )
+            else:
+                notes.append(msg)
+
+    status = "match" if not diffs else "mismatch"
+
+    logging.info("=" * 68)
+    logging.info("[GEOMETRY-SYNC] ラベル幾何との突合")
+    logging.info(f"  参照元: {origin}")
+    logging.info(
+        f"  BT   : PT L/S = {effective['pt_mult_long']}/{effective['pt_mult_short']}, "
+        f"SL L/S = {effective['sl_mult_long']}/{effective['sl_mult_short']}, "
+        f"TD L/S = {effective['td_minutes_long']}/{effective['td_minutes_short']} min, "
+        f"min_atr = {effective['atr_ratio_threshold']}"
+    )
+    logging.info(
+        f"  LABEL: PT L/S = {reference['pt_mult_long']}/{reference['pt_mult_short']}, "
+        f"SL L/S = {reference['sl_mult_long']}/{reference['sl_mult_short']}, "
+        f"TD L/S = {reference['td_minutes_long']}/{reference['td_minutes_short']} min, "
+        f"atr_gate = {reference['atr_ratio_threshold']}"
+    )
+
+    if notes:
+        logging.info("  ℹ️  幾何以外の差分 (BT を無効にはしない):")
+        for n in notes:
+            logging.info(f"     - {n}")
+
+    if status == "match":
+        logging.info("  ✅ バリア幾何 (pt/sl) はラベルと一致しています。")
+        logging.info("=" * 68)
+    else:
+        logging.warning("  " + "!" * 62)
+        logging.warning("  ❌ 幾何が食い違っています。この BT 結果は無効です。")
+        for d in diffs:
+            logging.warning(f"     - {d}")
+        logging.warning("     USER_PARAMS の【1】バリア幾何 を修正してください。")
+        logging.warning("  " + "!" * 62)
+        logging.info("=" * 68)
+        # TD 延長は strict の有無に関わらず必ず停止 (物理的に不可能なため)
+        _td_violation = any("TD をラベルより長く" in d for d in diffs)
+        if strict or _td_violation:
+            raise SystemExit(
+                "[GEOMETRY-SYNC] 幾何不一致のため中止しました。上のログを確認してください。"
+            )
+
+    return {
+        "status": status,
+        "source": origin,
+        "labeling": reference,
+        "backtest": effective,
+        "critical_diffs": diffs,
+        "informational_diffs": notes,
+    }
+
+
 # # タイムゾーン変換用
 # JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 
@@ -67,14 +647,19 @@ CONTRACT_SIZE = Decimal("100")  # 1 lot = 100 oz
 # ================================================================
 @dataclass
 class BacktestConfig:
-    """シミュレーションの全パラメータを一元管理 (V5 Two-Brain Architecture)"""
+    """シミュレーションの全パラメータを一元管理 (V5 Two-Brain Architecture)
 
-    initial_capital: float = 1000.0
+    ★ 既定値はすべてファイル冒頭の USER_PARAMS から取得する。
+      値を変えたいときは USER_PARAMS だけを編集すること。
+      （ここを直接書き換えると USER_PARAMS と二重管理になるので触らない）
+    """
+
+    initial_capital: float = USER_PARAMS["initial_capital"]
     simulation_data_path: Path = S6_WEIGHTED_DATASET
 
     # 期間フィルタ (YYYY-MM-DD, UTC, inclusive)。None なら全期間
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
+    start_date: Optional[str] = USER_PARAMS["start_date"]
+    end_date: Optional[str] = USER_PARAMS["end_date"]
 
     # V5: Long/Short独立のOOF予測パス
     oof_long_path: Path = S7_M2_OOF_PREDICTIONS_LONG
@@ -83,82 +668,78 @@ class BacktestConfig:
     # V5: 純化特徴量ディレクトリ (In-Sample拡張時の布石として保持)
     purified_features_dir: Path = S3_SELECTED_FEATURES_PURIFIED_DIR
 
-    # --- V5 新規: 自動ロット調整と発火閾値 ---
-    auto_lot_base_capital: float = 1000.0
-    auto_lot_size_per_base: float = 0.1
+    # --- 資金管理 ---
+    auto_lot_base_capital: float = USER_PARAMS["auto_lot_base_capital"]
+    auto_lot_size_per_base: float = USER_PARAMS["auto_lot_size_per_base"]
+    use_fixed_lot: bool = USER_PARAMS["use_fixed_lot"]
+    fixed_lot_size: float = USER_PARAMS["fixed_lot_size"]
+    use_fixed_risk: bool = USER_PARAMS["use_fixed_risk"]
+    fixed_risk_percent: float = USER_PARAMS["fixed_risk_percent"]
 
-    # ▼▼▼ 追加: 固定比率資金管理のパラメータ ▼▼▼
-    use_fixed_risk: bool = True
-    fixed_risk_percent: float = (
-        0.02  # 口座残高の何%を1トレードのリスクとするか (0.02 = 2%)
-    )
-    # ▲▲▲ ここまで追加 ▲▲▲
+    # --- 発注ゲート ---
+    m2_proba_threshold: float = USER_PARAMS["m2_proba_threshold"]
+    m2_delta_threshold: float = USER_PARAMS["m2_delta_threshold"]
 
-    m2_proba_threshold: float = 0.70
-    m2_delta_threshold: float = 0.30  # ★追加: LongとShortの確率の差分(Delta)閾値
-
-    test_limit_partitions: int = 0
+    test_limit_partitions: int = USER_PARAMS["test_limit_partitions"]
     oof_mode: bool = True
-    min_capital_threshold: float = 1.0
-    min_lot_size: float = 0.01
-    min_atr_threshold: float = (
-        0.8  # ★修正: ドル値(2.0) → ATR Ratio閾値(0.8) (プロンプト⑯ 修正②)
+    min_capital_threshold: float = USER_PARAMS["min_capital_threshold"]
+    min_lot_size: float = USER_PARAMS["min_lot_size"]
+
+    # --- ボラティリティ・フィルター (0.0 = 無効) ---
+    min_atr_threshold: float = USER_PARAMS["min_atr_threshold"]
+    max_atr_threshold: float = USER_PARAMS["max_atr_threshold"]
+    min_atr_value: float = USER_PARAMS["min_atr_value"]
+    max_atr_value: float = USER_PARAMS["max_atr_value"]
+    min_baseline_atr: float = USER_PARAMS["min_baseline_atr"]
+    max_baseline_atr: float = USER_PARAMS["max_baseline_atr"]
+    min_baseline_ratio: float = USER_PARAMS["min_baseline_ratio"]
+    baseline_ratio_lookback_days: int = USER_PARAMS["baseline_ratio_lookback_days"]
+    min_sar_threshold: float = USER_PARAMS["min_sar_threshold"]
+    sar_lookback_days: int = USER_PARAMS["sar_lookback_days"]
+    atr_ratio_bands: List[float] = field(
+        default_factory=lambda: list(USER_PARAMS["atr_ratio_bands"])
     )
-    # [baseline_ATR床フィルター] 前日24h ATR平均の絶対下限 (0.0 = フィルターなし)
-    # baseline_ATR = atr_value / atr_ratio (= 直近480本のATR平均 = 前日の平均ボラ水準)
-    # この値未満の場合はエントリーをスキップ (前日が静かすぎる日は入らない)
-    # 分析結果: 0.82でPF 19.09→19.62, 0.90でPF 19.97, 1.00でPF 20.27
-    # Optunaで最適値を探索すること (backtest_simulator_run_optuna_baseline.py)
-    min_baseline_atr: float = 0.0
 
-    # [baseline_ratio相対フィルター] 前日24h baseline / 過去N日 baseline の比率下限
-    # baseline_ratio = mean(ATR,1日) / mean(ATR,N日) = 昨日 vs 過去N日平均の相対ボラ比率
-    # 価格水準($1800/$4600)に依存しないスケールフリーなフィルター
-    # 0.0 = フィルターなし（デフォルト）
-    # Optunaで探索: backtest_simulator_run_optuna_baseline_ratio.py
-    min_baseline_ratio: float = 0.0
-    baseline_ratio_lookback_days: int = 7  # 分母の長期ウィンドウ日数
+    max_positions: int = USER_PARAMS["max_positions"]
 
-    # [SAR: 日中季節性調整済み相対ATRフィルター]
-    # SAR = 現在ATR / 過去D日間の同時刻ATR平均
-    # 「UTC 13:00のATRを過去D日のUTC 13:00平均と比較」
-    # → 24h混合ベースラインの問題を根本解決
-    # → XAU/USDの時間帯季節性（Tokyo静/London活発）を分離評価
-    # → 価格水準非依存・重複ウィンドウ問題なし
-    # 0.0 = フィルターなし（デフォルト）
-    # Optunaで探索: backtest_simulator_run_optuna_sar.py
-    min_sar_threshold: float = 0.0
-    sar_lookback_days: int = 10  # 過去何日間の同時刻平均を使うか
+    # --- サーキットブレーカーと同時発注禁止 ---
+    prevent_simultaneous_orders: bool = USER_PARAMS["prevent_simultaneous_orders"]
+    max_consecutive_sl: int = USER_PARAMS["max_consecutive_sl"]
+    cooldown_minutes_after_sl: int = USER_PARAMS["cooldown_minutes_after_sl"]
 
-    max_positions: int = 100
-
-    # --- V5 新規: サーキットブレーカーと同時発注禁止 ---
-    prevent_simultaneous_orders: bool = True
-    max_consecutive_sl: int = 2
-    cooldown_minutes_after_sl: int = 30
-
-    base_leverage: float = 2000.0
-    spread_pips: float = 36.0
-    value_per_pip: float = 1.0
+    base_leverage: float = USER_PARAMS["base_leverage"]
+    spread_pips: float = USER_PARAMS["spread_pips"]
+    value_per_pip: float = USER_PARAMS["value_per_pip"]
 
     # ==========================================
-    # V5 新規追加: 取引ロジックの固定パラメータ
+    # バリア幾何 — ★ラベリング側と一致必須★ (USER_PARAMS【1】)
     # ==========================================
-    sl_multiplier_long: float = 0.3
-    pt_multiplier_long: float = 1.5
-    sl_multiplier_short: float = 0.3
-    pt_multiplier_short: float = 1.5
+    sl_multiplier_long: float = USER_PARAMS["sl_multiplier_long"]
+    pt_multiplier_long: float = USER_PARAMS["pt_multiplier_long"]
+    sl_multiplier_short: float = USER_PARAMS["sl_multiplier_short"]
+    pt_multiplier_short: float = USER_PARAMS["pt_multiplier_short"]
 
-    td_minutes_long: float = 30.0
-    td_minutes_short: float = 30.0
+    use_barriers: bool = USER_PARAMS["use_barriers"]
+    td_minutes_long: float = USER_PARAMS["td_minutes_long"]
+    td_minutes_short: float = USER_PARAMS["td_minutes_short"]
 
-    # ▼▼▼ ここから追加 ▼▼▼
     # ==========================================
-    # V5 Optuna対応: 証拠金維持率とロスカット設定
+    # シグナル源 (USER_PARAMS【9】)
     # ==========================================
-    margin_call_percent: float = 0.0  # 証拠金維持率がこれを下回ると新規エントリー禁止
-    stop_out_percent: float = 0.0  # 証拠金維持率がこれを下回ると強制ロスカット
-    # ▲▲▲ ここまで追加 ▲▲▲
+    signal_source: str = USER_PARAMS["signal_source"]
+    rule_er_column: str = USER_PARAMS["rule_er_column"]
+    rule_er_min: float = USER_PARAMS["rule_er_min"]
+    rule_er_max: float = USER_PARAMS["rule_er_max"]
+    rule_d_column: str = USER_PARAMS["rule_d_column"]
+    rule_d_abs_min: float = USER_PARAMS["rule_d_abs_min"]
+    rule_d_abs_max: float = USER_PARAMS["rule_d_abs_max"]
+    rule_direction: str = USER_PARAMS["rule_direction"]
+
+    # ==========================================
+    # 証拠金維持率とロスカット設定
+    # ==========================================
+    margin_call_percent: float = USER_PARAMS["margin_call_percent"]
+    stop_out_percent: float = USER_PARAMS["stop_out_percent"]
 
 
 class BacktestSimulator:
@@ -353,6 +934,8 @@ class BacktestSimulator:
         DECIMAL_MIN_CAPITAL = Decimal(str(self.config.min_capital_threshold))
 
         self.cb_simultaneous_prevented = 0
+        self.cb_simultaneous_taken = 0  # 両建て成立回数
+        self.rule_fire_count = 0  # [RULE-MODE] ルール発火数
         self.cb_cooldown_long = 0
         self.cb_cooldown_short = 0
         self.high_water_mark = self._current_capital
@@ -447,6 +1030,19 @@ class BacktestSimulator:
         report_data["max_consec_sl_total"] = self.max_consec_sl_total
         report_data["max_consec_loss_total"] = self.max_consec_loss_total
 
+        # [GEOMETRY-SYNC] 何を評価したのかをレポート自身に残す。
+        #   後からレポートだけ見て「このBTは信じてよいか」を判定できるようにする。
+        report_data["geometry_check"] = GEOMETRY_CHECK_RESULT
+        report_data["signal_source"] = str(self.config.signal_source)
+        report_data["rule_fire_count"] = int(getattr(self, "rule_fire_count", 0))
+        report_data["label_td_minutes"] = float(LABEL_TD_MINUTES)
+        report_data["action_horizon_min"] = float(ACTION_HORIZON_MIN)
+        report_data["effective_settings"] = {
+            k: getattr(self.config, k)
+            for k in USER_PARAMS.keys()
+            if hasattr(self.config, k)
+        }
+
         try:
             with open(FINAL_REPORT_PATH, "w") as f:
                 json.dump(report_data, f, indent=4, default=str)
@@ -468,6 +1064,12 @@ class BacktestSimulator:
             "duration_long",
             "duration_short",
         ]
+        # [RULE-MODE] 効率比 / 符号つき1バー変位。create_proxy_labels が S6 に
+        #   出力している列 (split_features_first_orthogonal の M2_EXACT と同じ)。
+        #   signal_source="rule" のときに必須。"model" のときも診断用に読む。
+        for _c in (self.config.rule_er_column, self.config.rule_d_column):
+            if _c and _c not in base_cols:
+                base_cols.append(_c)
 
         if not self.config.oof_mode:  # In-Sample Mode
             raise NotImplementedError(
@@ -554,10 +1156,25 @@ class BacktestSimulator:
             )
 
             # ★TDのハードコード解除
+            # [TD-RESIM/OFFSET-FIX] S6 の timestamp は t0 = L (ラベル時刻) であり、
+            #   エントリーは L + ACTION_HORIZON (= L+3分)。強制決済 (TO) の時刻は
+            #   entry + TD = L + ACTION_HORIZON + TD である。
+            #   旧実装は timestamp + TD (= L + TD) を引いており、TO 決済価格が
+            #   ACTION_HORIZON ぶん (M3 なら 3 分) 手前の価格になっていた。
+            #   TD を短縮すると TO 比率が上がるため無視できなくなる。
+            # [OFFSET-FIX2] close 列はバー X の終値 = P(X + バー長) であり、
+            #   ACTION_HORIZON ぶんのオフセットが【すでに入っている】。
+            #   entry = L + AH、狙う決済 = L + AH + TD、close(X) = P(X + AH)
+            #     ⇒ 必要なバー X = L + TD
+            #   以前 (私の修正) は X = L + AH + TD としており、AH ぶん
+            #   (M3 なら 3 分) 長く保有していた。TD=15 のつもりが実質 18 分。
+            #   元の `timestamp + td_minutes` が正しかった。差し戻す。
             lf = lf.with_columns(
                 (
                     pl.col("timestamp")
-                    + pl.duration(minutes=int(self.config.td_minutes_long))
+                    + pl.duration(
+                        seconds=int(round(float(self.config.td_minutes_long) * 60.0))
+                    )
                 ).alias("ts_plus_long")
             )
             lf = lf.join_asof(
@@ -570,7 +1187,9 @@ class BacktestSimulator:
             lf = lf.with_columns(
                 (
                     pl.col("timestamp")
-                    + pl.duration(minutes=int(self.config.td_minutes_short))
+                    + pl.duration(
+                        seconds=int(round(float(self.config.td_minutes_short) * 60.0))
+                    )
                 ).alias("ts_plus_short")
             )
             lf = lf.join_asof(
@@ -707,6 +1326,25 @@ class BacktestSimulator:
             sar_chunk = df_chunk["sar"].fill_null(float("nan")).to_numpy()
         else:
             sar_chunk = None
+
+        # [RULE-MODE] 効率比 / 符号つき1バー変位
+        _use_rule = str(self.config.signal_source).lower() == "rule"
+        er_chunk = (
+            df_chunk[self.config.rule_er_column].to_numpy()
+            if self.config.rule_er_column in df_chunk.columns
+            else None
+        )
+        d_chunk = (
+            df_chunk[self.config.rule_d_column].to_numpy()
+            if self.config.rule_d_column in df_chunk.columns
+            else None
+        )
+        if _use_rule and (er_chunk is None or d_chunk is None):
+            raise KeyError(
+                f"signal_source='rule' には S6 に "
+                f"'{self.config.rule_er_column}' と '{self.config.rule_d_column}' が必要です。"
+                f" 実際の列: {sorted(df_chunk.columns)}"
+            )
 
         # V5 Two-Brain の確率とラベル
         p_long_chunk = df_chunk["m2_proba_long"].to_numpy()
@@ -857,15 +1495,63 @@ class BacktestSimulator:
             # LongとShortの確率の差分（Delta）を計算
             delta = abs(p_l - p_s)
 
-            # 条件1: 差分(Delta)が閾値以上開いていること
-            # 条件2: 勝つ方の絶対確率自体も最低限の閾値(m2_proba_threshold)を超えていること
-            if delta >= self.config.m2_delta_threshold:
-                if p_l > p_s and p_l > self.config.m2_proba_threshold:
-                    should_trade_long = True
-                elif p_s > p_l and p_s > self.config.m2_proba_threshold:
-                    should_trade_short = True
+            if _use_rule:
+                # ==================================================
+                # [RULE-MODE] 脳を一切使わない。効率比 ER と符号つき変位 d だけ。
+                #   Residual_Drift_Harvester_Theory §13.5〜13.6
+                #     ER 高い(直近すでに走りきった) + そこそこ大きい 1 本
+                #       → その後【逆行】する (行き過ぎの解消)
+                #     モデル非依存・6年すべて同符号
+                #   発火: er_min <= ER (< er_max) かつ d_abs_min <= |d| < d_abs_max
+                #   方向: reverse なら −sign(d) / follow なら +sign(d)
+                #   m2_proba / m2_delta はこのモードでは一切参照しない。
+                #   sign(d) で方向が一意に決まるので両建ては構造的に発生しない。
+                # ==================================================
+                _er = er_chunk[i]
+                _d = d_chunk[i]
+                _ok = (
+                    np.isfinite(_er)
+                    and np.isfinite(_d)
+                    and _er >= self.config.rule_er_min
+                    and (
+                        self.config.rule_er_max <= 0.0 or _er < self.config.rule_er_max
+                    )
+                    and self.config.rule_d_abs_min
+                    <= abs(_d)
+                    < self.config.rule_d_abs_max
+                )
+                if _ok and _d != 0.0:
+                    _sgn = 1 if _d > 0 else -1
+                    if str(self.config.rule_direction).lower() == "reverse":
+                        _sgn = -_sgn
+                    if _sgn > 0:
+                        should_trade_long = True
+                    else:
+                        should_trade_short = True
+                    self.rule_fire_count += 1
 
-            # 両方Falseのまま（差分が足りない、または絶対確率が足りない）場合はブロックカウント
+            elif self.config.prevent_simultaneous_orders:
+                # ---- delta で勝った【片方だけ】を発注 (従来の挙動) ----
+                # 条件1: 差分(Delta)が閾値以上開いていること
+                # 条件2: 勝つ方の絶対確率自体も m2_proba_threshold を超えていること
+                if delta >= self.config.m2_delta_threshold:
+                    if p_l > p_s and p_l > self.config.m2_proba_threshold:
+                        should_trade_long = True
+                    elif p_s > p_l and p_s > self.config.m2_proba_threshold:
+                        should_trade_short = True
+            else:
+                # ---- [FLAG-FIX] 同時発注を許可: long/short を独立に評価 ----
+                #   旧実装はこの分岐が無く if/elif 直書きだったため、
+                #   prevent_simultaneous_orders=False にしても
+                #   --allow-simultaneous を付けても同時発注は解除されなかった。
+                if p_l > self.config.m2_proba_threshold:
+                    should_trade_long = True
+                if p_s > self.config.m2_proba_threshold:
+                    should_trade_short = True
+                if should_trade_long and should_trade_short:
+                    self.cb_simultaneous_taken += 1
+
+            # 両方Falseのまま（発注なし）の回数をカウント
             if not should_trade_long and not should_trade_short:
                 self.cb_simultaneous_prevented += 1
 
@@ -937,12 +1623,47 @@ class BacktestSimulator:
                     ):
                         continue
 
+                    # [atr_value 帯] バリア幅そのものの下限/上限 (USD)。0.0 = 無効。
+                    #   スプレッドが USD 固定である以上、収益性を決めるのは
+                    #   atr_ratio(相対) ではなく atr_value(絶対)。
+                    if (
+                        self.config.min_atr_value > 0.0
+                        and atr_value_float < self.config.min_atr_value
+                    ):
+                        continue
+                    if (
+                        self.config.max_atr_value > 0.0
+                        and atr_value_float >= self.config.max_atr_value
+                    ):
+                        continue
+
+                    # [ATR Ratio 帯の上限] 0.0 = 無効。
+                    #   min_atr_threshold と組み合わせて「この帯だけ撃つ」を作れる。
+                    #   例: min=0.0 / max=0.8 → ATR Ratio Band の "<0.5" と "0.5-0.8" だけ
+                    if (
+                        self.config.max_atr_threshold > 0.0
+                        and atr_ratio_float >= self.config.max_atr_threshold
+                    ):
+                        continue
+
                     # [baseline_ATR床フィルター] 前日24h ATR平均の絶対下限チェック
                     # baseline_atr = atr_value / atr_ratio (= 直近480本のATR平均)
                     # min_baseline_atr=0.0 のとき無効 (後方互換)
-                    if self.config.min_baseline_atr > 0.0:
+                    if (
+                        self.config.min_baseline_atr > 0.0
+                        or self.config.max_baseline_atr > 0.0
+                    ):
                         baseline_atr_float = atr_value_float / (atr_ratio_float + 1e-10)
-                        if baseline_atr_float < self.config.min_baseline_atr:
+                        if (
+                            self.config.min_baseline_atr > 0.0
+                            and baseline_atr_float < self.config.min_baseline_atr
+                        ):
+                            continue
+                        # [baseline_ATR 上限] 0.0 = 無効
+                        if (
+                            self.config.max_baseline_atr > 0.0
+                            and baseline_atr_float >= self.config.max_baseline_atr
+                        ):
                             continue
 
                     # [baseline_ratio相対フィルター] 昨日ボラ / 過去N日ボラ の比率チェック
@@ -970,7 +1691,13 @@ class BacktestSimulator:
                     # 旧: ハードコード乗数方式 (0.25倍/0.5倍) → 新: 証拠金上限数式
 
                     # ▼▼▼ 修正: 固定比率(Fixed Risk)と固定複利(Auto Lot)の分岐 ▼▼▼
-                    if self.config.use_fixed_risk:
+                    if self.config.use_fixed_lot:
+                        # [FIXED-LOT] エッジ測定モード。常に同じロット。
+                        #   複利も資産減少も効かないので、破産で期間が
+                        #   途中で切れることがなく「1トレードあたりの期待値」を
+                        #   全期間で観測できる。資金管理の評価には使えない。
+                        base_lot = Decimal(str(self.config.fixed_lot_size))
+                    elif self.config.use_fixed_risk:
                         risk_pct_dec = Decimal(str(self.config.fixed_risk_percent))
                         max_loss_amount = current_capital * risk_pct_dec
                         # ▼▼ DECIMAL_SL_MULT を current_sl_mult に変更 ▼▼
@@ -1070,25 +1797,61 @@ class BacktestSimulator:
                             else 0.0
                         )
 
+                        # [TD-RESIM] エントリー起点の経過分に換算してから TD 判定。
+                        #   duration は t0 = L 起点なので ACTION_HORIZON_MIN を引く。
+                        #   旧実装は PT 分岐 (valid_label==1) に TD 判定が無く、
+                        #   TD を短縮しても「新TD より後に付いた PT」が満額の勝ちの
+                        #   まま計上されていた (= TD 短縮が勝ち側だけに甘くなる主因)。
+                        _ah_m = float(ACTION_HORIZON_MIN)
+                        _td_l = float(self.config.td_minutes_long)
+                        _td_s = float(self.config.td_minutes_short)
+                        _elapsed_from_entry = duration_val - _ah_m
+                        _within_td_long = _elapsed_from_entry < (_td_l - 1e-9)
+                        _within_td_short = _elapsed_from_entry < (_td_s - 1e-9)
+
+                        # [TD-RESIM/HOLD] 実際の保有時間 (エントリー起点)。
+                        #   TD 打ち切りが起きた玉はここで頭打ちになる。
+                        #   ★旧実装はログの "TD" 列にラベル生の duration をそのまま
+                        #     入れていたため、TD を絞っても Avg TD が縮まず
+                        #     「TD が効いていない」ように見えていた。実際には
+                        #     PnL 側では効いており、見た目だけが生値だった。
+                        # [TIME-EXIT] バリアを使わないモード。
+                        #   PT/SL 判定を丸ごと無効化し、必ず TD で成行決済する。
+                        #   測定が測った「t 分後の変位」をそのまま損益にする。
+                        if not self.config.use_barriers:
+                            _within_td_long = False
+                            _within_td_short = False
+
+                        _td_use = _td_l if direction_int == 1 else _td_s
+                        if not self.config.use_barriers:
+                            # [TIME-EXIT] バリアを見ないので保有は常に TD ちょうど。
+                            #   旧: min(elapsed, TD) だとラベルの duration に
+                            #   引きずられて Avg Hold が TD より短く表示されていた
+                            #   (損益は close_future(entry+TD) で正しかった)。
+                            _hold_from_entry = _td_use
+                        else:
+                            _hold_from_entry = min(
+                                max(_elapsed_from_entry, 0.0), _td_use
+                            )
+                        # ポジション占有時間 (L 起点)。証拠金の解放時刻に使う。
+                        _eff_duration_from_L = _ah_m + _hold_from_entry
+                        _exit_kind = "TO"  # 各分岐で上書き
+
                         # V5 追加: Exit Price ベースの厳密な PnL 計算 (スプレッド二重取り回避)
                         exit_price_decimal = current_price_decimal
                         if direction_int == 1:  # Long
-                            if valid_label == 1:
-                                # ★ DECIMAL_PT_MULT を current_pt_mult に変更
+                            if valid_label == 1 and _within_td_long:
+                                _exit_kind = "PT"
                                 exit_price_decimal = current_price_decimal + (
                                     Decimal(str(atr_value_float)) * current_pt_mult
                                 )
-                            elif (
-                                # ★ 120.0 などの直書きを td_minutes_long に変更
-                                valid_label == 0
-                                and duration_val < (self.config.td_minutes_long - 0.1)
-                            ):
-                                # ★ DECIMAL_SL_MULT を current_sl_mult に変更
+                            elif valid_label == 0 and _within_td_long:
+                                _exit_kind = "SL"
                                 exit_price_decimal = current_price_decimal - (
                                     Decimal(str(atr_value_float)) * current_sl_mult
                                 )
                                 is_sl_hit = True
-                            else:  # タイムアウト
+                            else:  # タイムアウト (TD 到達 or TD 短縮による打ち切り)
                                 future_p = (
                                     close_future_float
                                     if (
@@ -1105,22 +1868,18 @@ class BacktestSimulator:
                             )
 
                         else:  # Short
-                            if valid_label == 1:
-                                # ★ DECIMAL_PT_MULT を current_pt_mult に変更
+                            if valid_label == 1 and _within_td_short:
+                                _exit_kind = "PT"
                                 exit_price_decimal = current_price_decimal - (
                                     Decimal(str(atr_value_float)) * current_pt_mult
                                 )
-                            elif (
-                                # ★ 60.0 などの直書きを td_minutes_short に変更
-                                valid_label == 0
-                                and duration_val < (self.config.td_minutes_short - 0.1)
-                            ):
-                                # ★ DECIMAL_SL_MULT を current_sl_mult に変更
+                            elif valid_label == 0 and _within_td_short:
+                                _exit_kind = "SL"
                                 exit_price_decimal = current_price_decimal + (
                                     Decimal(str(atr_value_float)) * current_sl_mult
                                 )
                                 is_sl_hit = True
-                            else:  # タイムアウト
+                            else:  # タイムアウト (TD 到達 or TD 短縮による打ち切り)
                                 future_p = (
                                     close_future_float
                                     if (
@@ -1177,9 +1936,47 @@ class BacktestSimulator:
                             if total_used_margin > DECIMAL_ZERO
                             else Decimal("9999.0")
                         )
+                        # [SPREAD-FIX] 資本更新は capital = capital − spread + pnl だが、
+                        #   従来ログの "pnl" は spread 控除【前】の gross だった。
+                        #   そのため PF・勝率・平均利益/損失・Exit内訳がすべて
+                        #   グロス評価になり、balance と食い違っていた
+                        #   (実測: Exit内訳合計 +274.67 に対し Net Profit −1000.00)。
+                        #   "pnl" を net に統一し、gross は別列で保持する。
+                        _pnl_net = pnl - spread_cost_decimal
                         _log_entry = {
                             "timestamp": current_timestamp,
-                            "pnl": pnl,
+                            "pnl": _pnl_net,
+                            "pnl_gross": pnl,
+                            # [DISP] 実現変位 (ATR単位)。測定 measure_mu_time_profile の
+                            #   E[ΔX(t)×方向] と直接比較できる形。符号は測定と逆
+                            #   (測定の −0.2508 = こちらの +0.2508)。
+                            # [VERIFY] 選抜条件そのものを記録する。
+                            #   測定と同じバーを拾えているかを後から直接検算できる。
+                            "er": (
+                                float(er_chunk[i])
+                                if er_chunk is not None and np.isfinite(er_chunk[i])
+                                else float("nan")
+                            ),
+                            "d_atr": (
+                                float(d_chunk[i])
+                                if d_chunk is not None and np.isfinite(d_chunk[i])
+                                else float("nan")
+                            ),
+                            "disp_atr": (
+                                float(pnl)
+                                / (
+                                    float(final_lot_size_decimal)
+                                    * 100.0
+                                    * float(atr_value_float)
+                                )
+                                if (
+                                    final_lot_size_decimal > DECIMAL_ZERO
+                                    and atr_value_float
+                                    and np.isfinite(atr_value_float)
+                                    and atr_value_float > 0
+                                )
+                                else float("nan")
+                            ),
                             "balance": current_capital,
                             "m2_proba": float(p_float),
                             "direction": int(direction_int),
@@ -1194,6 +1991,10 @@ class BacktestSimulator:
                             "aL": int(current_active_longs),
                             "aS": int(current_active_shorts),
                             "TD": float(duration_val),
+                            # [TD-RESIM/HOLD] 実保有時間 (エントリー起点、TD 打ち切り反映)
+                            "hold": float(_hold_from_entry),
+                            # 決済種別: PT / SL / TO (TD 打ち切りを含む)
+                            "exit": str(_exit_kind),
                             "DD(%)": float(current_dd_pct),
                             "mg_lv%": _mg_lv,
                             "csl_L": 0,  # 決済時に上書き
@@ -1201,9 +2002,13 @@ class BacktestSimulator:
                             "closs": 0,  # 決済時に上書き
                         }
 
+                        # [TD-RESIM] 証拠金の解放時刻も打ち切り後の実決済時刻にする。
+                        #   旧実装はラベル生 duration で解放していたため、TD を絞っても
+                        #   ポジションが本来より長く枠を占有し、同時保有数・証拠金・
+                        #   max_positions の判定が実態とズレていた。
                         if duration_float is not None and np.isfinite(duration_float):
                             new_exit_time = current_timestamp_int + int(
-                                duration_float * 60 * 1_000_000
+                                _eff_duration_from_L * 60 * 1_000_000
                             )
                             active_exit_times.append(new_exit_time)
                             pending_exits.append(
@@ -1241,7 +2046,11 @@ class BacktestSimulator:
         # V5仕様のトレードログスキーマ
         trade_log_schema = {
             "timestamp": pl.Datetime,
-            "pnl": pl.Object,
+            "pnl": pl.Object,  # スプレッド控除後 (balance と整合)
+            "pnl_gross": pl.Object,  # スプレッド控除前
+            "er": pl.Float64,  # 効率比 (選抜条件)
+            "d_atr": pl.Float64,  # 符号つき1バー変位 (選抜条件)
+            "disp_atr": pl.Float64,  # 実現変位 (ATR単位)
             "balance": pl.Object,
             "m2_proba": pl.Float64,
             "direction": pl.Int8,
@@ -1256,6 +2065,8 @@ class BacktestSimulator:
             "aL": pl.Int32,
             "aS": pl.Int32,
             "TD": pl.Float64,
+            "hold": pl.Float64,  # 実保有分(エントリー起点・TD打ち切り反映)
+            "exit": pl.Utf8,  # PT / SL / TO
             "DD(%)": pl.Float64,
             "mg_lv%": pl.Float64,  # 証拠金維持率(%)
             "csl_L": pl.Int32,  # Long連続SL（決済後）
@@ -1421,8 +2232,19 @@ class BacktestSimulator:
             ).drop_nans()
 
             # V5 仕様: 1=Win, 0=Lose
-            winning_trades = trade_log.filter(pl.col("label") == 1)
-            losing_trades = trade_log.filter(pl.col("label") == 0)
+            # [WINRATE-FIX] 旧実装は label(=PTラベルか) で勝敗を数えていた。
+            #   実損益ではないため、
+            #     ・TD 打ち切りで label=1 が損失決済になるケース
+            #     ・use_barriers=False (時間決済) で label が無意味になるケース
+            #   のいずれでも Win Rate / Average Profit / Average Loss が壊れる。
+            #   実測でも Direction 別勝率の加重平均と 64 件食い違っていた。
+            #   スプレッド控除後の実損益 (pnl) で数える。
+            _pnl_f = [
+                float(x) if x is not None else 0.0 for x in trade_log["pnl"].to_list()
+            ]
+            _win_mask = pl.Series("w", [v > 0 for v in _pnl_f])
+            winning_trades = trade_log.filter(_win_mask)
+            losing_trades = trade_log.filter(~_win_mask)
 
             num_winning_trades = len(winning_trades)
             num_losing_trades = len(losing_trades)
@@ -1624,6 +2446,7 @@ class BacktestSimulator:
                 decimal_cols_round = {
                     "balance": 2,  # ★変更
                     "pnl": 2,
+                    "pnl_gross": 2,
                     "spread": 2,  # ★変更
                     "margin": 2,  # ★変更
                     "close_price": 3,
@@ -1651,6 +2474,7 @@ class BacktestSimulator:
                     "atr_ratio": 4,
                     "leverage": 0,
                     "TD": 1,
+                    "hold": 1,
                     "DD(%)": 2,
                     "mg_lv%": 1,
                 }
@@ -1671,6 +2495,10 @@ class BacktestSimulator:
                     "label",
                     "m2_proba",
                     "pnl",
+                    "pnl_gross",
+                    "er",
+                    "d_atr",
+                    "disp_atr",
                     "balance",
                     "lot_size",
                     "aL",
@@ -1682,6 +2510,8 @@ class BacktestSimulator:
                     "atr_value",
                     "atr_ratio",
                     "TD",
+                    "hold",
+                    "exit",
                     "DD(%)",
                     "mg_lv%",
                     "csl_L",
@@ -1736,8 +2566,15 @@ class BacktestSimulator:
                 s_trades = trade_log.filter(pl.col("direction") == -1)
                 count_l = len(l_trades)
                 count_s = len(s_trades)
-                avg_td_l = l_trades["TD"].mean() if count_l > 0 else 0.0
-                avg_td_s = s_trades["TD"].mean() if count_s > 0 else 0.0
+                # [TD-RESIM/HOLD] "TD" はラベル生 duration (L 起点)、
+                #   "hold" は TD 打ち切りを反映した実保有分 (エントリー起点)。
+                #   Avg TD は実保有分で出す (旧実装は生 duration で、TD を絞っても
+                #   数字が縮まず「TD が効いていない」ように見えた)。
+                _hold_col = "hold" if "hold" in trade_log.columns else "TD"
+                avg_td_l = l_trades[_hold_col].mean() if count_l > 0 else 0.0
+                avg_td_s = s_trades[_hold_col].mean() if count_s > 0 else 0.0
+                avg_raw_l = l_trades["TD"].mean() if count_l > 0 else 0.0
+                avg_raw_s = s_trades["TD"].mean() if count_s > 0 else 0.0
 
                 # 方向別 勝率・PF
                 def _win_rate_pf(trades):
@@ -1778,21 +2615,24 @@ class BacktestSimulator:
                 # )
 
                 # ▼▼▼ 修正後 ▼▼▼
-                to_count = len(
-                    trade_log.filter(
-                        (pl.col("label") == 0)
+                # [TD-RESIM] 決済種別は決済時点で確定済みなので "exit" 列を直接数える。
+                #   (旧: label と TD から推定していたため、TD 打ち切りで TO 化した
+                #    PT 玉が数え漏れていた)
+                if "exit" in trade_log.columns:
+                    to_count = len(trade_log.filter(pl.col("exit") == "TO"))
+                else:
+                    _ah = float(ACTION_HORIZON_MIN)
+                    _to_expr = (
+                        (pl.col("direction") == 1)
+                        & ((pl.col("TD") - _ah) >= (self.config.td_minutes_long - 1e-9))
+                    ) | (
+                        (pl.col("direction") == -1)
                         & (
-                            (
-                                (pl.col("direction") == 1)
-                                & (pl.col("TD") >= (self.config.td_minutes_long - 0.1))
-                            )
-                            | (
-                                (pl.col("direction") == -1)
-                                & (pl.col("TD") >= (self.config.td_minutes_short - 0.1))
-                            )
+                            (pl.col("TD") - _ah)
+                            >= (self.config.td_minutes_short - 1e-9)
                         )
                     )
-                )
+                    to_count = len(trade_log.filter(_to_expr))
                 m2_lst = trade_log["m2_proba"].to_list()
                 m2_bins = {
                     "<= 0.50": sum(1 for x in m2_lst if x <= 0.50),
@@ -1818,21 +2658,11 @@ class BacktestSimulator:
                     logging.warning(
                         "atr_ratio column not found in trade_log. Falling back to atr_value."
                     )
+                # [BANDS] 帯の区切りは USER_PARAMS["atr_ratio_bands"] から
+                _ratio_band_defs = _build_band_defs(self.config.atr_ratio_bands)
                 atr_bins = {
-                    "< 0.5": sum(1 for x in atr_rel_lst if x is not None and x < 0.5),
-                    "0.5-0.8": sum(
-                        1 for x in atr_rel_lst if x is not None and 0.5 <= x < 0.8
-                    ),
-                    "0.8-1.0": sum(
-                        1 for x in atr_rel_lst if x is not None and 0.8 <= x < 1.0
-                    ),
-                    "1.0-1.2": sum(
-                        1 for x in atr_rel_lst if x is not None and 1.0 <= x < 1.2
-                    ),
-                    "1.2-1.5": sum(
-                        1 for x in atr_rel_lst if x is not None and 1.2 <= x < 1.5
-                    ),
-                    ">= 1.5": sum(1 for x in atr_rel_lst if x is not None and x >= 1.5),
+                    _bn: sum(1 for x in atr_rel_lst if x is not None and _bf(x))
+                    for _bn, _bf in _ratio_band_defs
                 }
 
                 # pnl・labelリストを帯別分析で共通利用するため先に取得
@@ -1877,14 +2707,8 @@ class BacktestSimulator:
 
                 # ATR Ratio帯別 勝率・PF分析
                 atr_band_stats = {}
-                atr_band_defs = [
-                    ("< 0.5", lambda x: x < 0.5),
-                    ("0.5-0.8", lambda x: 0.5 <= x < 0.8),
-                    ("0.8-1.0", lambda x: 0.8 <= x < 1.0),
-                    ("1.0-1.2", lambda x: 1.0 <= x < 1.2),
-                    ("1.2-1.5", lambda x: 1.2 <= x < 1.5),
-                    (">= 1.5", lambda x: x >= 1.5),
-                ]
+                # [BANDS] USER_PARAMS["atr_ratio_bands"] で区切りを変えられる
+                atr_band_defs = _ratio_band_defs
                 for band_name, band_fn in atr_band_defs:
                     idxs = [
                         i
@@ -1904,9 +2728,12 @@ class BacktestSimulator:
                     pf = sum(wins) / abs(sum(loses)) if loses else float("inf")
                     atr_band_stats[band_name] = {
                         "count": len(idxs),
-                        "win_rate": sum(1 for l in band_labels if l == 1)
-                        / len(idxs)
-                        * 100,
+                        # [WINRATE-FIX] 旧実装は label==1 の割合を勝率としていたが、
+                        #   TD 打ち切りで label==1 が損失決済になりうるため、
+                        #   全体の Win Rate (pnl>0) と定義が食い違っていた。pnl 基準に統一。
+                        "win_rate": len(wins) / len(band_pnls) * 100
+                        if band_pnls
+                        else 0.0,
                         "pf": pf,
                         "avg_pnl": sum(band_pnls) / len(band_pnls),
                     }
@@ -1970,14 +2797,8 @@ class BacktestSimulator:
                     else [1.0] * len(ts_list2)
                 )
 
-                atr_bands = [
-                    ("< 0.5", lambda x: x < 0.5),
-                    ("0.5-0.8", lambda x: 0.5 <= x < 0.8),
-                    ("0.8-1.0", lambda x: 0.8 <= x < 1.0),
-                    ("1.0-1.2", lambda x: 1.0 <= x < 1.2),
-                    ("1.2-1.5", lambda x: 1.2 <= x < 1.5),
-                    (">= 1.5", lambda x: x >= 1.5),
-                ]
+                # [BANDS] USER_PARAMS["atr_ratio_bands"] で区切りを変えられる
+                atr_bands = _build_band_defs(self.config.atr_ratio_bands)
 
                 hour_idx = {}
                 weekday_idx = {}
@@ -2104,8 +2925,181 @@ class BacktestSimulator:
                 f.write(f"Max Concurrent Total:\t{max_active_tot}\n")
                 f.write(f"Total Long Trades:\t{count_l}\n")
                 f.write(f"Total Short Trades:\t{count_s}\n")
-                f.write(f"Avg TD (Long):\t\t{avg_td_l:.1f} mins\n")
-                f.write(f"Avg TD (Short):\t\t{avg_td_s:.1f} mins\n")
+                f.write(
+                    f"Avg Hold (Long):\t{avg_td_l:.1f} mins   "
+                    f"(ラベル生 duration: {avg_raw_l:.1f})\n"
+                )
+                f.write(
+                    f"Avg Hold (Short):\t{avg_td_s:.1f} mins   "
+                    f"(ラベル生 duration: {avg_raw_s:.1f})\n"
+                )
+                f.write(
+                    f"  ※ Avg Hold = エントリー起点の実保有分 (TD={self.config.td_minutes_long:g}"
+                    f"/{self.config.td_minutes_short:g} 打ち切り反映)\n"
+                )
+                f.write(
+                    f"  ※ ラベル生 duration = L 起点・打ち切り前 "
+                    f"(ラベル TD {LABEL_TD_MINUTES:g} 分 + 行動地平 {ACTION_HORIZON_MIN:g} 分)\n"
+                )
+                # [SPREAD-FIX] コスト内訳と照合
+                if "spread" in trade_log.columns:
+                    _sp = sum(
+                        float(x) for x in trade_log["spread"].to_list() if x is not None
+                    )
+                    _gr = (
+                        sum(
+                            float(x)
+                            for x in trade_log["pnl_gross"].to_list()
+                            if x is not None
+                        )
+                        if "pnl_gross" in trade_log.columns
+                        else float("nan")
+                    )
+                    _nt = sum(
+                        float(x) for x in trade_log["pnl"].to_list() if x is not None
+                    )
+                    f.write("\n--- Cost Breakdown ---\n")
+                    f.write(f"  Gross PnL (スプレッド控除前) : {_gr:>12,.2f}\n")
+                    f.write(f"  Total Spread Cost            : {-_sp:>12,.2f}\n")
+                    f.write(f"  Net PnL (= 以降の全指標の基準): {_nt:>12,.2f}\n")
+                    if len(trade_log) > 0:
+                        f.write(
+                            f"  1トレード平均: gross {_gr / len(trade_log):+.3f}"
+                            f" / spread {-_sp / len(trade_log):+.3f}"
+                            f" / net {_nt / len(trade_log):+.3f}\n"
+                        )
+                    if abs(_gr) > 1e-9:
+                        f.write(
+                            f"  スプレッドが gross を食う割合: {_sp / abs(_gr) * 100:.1f}%\n"
+                        )
+                    f.write("\n")
+
+                # [DISP] 年別 実現変位 — measure_mu_time_profile 第3段と直接突合する表
+                if "disp_atr" in trade_log.columns:
+                    f.write("\n--- 年別 実現変位 (ATR単位) ---\n")
+                    f.write(
+                        "  measure_mu_time_profile.py --rule sweep の【第3段】と"
+                        "直接比較できます。\n"
+                        "  測定は E[ΔX×sign(d)] で逆行が負、こちらは損益なので符号が反転します。\n"
+                        "  例) 測定 -0.2508  ⇔  BT +0.2508\n\n"
+                    )
+                    f.write(
+                        f"  {'年':>6}{'n':>8}{'効果':>10}{'SE':>9}{'t':>8}"
+                        f"{'±3刈り':>11}{'t':>8}   符号\n"
+                    )
+                    f.write("  " + "-" * 71 + "\n")
+                    _yrs = [t.year for t in trade_log["timestamp"].to_list()]
+                    _ds = [
+                        (float(x) if x is not None else float("nan"))
+                        for x in trade_log["disp_atr"].to_list()
+                    ]
+                    _all: List[float] = []
+                    for _y in sorted(set(_yrs)):
+                        _v = [
+                            d
+                            for yy, d in zip(_yrs, _ds)
+                            if yy == _y and d == d  # NaN 除外
+                        ]
+                        if len(_v) < 2:
+                            continue
+                        _all.extend(_v)
+                        _m = float(np.mean(_v))
+                        _se = float(np.std(_v, ddof=1) / np.sqrt(len(_v)))
+                        _t = _m / _se if _se > 0 else 0.0
+                        # [OUTLIER] ±3 ATR で刈った平均。外れ値(週末ギャップ・
+                        #   板飛び等)が平均を潰していないかの判定に使う。
+                        #   測定器は STALE_TICK_LIMIT / disc 対応でこの種のバーを
+                        #   落としているが、BT には同等の除外が無い。
+                        _w = [min(max(x, -3.0), 3.0) for x in _v]
+                        _mw = float(np.mean(_w))
+                        _sew = float(np.std(_w, ddof=1) / np.sqrt(len(_w)))
+                        _tw = _mw / _sew if _sew > 0 else 0.0
+                        _sg = "順行" if _m > 0 else "逆行"
+                        _bar = "#" * min(20, int(abs(_t) * 4))
+                        f.write(
+                            f"  {_y:>6}{len(_v):>8}{_m:>+10.4f}{_se:>9.4f}"
+                            f"{_t:>+8.2f}{_mw:>+11.4f}{_tw:>+8.2f}   {_sg} {_bar}\n"
+                        )
+                    if len(_all) > 1:
+                        _m = float(np.mean(_all))
+                        _se = float(np.std(_all, ddof=1) / np.sqrt(len(_all)))
+                        f.write("  " + "-" * 52 + "\n")
+                        f.write(
+                            f"  {'統合':>6}{len(_all):>8}{_m:>+10.4f}{_se:>9.4f}"
+                            f"{(_m / _se if _se > 0 else 0.0):>+8.2f}\n"
+                        )
+                        # [OUTLIER] 分布の裾を見る。測定 σ ≒ 1.5 に対し
+                        #   BT σ が大きければ、測定が落としているバーを拾っている。
+                        _q = np.percentile(_all, [0.1, 1, 5, 25, 50, 75, 95, 99, 99.9])
+                        f.write("\n  disp_atr の分布 (外れ値診断):\n")
+                        f.write(
+                            "    "
+                            + "".join(
+                                f"{lbl:>9}"
+                                for lbl in [
+                                    "0.1%",
+                                    "1%",
+                                    "5%",
+                                    "25%",
+                                    "50%",
+                                    "75%",
+                                    "95%",
+                                    "99%",
+                                    "99.9%",
+                                ]
+                            )
+                            + "\n"
+                        )
+                        f.write("    " + "".join(f"{v:>9.3f}" for v in _q) + "\n")
+                        _sd = float(np.std(_all, ddof=1))
+                        _n3 = sum(1 for x in _all if abs(x) > 3.0)
+                        f.write(
+                            f"    σ = {_sd:.3f}  (測定器 ≒ 1.5)"
+                            f" / |disp| > 3 ATR: {_n3} 件 ({100.0 * _n3 / len(_all):.2f}%)\n\n"
+                        )
+                        _sp_per = (
+                            0.36
+                            if not len(trade_log)
+                            else sum(
+                                float(x)
+                                for x in trade_log["spread"].to_list()
+                                if x is not None
+                            )
+                            / len(trade_log)
+                        )
+                        _lot = float(self.config.fixed_lot_size)
+                        if _m > 0 and _lot > 0:
+                            f.write(
+                                f"  損益分岐 ATR = spread/件 ÷ (効果 × lot × 100)"
+                                f" = {_sp_per:.3f} ÷ ({_m:.4f} × {_lot} × 100)"
+                                f" = {_sp_per / (_m * _lot * 100):.2f} USD\n"
+                            )
+                    f.write("\n")
+
+                # 決済種別の内訳 (PT / SL / TO)
+                if "exit" in trade_log.columns:
+                    f.write("\n--- Exit Type Breakdown ---\n")
+                    f.write(
+                        f"  {'Type':<6}{'Count':>7}{'Ratio%':>9}"
+                        f"{'WinRate%':>10}{'TotalPnL':>12}{'AvgPnL':>10}\n"
+                    )
+                    _tot_n = len(trade_log)
+                    for _k in ("PT", "SL", "TO"):
+                        _sub = trade_log.filter(pl.col("exit") == _k)
+                        _n = len(_sub)
+                        if _n == 0:
+                            f.write(
+                                f"  {_k:<6}{0:>7}{0.0:>9.1f}{'-':>10}{'-':>12}{'-':>10}\n"
+                            )
+                            continue
+                        _pnls = [float(x) for x in _sub["pnl"].to_list()]
+                        _wins = sum(1 for x in _pnls if x > 0)
+                        _sum = sum(_pnls)
+                        f.write(
+                            f"  {_k:<6}{_n:>7}{100.0 * _n / _tot_n:>9.1f}"
+                            f"{100.0 * _wins / _n:>10.2f}{_sum:>12.2f}{_sum / _n:>10.3f}\n"
+                        )
+                    f.write("\n")
                 f.write(f"Timeout (TO) Count:\t{to_count}\n\n")
 
                 _proba_label = (
@@ -2291,26 +3285,47 @@ class BacktestSimulator:
                     f"  {'Session':<10}{'Trades':>8}{'WinRate%':>10}{'PF':>8}{'AvgPnL':>14}{'TotalPnL':>16}\n"
                 )
                 f.write("  " + "-" * 66 + "\n")
-                for s in session_order:
-                    hs = [
-                        st
-                        for h, st in hourly_stats.items()
-                        if _session(h) == s and st is not None
-                    ]
-                    if not hs:
+                # [SESSION-PF-FIX] 旧実装は「1時間ごとの合計PnL」を勝ち負けに
+                #   振り分けて PF を作っていた (= 勝ちの時間帯の合計 / 負けの時間帯の合計)。
+                #   これは Profit Factor ではなく、全部の時間帯がマイナスなら 0.00 に
+                #   なる別物だった (実測: London 124件 勝率36% で PF 0.00)。
+                #   トレード単位の gross profit / gross loss に直す。
+                _sess_acc = {
+                    _s: {"n": 0, "win": 0, "gp": 0.0, "gl": 0.0, "tot": 0.0}
+                    for _s in session_order
+                }
+                for _ts, _pv in zip(
+                    trade_log["timestamp"].to_list(), trade_log["pnl"].to_list()
+                ):
+                    try:
+                        _h_jst = (_ts.hour + 9) % 24
+                    except Exception:
                         continue
-                    tc = sum(x["count"] for x in hs)
-                    tw = sum(int(x["count"] * x["win_rate"] / 100) for x in hs)
-                    wr = tw / tc * 100 if tc > 0 else 0
-                    all_pnl = [x["total_pnl"] for x in hs]
-                    pw = sum(x for x in all_pnl if x > 0)
-                    pl_neg = sum(x for x in all_pnl if x < 0)
-                    pf_s = pw / abs(pl_neg) if pl_neg != 0 else float("inf")
+                    _sname = _session(_h_jst)
+                    if _sname not in _sess_acc:
+                        continue
+                    _p = float(_pv) if _pv is not None else 0.0
+                    _a = _sess_acc[_sname]
+                    _a["n"] += 1
+                    _a["tot"] += _p
+                    if _p > 0:
+                        _a["win"] += 1
+                        _a["gp"] += _p
+                    elif _p < 0:
+                        _a["gl"] += -_p
+
+                for s in session_order:
+                    _a = _sess_acc.get(s)
+                    if not _a or _a["n"] == 0:
+                        continue
+                    tc = _a["n"]
+                    wr = _a["win"] / tc * 100
+                    pf_s = _a["gp"] / _a["gl"] if _a["gl"] > 0 else float("inf")
                     pf_str = f"{pf_s:.2f}" if pf_s != float("inf") else "inf"
-                    tot = sum(all_pnl)
-                    avg = tot / tc if tc > 0 else 0
+                    tot = _a["tot"]
+                    avg = tot / tc
                     f.write(
-                        f"  {s:<10}{tc:>8}{wr:>9.2f}%{pf_str:>8}{avg:>14,.0f}{tot:>16,.0f}\n"
+                        f"  {s:<10}{tc:>8}{wr:>9.2f}%{pf_str:>8}{avg:>14,.2f}{tot:>16,.2f}\n"
                     )
                 f.write("\n")
 
@@ -2325,7 +3340,7 @@ class BacktestSimulator:
                         continue
                     pf_str = f"{st['pf']:.2f}" if st["pf"] != float("inf") else "inf"
                     f.write(
-                        f"  {wd_names[wd]:<12}{st['count']:>8}{st['win_rate']:>9.2f}%{pf_str:>8}{st['avg_pnl']:>14,.0f}{st['total_pnl']:>16,.0f}\n"
+                        f"  {wd_names[wd]:<12}{st['count']:>8}{st['win_rate']:>9.2f}%{pf_str:>8}{st['avg_pnl']:>14,.2f}{st['total_pnl']:>16,.2f}\n"
                     )
                 f.write("\n")
 
@@ -2681,7 +3696,72 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use-fixed-risk",
         action="store_true",
-        help="Use fixed risk % position sizing instead of auto lot.",
+        # [BUGFIX] argparse は help 文字列を % 書式として展開するため、
+        #   素の % があると --help 実行時に ValueError で落ちる。%% にエスケープする。
+        help="Use fixed risk %% position sizing instead of auto lot.",
+    )
+    parser.add_argument(
+        "--no-fixed-risk",
+        action="store_true",
+        dest="no_fixed_risk",
+        help="Disable fixed-risk sizing and fall back to auto-lot.",
+    )
+    # [追加] USER_PARAMS にあるが CLI から届いていなかったフィルター群
+    parser.add_argument(
+        "--max-atr",
+        type=float,
+        default=default_config.max_atr_threshold,
+        dest="max_atr",
+        help=f"Upper bound on atr_ratio (0 = off). Default: {default_config.max_atr_threshold}",
+    )
+    parser.add_argument(
+        "--max-baseline-atr",
+        type=float,
+        default=default_config.max_baseline_atr,
+        help=f"Upper bound on baseline ATR in USD (0 = off). Default: {default_config.max_baseline_atr}",
+    )
+    parser.add_argument(
+        "--min-baseline-atr",
+        type=float,
+        default=default_config.min_baseline_atr,
+        help=f"Absolute floor on baseline ATR in USD (0 = off). Default: {default_config.min_baseline_atr}",
+    )
+    parser.add_argument(
+        "--min-baseline-ratio",
+        type=float,
+        default=default_config.min_baseline_ratio,
+        help=f"Floor on baseline_ratio (0 = off). Default: {default_config.min_baseline_ratio}",
+    )
+    parser.add_argument(
+        "--baseline-days",
+        type=int,
+        default=default_config.baseline_ratio_lookback_days,
+        help=f"Lookback days for baseline_ratio denominator. Default: {default_config.baseline_ratio_lookback_days}",
+    )
+    parser.add_argument(
+        "--min-sar",
+        type=float,
+        default=default_config.min_sar_threshold,
+        help=f"Floor on seasonality-adjusted ATR ratio (0 = off). Default: {default_config.min_sar_threshold}",
+    )
+    parser.add_argument(
+        "--sar-days",
+        type=int,
+        default=default_config.sar_lookback_days,
+        help=f"Lookback days for SAR same-hour average. Default: {default_config.sar_lookback_days}",
+    )
+    parser.add_argument(
+        "--strict-geometry",
+        action="store_true",
+        default=bool(USER_PARAMS.get("strict_geometry", True)),
+        dest="strict_geometry",
+        help="Abort if BT barrier geometry (pt/sl) does not match the labeling script.",
+    )
+    parser.add_argument(
+        "--no-strict-geometry",
+        action="store_false",
+        dest="strict_geometry",
+        help="Warn instead of aborting on geometry mismatch.",
     )
     parser.add_argument(
         "--fixed-risk-pct",
@@ -2862,8 +3942,10 @@ if __name__ == "__main__":
         end_date=args.end_date,
         auto_lot_base_capital=args.auto_lot_base_capital,
         auto_lot_size_per_base=args.auto_lot_size_per_base,
-        use_fixed_risk=default_config.use_fixed_risk,
-        fixed_risk_percent=default_config.fixed_risk_percent,
+        # [BUGFIX] 旧: default_config.* を直接渡していたため --fixed-risk-pct が無効だった。
+        #   ロットサイズ → 資産曲線 → 破産判定まで直撃する無音バグ。
+        use_fixed_risk=(not args.no_fixed_risk) and USER_PARAMS["use_fixed_risk"],
+        fixed_risk_percent=args.fixed_risk_pct,
         base_leverage=args.base_leverage,
         m2_proba_threshold=args.m2_th,
         m2_delta_threshold=args.m2_delta,  # ★これを追加！
@@ -2871,6 +3953,13 @@ if __name__ == "__main__":
         oof_mode=True,
         min_capital_threshold=args.min_capital,
         min_atr_threshold=args.min_atr,
+        max_atr_threshold=args.max_atr,
+        max_baseline_atr=args.max_baseline_atr,
+        min_baseline_atr=args.min_baseline_atr,
+        min_baseline_ratio=args.min_baseline_ratio,
+        baseline_ratio_lookback_days=args.baseline_days,
+        min_sar_threshold=args.min_sar,
+        sar_lookback_days=args.sar_days,
         value_per_pip=args.value_per_pip,
         spread_pips=args.spread_pips,
         max_positions=args.max_positions,
@@ -2895,6 +3984,107 @@ if __name__ == "__main__":
         parser.error("--spread-pips cannot be negative.")
     if config.sl_multiplier_long <= 0 or config.sl_multiplier_short <= 0:
         parser.error("SL multipliers must be greater than 0.")
+    if config.use_fixed_risk and not (0.0 < config.fixed_risk_percent < 1.0):
+        parser.error("fixed_risk_percent must be in (0, 1), e.g. 0.02 for 2%.")
+
+    # ======================================================================
+    # [GEOMETRY-SYNC] ラベル幾何との突合 — シミュレーション開始前に必ず実行
+    # ======================================================================
+    geometry_check = verify_geometry_against_labeling(
+        config, strict=bool(args.strict_geometry)
+    )
+    GEOMETRY_CHECK_RESULT = geometry_check
+
+    # [TD-RESIM] ラベル側の TD / 行動地平をグローバルへ反映
+    _lab = geometry_check.get("labeling") or {}
+    LABEL_TD_MINUTES = float(
+        _lab.get("td_minutes_long", _LABEL_GEOMETRY_FALLBACK["td_minutes_long"])
+    )
+    ACTION_HORIZON_MIN = (
+        float(
+            _lab.get(
+                "action_horizon_sec",
+                _LABEL_GEOMETRY_FALLBACK["action_horizon_sec"],
+            )
+        )
+        / 60.0
+    )
+    logging.info(
+        f"[TD-RESIM] ラベル TD = {LABEL_TD_MINUTES:g} 分 (エントリー起点) / "
+        f"行動地平 = {ACTION_HORIZON_MIN:g} 分 (L → エントリー)"
+    )
+    if (
+        config.td_minutes_long < LABEL_TD_MINUTES - 1e-9
+        or config.td_minutes_short < LABEL_TD_MINUTES - 1e-9
+    ):
+        logging.info(
+            f"[TD-RESIM] TD 短縮モード: L={config.td_minutes_long:g} / "
+            f"S={config.td_minutes_short:g} 分。経過が新 TD を超えた PT/SL は"
+            " すべて close_future による強制決済に再分類します。"
+        )
+
+    # ---------------- 実効設定の明示 ----------------
+    logging.info("-" * 68)
+    logging.info("[EFFECTIVE SETTINGS]  (USER_PARAMS + CLI 上書き後の最終値)")
+    if str(config.signal_source).lower() == "rule":
+        logging.info(
+            "  signal  : ★RULE (脳不使用) — "
+            f"{config.rule_er_column} >= {config.rule_er_min:g}"
+            + (f" かつ < {config.rule_er_max:g}" if config.rule_er_max > 0 else "")
+            + f" / {config.rule_d_abs_min:g} <= |{config.rule_d_column}| < "
+            f"{config.rule_d_abs_max:g} / 方向={config.rule_direction}"
+            f"  (m2_th / m2_delta は無効)"
+        )
+    else:
+        logging.info("  signal  : MODEL (M2 OOF 確率でゲート)")
+    logging.info(
+        f"  barrier : PT {config.pt_multiplier_long}/{config.pt_multiplier_short}"
+        f" | SL {config.sl_multiplier_long}/{config.sl_multiplier_short}"
+        f" | TD {config.td_minutes_long}/{config.td_minutes_short} min   (L/S)"
+        + (
+            ""
+            if config.use_barriers
+            else "   ★TIME-EXIT (PT/SL 無効・必ず TD で成行決済)"
+        )
+    )
+    logging.info(
+        f"  gates   : m2_th={config.m2_proba_threshold}"
+        f" | m2_delta={config.m2_delta_threshold}"
+        f" | atr_ratio=[{config.min_atr_threshold:g}, "
+        f"{('∞' if config.max_atr_threshold <= 0 else format(config.max_atr_threshold, 'g'))})"
+        f" | atr_value=[{config.min_atr_value:g}, "
+        f"{('∞' if config.max_atr_value <= 0 else format(config.max_atr_value, 'g'))}) USD"
+        f" | baseline_atr=[{config.min_baseline_atr:g}, "
+        f"{('∞' if config.max_baseline_atr <= 0 else format(config.max_baseline_atr, 'g'))}) USD"
+        f" | min_baseline_ratio={config.min_baseline_ratio}"
+        f" | min_sar={config.min_sar_threshold}"
+    )
+    logging.info(
+        (
+            "  sizing  : ★FIXED-LOT "
+            + f"{config.fixed_lot_size:g} lot (エッジ測定モード)"
+            if config.use_fixed_lot
+            else ""
+        )
+        or f"  sizing  : fixed_risk={config.use_fixed_risk}"
+        f" ({config.fixed_risk_percent * 100:.2f}%)"
+        f" | leverage={config.base_leverage} | max_positions={config.max_positions}"
+    )
+    logging.info(
+        f"  cost    : spread_pips={config.spread_pips}"
+        f" | value_per_pip={config.value_per_pip}"
+    )
+    logging.info(
+        f"  capital : initial={config.initial_capital}"
+        f" | period={config.start_date or 'ALL'} 〜 {config.end_date or 'ALL'}"
+    )
+    if abs(config.pt_multiplier_long - config.sl_multiplier_long) < 1e-9:
+        logging.info(
+            "  note    : 対称バリア (pt=sl) のため基底率≈50%。"
+            "p_short≈1−p_long となり delta≈|2·p_long−1| なので、"
+            "m2_delta は m2_th に支配されます (m2_th 単独で振ること)。"
+        )
+    logging.info("-" * 68)
 
     simulator = BacktestSimulator(config)
 
@@ -2927,12 +4117,41 @@ if __name__ == "__main__":
     import datetime as _dt
 
     _now_str = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    _risk_pct = int(config.fixed_risk_percent * 100)
+    _risk_pct = config.fixed_risk_percent * 100
+    # [GEOMETRY-SYNC] 幾何とフィルタをフォルダ名に焼き込む。
+    #   旧実装は Th/D/R しか含めず、pt/sl/td 違いのレポートが区別できなかった。
+    #   幾何不一致のまま続行した場合は _GEOMISMATCH を付す。
+    _geo_tag = (
+        f"_PT{config.pt_multiplier_long:g}"
+        f"_SL{config.sl_multiplier_long:g}"
+        f"_TD{config.td_minutes_long:g}"
+    )
+    _flt_tag = ""
+    if config.min_baseline_atr > 0:
+        _flt_tag += f"_bATR{config.min_baseline_atr:g}"
+    if config.min_baseline_ratio > 0:
+        _flt_tag += f"_bRatio{config.min_baseline_ratio:g}"
+    if config.min_sar_threshold > 0:
+        _flt_tag += f"_SAR{config.min_sar_threshold:g}"
+    if config.min_atr_threshold > 0 or config.max_atr_threshold > 0:
+        _hi = (
+            "inf" if config.max_atr_threshold <= 0 else f"{config.max_atr_threshold:g}"
+        )
+        _flt_tag += f"_aATR{config.min_atr_threshold:g}to{_hi}"
+    if config.max_baseline_atr > 0:
+        _flt_tag += f"_bATRmax{config.max_baseline_atr:g}"
+    _mismatch_tag = "_GEOMISMATCH" if geometry_check.get("status") == "mismatch" else ""
+    _mode_tag = (
+        "RULE" if str(config.signal_source).lower() == "rule" else inference_mode
+    )
     _folder_name = (
-        f"{inference_mode}_{_now_str}"
+        f"{_mode_tag}_{_now_str}"
+        f"{_geo_tag}"
         f"_Th{config.m2_proba_threshold}"
         f"_D{config.m2_delta_threshold}"
-        f"_R{_risk_pct}"
+        f"_R{_risk_pct:g}"
+        f"{_flt_tag}"
+        f"{_mismatch_tag}"
     )
     _result_dir = S7_BACKTEST_SIM_RESULTS / _folder_name
     _result_dir.mkdir(parents=True, exist_ok=True)
@@ -2988,6 +4207,20 @@ if __name__ == "__main__":
         return data
 
     preloaded_data = load_or_generate_cache()
+
+    # [CACHE-GUARD] 必要列の検証。古いキャッシュなら自動で作り直す。
+    if not validate_preload_columns(preloaded_data, config, active_cache_path):
+        try:
+            active_cache_path.unlink()
+        except OSError:
+            pass
+        logging.info("[CACHE-GUARD] キャッシュを再生成します...")
+        preloaded_data = simulator.preload_data()
+        active_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(active_cache_path, "wb") as f:
+            pickle.dump(preloaded_data, f)
+        logging.info(f"[CACHE-GUARD] 再生成して保存しました: {active_cache_path}")
+        validate_preload_columns(preloaded_data, config, active_cache_path)
 
     # ─── キャッシュ load 後の期間フィルタ ───
     # キャッシュには全期間データが入っているため、--start-date / --end-date が

@@ -1,4 +1,13 @@
-# Project Forge - Central Configuration Blueprint (v4)
+# Project Forge - Central Configuration Blueprint (v5 / PROTOTYPE GEOMETRY)
+#
+# [PROTO] 2025-11 プロトタイプ脳の幾何へ切り替え済み。変更点:
+#   BARRIER_ATR_PERIOD : 13 → 21
+#   LABEL_CONFIG       : td_minutes 60 → 1200 / min_atr_threshold 0.8(相対) → 5.0(絶対USD)
+#   追加宣言           : TRIGGER_TIMEFRAME / ACTION_HORIZON_SEC / ATR_ABS_THRESHOLD
+#                        PROTO_PT_MULT / PROTO_SL_MULT / PROTO_TD / ER_WINDOWS_BY_TRIGGER
+#
+# 未追随（本番投入前に手当てが必要）:
+#   realtime_feature_engine.py L152  ATR_CALC_PERIOD = 13   ← blueprint を見ていない
 from pathlib import Path
 
 # =================================================================
@@ -92,11 +101,26 @@ WF_CONFIG = {
 
 # --- Chapter 2 ラベル生成設定（トリプルバリア）---
 # risk_config.json（本番用）とは独立した訓練用パラメータ
+#
+# [PROTO] プロトタイプ脳の幾何に合わせた。
+#   出典: create_proxy_labels_polars_patch_regime1.py (2025-11-05)
+#         REGIME_RULE_R4 = {"pt": 1.0, "sl": 5.0, "td": "1200m"}
+#         ATR_REGIME_CUTOFF = 5.0  (絶対値 USD、相対比ではない)
+#
+# ★ 消費側は 2_E_hf_meta_model_trainer.py のみ (Step 11)。
+#   Step 14-22 のみ回す場合は使われないが、ラベリング側と食い違ったまま
+#   残すと次に 2_E を回したとき幾何が二重定義になるため揃えてある。
+#
+# ★ min_atr_threshold の意味が変わっている点に注意:
+#     旧 0.8 = atr_ratio (相対比) の下限
+#     新 5.0 = 絶対 ATR (USD) の下限
+#   2_E 側は L343 で min_atr_threshold を読んでいるので、
+#   2_E を再実行する場合は比較対象が相対比か絶対値かを必ず確認すること。
 LABEL_CONFIG = {
-    "pt_multiplier": 1.0,
-    "sl_multiplier": 5.0,
-    "td_minutes": 60,  # H1データ基準: 1バー = 60分
-    "min_atr_threshold": 0.8,
+    "pt_multiplier": 1.0,     # [PROTO] 変更なし (旧も 1.0)
+    "sl_multiplier": 5.0,     # [PROTO] 変更なし (旧も 5.0)
+    "td_minutes": 1200,       # [PROTO] 旧 60 → 1200 (20時間)
+    "min_atr_threshold": 5.0, # [PROTO] 旧 0.8 (相対比) → 5.0 (絶対 USD)
 }
 
 # --- Chapter 2 統計フィルター閾値 ---
@@ -135,12 +159,90 @@ NEUTRALIZATION_CONFIG = {
 }
 
 # --- Chapter 2 その他定数 ---
-BARRIER_ATR_PERIOD = 13  # トリプルバリアのATR期間
+# [PROTO] トリプルバリアのATR期間: 13 → 21
+#   プロトタイプ脳は e1c_atr_21 でゲートもバリア幅も決めていた。
+#     regime1 SOURCE_ATR_COLUMN_NAME = "e1c_atr_21"
+#   ATR_ABS_THRESHOLD = 5.0 USD は ATR(21) に対して較正された閾値のため、
+#   期間を 13 のままにすると閾値の意味が変わる。
+#
+# ★★ 本番投入前に必ず直すこと ★★
+#   realtime_feature_engine.py L152 の
+#       ATR_CALC_PERIOD = 13
+#   は blueprint を参照せずハードコードされている。
+#   ここを 21 にしないと、学習(ATR21)と本番(ATR13)でバリア幅が割れる。
+#   影響箇所: rfe L1961 / L2082 (calculate_barrier_atr) / L2609
+#   学習(Step 14-22)だけなら影響なし。本番デプロイ時のチェック項目。
+#
+# 消費側:
+#   create_proxy_labels_...V5.py  … ATR_PERIOD として使用 (今回は 21 を直書き)
+#   2_E_hf_meta_model_trainer.py  … L501/L515 の Wilder EWM
+#   backtest_simulator_cimera.py  … S6 の atr_value 列を読むため自動追随
+BARRIER_ATR_PERIOD = 21
 # ※ATRの時間足はシグナル発現した時間足（M1/M3/M5等）に対応したものを使用。固定時間足ではない。
 ATR_BASELINE_DAYS = 1  # ATR Ratioのベースライン期間（日数）
 # 各時間足のN = timeframe_bars_per_day[tf] * ATR_BASELINE_DAYS
 # 例：M1なら1440バー・H1なら24バー・D1なら1バーがベースライン
+
+# --- セッション別 ATR Ratio (session_atr_ratio) ---
+# 既存 atr_ratio(直近1日の"時間帯混合"平均比)は、Oceania/Overlap等ボラ水準の
+# 異なる時間帯を同一分母でならすため、閑散帯を構造的に過小評価する欠陥がある。
+# session_atr_ratio は「今のATR ÷ 同一セッションの過去 SESSION_BASELINE_DAYS 日の
+# ATR平均」で、"その時間帯にしては異常に動いているか"を測る。主指標はこちら。
+# セッション境界は UTC hour で定義(計算系はUTC0。JSTはレポート表示専用)。
+# BT backtest_simulator_cimera._session と同一写像 (UTC h → +9 JST → session)。
+SESSION_BASELINE_DAYS = 3  # session_atr_ratio のベースライン日数（同一セッションのみ）
+# UTC hour → セッション名。_session(JST) と等価: JST 9-16=UTC 0-7 Tokyo 等。
+SESSION_BY_UTC_HOUR = {
+    **{h: "Tokyo"   for h in range(0, 7)},    # JST  9-16
+    **{h: "London"  for h in range(7, 12)},   # JST 16-21
+    **{h: "Overlap" for h in (12, 13, 14, 15)},  # JST 21-01
+    **{h: "NY"      for h in range(16, 21)},   # JST  1-06
+    **{h: "Oceania" for h in (21, 22, 23)},   # JST  6-09
+}
+
 MAX_WORKERS_DIVISOR = 1  # cpu_count // MAX_WORKERS_DIVISOR でワーカー数決定（旧: 2）
+
+# =================================================================
+# [PROTO] トリガー時間足とプロトタイプ幾何 — 単一の宣言
+# -----------------------------------------------------------------
+# 2025-11 のプロトタイプ脳（本番実績 22倍）の幾何を再現するための定義。
+# 現時点では参照用（各スクリプトは自前の定数を持つ）だが、
+# 「どのTFで、どの閾値で回しているか」を1箇所で確認できるようにする。
+#
+# 変更する場合、下記4ファイルを必ず同時に合わせること:
+#   1. create_proxy_labels_...V5.py : TARGET_TIMEFRAMES / ACTION_HORIZON_SEC
+#                                     / ATR_PERIOD / ATR_ABS_THRESHOLD
+#                                     / RULE_LONG / RULE_SHORT
+#   2. split_features_first_orthogonal.py : TRIGGER_TF / ER_WINDOWS
+#   3. backtest_simulator_cimera.py : USER_PARAMS の pt/sl/td/min_atr
+#   4. realtime_feature_engine.py   : ATR_CALC_PERIOD
+# =================================================================
+TRIGGER_TIMEFRAME = "M1"        # ラベリングのトリガー足（毎分判定）
+ACTION_HORIZON_SEC = 60         # = TRIGGER_TIMEFRAME の秒数
+
+ATR_ABS_THRESHOLD = 5.0         # 母集団選抜: 絶対 ATR(21) >= 5.0 USD
+                                #   旧: atr_ratio >= 0.0（ゲート撤廃）
+                                #   相対比は「いつもと比べて」、絶対値は
+                                #   「スプレッドに対して十分大きいか」を測る。
+                                #   コストが USD 固定なので経済性は後者に効く。
+
+PROTO_PT_MULT = 1.0             # PT = ATR × 1.0（浅い利確）
+PROTO_SL_MULT = 5.0             # SL = ATR × 5.0（深い損切り）
+PROTO_TD = "1200m"              # 時間バリア 1200分（20時間）
+
+# 効率比の窓（ラベリング ER_WINDOWS_BY_TF と一致させること）
+#   M0.5:(120,150) / M1:(60,80) / M3:(20,25) / M5:(12,15) / M8:(8,10) / M15:(4,5)
+ER_WINDOWS_BY_TRIGGER = (60, 80)
+
+# 幾何だけの基準線（BTの読み方）:
+#   無ドリフトRWで PT=1×ATR / SL=5×ATR なら P(PT先着) = 5/(1+5) = 83.3%
+#   モデルが無くてもこの勝率は出る。これを超えているかで判断すること。
+#
+# 既知の副作用: PT/SL が非対称(1:5)なので「long も short も label=1」が復活する。
+#   無ドリフトMC実測でボラ標準 18% / ボラ2倍 52%。
+#   プロトタイプは Long 専用(regime1 L961 direction=1固定)だったため
+#   問題にならなかった。両方向学習では short 側のラベルが汚染される。
+#   → 評価は Long 側で見ること。
 
 # --- Stratum 3: 検証成果物 ---
 S3_ARTIFACTS = _SYM / "stratum_3_artifacts"
@@ -176,7 +278,9 @@ S3_LF_ENVIRONMENT_SCORES = S3_ARTIFACTS / "lf_environment_scores.parquet"
 S3_OPTUNA_RESULTS_DIR = S3_ARTIFACTS / "optuna_results"
 
 # ラベル生成でATRを自前計算するためのS1_PROCESSEDへの参照
-# （e1c_atr_13は相対値のため使用不可・OHLCVからWilder平滑化で計算する）
+# （e1c_atr_21 は現行エンジンでは相対値(scale_by_atr)のため使用不可。
+#   ラベリングが S1_PROCESSED の OHLCV から Wilder 平滑化で USD建て ATR を
+#   自前計算し、atr_value 列として S6 に出す。ゲートもこれを使う。）
 # S1_PROCESSEDは既に定義済みのため追記不要
 
 # Stratum 4: マスターテーブル (廃止 — git history 参照)

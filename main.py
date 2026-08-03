@@ -2030,7 +2030,6 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                         tp_multiplier=current_tp_mult,  # 修正反映
                         current_spread_pips=current_spread,
                         atr_ratio=current_atr_ratio,  # ★追加: ATR Ratio をリスクエンジンに渡す
-                        price_at_L=signal.market_info.get("price_at_L", 0.0),  # [L-ANCHOR] PT を L 起点に
                     )
 
                     # [DEBUG-BARRIER] 発注直前の診断ログ — バリア幅異常の原因特定用
@@ -2038,17 +2037,15 @@ def main(dry_run: bool = False, ols_dump: bool = False):
                     # HOLDコマンドの場合はこれらキーが無いためフォールバックを用意。
                     _entry_price = signal.market_info["current_price"]
                     _sl_dollar = float(command.get("sl_width", 0.0))
-                    _sl_dollar_from_L = float(command.get("sl_width_from_L", 0.0))
                     _tp_dollar = float(command.get("tp_width", 0.0))
-                    _tp_dollar_full = float(command.get("tp_width_full", 0.0))
                     _buf_len = signal.market_info.get("atr_buffer_len", -1)
                     _last_tr = signal.market_info.get("last_tr", -1.0)
                     if command["action"] != "HOLD":
                         logger.info(
                             f"📐 BARRIER | {direction} @ {_entry_price:.3f}\n"
                             f" | ATR={current_atr:.4f} last_TR={_last_tr:.4f} buf={_buf_len}\n"
-                            f" | SL ${_sl_dollar:.3f}/L${_sl_dollar_from_L:.3f} (x{current_sl_mult})"
-                            f" | TP ${_tp_dollar:.3f}/full${_tp_dollar_full:.3f} (x{current_tp_mult})"
+                            f" | SL ${_sl_dollar:.3f} (x{current_sl_mult})"
+                            f" | TP ${_tp_dollar:.3f} (x{current_tp_mult})"
                         )
 
                     # [BARRIER-GUARD] 最低ドル幅フィルター

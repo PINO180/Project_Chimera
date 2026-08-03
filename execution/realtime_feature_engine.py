@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 # ▲▲▲ ここまで追加 ▲▲▲
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 import json
 import re
@@ -56,6 +56,24 @@ TIMEFRAME_BARS_PER_DAY: Dict[str, int] = {
     # "M30": 48,
     # "H1": 24,
     # "H4": 6, "H6": 4, "H12": 2, "D1": 1,  # [FIX] 使用されない時間足
+}
+
+# =============================================================================
+# 効率比の窓（バー本数）— 学習側 create_proxy_labels の ER_WINDOWS_BY_TF と同一
+# -----------------------------------------------------------------------------
+#   ER(K) = |close[t] − close[t−K]| / Σ|close[i] − close[i−1]|
+#   実時間で 60分 / 75-80分 になるよう時間足ごとに設定する。
+#   （測定で「その場のレジーム」の時間スケールが60〜80分と判明したため。
+#     M3足でもM1足でも実時間60〜80分が最適という結果だった）
+#   ★学習側を変えたら必ずここも変えること。ずれると学習と本番で特徴量が食い違う。
+# =============================================================================
+ER_WINDOWS_BY_TF: Dict[str, tuple] = {
+    "M0.5": (120, 150),
+    "M1": (60, 80),
+    "M3": (20, 25),
+    "M5": (12, 15),
+    "M8": (8, 10),
+    "M15": (4, 5),
 }
 
 from execution.realtime_feature_engine_1A_statistics import FeatureModule1A
@@ -1974,6 +1992,58 @@ class RealtimeFeatureEngine:
             if tf_name in self.latest_features_cache:
                 self.latest_features_cache[tf_name]["atr_ratio"] = atr_ratio
 
+            # =================================================================
+            # 追加特徴量 — 学習側 create_proxy_labels と【同一式】
+            # -----------------------------------------------------------------
+            #  (1) 効率比 eff_ratio_{K}
+            #        ER(K) = |close[t] − close[t−K]| / Σ|close[i] − close[i−1]|
+            #        1に近い = 直近K本を一方向に走った（その場がトレンド）
+            #        0に近い = 行って戻った（その場がレンジ）
+            #
+            #  (2) 符号つき1バー変位 d_atr
+            #        d_atr = (close − open) / ATR
+            #        M3バー [L, L+180) では open=P(L)、close=P(L+180) なので、
+            #        これは d = P(L+180) − P(L) を ATR で正規化したものと同一。
+            #        既存の e1d_body_size_atr は abs() 付きで符号が落ちているため
+            #        別途必要。
+            #
+            #  学習側の列名は eff_ratio_{K}_{tf} / d_atr_{tf}（例 eff_ratio_20_M3）。
+            #  ここでは latest_features_cache[tf]["eff_ratio_{K}"] / ["d_atr"] に入れる。
+            #  calculate_feature_vector が "eff_ratio_20_M3" を要求したとき、
+            #  atr_ratio_M3 と同じ経路で取得される。
+            #
+            #  ★学習側と1文字でも式が違うと乖離する。変更時は必ず両方を直すこと。
+            #    学習側: L_180_create_proxy_labels...py の ER_WINDOWS_BY_TF 付近
+            # =================================================================
+            if tf_name in self.latest_features_cache:
+                # (1) 効率比
+                er_windows = ER_WINDOWS_BY_TF.get(tf_name, (20, 25))
+                for k in er_windows:
+                    if len(close) >= k + 1:
+                        seg = np.asarray(close[-(k + 1):], dtype=np.float64)
+                        direction = abs(float(seg[-1] - seg[0]))
+                        volatility = float(np.abs(np.diff(seg)).sum())
+                        er_val = direction / (volatility + 1e-12)
+                    else:
+                        er_val = 0.0
+                    self.latest_features_cache[tf_name][f"eff_ratio_{k}"] = er_val
+
+                # (2) 符号つき1バー変位
+                try:
+                    _open_arr = data["open"]
+                    if len(_open_arr) > 0 and len(close) > 0:
+                        d_atr_val = float(
+                            (float(close[-1]) - float(_open_arr[-1]))
+                            / (atr_value + 1e-10)
+                        )
+                    else:
+                        d_atr_val = 0.0
+                except (KeyError, IndexError, TypeError):
+                    d_atr_val = 0.0
+                if not np.isfinite(d_atr_val):
+                    d_atr_val = 0.0
+                self.latest_features_cache[tf_name]["d_atr"] = d_atr_val
+
             if atr_ratio >= atr_threshold:
                 # [DEBUG] バッファ診断情報を計算
                 atr_buffer_len = len(atr_arr)
@@ -2016,48 +2086,11 @@ class RealtimeFeatureEngine:
                     float(barrier_atr) if np.isfinite(barrier_atr) else atr_value
                 )
 
-                # [L-ANCHOR §41.8] price(L) を market_info へ追加。
-                #   ラベリングの L アンカー = 「timestamp <= L の最後の tick mid」
-                #   (create_proxy_labels: tick mid を L で join_asof(backward))。
-                #   学習側 M0.5 バーは group_key = ts//30s の floor バケットで
-                #   bar(T) = [T, T+30s) の集計、close = last mid (s1_1_B L200-201)。
-                #   よって「L で閉じた M0.5 バー = bar(L-30s) の close」が
-                #   「timestamp < L の最後の tick mid」に一致 (境界 tick=L ちょうどの
-                #   1 点のみ join_asof と異なるが ms 精度で実務上無視できる)。
-                #   本番 EA の M0.5 も CopyTicksRange の同一バケット・同一 mid 定義
-                #   ([TICK-AGG-FIX A-2]) なので bit 一致。
-                #   timestamp 引数 = M3 close = L+180 → L = timestamp - 180s。
-                #   探索は m05_dataframe (deque of dict, timestamp 昇順) を末尾から。
-                price_at_L = 0.0
-                try:
-                    _L_ts = timestamp - timedelta(seconds=180)
-                    _target_m05_ts = _L_ts - timedelta(seconds=30)
-                    for _b in reversed(self.m05_dataframe):
-                        _bts = _b["timestamp"]
-                        if _bts == _target_m05_ts:
-                            price_at_L = float(_b["close"])
-                            break
-                        if _bts < _target_m05_ts:
-                            # 30s 欠落 (流動性ギャップ等) → それ以前で最後に閉じた
-                            # M0.5 close = 「timestamp < L の最後の mid」に一致するので採用
-                            price_at_L = float(_b["close"])
-                            break
-                except Exception as _e:
-                    self.logger.warning(f"[L-ANCHOR] price_at_L 取得失敗: {_e}")
-                if price_at_L <= 0.0:
-                    # フォールバック: 取得不能時は current_price (=約定基準 PT に退化)。
-                    # risk engine 側は price_at_L<=0 を「L 起点 PT 不可」として扱う。
-                    self.logger.warning(
-                        "[L-ANCHOR] price_at_L が取得できません。current_price に"
-                        "フォールバックします (PT は約定基準に退化)。"
-                    )
-
                 market_info = {
                     "atr_value": barrier_atr_value,  # SL/TP計算用（堅牢版）
                     "atr_value_raw": atr_value,       # 参考値（学習側と同一のWilder EWM）
                     "atr_ratio": atr_ratio,
                     "current_price": current_price,
-                    "price_at_L": price_at_L,  # [L-ANCHOR] L 時点価格 (0.0=取得不能)
                     "sl_multiplier_long": self.risk_config.get(
                         "sl_multiplier_long", 5.0
                     ),
